@@ -1,0 +1,25 @@
+# All I/O is async. Use tokio::fs, tokio::process, tokio::net and tokio::time.
+disallowed-methods = [
+    { path = "std::fs::read", reason = "use tokio::fs" },
+    { path = "std::fs::read_to_string", reason = "use tokio::fs" },
+    { path = "std::fs::write", reason = "use tokio::fs" },
+    { path = "std::fs::read_dir", reason = "use tokio::fs" },
+    { path = "std::fs::create_dir", reason = "use tokio::fs" },
+    { path = "std::fs::create_dir_all", reason = "use tokio::fs" },
+    { path = "std::fs::remove_file", reason = "use tokio::fs" },
+    { path = "std::fs::remove_dir", reason = "use tokio::fs" },
+    { path = "std::fs::remove_dir_all", reason = "use tokio::fs" },
+    { path = "std::fs::rename", reason = "use tokio::fs" },
+    { path = "std::fs::copy", reason = "use tokio::fs" },
+    { path = "std::fs::metadata", reason = "use tokio::fs" },
+    { path = "std::fs::symlink_metadata", reason = "use tokio::fs" },
+    { path = "std::fs::canonicalize", reason = "use tokio::fs" },
+    { path = "std::thread::sleep", reason = "use tokio::time::sleep" },
+]
+disallowed-types = [
+    { path = "std::fs::File", reason = "use tokio::fs::File" },
+    { path = "std::fs::OpenOptions", reason = "use tokio::fs::OpenOptions" },
+    { path = "std::process::Command", reason = "use tokio::process::Command" },
+    { path = "std::net::TcpStream", reason = "use tokio::net::TcpStream" },
+    { path = "std::net::TcpListener", reason = "use tokio::net::TcpListener" },
+]

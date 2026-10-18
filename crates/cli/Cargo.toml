@@ -1,0 +1,22 @@
+[package]
+name = "reagent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "reagent"
+path = "src/main.rs"
+
+[dependencies]
+reagent-ai.workspace = true
+reagent-agent.workspace = true
+reagent-tools.workspace = true
+reagent-script.workspace = true
+reagent-mcp.workspace = true
+reagent-tui.workspace = true
+
+[lints]
+workspace = true
