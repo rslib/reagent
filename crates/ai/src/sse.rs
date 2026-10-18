@@ -18,6 +18,15 @@ impl SseSplitter {
         Self::default()
     }
 
+    /// Returns the last line when the stream ended without a final newline.
+    pub fn finish(&mut self) -> Option<&[u8]> {
+        if self.carry.is_empty() {
+            return None;
+        }
+        self.completed = std::mem::take(&mut self.carry);
+        Some(trim_cr(&self.completed))
+    }
+
     /// Feeds one chunk and returns a cursor over the lines it completes.
     pub fn push<'a>(&'a mut self, chunk: &'a [u8]) -> Lines<'a> {
         Lines {
@@ -152,6 +161,18 @@ mod tests {
         let second = lines.next_line().unwrap();
         assert_eq!(second, b"data: two");
         assert_eq!(second.as_ptr() as usize - base, 10);
+    }
+
+    #[test]
+    fn finish_returns_a_last_line_without_a_newline() {
+        let mut splitter = SseSplitter::new();
+        let lines = collect(
+            &mut splitter,
+            &Bytes::from_static(b"data: one\ndata: two\r"),
+        );
+        assert_eq!(lines, vec![b"data: one".to_vec()]);
+        assert_eq!(splitter.finish(), Some(&b"data: two"[..]));
+        assert_eq!(splitter.finish(), None);
     }
 
     #[test]

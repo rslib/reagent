@@ -3,7 +3,9 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use futures_util::stream::{self, BoxStream};
+use bytes::Bytes;
+use futures_util::FutureExt;
+use futures_util::stream::{self, BoxStream, StreamExt};
 
 use crate::{Error, Provider, Request, StreamEvent};
 
@@ -48,9 +50,9 @@ impl Provider for FakeProvider {
         "fake"
     }
 
-    fn stream(&self, request: &Request) -> BoxStream<'static, Result<StreamEvent, Error>> {
+    fn stream(&self, request: &Request<'_>) -> BoxStream<'static, Result<StreamEvent, Error>> {
         self.seen.lock().expect("seen lock").push(SeenRequest {
-            model: request.model.clone(),
+            model: request.model.to_string(),
             messages: request.messages.len(),
         });
         let reply = self
@@ -63,20 +65,51 @@ impl Provider for FakeProvider {
     }
 }
 
+/// A provider wire format for [`parse_chunks`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wire {
+    /// Anthropic Messages.
+    Anthropic,
+    /// OpenAI Responses.
+    OpenAiResponses,
+    /// OpenAI-compatible Chat Completions.
+    OpenAiChat,
+}
+
+/// Runs `chunks` through the real stream glue and parser of `wire`, as if they
+/// came from the socket, and returns every item the stream yields.
+pub fn parse_chunks(wire: Wire, chunks: Vec<Bytes>) -> Vec<Result<StreamEvent, Error>> {
+    let input = stream::iter(chunks.into_iter().map(Ok));
+    let events = match wire {
+        Wire::Anthropic => {
+            crate::openai::event_stream(input, crate::anthropic::stream::StreamParser::new())
+        }
+        Wire::OpenAiResponses => crate::openai::event_stream(
+            input,
+            crate::openai::responses::stream::StreamParser::new(),
+        ),
+        Wire::OpenAiChat => {
+            crate::openai::event_stream(input, crate::openai::chat::StreamParser::new())
+        }
+    };
+    events
+        .collect::<Vec<_>>()
+        .now_or_never()
+        .expect("chunks from memory are always ready")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{Message, ReasoningLevel, StopReason};
 
-    fn request(model: &str, messages: usize) -> Request {
+    fn request<'a>(model: &'a str, history: &'a [Message]) -> Request<'a> {
         Request {
-            model: model.into(),
+            model,
             max_tokens: 64,
             system: None,
-            tools: Vec::new(),
-            messages: (0..messages)
-                .map(|i| Message::user(format!("m{i}")))
-                .collect(),
+            tools: &[],
+            messages: history,
             reasoning: Some(ReasoningLevel::Low),
             cache_key: None,
         }
@@ -105,7 +138,8 @@ mod tests {
             ],
             vec![StreamEvent::TextDelta("second".into())],
         ]);
-        let request = request("fake-model", 2);
+        let history: Vec<Message> = (0..2).map(|i| Message::user(format!("m{i}"))).collect();
+        let request = request("fake-model", &history);
 
         assert_eq!(
             drain(&mut provider.stream(&request)),
@@ -137,8 +171,9 @@ mod tests {
     fn push_reply_queues_at_the_back() {
         let provider = FakeProvider::new(vec![]);
         provider.push_reply(vec![StreamEvent::TextDelta("queued".into())]);
+        let history = vec![Message::user("m0")];
         assert_eq!(
-            drain(&mut provider.stream(&request("m", 1))),
+            drain(&mut provider.stream(&request("m", &history))),
             vec![StreamEvent::TextDelta("queued".into())]
         );
     }
@@ -146,6 +181,6 @@ mod tests {
     #[test]
     fn an_exhausted_provider_yields_nothing() {
         let provider = FakeProvider::new(vec![]);
-        assert!(drain(&mut provider.stream(&request("m", 0))).is_empty());
+        assert!(drain(&mut provider.stream(&request("m", &[]))).is_empty());
     }
 }

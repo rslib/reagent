@@ -527,12 +527,13 @@ mod tests {
     #[test]
     fn request_body_is_stable_for_the_same_history() {
         let provider = crate::openai::responses::OpenAiResponses::new("key", "http://localhost");
+        let history = vec![Message::user("one")];
         let request = Request {
-            model: "gpt-5".into(),
+            model: "gpt-5",
             max_tokens: 128,
             system: None,
-            tools: Vec::new(),
-            messages: vec![Message::user("one")],
+            tools: &[],
+            messages: &history,
             reasoning: None,
             cache_key: None,
         };

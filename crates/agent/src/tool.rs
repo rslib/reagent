@@ -67,9 +67,12 @@ pub trait Tool: Send + Sync {
 ///
 /// The tool list built from a registry is stable for a given set of tools
 /// because the order comes from a sorted map, so the prompt-cache prefix of
-/// a session is not disturbed by registry state.
+/// a session is not disturbed by registry state. The specs are kept in one
+/// sorted slice beside the map, so a request hands the provider a borrow
+/// instead of rebuilding a list.
 pub struct Registry {
     tools: BTreeMap<String, Box<dyn Tool>>,
+    specs: Vec<ToolSpec>,
 }
 
 impl Registry {
@@ -77,6 +80,7 @@ impl Registry {
     pub fn new() -> Self {
         Self {
             tools: BTreeMap::new(),
+            specs: Vec::new(),
         }
     }
 
@@ -84,6 +88,14 @@ impl Registry {
     pub fn add(&mut self, tool: impl Tool + 'static) {
         let name = tool.spec().name.clone();
         self.tools.insert(name, Box::new(tool));
+        self.rebuild_specs();
+    }
+
+    /// Rebuilds the sorted spec slice after a tool was added or replaced.
+    fn rebuild_specs(&mut self) {
+        self.specs.clear();
+        self.specs
+            .extend(self.tools.values().map(|tool| tool.spec().clone()));
     }
 
     /// The tool names in stable sorted order.
@@ -92,8 +104,11 @@ impl Registry {
     }
 
     /// The tool specs in stable sorted order, for a provider request.
-    pub fn specs(&self) -> impl Iterator<Item = &ToolSpec> + '_ {
-        self.tools.values().map(|tool| tool.spec())
+    ///
+    /// The slice is rebuilt by [`Registry::add`], so a caller borrows it
+    /// without copying a schema.
+    pub fn specs(&self) -> &[ToolSpec] {
+        &self.specs
     }
 
     /// Looks up a tool by name.
@@ -228,12 +243,13 @@ mod tests {
     }
 
     #[test]
-    fn specs_follow_the_same_sorted_order() {
+    fn specs_are_one_sorted_slice() {
         let registry = registry_of(&["b", "a"]);
+        let specs: &[ToolSpec] = registry.specs();
         assert_eq!(
-            registry
-                .specs()
-                .map(|spec: &ToolSpec| spec.name.as_str())
+            specs
+                .iter()
+                .map(|spec| spec.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["a", "b"]
         );

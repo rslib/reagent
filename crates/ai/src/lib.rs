@@ -4,6 +4,8 @@ pub mod anthropic;
 pub(crate) mod cross_provider;
 #[cfg(feature = "testing")]
 pub mod fake;
+mod http;
+mod key;
 pub mod openai;
 pub mod sse;
 pub mod types;
@@ -78,22 +80,27 @@ impl From<serde_json::Error> for Error {
 }
 
 /// One request to a provider.
+///
+/// The model id, the system prompt, the tools and the history are borrowed
+/// from the caller, so a turn copies no message and no tool schema. A provider
+/// builds its body inside [`Provider::stream`] and never holds the borrow past
+/// that call.
 #[derive(Debug)]
-pub struct Request {
+pub struct Request<'a> {
     /// The provider model id.
-    pub model: String,
+    pub model: &'a str,
     /// The cap on reply tokens, not counting the reasoning budget.
     pub max_tokens: u32,
     /// The system prompt, if any.
-    pub system: Option<Text>,
+    pub system: Option<&'a Text>,
     /// Tools offered to the model.
-    pub tools: Vec<ToolSpec>,
+    pub tools: &'a [ToolSpec],
     /// The conversation so far, oldest first.
-    pub messages: Vec<Message>,
+    pub messages: &'a [Message],
     /// How much reasoning the provider may spend.
     pub reasoning: Option<ReasoningLevel>,
     /// A stable key that identifies the cached prompt prefix of this session.
-    pub cache_key: Option<Text>,
+    pub cache_key: Option<&'a Text>,
 }
 
 /// A streaming chat provider.
@@ -105,5 +112,5 @@ pub trait Provider: Send + Sync {
     ///
     /// The body is built before the stream starts, so the history is never
     /// cloned and never held past this call.
-    fn stream(&self, request: &Request) -> BoxStream<'static, Result<StreamEvent, Error>>;
+    fn stream(&self, request: &Request<'_>) -> BoxStream<'static, Result<StreamEvent, Error>>;
 }

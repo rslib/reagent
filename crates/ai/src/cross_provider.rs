@@ -43,12 +43,12 @@ mod tests {
     use crate::openai::responses::{OpenAiResponses, stream::StreamParser as ResponsesParser};
     use crate::types::{AssistantMessage, ToolCall, Usage};
 
-    fn request(reasoning: Option<ReasoningLevel>, messages: Vec<Message>) -> Request {
+    fn request<'a>(reasoning: Option<ReasoningLevel>, messages: &'a [Message]) -> Request<'a> {
         Request {
-            model: "m".into(),
+            model: "m",
             max_tokens: 128,
             system: None,
-            tools: Vec::new(),
+            tools: &[],
             messages,
             reasoning,
             cache_key: None,
@@ -85,7 +85,7 @@ mod tests {
             Message::tool_result("call_01", "ok", false),
             Message::user("explain"),
         ];
-        let request = request(Some(ReasoningLevel::Medium), history);
+        let request = request(Some(ReasoningLevel::Medium), &history);
 
         let anthropic = Anthropic::new("key", "http://localhost");
         let body = anthropic.request_body(&request).unwrap();
@@ -114,7 +114,7 @@ mod tests {
             assistant("openai", vec![Content::text("hi"), tool_call()]),
             Message::tool_result("call_01", "ok", false),
         ];
-        let request = request(Some(ReasoningLevel::High), history);
+        let request = request(Some(ReasoningLevel::High), &history);
         let body = Anthropic::new("key", "http://localhost")
             .request_body(&request)
             .unwrap();
@@ -139,7 +139,7 @@ mod tests {
             ),
             Message::tool_result("call_01", "ok", false),
         ];
-        let request = request(Some(ReasoningLevel::High), history);
+        let request = request(Some(ReasoningLevel::High), &history);
         let body = Anthropic::new("key", "http://localhost")
             .request_body(&request)
             .unwrap();
@@ -157,7 +157,7 @@ mod tests {
             ),
             Message::tool_result("call_01", "ok", false),
         ];
-        let request = request(Some(ReasoningLevel::High), history);
+        let request = request(Some(ReasoningLevel::High), &history);
         let body = Anthropic::new("key", "http://localhost")
             .request_body(&request)
             .unwrap();
@@ -182,7 +182,7 @@ mod tests {
             ),
             Message::tool_result("call_01", "ok", false),
         ];
-        let request = request(Some(ReasoningLevel::High), history);
+        let request = request(Some(ReasoningLevel::High), &history);
         let body = Anthropic::new("key", "http://localhost")
             .request_body(&request)
             .unwrap();
@@ -198,11 +198,11 @@ mod tests {
             assistant("openai", vec![Content::text("hi"), tool_call()]),
         ];
         assert!(
-            anthropic_reasoning(&request(None, history.clone())).is_none(),
+            anthropic_reasoning(&request(None, &history)).is_none(),
             "no reasoning was requested"
         );
         assert!(
-            anthropic_reasoning(&request(Some(ReasoningLevel::Low), history)).is_none(),
+            anthropic_reasoning(&request(Some(ReasoningLevel::Low), &history)).is_none(),
             "a tool use without thinking disables thinking"
         );
     }
@@ -215,11 +215,13 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/openai_responses_text.sse"
         ));
+        let mut events = Vec::new();
         for line in fixture.lines() {
-            for event in parser.push_line(line.as_bytes()).unwrap() {
-                if let StreamEvent::Usage(seen) = event {
-                    usage = seen;
-                }
+            parser.push_line(line.as_bytes(), &mut events).unwrap();
+        }
+        for event in events {
+            if let StreamEvent::Usage(seen) = event {
+                usage = seen;
             }
         }
         parser.finish().unwrap();
@@ -231,11 +233,13 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/openai_chat_tool.sse"
         ));
+        let mut events = Vec::new();
         for line in fixture.lines() {
-            for event in parser.push_line(line.as_bytes()).unwrap() {
-                if let StreamEvent::Usage(seen) = event {
-                    usage = seen;
-                }
+            parser.push_line(line.as_bytes(), &mut events).unwrap();
+        }
+        for event in events {
+            if let StreamEvent::Usage(seen) = event {
+                usage = seen;
             }
         }
         parser.finish().unwrap();

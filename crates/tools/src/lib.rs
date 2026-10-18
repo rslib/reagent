@@ -1,1 +1,20 @@
-//! Native tools: read, write, edit, bash, grep, find.
+//! Native tools: read, write, edit, bash.
+
+use std::path::{Path, PathBuf};
+
+mod atomic;
+mod process_group;
+
+pub mod bash;
+pub mod edit;
+pub mod read;
+pub mod write;
+
+/// Resolves a tool path: an absolute path as is, a relative one under
+/// `working_dir`.
+fn resolve(working_dir: &Path, path: &str) -> Result<PathBuf, String> {
+    if path.is_empty() {
+        return Err("invalid arguments: path must not be empty".into());
+    }
+    Ok(working_dir.join(path))
+}

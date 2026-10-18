@@ -1,9 +1,8 @@
 //! Parses the OpenAI Responses SSE stream.
 
-use std::borrow::Cow;
-
 use serde::Deserialize;
 
+use crate::openai::JsonStr;
 use crate::types::StopReason;
 use crate::{Error, StreamEvent, Text, Usage};
 
@@ -28,13 +27,13 @@ impl StreamParser {
         Self::default()
     }
 
-    /// Feeds one SSE line and returns the events it carries.
-    pub fn push_line(&mut self, line: &[u8]) -> Result<Vec<StreamEvent>, Error> {
+    /// Feeds one SSE line and appends the events it carries to `out`.
+    pub fn push_line(&mut self, line: &[u8], out: &mut Vec<StreamEvent>) -> Result<(), Error> {
         if self.failed {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let Some(data) = data_of(line) else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let data = match std::str::from_utf8(data) {
             Ok(data) => data,
@@ -51,87 +50,119 @@ impl StreamParser {
             }
         };
 
-        let mut out = Vec::new();
-        match event {
-            Event::OutputItemAdded { item } => {
-                if item.kind == "function_call" {
-                    let call_id: Text = item.call_id.unwrap_or_default().into();
-                    let name: Text = item.name.unwrap_or_default().into();
-                    if let Some(id) = item.id {
-                        self.remember(id, &call_id);
+        match event.kind {
+            "response.output_item.added" => {
+                if let Some(item) = event.item
+                    && item.kind == "function_call"
+                {
+                    let call_id: Text = item.call_id.unwrap_or_default().as_str().into();
+                    let name: Text = item.name.unwrap_or_default().as_str().into();
+                    if let Some(id) = item.id.as_ref() {
+                        self.remember(id.as_str(), &call_id);
                     }
                     self.saw_tool_call = true;
                     out.push(StreamEvent::ToolCallStart { id: call_id, name });
                 }
+                Ok(())
             }
-            Event::OutputItemDone { item } => {
-                if item.kind == "function_call" {
-                    let call_id = self
-                        .call_id_for(item.id)
-                        .unwrap_or_else(|| Text::from(item.call_id.unwrap_or_default()));
-                    self.saw_tool_call = true;
-                    out.push(StreamEvent::ToolCallEnd { id: call_id });
-                } else if item.kind == "reasoning"
-                    && let Some(encrypted) = item.encrypted_content
-                {
-                    out.push(StreamEvent::ThinkingSignature(super::pack_reasoning(
-                        item.id, encrypted,
-                    )));
+            "response.output_item.done" => {
+                if let Some(item) = event.item {
+                    if item.kind == "function_call" {
+                        let call_id = self
+                            .call_id_for(item.id.as_ref().map(JsonStr::as_str))
+                            .unwrap_or_else(|| {
+                                Text::from(item.call_id.unwrap_or_default().as_str())
+                            });
+                        self.saw_tool_call = true;
+                        out.push(StreamEvent::ToolCallEnd { id: call_id });
+                    } else if item.kind == "reasoning"
+                        && let Some(encrypted) = item.encrypted_content.as_ref()
+                    {
+                        out.push(StreamEvent::ThinkingSignature(super::pack_reasoning(
+                            item.id.as_ref().map(JsonStr::as_str),
+                            encrypted.as_str(),
+                        )));
+                    }
                 }
+                Ok(())
             }
-            Event::OutputTextDelta { delta } => {
-                out.push(StreamEvent::TextDelta(Text::from(delta.as_ref())));
+            "response.output_text.delta" => {
+                let Some(delta) = event.delta else {
+                    return Err(self.missing("response.output_text.delta", "delta"));
+                };
+                out.push(StreamEvent::TextDelta(Text::from(delta.as_str())));
+                Ok(())
             }
-            Event::ReasoningSummaryTextDelta { delta } => {
-                out.push(StreamEvent::ThinkingDelta(Text::from(delta.as_ref())));
+            "response.reasoning_summary_text.delta" => {
+                let Some(delta) = event.delta else {
+                    return Err(self.missing("response.reasoning_summary_text.delta", "delta"));
+                };
+                out.push(StreamEvent::ThinkingDelta(Text::from(delta.as_str())));
+                Ok(())
             }
-            Event::FunctionCallArgumentsDelta { item_id, delta } => {
-                let id = self.call_id_for(Some(item_id)).unwrap_or_default();
+            "response.function_call_arguments.delta" => {
+                const KIND: &str = "response.function_call_arguments.delta";
+                let Some(delta) = event.delta else {
+                    return Err(self.missing(KIND, "delta"));
+                };
+                if event.item_id.is_none() {
+                    return Err(self.missing(KIND, "item_id"));
+                }
+                let id = self.call_id_for(event.item_id).unwrap_or_default();
                 out.push(StreamEvent::ToolCallDelta {
                     id,
-                    partial_json: Text::from(delta.as_ref()),
+                    partial_json: Text::from(delta.as_str()),
                 });
+                Ok(())
             }
-            Event::Completed { response } => {
+            "response.completed" => {
                 self.done = true;
                 self.stop_reason = Some(if self.saw_tool_call {
                     StopReason::ToolUse
                 } else {
                     StopReason::EndTurn
                 });
-                if let Some(usage) = response.usage {
+                if let Some(usage) = event.response.usage {
                     self.usage = usage_of(usage);
                 }
                 out.push(StreamEvent::Usage(self.usage));
+                Ok(())
             }
-            Event::Incomplete { response } => {
+            "response.incomplete" => {
                 self.done = true;
                 self.stop_reason = Some(incomplete_reason(
-                    response
+                    event
+                        .response
                         .incomplete_details
                         .as_ref()
-                        .and_then(|details| details.reason.as_deref()),
+                        .and_then(|details| details.reason),
                 ));
-                if let Some(usage) = response.usage {
+                if let Some(usage) = event.response.usage {
                     self.usage = usage_of(usage);
                 }
                 out.push(StreamEvent::Usage(self.usage));
+                Ok(())
             }
-            Event::Failed { response } => {
-                let message = response
+            "response.failed" => {
+                let message = event
+                    .response
                     .error
-                    .map(|error| error.message.into_owned())
+                    .map(|error| error.message.as_str().to_string())
                     .unwrap_or_else(|| "response failed".into());
                 self.failed = true;
-                return Err(Error::Protocol(message));
+                Err(Error::Protocol(message))
             }
-            Event::Error { message } => {
+            "error" => {
                 self.failed = true;
-                return Err(Error::Protocol(message.into_owned()));
+                let message = event
+                    .message
+                    .as_ref()
+                    .map(JsonStr::as_str)
+                    .unwrap_or("stream error");
+                Err(Error::Protocol(message.to_string()))
             }
-            Event::Unknown => {}
+            _ => Ok(()),
         }
-        Ok(out)
     }
 
     /// Ends the stream after an error from outside the parser, such as HTTP.
@@ -156,11 +187,16 @@ impl StreamParser {
             self.stop_reason.take().unwrap_or(StopReason::EndTurn),
         )))
     }
-
     fn remember(&mut self, item_id: &str, call_id: &Text) {
         if !self.tool_ids.iter().any(|(id, _)| id == item_id) {
             self.tool_ids.push((item_id.to_string(), call_id.clone()));
         }
+    }
+
+    /// Fails the stream for a known event that lacks a field it needs.
+    fn missing(&mut self, kind: &str, field: &str) -> Error {
+        self.failed = true;
+        Error::Protocol(format!("{kind} event without {field}"))
     }
 
     fn call_id_for(&self, item_id: Option<&str>) -> Option<Text> {
@@ -169,6 +205,24 @@ impl StreamParser {
             .iter()
             .find(|(id, _)| id == item_id)
             .map(|(_, call_id)| call_id.clone())
+    }
+}
+
+impl crate::openai::EventParser for StreamParser {
+    fn push_line(&mut self, line: &[u8], out: &mut Vec<StreamEvent>) -> Result<(), Error> {
+        StreamParser::push_line(self, line, out)
+    }
+
+    fn fail(&mut self) {
+        StreamParser::fail(self);
+    }
+
+    /// Appends the stop event the parser held back for the end of the stream.
+    fn finish(&mut self, out: &mut Vec<StreamEvent>) -> Result<(), Error> {
+        if let Some(event) = StreamParser::finish(self)? {
+            out.push(event);
+        }
+        Ok(())
     }
 }
 
@@ -197,58 +251,25 @@ fn data_of(line: &[u8]) -> Option<&[u8]> {
     (!rest.is_empty()).then_some(rest)
 }
 
+/// One Responses event, flattened so the parser buffers no field of it.
+///
+/// An internally tagged enum makes serde hold the whole event and read the
+/// fields back out, which allocates a map per event. Dispatching on the type
+/// here keeps every field borrowed from the line instead.
 #[derive(Deserialize)]
-#[serde(tag = "type")]
-enum Event<'a> {
-    #[serde(rename = "response.output_item.added")]
-    OutputItemAdded {
-        #[serde(borrow)]
-        item: Item<'a>,
-    },
-    #[serde(rename = "response.output_item.done")]
-    OutputItemDone {
-        #[serde(borrow)]
-        item: Item<'a>,
-    },
-    #[serde(rename = "response.output_text.delta")]
-    OutputTextDelta {
-        #[serde(borrow)]
-        delta: Cow<'a, str>,
-    },
-    #[serde(rename = "response.reasoning_summary_text.delta")]
-    ReasoningSummaryTextDelta {
-        #[serde(borrow)]
-        delta: Cow<'a, str>,
-    },
-    #[serde(rename = "response.function_call_arguments.delta")]
-    FunctionCallArgumentsDelta {
-        #[serde(borrow)]
-        item_id: &'a str,
-        #[serde(borrow)]
-        delta: Cow<'a, str>,
-    },
-    #[serde(rename = "response.completed")]
-    Completed {
-        #[serde(borrow)]
-        response: ResponseObject<'a>,
-    },
-    #[serde(rename = "response.incomplete")]
-    Incomplete {
-        #[serde(borrow)]
-        response: ResponseObject<'a>,
-    },
-    #[serde(rename = "response.failed")]
-    Failed {
-        #[serde(borrow)]
-        response: ResponseObject<'a>,
-    },
-    #[serde(rename = "error")]
-    Error {
-        #[serde(borrow)]
-        message: Cow<'a, str>,
-    },
-    #[serde(other)]
-    Unknown,
+struct Event<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: &'a str,
+    #[serde(default, borrow)]
+    item: Option<Item<'a>>,
+    #[serde(default, borrow)]
+    delta: Option<JsonStr<'a>>,
+    #[serde(default, borrow)]
+    item_id: Option<&'a str>,
+    #[serde(default, borrow)]
+    response: ResponseObject<'a>,
+    #[serde(default, borrow)]
+    message: Option<JsonStr<'a>>,
 }
 
 #[derive(Deserialize)]
@@ -256,16 +277,16 @@ struct Item<'a> {
     #[serde(rename = "type", borrow)]
     kind: &'a str,
     #[serde(default, borrow)]
-    id: Option<&'a str>,
+    id: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
-    call_id: Option<&'a str>,
+    call_id: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
-    name: Option<&'a str>,
+    name: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
-    encrypted_content: Option<&'a str>,
+    encrypted_content: Option<JsonStr<'a>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct ResponseObject<'a> {
     #[serde(default)]
     usage: Option<UsageJson>,
@@ -278,13 +299,13 @@ struct ResponseObject<'a> {
 #[derive(Deserialize)]
 struct IncompleteDetails<'a> {
     #[serde(default, borrow)]
-    reason: Option<Cow<'a, str>>,
+    reason: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
 struct ApiError<'a> {
     #[serde(default, borrow)]
-    message: Cow<'a, str>,
+    message: JsonStr<'a>,
 }
 
 #[derive(Default, Deserialize)]
@@ -315,7 +336,9 @@ mod tests {
         let mut parser = StreamParser::new();
         let mut events = Vec::new();
         for line in fixture.lines() {
-            events.extend(parser.push_line(line.as_bytes()).expect("fixture parses"));
+            parser
+                .push_line(line.as_bytes(), &mut events)
+                .expect("fixture parses");
         }
         let stop = parser.finish();
         (events, stop)
@@ -391,7 +414,8 @@ mod tests {
     fn maps_an_incomplete_response_to_max_tokens() {
         let mut parser = StreamParser::new();
         let line = br#"data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":5,"output_tokens":9}}}"#;
-        let events = parser.push_line(line).unwrap();
+        let mut events = Vec::new();
+        parser.push_line(line, &mut events).unwrap();
         assert_eq!(
             events,
             vec![StreamEvent::Usage(Usage {
@@ -410,7 +434,8 @@ mod tests {
     fn a_failed_response_is_an_error() {
         let mut parser = StreamParser::new();
         let line = br#"data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"boom"}}}"#;
-        let error = parser.push_line(line).unwrap_err();
+        let mut out = Vec::new();
+        let error = parser.push_line(line, &mut out).unwrap_err();
         assert!(matches!(error, Error::Protocol(message) if message == "boom"));
     }
 
@@ -418,16 +443,19 @@ mod tests {
     fn an_error_event_stops_with_the_message() {
         let mut parser = StreamParser::new();
         let line = br#"data: {"type":"error","code":"overloaded","message":"Overloaded"}"#;
-        let error = parser.push_line(line).unwrap_err();
+        let mut out = Vec::new();
+        let error = parser.push_line(line, &mut out).unwrap_err();
         assert!(matches!(error, Error::Protocol(message) if message == "Overloaded"));
     }
 
     #[test]
     fn missing_response_completed_is_an_error() {
         let mut parser = StreamParser::new();
+        let mut out = Vec::new();
         parser
             .push_line(
                 br#"data: {"type":"response.output_text.delta","item_id":"m","output_index":0,"delta":"hi"}"#,
+                &mut out,
             )
             .unwrap();
         let error = parser.finish().unwrap_err();
@@ -439,19 +467,22 @@ mod tests {
     #[test]
     fn an_error_ends_the_stream() {
         let mut parser = StreamParser::new();
+        let mut out = Vec::new();
         let error = parser
-            .push_line(br#"data: {"type":"error","code":"overloaded","message":"boom"}"#)
+            .push_line(
+                br#"data: {"type":"error","code":"overloaded","message":"boom"}"#,
+                &mut out,
+            )
             .unwrap_err();
         assert!(matches!(error, Error::Protocol(message) if message == "boom"));
-        assert!(
-            parser
-                .push_line(
-                    br#"data: {"type":"response.output_text.delta","item_id":"m","output_index":0,"delta":"late"}"#,
-                )
-                .unwrap()
-                .is_empty(),
-            "no event follows an error"
-        );
+        let mut late = Vec::new();
+        parser
+            .push_line(
+                br#"data: {"type":"response.output_text.delta","item_id":"m","output_index":0,"delta":"late"}"#,
+                &mut late,
+            )
+            .unwrap();
+        assert!(late.is_empty(), "no event follows an error");
         assert_eq!(
             parser.finish().expect("finish is quiet after an error"),
             None
@@ -459,22 +490,41 @@ mod tests {
     }
 
     #[test]
+    fn push_line_appends_to_the_callers_buffer() {
+        let mut parser = StreamParser::new();
+        let mut out = Vec::new();
+        let first = br#"data: {"type":"response.output_text.delta","item_id":"m","output_index":0,"delta":"a"}"#;
+        let second = br#"data: {"type":"response.output_text.delta","item_id":"m","output_index":0,"delta":"b"}"#;
+        parser.push_line(first, &mut out).unwrap();
+        assert_eq!(out, vec![StreamEvent::TextDelta("a".into())]);
+        parser.push_line(second, &mut out).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                StreamEvent::TextDelta("a".into()),
+                StreamEvent::TextDelta("b".into())
+            ],
+            "the second line extends the same buffer"
+        );
+    }
+
+    #[test]
     fn ignores_non_data_lines() {
         let mut parser = StreamParser::new();
-        assert!(
-            parser
-                .push_line(b"event: response.created")
-                .unwrap()
-                .is_empty()
-        );
-        assert!(parser.push_line(b": keep-alive").unwrap().is_empty());
-        assert!(parser.push_line(b"data:").unwrap().is_empty());
+        let mut out = Vec::new();
+        parser
+            .push_line(b"event: response.created", &mut out)
+            .unwrap();
+        parser.push_line(b": keep-alive", &mut out).unwrap();
+        parser.push_line(b"data:", &mut out).unwrap();
+        assert!(out.is_empty());
     }
 
     #[test]
     fn a_malformed_data_line_is_an_error() {
         let mut parser = StreamParser::new();
-        let error = parser.push_line(b"data: {not json").unwrap_err();
+        let mut out = Vec::new();
+        let error = parser.push_line(b"data: {not json", &mut out).unwrap_err();
         assert!(matches!(error, Error::Json(_)));
     }
 
@@ -494,7 +544,7 @@ mod tests {
             let chunk = bytes::Bytes::copy_from_slice(chunk);
             let mut lines = splitter.push(&chunk);
             while let Some(line) = lines.next_line() {
-                events.extend(parser.push_line(line).expect("chunk parses"));
+                parser.push_line(line, &mut events).expect("chunk parses");
             }
         }
         let stop = parser.finish().expect("response.completed was seen");
@@ -510,5 +560,20 @@ mod tests {
             .expect("usage");
         assert_eq!(usage.input_tokens, 5);
         assert_eq!(usage.output_tokens, 2);
+    }
+    #[test]
+    fn a_known_event_without_its_payload_is_an_error() {
+        for line in [
+            &br#"data: {"type":"response.output_text.delta"}"#[..],
+            br#"data: {"type":"response.reasoning_summary_text.delta"}"#,
+            br#"data: {"type":"response.function_call_arguments.delta","item_id":"fc_1"}"#,
+            br#"data: {"type":"response.function_call_arguments.delta","delta":"{}"}"#,
+        ] {
+            let mut parser = StreamParser::new();
+            let mut out = Vec::new();
+            let error = parser.push_line(line, &mut out).unwrap_err();
+            assert!(matches!(error, Error::Protocol(_)), "{error:?}");
+            assert!(matches!(parser.finish(), Ok(None)), "one error per stream");
+        }
     }
 }

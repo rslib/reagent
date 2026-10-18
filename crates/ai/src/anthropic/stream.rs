@@ -1,9 +1,8 @@
 //! Parses the Anthropic Messages SSE stream.
 
-use std::borrow::Cow;
-
 use serde::Deserialize;
 
+use crate::openai::JsonStr;
 use crate::types::StopReason;
 use crate::{Error, StreamEvent, Text, Usage};
 
@@ -26,10 +25,16 @@ impl StreamParser {
         Self::default()
     }
 
-    /// Feeds one SSE line and returns the event it carries, if any.
-    pub fn push_line(&mut self, line: &[u8]) -> Result<Option<StreamEvent>, Error> {
+    /// Fails the stream for a known event that lacks a field it needs.
+    fn missing(&mut self, kind: &str, field: &str) -> Error {
+        self.failed = true;
+        Error::Protocol(format!("{kind} event without {field}"))
+    }
+
+    /// Feeds one SSE line and appends the event it carries, if any, to `out`.
+    pub fn push_line(&mut self, line: &[u8], out: &mut Vec<StreamEvent>) -> Result<(), Error> {
         let Some(data) = data_of(line) else {
-            return Ok(None);
+            return Ok(());
         };
         let data = match std::str::from_utf8(data) {
             Ok(data) => data,
@@ -46,73 +51,99 @@ impl StreamParser {
             }
         };
 
-        match event {
-            Event::MessageStart { message } => {
+        match event.kind {
+            "message_start" => {
+                let Some(message) = event.message else {
+                    return Err(self.missing("message_start", "message"));
+                };
                 self.usage.input_tokens = message.usage.input_tokens;
                 self.usage.cache_read_tokens = message.usage.cache_read_input_tokens;
                 self.usage.cache_write_tokens = message.usage.cache_creation_input_tokens;
-                Ok(None)
+                Ok(())
             }
-            Event::MessageDelta { delta, usage } => {
-                self.usage.output_tokens = usage.output_tokens;
-                self.stop_reason = delta.stop_reason.as_deref().map(stop_reason);
-                Ok(Some(StreamEvent::Usage(self.usage)))
+            "message_delta" => {
+                self.usage.output_tokens = event.usage.output_tokens;
+                self.stop_reason = event
+                    .delta
+                    .and_then(|delta| delta.stop_reason)
+                    .map(stop_reason);
+                out.push(StreamEvent::Usage(self.usage));
+                Ok(())
             }
-            Event::MessageStop => {
+            "message_stop" => {
                 self.done = true;
                 let reason = self.stop_reason.take().unwrap_or(StopReason::Error);
-                Ok(Some(StreamEvent::Stop(reason)))
+                out.push(StreamEvent::Stop(reason));
+                Ok(())
             }
-            Event::ContentBlockStart { content_block } => match content_block.kind {
-                "tool_use" => {
-                    let id: Text = content_block.id.unwrap_or_default().into();
-                    let name: Text = content_block.name.unwrap_or_default().into();
-                    self.tool_id = Some(id.clone());
-                    Ok(Some(StreamEvent::ToolCallStart { id, name }))
+            "content_block_start" => {
+                let Some(content_block) = event.content_block else {
+                    return Err(self.missing("content_block_start", "content_block"));
+                };
+                match content_block.kind {
+                    "tool_use" => {
+                        let id: Text = content_block.id.unwrap_or_default().as_str().into();
+                        let name: Text = content_block.name.unwrap_or_default().as_str().into();
+                        self.tool_id = Some(id.clone());
+                        out.push(StreamEvent::ToolCallStart { id, name });
+                    }
+                    "redacted_thinking" => {
+                        out.push(StreamEvent::RedactedThinking(Text::from(
+                            content_block.data.unwrap_or_default().as_str(),
+                        )));
+                    }
+                    _ => {}
                 }
-                "redacted_thinking" => Ok(Some(StreamEvent::RedactedThinking(Text::from(
-                    content_block.data.unwrap_or_default(),
-                )))),
-                _ => Ok(None),
-            },
-            Event::ContentBlockDelta { delta } => {
+                Ok(())
+            }
+            "content_block_delta" => {
+                let Some(delta) = event.delta else {
+                    return Err(self.missing("content_block_delta", "delta"));
+                };
                 let event = match delta {
                     Delta {
-                        kind: "text_delta",
+                        kind: Some("text_delta"),
                         text: Some(text),
                         ..
-                    } => StreamEvent::TextDelta(Text::from(text.as_ref())),
+                    } => StreamEvent::TextDelta(Text::from(text.as_str())),
                     Delta {
-                        kind: "thinking_delta",
+                        kind: Some("thinking_delta"),
                         thinking: Some(thinking),
                         ..
-                    } => StreamEvent::ThinkingDelta(Text::from(thinking.as_ref())),
+                    } => StreamEvent::ThinkingDelta(Text::from(thinking.as_str())),
                     Delta {
-                        kind: "signature_delta",
+                        kind: Some("signature_delta"),
                         signature: Some(signature),
                         ..
-                    } => StreamEvent::ThinkingSignature(Text::from(signature.as_ref())),
+                    } => StreamEvent::ThinkingSignature(Text::from(signature.as_str())),
                     Delta {
-                        kind: "input_json_delta",
+                        kind: Some("input_json_delta"),
                         partial_json: Some(partial_json),
                         ..
                     } => StreamEvent::ToolCallDelta {
                         id: self.tool_id.clone().unwrap_or_default(),
-                        partial_json: Text::from(partial_json.as_ref()),
+                        partial_json: Text::from(partial_json.as_str()),
                     },
-                    _ => return Ok(None),
+                    _ => return Ok(()),
                 };
-                Ok(Some(event))
+                out.push(event);
+                Ok(())
             }
-            Event::ContentBlockStop => Ok(self
-                .tool_id
-                .take()
-                .map(|id| StreamEvent::ToolCallEnd { id })),
-            Event::Ping | Event::Unknown => Ok(None),
-            Event::Error { error } => {
+            "content_block_stop" => {
+                if let Some(id) = self.tool_id.take() {
+                    out.push(StreamEvent::ToolCallEnd { id });
+                }
+                Ok(())
+            }
+            "error" => {
                 self.failed = true;
-                Err(Error::Protocol(error.message.into_owned()))
+                let message = event
+                    .error
+                    .map(|error| error.message.as_str().to_string())
+                    .unwrap_or_else(|| "stream error".into());
+                Err(Error::Protocol(message))
             }
+            _ => Ok(()),
         }
     }
 
@@ -137,6 +168,21 @@ impl StreamParser {
     }
 }
 
+impl crate::openai::EventParser for StreamParser {
+    fn push_line(&mut self, line: &[u8], out: &mut Vec<StreamEvent>) -> Result<(), Error> {
+        StreamParser::push_line(self, line, out)
+    }
+
+    fn fail(&mut self) {
+        StreamParser::fail(self);
+    }
+
+    /// This parser emits nothing at the end of a clean stream.
+    fn finish(&mut self, _out: &mut Vec<StreamEvent>) -> Result<(), Error> {
+        StreamParser::finish(self)
+    }
+}
+
 fn stop_reason(value: &str) -> StopReason {
     match value {
         "end_turn" | "stop_sequence" => StopReason::EndTurn,
@@ -153,35 +199,25 @@ fn data_of(line: &[u8]) -> Option<&[u8]> {
     (!rest.is_empty()).then_some(rest)
 }
 
+/// One Anthropic event, flattened so the parser buffers no field of it.
+///
+/// An internally tagged enum makes serde hold the whole event and read the
+/// fields back out, which allocates a map per event. Dispatching on the type
+/// here keeps every field borrowed from the line instead.
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum Event<'a> {
-    MessageStart {
-        message: StartedMessage,
-    },
-    ContentBlockStart {
-        #[serde(borrow)]
-        content_block: ContentBlock<'a>,
-    },
-    ContentBlockDelta {
-        #[serde(borrow)]
-        delta: Delta<'a>,
-    },
-    ContentBlockStop,
-    MessageDelta {
-        #[serde(borrow, default)]
-        delta: DeltaStop<'a>,
-        #[serde(default)]
-        usage: UsageJson,
-    },
-    MessageStop,
-    Ping,
-    Error {
-        #[serde(borrow)]
-        error: ApiError<'a>,
-    },
-    #[serde(other)]
-    Unknown,
+struct Event<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: &'a str,
+    #[serde(default)]
+    message: Option<StartedMessage>,
+    #[serde(default, borrow)]
+    content_block: Option<ContentBlock<'a>>,
+    #[serde(default, borrow)]
+    delta: Option<Delta<'a>>,
+    #[serde(default)]
+    usage: UsageJson,
+    #[serde(default, borrow)]
+    error: Option<ApiError<'a>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -202,42 +238,38 @@ struct StartedMessage {
     usage: UsageJson,
 }
 
-#[derive(Default, Deserialize)]
-struct DeltaStop<'a> {
-    #[serde(default, borrow)]
-    stop_reason: Option<Cow<'a, str>>,
-}
-
 #[derive(Deserialize)]
 struct ContentBlock<'a> {
     #[serde(rename = "type", borrow)]
     kind: &'a str,
     #[serde(default, borrow)]
-    id: Option<&'a str>,
+    id: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
-    name: Option<&'a str>,
+    name: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
-    data: Option<&'a str>,
+    data: Option<JsonStr<'a>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct Delta<'a> {
-    #[serde(rename = "type", borrow)]
-    kind: &'a str,
+    #[serde(rename = "type", default, borrow)]
+    kind: Option<&'a str>,
     #[serde(default, borrow)]
-    text: Option<Cow<'a, str>>,
+    text: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
-    thinking: Option<Cow<'a, str>>,
+    thinking: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
-    signature: Option<Cow<'a, str>>,
+    signature: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
-    partial_json: Option<Cow<'a, str>>,
+    partial_json: Option<JsonStr<'a>>,
+    #[serde(default, borrow)]
+    stop_reason: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
 struct ApiError<'a> {
     #[serde(borrow)]
-    message: Cow<'a, str>,
+    message: JsonStr<'a>,
 }
 
 #[cfg(test)]
@@ -246,13 +278,19 @@ mod tests {
     use crate::sse::SseSplitter;
     use bytes::Bytes;
 
+    fn parse_line(parser: &mut StreamParser, line: &[u8]) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        parser.push_line(line, &mut out).expect("line parses");
+        out
+    }
+
     fn parse(fixture: &str) -> Vec<StreamEvent> {
         let mut parser = StreamParser::new();
         let mut events = Vec::new();
         for line in fixture.lines() {
-            if let Some(event) = parser.push_line(line.as_bytes()).expect("fixture parses") {
-                events.push(event);
-            }
+            parser
+                .push_line(line.as_bytes(), &mut events)
+                .expect("fixture parses");
         }
         events
     }
@@ -336,9 +374,7 @@ mod tests {
             let chunk = Bytes::copy_from_slice(chunk);
             let mut lines = splitter.push(&chunk);
             while let Some(line) = lines.next_line() {
-                if let Some(event) = parser.push_line(line).expect("chunk parses") {
-                    events.push(event);
-                }
+                parser.push_line(line, &mut events).expect("chunk parses");
             }
         }
         parser.finish().expect("message_stop was seen");
@@ -360,11 +396,32 @@ mod tests {
     fn unescapes_text_with_json_escapes() {
         let mut parser = StreamParser::new();
         let line = br#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"line\n\"quoted\""}}"#;
-        let event = parser.push_line(line).unwrap().unwrap();
-        match event {
-            StreamEvent::TextDelta(text) => assert_eq!(&*text, "line\n\"quoted\""),
-            other => panic!("unexpected event: {other:?}"),
+        let events = parse_line(&mut parser, line);
+        match &events[..] {
+            [StreamEvent::TextDelta(text)] => assert_eq!(&**text, "line\n\"quoted\""),
+            other => panic!("unexpected events: {other:?}"),
         }
+    }
+
+    #[test]
+    fn push_line_appends_to_the_callers_buffer() {
+        let mut parser = StreamParser::new();
+        let mut out = Vec::new();
+        let first =
+            br#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"a"}}"#;
+        let second =
+            br#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"b"}}"#;
+        parser.push_line(first, &mut out).unwrap();
+        assert_eq!(out, vec![StreamEvent::TextDelta("a".into())]);
+        parser.push_line(second, &mut out).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                StreamEvent::TextDelta("a".into()),
+                StreamEvent::TextDelta("b".into())
+            ],
+            "the second line extends the same buffer"
+        );
     }
 
     #[test]
@@ -373,8 +430,8 @@ mod tests {
         let line =
             br#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}"#;
         assert_eq!(
-            parser.push_line(line).unwrap(),
-            Some(StreamEvent::ThinkingSignature("abc".into()))
+            parse_line(&mut parser, line),
+            vec![StreamEvent::ThinkingSignature("abc".into())]
         );
     }
 
@@ -383,44 +440,62 @@ mod tests {
         let mut parser = StreamParser::new();
         let line = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque"}}"#;
         assert_eq!(
-            parser.push_line(line).unwrap(),
-            Some(StreamEvent::RedactedThinking("opaque".into()))
+            parse_line(&mut parser, line),
+            vec![StreamEvent::RedactedThinking("opaque".into())]
         );
     }
 
     #[test]
     fn ignores_non_data_lines() {
         let mut parser = StreamParser::new();
-        assert!(parser.push_line(b"event: message_stop").unwrap().is_none());
-        assert!(parser.push_line(b": comment").unwrap().is_none());
-        assert!(parser.push_line(b"data:").unwrap().is_none());
+        assert!(parse_line(&mut parser, b"event: message_stop").is_empty());
+        assert!(parse_line(&mut parser, b": comment").is_empty());
+        assert!(parse_line(&mut parser, b"data:").is_empty());
     }
 
     #[test]
     fn a_malformed_data_line_is_an_error() {
         let mut parser = StreamParser::new();
-        let error = parser.push_line(b"data: {not json").unwrap_err();
+        let mut out = Vec::new();
+        let error = parser.push_line(b"data: {not json", &mut out).unwrap_err();
         assert!(matches!(error, Error::Json(_)));
     }
 
     #[test]
     fn an_error_event_stops_with_the_message() {
         let mut parser = StreamParser::new();
+        let mut out = Vec::new();
         let line =
             br#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
-        let error = parser.push_line(line).unwrap_err();
+        let error = parser.push_line(line, &mut out).unwrap_err();
         assert!(matches!(error, Error::Protocol(message) if message == "Overloaded"));
     }
 
     #[test]
     fn missing_message_stop_is_an_error() {
         let mut parser = StreamParser::new();
+        let mut out = Vec::new();
         parser
             .push_line(
                 br#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}"#,
+                &mut out,
             )
             .unwrap();
         let error = parser.finish().unwrap_err();
         assert!(matches!(error, Error::Protocol(message) if message.contains("message_stop")));
+    }
+    #[test]
+    fn a_known_event_without_its_payload_is_an_error() {
+        for line in [
+            &br#"data: {"type":"message_start"}"#[..],
+            br#"data: {"type":"content_block_start","index":0}"#,
+            br#"data: {"type":"content_block_delta","index":0}"#,
+        ] {
+            let mut parser = StreamParser::new();
+            let mut out = Vec::new();
+            let error = parser.push_line(line, &mut out).unwrap_err();
+            assert!(matches!(error, Error::Protocol(_)), "{error:?}");
+            assert!(parser.finish().is_ok(), "one error per stream");
+        }
     }
 }

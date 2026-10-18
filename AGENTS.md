@@ -8,6 +8,7 @@ A minimal coding agent in Rust, in the style of pi. Cargo workspace, toolchain p
 cargo build --workspace
 cargo test --workspace
 cargo nextest run -p reagent-agent -E 'test(/^session::/)'   # one module; fails when no test matches
+cargo nextest run -p reagent --features testing   # cli end-to-end tests; skipped without the feature
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo build --profile min -p reagent             # size build for footprint checks
@@ -36,6 +37,7 @@ A feature that does not move 1 or 2 in a measured run does not ship as a default
 | MCP client | `crates/mcp` (`reagent-mcp`) | depends on agent |
 | Terminal UI and markdown | `crates/tui` (`reagent-tui`) | depends on agent |
 | Binary and flags | `crates/cli` (`reagent`) | depends on all |
+| Model-facing prompt templates | none: `prompts/` at the root | baked into `crates/cli` with `include_str!` |
 | Harbor adapter | `bench/harbor` | Python, run with `uv` |
 
 Links point down this table only. Do not add a crate, and do not add a `common` or `utils` crate. Shared types go in `crates/ai`. Update this section in the change that moves an area.

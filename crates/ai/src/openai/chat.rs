@@ -1,16 +1,15 @@
 //! OpenAI-compatible Chat Completions provider.
 
-use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use bytes::{BufMut, Bytes, BytesMut};
+use futures_util::TryStreamExt;
 use futures_util::stream::BoxStream;
-use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
-use crate::openai::BodyCache;
-use crate::sse::SseSplitter;
+use crate::key::ApiKey;
+use crate::openai::{BodyCache, JsonStr};
 use crate::types::{
     AssistantMessage, Content, Message, ReasoningLevel, StopReason, Text, ToolSpec,
 };
@@ -30,7 +29,7 @@ pub struct ChatOptions {
 #[derive(Debug)]
 pub struct OpenAiChat {
     client: reqwest::Client,
-    api_key: String,
+    api_key: ApiKey,
     base_url: String,
     options: ChatOptions,
     head: Mutex<Option<Head>>,
@@ -57,8 +56,8 @@ impl OpenAiChat {
             max_completion_tokens: base_url.contains("api.openai.com"),
         };
         Self {
-            client: reqwest::Client::new(),
-            api_key: api_key.into(),
+            client: crate::http::client(),
+            api_key: ApiKey::new(api_key.into()),
             base_url,
             options,
             head: Mutex::new(None),
@@ -78,29 +77,29 @@ impl OpenAiChat {
     }
 
     /// Serializes the request body, reusing the bytes of unchanged messages.
-    pub(crate) fn request_body(&self, request: &Request) -> Result<Bytes, Error> {
+    pub(crate) fn request_body(&self, request: &Request<'_>) -> Result<Bytes, Error> {
         let reasoning = request.reasoning;
         let mut head = self.head.lock().expect("head cache lock");
         let reuse = head.as_ref().is_some_and(|cached| {
             cached.model == request.model
                 && cached.max_tokens == request.max_tokens
-                && cached.system == request.system
+                && cached.system.as_deref() == request.system.map(|system| &**system)
                 && cached.reasoning == reasoning
-                && cached.tools == request.tools
+                && cached.tools.as_slice() == request.tools
         });
         if !reuse {
             *head = Some(Head {
-                model: request.model.clone(),
+                model: request.model.to_string(),
                 max_tokens: request.max_tokens,
-                system: request.system.clone(),
+                system: request.system.cloned(),
                 reasoning,
-                tools: request.tools.clone(),
+                tools: request.tools.to_vec(),
                 builder: RequestBuilder::new(
-                    &request.model,
+                    request.model,
                     request.max_tokens,
-                    request.system.as_deref(),
+                    request.system.map(|system| &**system),
                     reasoning,
-                    &request.tools,
+                    request.tools,
                     self.options.max_completion_tokens,
                 ),
             });
@@ -108,7 +107,7 @@ impl OpenAiChat {
         let builder = &head.as_ref().expect("head is cached").builder;
 
         let mut bodies = self.bodies.lock().expect("body cache lock");
-        bodies.align(&request.messages, |message| {
+        bodies.align(request.messages, |message| {
             MessageBody::new(message, PROVIDER)
         })?;
         Ok(builder.body(bodies.bodies()))
@@ -120,13 +119,13 @@ impl Provider for OpenAiChat {
         PROVIDER
     }
 
-    fn stream(&self, request: &Request) -> BoxStream<'static, Result<StreamEvent, Error>> {
+    fn stream(&self, request: &Request<'_>) -> BoxStream<'static, Result<StreamEvent, Error>> {
         let body = match self.request_body(request) {
             Ok(body) => body,
             Err(error) => return Box::pin(futures_util::stream::iter([Err(error)])),
         };
         let url = self.url();
-        let api_key = self.api_key.clone();
+        let api_key = self.api_key.reveal().to_owned();
         let client = self.client.clone();
 
         let connect = futures_util::stream::once(async move {
@@ -159,39 +158,7 @@ fn parse_stream<S>(connect: S) -> BoxStream<'static, Result<StreamEvent, Error>>
 where
     S: futures_util::Stream<Item = Result<Bytes, Error>> + Send + 'static,
 {
-    let parser = Arc::new(Mutex::new(StreamParser::new()));
-    let mut splitter = SseSplitter::new();
-    let parser_for_events = Arc::clone(&parser);
-    let events = connect.flat_map(move |item| {
-        let mut out = Vec::new();
-        match item {
-            Ok(chunk) => {
-                let mut lines = splitter.push(&chunk);
-                while let Some(line) = lines.next_line() {
-                    match parser_for_events
-                        .lock()
-                        .expect("parser lock")
-                        .push_line(line)
-                    {
-                        Ok(events) => out.extend(events.into_iter().map(Ok)),
-                        Err(error) => out.push(Err(error)),
-                    }
-                }
-            }
-            Err(error) => {
-                parser_for_events.lock().expect("parser lock").fail();
-                out.push(Err(error));
-            }
-        }
-        futures_util::stream::iter(out)
-    });
-
-    let tail = futures_util::stream::once(async move {
-        parser.lock().expect("parser lock").finish().err().map(Err)
-    })
-    .flat_map(futures_util::stream::iter);
-
-    Box::pin(events.chain(tail))
+    crate::openai::event_stream(connect, StreamParser::new())
 }
 
 /// One message serialized in Chat Completions wire form, reusable across requests.
@@ -478,19 +445,20 @@ impl StreamParser {
         Self::default()
     }
 
-    /// Feeds one SSE line and returns the events it carries.
-    pub fn push_line(&mut self, line: &[u8]) -> Result<Vec<StreamEvent>, Error> {
+    /// Feeds one SSE line and appends the events it carries to `out`.
+    pub fn push_line(&mut self, line: &[u8], out: &mut Vec<StreamEvent>) -> Result<(), Error> {
         if self.failed {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let Some(data) = data_of(line) else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         if data == b"[DONE]" {
             self.done = true;
-            return Ok(vec![StreamEvent::Stop(
+            out.push(StreamEvent::Stop(
                 self.stop_reason.take().unwrap_or(StopReason::EndTurn),
-            )]);
+            ));
+            return Ok(());
         }
         let data = match std::str::from_utf8(data) {
             Ok(data) => data,
@@ -508,36 +476,35 @@ impl StreamParser {
         };
         if let Some(error) = chunk.error {
             self.failed = true;
-            return Err(Error::Protocol(error.message.into_owned()));
+            return Err(Error::Protocol(error.message.as_str().to_string()));
         }
 
-        let mut out = Vec::new();
-        for choice in chunk.choices {
+        for choice in chunk.choices.into_choices() {
             if let Some(reasoning) = choice.delta.reasoning_content {
-                out.push(StreamEvent::ThinkingDelta(Text::from(reasoning.as_ref())));
+                out.push(StreamEvent::ThinkingDelta(Text::from(reasoning.as_str())));
             }
             if let Some(content) = choice.delta.content
-                && !content.is_empty()
+                && !content.as_str().is_empty()
             {
-                out.push(StreamEvent::TextDelta(Text::from(content.as_ref())));
+                out.push(StreamEvent::TextDelta(Text::from(content.as_str())));
             }
             for call in choice.delta.tool_calls {
-                self.accept_tool_call(call, &mut out);
+                self.accept_tool_call(call, out);
             }
             if let Some(reason) = choice.finish_reason {
-                if matches!(reason.as_ref(), "tool_calls" | "function_call") {
+                if matches!(reason, "tool_calls" | "function_call") {
                     for (_, id) in &self.tool_ids {
                         out.push(StreamEvent::ToolCallEnd { id: id.clone() });
                     }
                 }
-                self.stop_reason = Some(stop_reason(reason.as_ref()));
+                self.stop_reason = Some(stop_reason(reason));
             }
         }
         if let Some(usage) = chunk.usage {
             self.usage = usage_of(usage);
             out.push(StreamEvent::Usage(self.usage));
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Ends the stream after an error from outside the parser, such as HTTP.
@@ -559,7 +526,7 @@ impl StreamParser {
     fn accept_tool_call(&mut self, call: ToolCallDelta<'_>, out: &mut Vec<StreamEvent>) {
         let index = match call.index {
             Some(index) => index,
-            None => match call.id.as_deref() {
+            None => match call.id.as_ref().map(JsonStr::as_str) {
                 Some(id) => self
                     .tool_ids
                     .iter()
@@ -569,22 +536,22 @@ impl StreamParser {
                 None => self.tool_ids.last().map(|(index, _)| *index).unwrap_or(0),
             },
         };
-        let id = self.id_for(index, call.id.as_deref());
+        let id = self.id_for(index, call.id.as_ref().map(JsonStr::as_str));
         let Some(function) = call.function else {
             return;
         };
         if let Some(name) = function.name {
             out.push(StreamEvent::ToolCallStart {
                 id: id.clone(),
-                name: Text::from(name.as_ref()),
+                name: Text::from(name.as_str()),
             });
         }
         if let Some(arguments) = function.arguments
-            && !arguments.is_empty()
+            && !arguments.as_str().is_empty()
         {
             out.push(StreamEvent::ToolCallDelta {
                 id,
-                partial_json: Text::from(arguments.as_ref()),
+                partial_json: Text::from(arguments.as_str()),
             });
         }
     }
@@ -607,6 +574,21 @@ impl StreamParser {
         };
         self.tool_ids.push((index, id.clone()));
         id
+    }
+}
+
+impl crate::openai::EventParser for StreamParser {
+    fn push_line(&mut self, line: &[u8], out: &mut Vec<StreamEvent>) -> Result<(), Error> {
+        StreamParser::push_line(self, line, out)
+    }
+
+    fn fail(&mut self) {
+        StreamParser::fail(self);
+    }
+
+    /// This parser emits nothing at the end of a clean stream.
+    fn finish(&mut self, _out: &mut Vec<StreamEvent>) -> Result<(), Error> {
+        StreamParser::finish(self)
     }
 }
 
@@ -640,11 +622,59 @@ fn data_of(line: &[u8]) -> Option<&[u8]> {
 #[derive(Deserialize)]
 struct Chunk<'a> {
     #[serde(default, borrow)]
-    choices: Vec<Choice<'a>>,
+    choices: Choices<'a>,
     #[serde(default)]
     usage: Option<UsageJson>,
     #[serde(default, borrow)]
     error: Option<ApiError<'a>>,
+}
+
+/// The choices of one chunk.
+///
+/// The common reply carries one choice, so the first is held inline and a
+/// chunk with a single choice allocates nothing.
+#[derive(Default)]
+struct Choices<'a> {
+    first: Option<Choice<'a>>,
+    rest: Vec<Choice<'a>>,
+}
+
+impl<'a> Choices<'a> {
+    /// Consumes the choices in reply order.
+    fn into_choices(self) -> impl Iterator<Item = Choice<'a>> {
+        self.first.into_iter().chain(self.rest)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Choices<'a> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ChoicesVisitor<'a>(std::marker::PhantomData<&'a ()>);
+
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for ChoicesVisitor<'a> {
+            type Value = Choices<'a>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a list of choices")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let first = seq.next_element::<Choice<'a>>()?;
+                let mut rest = Vec::new();
+                while let Some(choice) = seq.next_element::<Choice<'a>>()? {
+                    rest.push(choice);
+                }
+                Ok(Choices { first, rest })
+            }
+        }
+
+        deserializer.deserialize_seq(ChoicesVisitor(std::marker::PhantomData))
+    }
 }
 
 #[derive(Deserialize)]
@@ -652,15 +682,15 @@ struct Choice<'a> {
     #[serde(default, borrow)]
     delta: Delta<'a>,
     #[serde(default, borrow)]
-    finish_reason: Option<Cow<'a, str>>,
+    finish_reason: Option<&'a str>,
 }
 
 #[derive(Default, Deserialize)]
 struct Delta<'a> {
     #[serde(default, borrow)]
-    content: Option<Cow<'a, str>>,
+    content: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
-    reasoning_content: Option<Cow<'a, str>>,
+    reasoning_content: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
     tool_calls: Vec<ToolCallDelta<'a>>,
 }
@@ -670,7 +700,7 @@ struct ToolCallDelta<'a> {
     #[serde(default)]
     index: Option<u32>,
     #[serde(default, borrow)]
-    id: Option<Cow<'a, str>>,
+    id: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
     function: Option<FunctionDelta<'a>>,
 }
@@ -678,15 +708,15 @@ struct ToolCallDelta<'a> {
 #[derive(Deserialize)]
 struct FunctionDelta<'a> {
     #[serde(default, borrow)]
-    name: Option<Cow<'a, str>>,
+    name: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
-    arguments: Option<Cow<'a, str>>,
+    arguments: Option<JsonStr<'a>>,
 }
 
 #[derive(Deserialize)]
 struct ApiError<'a> {
     #[serde(default, borrow)]
-    message: Cow<'a, str>,
+    message: JsonStr<'a>,
 }
 
 #[derive(Default, Deserialize)]
@@ -715,7 +745,7 @@ struct CompletionDetails {
 
 #[cfg(test)]
 mod tests {
-    use futures_util::FutureExt;
+    use futures_util::{FutureExt, StreamExt};
 
     use super::*;
     use crate::Request;
@@ -778,11 +808,19 @@ mod tests {
         golden_builder().body(&bodies)
     }
 
+    fn parse_line(parser: &mut StreamParser, line: &[u8]) -> Vec<StreamEvent> {
+        let mut out = Vec::new();
+        parser.push_line(line, &mut out).expect("line parses");
+        out
+    }
+
     fn parse(fixture: &str) -> Vec<StreamEvent> {
         let mut parser = StreamParser::new();
         let mut events = Vec::new();
         for line in fixture.lines() {
-            events.extend(parser.push_line(line.as_bytes()).expect("fixture parses"));
+            parser
+                .push_line(line.as_bytes(), &mut events)
+                .expect("fixture parses");
         }
         parser.finish().expect("[DONE] was seen");
         events
@@ -912,12 +950,13 @@ mod tests {
 
     #[test]
     fn openai_base_url_uses_max_completion_tokens() {
+        let history = vec![Message::user("hi")];
         let request = Request {
-            model: "gpt-5".into(),
+            model: "gpt-5",
             max_tokens: 128,
             system: None,
-            tools: Vec::new(),
-            messages: vec![Message::user("hi")],
+            tools: &[],
+            messages: &history,
             reasoning: None,
             cache_key: None,
         };
@@ -977,8 +1016,29 @@ mod tests {
         let mut parser = StreamParser::new();
         let line = br#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"hmm"},"finish_reason":null}]}"#;
         assert_eq!(
-            parser.push_line(line).unwrap(),
+            parse_line(&mut parser, line),
             vec![StreamEvent::ThinkingDelta("hmm".into())]
+        );
+    }
+
+    #[test]
+    fn push_line_appends_to_the_callers_buffer() {
+        let mut parser = StreamParser::new();
+        let mut out = Vec::new();
+        let first =
+            br#"data: {"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}]}"#;
+        let second =
+            br#"data: {"choices":[{"index":0,"delta":{"content":"b"},"finish_reason":null}]}"#;
+        parser.push_line(first, &mut out).unwrap();
+        assert_eq!(out, vec![StreamEvent::TextDelta("a".into())]);
+        parser.push_line(second, &mut out).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                StreamEvent::TextDelta("a".into()),
+                StreamEvent::TextDelta("b".into())
+            ],
+            "the second line extends the same buffer"
         );
     }
 
@@ -987,7 +1047,7 @@ mod tests {
         let mut parser = StreamParser::new();
         let first = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}"#;
         assert_eq!(
-            parser.push_line(first).unwrap(),
+            parse_line(&mut parser, first),
             vec![StreamEvent::ToolCallStart {
                 id: "call_a".into(),
                 name: "read".into()
@@ -995,7 +1055,7 @@ mod tests {
         );
         let second = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{}"}}]},"finish_reason":null}]}"#;
         assert_eq!(
-            parser.push_line(second).unwrap(),
+            parse_line(&mut parser, second),
             vec![StreamEvent::ToolCallDelta {
                 id: "call_a".into(),
                 partial_json: "{}".into()
@@ -1003,7 +1063,7 @@ mod tests {
         );
         let third = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_b","function":{"name":"write","arguments":""}}]},"finish_reason":null}]}"#;
         assert_eq!(
-            parser.push_line(third).unwrap(),
+            parse_line(&mut parser, third),
             vec![StreamEvent::ToolCallStart {
                 id: "call_b".into(),
                 name: "write".into()
@@ -1016,7 +1076,7 @@ mod tests {
         let mut parser = StreamParser::new();
         let start = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":""}}]},"finish_reason":null}]}"#;
         assert_eq!(
-            parser.push_line(start).unwrap(),
+            parse_line(&mut parser, start),
             vec![StreamEvent::ToolCallStart {
                 id: "call_0".into(),
                 name: "read".into()
@@ -1024,7 +1084,7 @@ mod tests {
         );
         let done = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#;
         assert_eq!(
-            parser.push_line(done).unwrap(),
+            parse_line(&mut parser, done),
             vec![StreamEvent::ToolCallEnd {
                 id: "call_0".into()
             }]
@@ -1035,26 +1095,27 @@ mod tests {
     fn an_error_chunk_is_a_protocol_error() {
         let mut parser = StreamParser::new();
         let line = br#"data: {"error":{"message":"rate limited","type":"rate_limit_error"}}"#;
-        let error = parser.push_line(line).unwrap_err();
+        let mut out = Vec::new();
+        let error = parser.push_line(line, &mut out).unwrap_err();
         assert!(matches!(error, Error::Protocol(message) if message == "rate limited"));
     }
 
     #[test]
     fn an_error_ends_the_stream() {
         let mut parser = StreamParser::new();
+        let mut out = Vec::new();
         let error = parser
-            .push_line(br#"data: {"error":{"message":"boom"}}"#)
+            .push_line(br#"data: {"error":{"message":"boom"}}"#, &mut out)
             .unwrap_err();
         assert!(matches!(error, Error::Protocol(message) if message == "boom"));
-        assert!(
-            parser
-                .push_line(
-                    br#"data: {"choices":[{"index":0,"delta":{"content":"late"},"finish_reason":null}]}"#
-                )
-                .unwrap()
-                .is_empty(),
-            "no event follows an error"
-        );
+        let mut late = Vec::new();
+        parser
+            .push_line(
+                br#"data: {"choices":[{"index":0,"delta":{"content":"late"},"finish_reason":null}]}"#,
+                &mut late,
+            )
+            .unwrap();
+        assert!(late.is_empty(), "no event follows an error");
         parser.finish().expect("finish is quiet after an error");
     }
 
@@ -1062,7 +1123,7 @@ mod tests {
     fn two_tool_calls_keep_their_own_ids() {
         let mut parser = StreamParser::new();
         let first = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read","arguments":""}},{"index":1,"id":"call_b","function":{"name":"write","arguments":""}}]},"finish_reason":null}]}"#;
-        let events = parser.push_line(first).unwrap();
+        let events = parse_line(&mut parser, first);
         assert_eq!(
             events,
             vec![
@@ -1078,7 +1139,7 @@ mod tests {
         );
         let second = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{}"}}]},"finish_reason":null}]}"#;
         assert_eq!(
-            parser.push_line(second).unwrap(),
+            parse_line(&mut parser, second),
             vec![StreamEvent::ToolCallDelta {
                 id: "call_b".into(),
                 partial_json: "{}".into()
@@ -1089,8 +1150,12 @@ mod tests {
     #[test]
     fn missing_done_is_an_error() {
         let mut parser = StreamParser::new();
+        let mut out = Vec::new();
         parser
-            .push_line(br#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#)
+            .push_line(
+                br#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+                &mut out,
+            )
             .unwrap();
         let error = parser.finish().unwrap_err();
         assert!(matches!(error, Error::Protocol(message) if message.contains("[DONE]")));
@@ -1099,12 +1164,13 @@ mod tests {
     #[test]
     fn request_body_is_stable_for_the_same_history() {
         let provider = OpenAiChat::new("key", "http://localhost");
+        let history = vec![Message::user("one")];
         let request = Request {
-            model: "glm-4.6".into(),
+            model: "glm-4.6",
             max_tokens: 128,
             system: None,
-            tools: Vec::new(),
-            messages: vec![Message::user("one")],
+            tools: &[],
+            messages: &history,
             reasoning: None,
             cache_key: None,
         };

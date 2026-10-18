@@ -163,10 +163,15 @@ impl<'a> Agent<'a> {
 
         match message.stop_reason {
             Some(StopReason::ToolUse) => {
-                let calls = tool_calls(&message);
+                // The reply is recorded once, then borrowed back from history
+                // for its tool calls; no message is cloned.
                 if let Err(error) = record(Message::assistant(message), history, session).await {
                     return TurnOutcome::Error(error);
                 }
+                let calls = match history.last() {
+                    Some(Message::Assistant(assistant)) => tool_calls(assistant),
+                    _ => Vec::new(),
+                };
                 let results = crate::batch::run_all(&calls, self.registry, &self.token).await;
                 // Every result reaches history before any event is sent, so a
                 // cancel or a closed receiver cannot leave a call unanswered.
@@ -216,15 +221,15 @@ impl<'a> Agent<'a> {
         }
     }
 
-    fn request(&self, history: &[Message]) -> Request {
+    fn request<'h>(&'h self, history: &'h [Message]) -> Request<'h> {
         Request {
-            model: self.config.model.clone(),
+            model: &self.config.model,
             max_tokens: self.config.max_tokens,
-            system: self.config.system.clone(),
-            tools: self.registry.specs().cloned().collect(),
-            messages: history.to_vec(),
+            system: self.config.system.as_ref(),
+            tools: self.registry.specs(),
+            messages: history,
             reasoning: self.config.reasoning,
-            cache_key: self.config.cache_key.clone(),
+            cache_key: self.config.cache_key.as_ref(),
         }
     }
 }

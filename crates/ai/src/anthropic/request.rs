@@ -405,12 +405,12 @@ mod tests {
         .collect()
     }
 
-    fn request(model: &str, messages: Vec<Message>) -> Request {
+    fn request<'a>(model: &'a str, messages: &'a [Message]) -> Request<'a> {
         Request {
-            model: model.into(),
+            model,
             max_tokens: 128,
             system: None,
-            tools: Vec::new(),
+            tools: &[],
             messages,
             reasoning: None,
             cache_key: None,
@@ -593,8 +593,10 @@ mod tests {
     #[test]
     fn request_body_distinguishes_equal_length_histories() {
         let provider = Anthropic::new("key", "http://localhost");
-        let first = request("m", vec![Message::user("one")]);
-        let second = request("m", vec![Message::user("two")]);
+        let first_history = vec![Message::user("one")];
+        let second_history = vec![Message::user("two")];
+        let first = request("m", &first_history);
+        let second = request("m", &second_history);
         let first = provider.request_body(&first).unwrap();
         let second = provider.request_body(&second).unwrap();
         assert_ne!(first, second);
@@ -603,7 +605,8 @@ mod tests {
     #[test]
     fn request_body_is_stable_for_the_same_history() {
         let provider = Anthropic::new("key", "http://localhost");
-        let request = request("m", vec![Message::user("one")]);
+        let history = vec![Message::user("one")];
+        let request = request("m", &history);
         let first = provider.request_body(&request).unwrap();
         let second = provider.request_body(&request).unwrap();
         assert_eq!(first, second);
@@ -612,15 +615,14 @@ mod tests {
     #[test]
     fn request_body_replaces_a_compacted_history() {
         let provider = Anthropic::new("key", "http://localhost");
-        let long = request(
-            "m",
-            vec![
-                Message::user("one"),
-                Message::user("two"),
-                Message::user("three"),
-            ],
-        );
-        let short = request("m", vec![Message::user("different")]);
+        let long_history = vec![
+            Message::user("one"),
+            Message::user("two"),
+            Message::user("three"),
+        ];
+        let short_history = vec![Message::user("different")];
+        let long = request("m", &long_history);
+        let short = request("m", &short_history);
         let _ = provider.request_body(&long).unwrap();
         let short = provider.request_body(&short).unwrap();
         let text = std::str::from_utf8(&short).unwrap();
