@@ -502,8 +502,10 @@ mod tests {
             .await;
         let elapsed = start.elapsed();
         assert!(!output.is_error, "{}", output.content);
+        // About 2 s warm; a cold cache or a busy machine can take 7-18 s. A
+        // reader that loads or rescans the file is far slower than 30 s.
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
+            elapsed < std::time::Duration::from_secs(30),
             "took too long: {elapsed:?}"
         );
         assert_eq!(

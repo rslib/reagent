@@ -14,7 +14,12 @@ from pathlib import Path, PurePosixPath
 from harbor.models.agent.context import AgentContext
 
 from reagent_harbor import agent
-from reagent_harbor.agent import DIST_BINARY, build_command, populate_context
+from reagent_harbor.agent import (
+    DIST_BINARY,
+    build_command,
+    populate_context,
+    put_task_in_env,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "events.jsonl"
 HARD_INSTRUCTION = "fix \"it\" & 'that'\nthen $HOME `whoami` \\ done; exit 3"
@@ -22,13 +27,20 @@ HARD_INSTRUCTION = "fix \"it\" & 'that'\nthen $HOME `whoami` \\ done; exit 3"
 FAKE_REAGENT = """#!/usr/bin/env python3
 import json, sys
 json.dump(sys.argv[1:], open(sys.argv[0] + ".args", "w"))
+open(sys.argv[0] + ".stdin", "w").write(sys.stdin.read())
 print('{"type":"summary","input":1,"output":2,"cache_read":0,"cache_write":0,"turns":1}')
 print("an error line", file=sys.stderr)
 sys.exit(124)
 """
 
 
-def run_command(tmp_path: Path, timeout_sec: int | None) -> tuple[subprocess.CompletedProcess[str], Path]:
+def run_command(
+    tmp_path: Path,
+    timeout_sec: int | None,
+    *,
+    task_env: str = "REAGENT_TASK_TEST",
+    policy: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
     fake = tmp_path / "reagent"
     fake.write_text(FAKE_REAGENT)
     fake.chmod(0o755)
@@ -36,18 +48,26 @@ def run_command(tmp_path: Path, timeout_sec: int | None) -> tuple[subprocess.Com
     command = build_command(
         workdir="/app dir",
         model_id="claude-sonnet-5-5",
-        instruction=HARD_INSTRUCTION,
+        task_env=task_env,
         logs_dir=PurePosixPath(logs),
         timeout_sec=timeout_sec,
+        policy=policy,
     ).replace(agent._AGENT_BINARY, str(fake), 1)
-    result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, check=False)
+    env = dict(os.environ)
+    env[task_env] = HARD_INSTRUCTION
+    result = subprocess.run(
+        ["bash", "-c", command], env=env, capture_output=True, text=True, check=False
+    )
     return result, logs
 
 
-def test_the_command_passes_the_instruction_unchanged(tmp_path: Path) -> None:
+def test_the_command_passes_the_instruction_on_stdin_not_argv(
+    tmp_path: Path,
+) -> None:
     result, _ = run_command(tmp_path, timeout_sec=None)
     assert result.returncode == 0, result.stderr
     args = json.loads((tmp_path / "reagent.args").read_text())
+    # reagent reads the task from stdin: `-p -`, never the text itself.
     assert args == [
         "--json",
         "--cwd",
@@ -55,8 +75,20 @@ def test_the_command_passes_the_instruction_unchanged(tmp_path: Path) -> None:
         "--model",
         "claude-sonnet-5-5",
         "-p",
-        HARD_INSTRUCTION,
+        "-",
     ]
+    assert "--policy" not in args
+    # The instruction arrives unchanged on reagent's stdin.
+    assert (tmp_path / "reagent.stdin").read_text() == HARD_INSTRUCTION
+    # The instruction is in none of reagent's argv.
+    assert HARD_INSTRUCTION not in json.dumps(args)
+
+
+def test_the_command_adds_the_policy_flag(tmp_path: Path) -> None:
+    result, _ = run_command(tmp_path, timeout_sec=None, policy="completion,budget")
+    assert result.returncode == 0, result.stderr
+    args = json.loads((tmp_path / "reagent.args").read_text())
+    assert args[args.index("--policy") + 1] == "completion,budget"
 
 
 def test_the_command_sets_the_deadline_below_the_timeout(tmp_path: Path) -> None:
@@ -127,3 +159,19 @@ def test_harbor_imports_the_agent_with_the_run_sh_pythonpath() -> None:
     assert import_like_harbor(None).returncode != 0
     result = import_like_harbor(harbor_dir)
     assert result.returncode == 0, result.stderr
+
+
+def test_the_task_env_var_feeds_the_command_and_the_text_stays_out() -> None:
+    env: dict[str, str] = {"ANTHROPIC_API_KEY": "k"}
+    task_env = put_task_in_env(env, HARD_INSTRUCTION)
+    assert env[task_env] == HARD_INSTRUCTION
+    assert put_task_in_env({}, "x") != task_env, "each run gets a new name"
+    command = build_command(
+        workdir="/app",
+        model_id="m",
+        task_env=task_env,
+        logs_dir=PurePosixPath("/logs/agent"),
+        timeout_sec=None,
+    )
+    assert task_env in command
+    assert "fix" not in command and "whoami" not in command

@@ -137,11 +137,18 @@ impl StreamParser {
             }
             "error" => {
                 self.failed = true;
-                let message = event
-                    .error
-                    .map(|error| error.message.as_str().to_string())
-                    .unwrap_or_else(|| "stream error".into());
-                Err(Error::Protocol(message))
+                let (message, retryable) = match event.error {
+                    Some(error) => {
+                        let retryable = error.kind.is_some_and(retryable);
+                        (error.message.as_str().to_string(), retryable)
+                    }
+                    None => ("stream error".into(), false),
+                };
+                if retryable {
+                    Err(Error::Transient(message))
+                } else {
+                    Err(Error::Protocol(message))
+                }
             }
             _ => Ok(()),
         }
@@ -268,8 +275,17 @@ struct Delta<'a> {
 
 #[derive(Deserialize)]
 struct ApiError<'a> {
-    #[serde(borrow)]
+    #[serde(default, borrow)]
     message: JsonStr<'a>,
+    #[serde(default, borrow, rename = "type")]
+    kind: Option<&'a str>,
+}
+
+/// Whether an Anthropic stream `error` event is safe to retry. `overloaded_error`
+/// and `api_error` are transient; authentication, request-validation and other
+/// errors are not.
+fn retryable(kind: &str) -> bool {
+    matches!(kind, "overloaded_error" | "api_error")
 }
 
 #[cfg(test)]
@@ -462,13 +478,28 @@ mod tests {
     }
 
     #[test]
-    fn an_error_event_stops_with_the_message() {
+    fn a_retryable_error_event_is_transient() {
         let mut parser = StreamParser::new();
         let mut out = Vec::new();
         let line =
             br#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
         let error = parser.push_line(line, &mut out).unwrap_err();
-        assert!(matches!(error, Error::Protocol(message) if message == "Overloaded"));
+        assert!(matches!(error, Error::Transient(message) if message == "Overloaded"));
+        let mut parser = StreamParser::new();
+        let mut out = Vec::new();
+        let line = br#"data: {"type":"error","error":{"type":"api_error","message":"Boom"}}"#;
+        let error = parser.push_line(line, &mut out).unwrap_err();
+        assert!(matches!(error, Error::Transient(message) if message == "Boom"));
+    }
+
+    #[test]
+    fn a_non_retryable_error_event_is_a_protocol_error() {
+        let mut parser = StreamParser::new();
+        let mut out = Vec::new();
+        let line =
+            br#"data: {"type":"error","error":{"type":"invalid_request_error","message":"No"}}"#;
+        let error = parser.push_line(line, &mut out).unwrap_err();
+        assert!(matches!(error, Error::Protocol(message) if message == "No"));
     }
 
     #[test]

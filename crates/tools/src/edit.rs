@@ -11,6 +11,8 @@ use reagent_ai::ToolSpec;
 
 use crate::{atomic, resolve};
 
+mod fuzzy;
+
 /// The maximum number of lines shown in a nearest-match error hint.
 const HINT_LINES: usize = 20;
 
@@ -53,12 +55,66 @@ impl Edit {
         if args.old_string.is_empty() {
             return Err("invalid arguments: old_string must not be empty".into());
         }
-        let (old, new) = line_endings_of(&original, &args.old_string, &args.new_string);
-        let matches = count_matches(&original, &old);
+        let (mut old, mut new) = line_endings_of(&original, &args.old_string, &args.new_string);
         let replace_all = args.replace_all.unwrap_or(false);
+        let mut matches = count_matches(&original, &old);
+        let mut stripped = false;
+
+        if matches == 0
+            && let Some(old_text) = strip_read_prefixes(&args.old_string)
+        {
+            let new_text = strip_some_read_prefixes(&args.new_string);
+            let (o, n) = line_endings_of(&original, &old_text, &new_text);
+            old = Cow::Owned(o.into_owned());
+            new = Cow::Owned(n.into_owned());
+            matches = count_matches(&original, &old);
+            stripped = true;
+        }
+
+        let note = if stripped {
+            "removing read line numbers"
+        } else {
+            ""
+        };
 
         if matches == 0 {
-            return Err(not_found_hint(&path, &original, &old));
+            let Some((tier, spans)) = fuzzy::find(&original, &old) else {
+                return Err(not_found_hint(&path, &original, &old));
+            };
+            if spans.len() > 1 && !replace_all {
+                let lines: Vec<usize> = spans.iter().map(|span| span.line).collect();
+                return Err(multiple_matches_at(&path, &lines));
+            }
+            let spans = if replace_all { &spans[..] } else { &spans[..1] };
+            let mut result = String::with_capacity(original.len());
+            let mut copied = 0;
+            let mut indented = false;
+            for span in spans {
+                result.push_str(&original[copied..span.range.start]);
+                match fuzzy::indent_gap(&original, span, &old) {
+                    Some(gap) => {
+                        fuzzy::push_indented(&mut result, &new, gap);
+                        indented = true;
+                    }
+                    None => result.push_str(&new),
+                }
+                copied = span.range.end;
+            }
+            result.push_str(&original[copied..]);
+
+            atomic::write(&path, result.as_bytes()).await?;
+            let joiner = if stripped { " and " } else { "" };
+            let indent = if indented {
+                ", new_string indented to match"
+            } else {
+                ""
+            };
+            return Ok(ToolOutput::ok(format!(
+                "replaced {} occurrence(s) in {} (matched after {note}{joiner}{}{indent}); the file text differs from old_string, so read the file before the next edit",
+                spans.len(),
+                path.display(),
+                tier.describe()
+            )));
         }
         if matches > 1 && !replace_all {
             return Err(multiple_matches(&path, &original, &old));
@@ -71,11 +127,43 @@ impl Edit {
         };
 
         atomic::write(&path, result.as_bytes()).await?;
+        let note = if stripped {
+            format!(" (matched after {note})")
+        } else {
+            String::new()
+        };
         Ok(ToolOutput::ok(format!(
-            "replaced {matches} occurrence(s) in {}",
+            "replaced {matches} occurrence(s) in {}{note}",
             path.display()
         )))
     }
+}
+
+/// Removes a read prefix (`N<TAB>`) from every line, or returns `None` when
+/// any line lacks one.
+fn strip_read_prefixes(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        out.push_str(line[digits..].strip_prefix('\t')?);
+    }
+    Some(out)
+}
+
+/// Removes a read prefix (`N<TAB>`) from each line that has one.
+fn strip_some_read_prefixes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+        match line[digits..].strip_prefix('\t') {
+            Some(rest) if digits > 0 => out.push_str(rest),
+            _ => out.push_str(line),
+        }
+    }
+    out
 }
 
 /// Converts `old` and `new` to CRLF when the file uses CRLF and `old` does
@@ -164,7 +252,11 @@ fn nearest_line(lines: &[&str], needle: &str) -> usize {
 
 /// Builds the error for more than one match without `replace_all`.
 fn multiple_matches(path: &Path, original: &str, needle: &str) -> String {
-    let lines = match_lines(original, needle);
+    multiple_matches_at(path, &match_lines(original, needle))
+}
+
+/// Builds the multiple-match error from the 1-based line numbers of the matches.
+fn multiple_matches_at(path: &Path, lines: &[usize]) -> String {
     let shown: Vec<String> = lines.iter().take(3).map(|n| n.to_string()).collect();
     format!(
         "text matches {} time(s) in {} at line(s) {}; add context to old_string or pass replace_all=true",
@@ -368,6 +460,297 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(&path).await.unwrap(),
             "x\r\ny\r\nc\r\n"
+        );
+    }
+
+    async fn run_edit(tmp: &tempfile::TempDir, args: serde_json::Value) -> ToolOutput {
+        tool(tmp)
+            .run(&args.to_string(), &CancellationToken::new())
+            .await
+    }
+
+    async fn read(tmp: &tempfile::TempDir, name: &str) -> String {
+        tokio::fs::read_to_string(tmp.path().join(name))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn prefix_strip_matches_after_removing_read_numbers() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "alpha\nbeta\ngamma\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"2\tbeta\n3\tgamma","new_string":"2\tBETA\n3\tGAMMA"}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("read line numbers"),
+            "{}",
+            output.content
+        );
+        assert_eq!(read(&tmp, "f.txt").await, "alpha\nBETA\nGAMMA\n");
+    }
+
+    #[tokio::test]
+    async fn prefix_is_removed_from_the_new_string_lines_that_have_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "alpha\nbeta\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"2\tbeta","new_string":"2\tBETA\nplain"}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(read(&tmp, "f.txt").await, "alpha\nBETA\nplain\n");
+    }
+
+    #[tokio::test]
+    async fn prefix_strip_then_fallback_keeps_crlf() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "a\r\n  b  \r\n  c\r\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"2\tb\n3\tc","new_string":"2\tB\n3\tC"}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output
+                .content
+                .contains("removing read line numbers and trimming whitespace"),
+            "{}",
+            output.content
+        );
+        assert_eq!(read(&tmp, "f.txt").await, "a\r\n  B\r\n  C\r\n");
+    }
+
+    #[tokio::test]
+    async fn prefix_mixed_old_string_is_not_stripped() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "alpha\nbeta\ngamma\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"2\tbeta\ngamma","new_string":"x"}),
+        )
+        .await;
+        assert!(output.is_error, "{}", output.content);
+        assert_eq!(read(&tmp, "f.txt").await, "alpha\nbeta\ngamma\n");
+    }
+
+    #[tokio::test]
+    async fn prefix_exact_match_with_number_text_is_used_as_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "1\tfoo\nbar\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"1\tfoo","new_string":"1\tbaz"}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            !output.content.contains("read line numbers"),
+            "{}",
+            output.content
+        );
+        assert_eq!(read(&tmp, "f.txt").await, "1\tbaz\nbar\n");
+    }
+
+    #[tokio::test]
+    async fn fallback_trailing_whitespace_matches_tier_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "a  \nb\t\nc\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"a\nb","new_string":"X\nY"}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("trimming trailing whitespace"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("read the file"),
+            "{}",
+            output.content
+        );
+        assert_eq!(read(&tmp, "f.txt").await, "X\nY\nc\n");
+    }
+
+    #[tokio::test]
+    async fn fallback_indentation_replaces_the_original_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "fn f() {\n        a();\n        b();\n}\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"a();\nb();\n","new_string":"c();\n"}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("matched after trimming whitespace"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("indented to match"),
+            "{}",
+            output.content
+        );
+        assert_eq!(read(&tmp, "f.txt").await, "fn f() {\n        c();\n}\n");
+    }
+
+    #[tokio::test]
+    async fn fallback_indentation_keeps_relative_indent() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.py", "def f():\n    if x:\n        y()\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.py","old_string":"if x:\n    y()","new_string":"if x:\n    z()\n\n    w()"}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(
+            read(&tmp, "f.py").await,
+            "def f():\n    if x:\n        z()\n\n        w()\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_uneven_indent_inserts_new_string_as_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "  a\n    b\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"a\nb","new_string":"c"}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(!output.content.contains("indented"), "{}", output.content);
+        assert_eq!(read(&tmp, "f.txt").await, "c\n");
+    }
+
+    #[tokio::test]
+    async fn fallback_punctuation_matches_tier_three() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            &tmp,
+            "f.txt",
+            "say \u{201c}hi\u{201d} \u{2014} ok\u{a0}now\nnext\n",
+        )
+        .await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"say \"hi\" - ok now","new_string":"done"}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("normalising punctuation"),
+            "{}",
+            output.content
+        );
+        assert_eq!(read(&tmp, "f.txt").await, "done\nnext\n");
+    }
+
+    #[tokio::test]
+    async fn fallback_tiers_run_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "  a\n  b\na \nb \n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"a\nb","new_string":"X"}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("trimming trailing whitespace"),
+            "{}",
+            output.content
+        );
+        assert_eq!(read(&tmp, "f.txt").await, "  a\n  b\nX\n");
+    }
+
+    #[tokio::test]
+    async fn fallback_multiple_matches_is_an_error_with_line_numbers() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "x\n a\n b\ny\n a\n b\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"a\nb","new_string":"X"}),
+        )
+        .await;
+        assert!(output.is_error, "{}", output.content);
+        assert!(output.content.contains("2 time"), "{}", output.content);
+        assert!(output.content.contains("2, 5"), "{}", output.content);
+        assert_eq!(read(&tmp, "f.txt").await, "x\n a\n b\ny\n a\n b\n");
+    }
+
+    #[tokio::test]
+    async fn fallback_replace_all_replaces_every_match_at_the_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "x\n a\n b\ny\n a\n b\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"a\nb","new_string":"X","replace_all":true}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("replaced 2 occurrence"),
+            "{}",
+            output.content
+        );
+        assert_eq!(read(&tmp, "f.txt").await, "x\n X\ny\n X\n");
+    }
+
+    #[tokio::test]
+    async fn fallback_keeps_crlf() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "a\r\n  b \r\nc\r\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"a\nb","new_string":"x\ny"}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(read(&tmp, "f.txt").await, "x\r\ny\r\nc\r\n");
+    }
+
+    #[tokio::test]
+    async fn fallback_is_not_used_for_an_exact_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "a\nb\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"a","new_string":"X"}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            !output.content.contains("matched after"),
+            "{}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_not_found_keeps_the_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "one\ntwo\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"zzz","new_string":"X"}),
+        )
+        .await;
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("text not found"),
+            "{}",
+            output.content
         );
     }
 }

@@ -4,6 +4,7 @@ mod args;
 mod json;
 mod prompt;
 mod run;
+mod snapshot;
 
 /// The estimated-token budget for the system prompt and tool specs.
 #[cfg(test)]
@@ -26,7 +27,7 @@ fn main() -> std::process::ExitCode {
             println!("reagent {}", env!("CARGO_PKG_VERSION"));
             return std::process::ExitCode::SUCCESS;
         }
-        args::Outcome::Run(args) => args,
+        args::Outcome::Run(args) => *args,
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()

@@ -5,13 +5,24 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use reagent_ai::{
-    AssistantMessage, Content, Message, Provider, ReasoningLevel, Request, StopReason, StreamEvent,
-    Text, ToolCall, Usage,
+    AssistantMessage, Content, Error, Message, Provider, ReasoningLevel, Request, StopReason,
+    StreamEvent, Text, ToolCall, ToolResult, Usage,
 };
 
 use crate::event::{Event, TurnEndReason};
+use crate::mask::Mask;
+use crate::policy::{PolicyRun, TurnPolicy, TurnView};
 use crate::session::Session;
 use crate::tool::Registry;
+
+/// The note added after a max_tokens stop, baked in from `prompts/max_tokens.md`.
+const MAX_TOKENS_NOTE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../prompts/max_tokens.md"
+));
+
+/// How many max_tokens stops in a row the loop recovers from before it stops.
+const MAX_TOKENS_RECOVERIES: u32 = 3;
 
 /// The parts of a [`Request`] a session controls, besides the conversation.
 #[derive(Clone, Debug)]
@@ -37,6 +48,8 @@ pub struct Agent<'a> {
     registry: &'a Registry,
     config: AgentConfig,
     token: CancellationToken,
+    policies: Vec<Box<dyn TurnPolicy>>,
+    mask: Option<Mask>,
 }
 
 impl<'a> Agent<'a> {
@@ -53,7 +66,40 @@ impl<'a> Agent<'a> {
             registry,
             config,
             token,
+            policies: Vec::new(),
+            mask: None,
         }
+    }
+
+    /// Creates the loop with a set of policies run after every turn.
+    ///
+    /// With no policies (the default, see [`Agent::new`]) the loop behaves
+    /// exactly as without them.
+    pub fn with_policies(
+        provider: &'a dyn Provider,
+        registry: &'a Registry,
+        config: AgentConfig,
+        token: CancellationToken,
+        policies: Vec<Box<dyn TurnPolicy>>,
+    ) -> Self {
+        Self {
+            provider,
+            registry,
+            config,
+            token,
+            policies,
+            mask: None,
+        }
+    }
+
+    /// Turns on observation masking: before each request, old large tool
+    /// outputs in `history` become a stub (see [`Mask`]). Off by default.
+    ///
+    /// Only the in-memory history changes; the session file is not touched.
+    #[must_use]
+    pub fn with_mask(mut self) -> Self {
+        self.mask = Some(Mask);
+        self
     }
 
     /// Runs the conversation until a reply has no tool call, a cap is reached
@@ -61,14 +107,18 @@ impl<'a> Agent<'a> {
     ///
     /// Appends the assistant replies and tool results to `history`, records one
     /// [`crate::session::Entry`] per message in `session` (when given, flushed
-    /// at each turn end) and reports streamed [`Event`]s on `events`.
+    /// at each turn end) and reports streamed [`Event`]s on `events`. After
+    /// each normal turn the configured policies run and may inject a message
+    /// or stop the run; with no policies the loop acts exactly as without them.
     pub async fn run(
-        &self,
+        &mut self,
         history: &mut Vec<Message>,
         mut session: Option<&mut Session>,
         events: &mpsc::Sender<Event>,
     ) {
+        let started = std::time::Instant::now();
         let mut turns: u32 = 0;
+        let mut max_tokens_streak: u32 = 0;
         let mut run_reason = loop {
             if self.config.max_turns.is_some_and(|cap| turns >= cap) {
                 break TurnEndReason::MaxTurns;
@@ -78,6 +128,9 @@ impl<'a> Agent<'a> {
             }
             turns += 1;
 
+            if let Some(mask) = &self.mask {
+                mask.apply(history);
+            }
             let mut outcome = self.run_turn(history, &mut session, events).await;
             // Every turn end flushes, whatever ended the turn.
             if let Some(session) = session.as_mut()
@@ -86,22 +139,22 @@ impl<'a> Agent<'a> {
             {
                 outcome = TurnOutcome::Error(session_error(&error));
             }
+            match outcome {
+                TurnOutcome::Stopped(StopReason::MaxTokens)
+                    if max_tokens_streak < MAX_TOKENS_RECOVERIES =>
+                {
+                    max_tokens_streak += 1;
+                    outcome = self
+                        .recover_from_max_tokens(history, &mut session, events)
+                        .await;
+                }
+                TurnOutcome::Continue | TurnOutcome::Finish => max_tokens_streak = 0,
+                _ => {}
+            }
 
-            let (turn_reason, run_end) = match outcome {
-                TurnOutcome::Continue => (TurnEndReason::EndTurn, None),
-                TurnOutcome::Finish => (TurnEndReason::EndTurn, Some(TurnEndReason::EndTurn)),
-                TurnOutcome::Stopped(reason) => (
-                    TurnEndReason::Stopped(reason),
-                    Some(TurnEndReason::Stopped(reason)),
-                ),
-                TurnOutcome::Cancelled => {
-                    (TurnEndReason::Cancelled, Some(TurnEndReason::Cancelled))
-                }
-                TurnOutcome::Error(message) => {
-                    emit(events, &self.token, Event::Error(message)).await;
-                    (TurnEndReason::Error, Some(TurnEndReason::Error))
-                }
-            };
+            let (turn_reason, run_end) = self
+                .after_turn(outcome, turns, started, history, &mut session, events)
+                .await;
             let closed = emit(events, &self.token, Event::TurnEnd(turn_reason)).await;
             if let Some(reason) = run_end {
                 break reason;
@@ -117,6 +170,142 @@ impl<'a> Agent<'a> {
         emit(events, &self.token, Event::RunEnd(run_reason)).await;
     }
 
+    /// Maps a turn outcome to its turn-end reason and whether the run stops.
+    ///
+    /// For the two normal outcomes (tools ran, or the model ended without a
+    /// tool) the configured policies decide: an injected message appends to
+    /// the last tool result or starts a new user message and the run
+    /// continues, a stop ends it, and a no-tool turn with no injection ends.
+    async fn after_turn(
+        &mut self,
+        outcome: TurnOutcome,
+        index: u32,
+        started: std::time::Instant,
+        history: &mut Vec<Message>,
+        session: &mut Option<&mut Session>,
+        events: &mpsc::Sender<Event>,
+    ) -> (TurnEndReason, Option<TurnEndReason>) {
+        match outcome {
+            TurnOutcome::Continue => {
+                let run_end = self
+                    .apply_policies(index, true, started, history, session, events)
+                    .await;
+                (TurnEndReason::EndTurn, run_end)
+            }
+            TurnOutcome::Finish => {
+                let run_end = self
+                    .apply_policies(index, false, started, history, session, events)
+                    .await;
+                (TurnEndReason::EndTurn, run_end)
+            }
+            TurnOutcome::Stopped(reason) => (
+                TurnEndReason::Stopped(reason),
+                Some(TurnEndReason::Stopped(reason)),
+            ),
+            TurnOutcome::Recovered => (TurnEndReason::Stopped(StopReason::MaxTokens), None),
+            TurnOutcome::Cancelled => (TurnEndReason::Cancelled, Some(TurnEndReason::Cancelled)),
+            TurnOutcome::Error(message) => {
+                emit(events, &self.token, Event::Error(message)).await;
+                (TurnEndReason::Error, Some(TurnEndReason::Error))
+            }
+        }
+    }
+
+    /// Adds the max_tokens note as a new user message so the next turn runs.
+    ///
+    /// The note never edits an earlier message: the prompt cache and the
+    /// replayed thinking blocks stay valid.
+    async fn recover_from_max_tokens(
+        &mut self,
+        history: &mut Vec<Message>,
+        session: &mut Option<&mut Session>,
+        events: &mpsc::Sender<Event>,
+    ) -> TurnOutcome {
+        let message = Message::user(MAX_TOKENS_NOTE);
+        if let Some(session) = session.as_mut()
+            && let Err(error) = session.append(&message).await
+        {
+            return TurnOutcome::Error(session_error(&error));
+        }
+        history.push(message);
+        if emit(
+            events,
+            &self.token,
+            Event::PolicyNote(Text::from(MAX_TOKENS_NOTE)),
+        )
+        .await
+        {
+            return TurnOutcome::Cancelled;
+        }
+        TurnOutcome::Recovered
+    }
+
+    /// Runs the policies after one normal turn and applies what they asked.
+    ///
+    /// Returns the run-end reason when the run stops after this turn.
+    ///
+    /// An injected user message (after a no-tool turn) is emitted as a
+    /// `PolicyNote` and, when a session is open, appended to it like any other
+    /// message. An injected text on a tool turn is appended in place to the
+    /// last tool result, which was already recorded to the session as that
+    /// result; the append is not re-recorded because a session is append-only.
+    async fn apply_policies(
+        &mut self,
+        index: u32,
+        ran_tools: bool,
+        started: std::time::Instant,
+        history: &mut Vec<Message>,
+        session: &mut Option<&mut Session>,
+        events: &mpsc::Sender<Event>,
+    ) -> Option<TurnEndReason> {
+        if self.policies.is_empty() {
+            // No policies: a tool turn continues, a no-tool turn ends.
+            return if ran_tools {
+                None
+            } else {
+                Some(TurnEndReason::EndTurn)
+            };
+        }
+
+        let elapsed = started.elapsed();
+        let (injected, notes, continue_run) = {
+            let (assistant, tools) = last_turn(history);
+            let view = TurnView {
+                index,
+                elapsed,
+                ran_tools,
+                assistant,
+                tools: &tools,
+            };
+            let run = PolicyRun::new(&mut self.policies, &view);
+            let continue_run = run.continue_run();
+            (run.injected.clone(), run.notes, continue_run)
+        };
+
+        // When a policy stopped the run, any other policy's injected text is
+        // discarded, so no note for it reaches the UI.
+        if !continue_run {
+            return Some(TurnEndReason::EndTurn);
+        }
+        if let Some(text) = injected {
+            for note in &notes {
+                emit(events, &self.token, note.clone()).await;
+            }
+            if ran_tools {
+                append_to_last_tool_result(history, &text);
+            } else {
+                let message = Message::user(text.clone());
+                if let Some(session) = session.as_mut()
+                    && let Err(error) = session.append(&message).await
+                {
+                    emit(events, &self.token, Event::Error(session_error(&error))).await;
+                }
+                history.push(message);
+            }
+        }
+        None
+    }
+
     /// Streams one provider reply, records it and any tool results, and reports
     /// how the turn ended.
     async fn run_turn(
@@ -126,35 +315,53 @@ impl<'a> Agent<'a> {
         events: &mpsc::Sender<Event>,
     ) -> TurnOutcome {
         let mut assembler = Assembler::new();
-        {
-            let request = self.request(history);
-            let mut stream = self.provider.stream(&request);
-            loop {
-                let item = tokio::select! {
-                    item = stream.next() => item,
-                    () = self.token.cancelled() => return TurnOutcome::Cancelled,
-                };
-                let Some(item) = item else { break };
-                match item {
-                    Ok(event) => {
-                        if let Some(event) = stream_event(&event)
-                            && emit(events, &self.token, event).await
-                        {
-                            return TurnOutcome::Cancelled;
-                        }
-                        assembler.push(event);
+        // How many retries already ran, capped at [`crate::retry::MAX_RETRIES`].
+        let mut retries: u32 = 0;
+        // None when the stream ended cleanly, else the error that stopped it
+        // and, on the last allowed attempt, ends the turn.
+        let mut stop_error: Option<Error> = None;
+        loop {
+            let outcome = self.consume_stream(history, events, &mut assembler).await;
+            match outcome {
+                ConsumeOutcome::Cancelled | ConsumeOutcome::Finished => break,
+                ConsumeOutcome::StreamError(error) => {
+                    if retries >= crate::retry::MAX_RETRIES || error.retry_hint().is_none() {
+                        stop_error = Some(error);
+                        break;
                     }
-                    Err(error) => {
-                        return TurnOutcome::Error(Text::from(error.to_string()));
+                    // A retry resets the partial reply but pushes nothing to
+                    // history, so a retry never re-sends a finished message.
+                    let wait = error.retry_hint().flatten();
+                    let delay = crate::retry::delay(retries, wait, crate::retry::jitter());
+                    let event = Event::Retry {
+                        attempt: retries + 1,
+                        delay_ms: delay.as_millis() as u64,
+                        error: Text::from(error.to_string()),
+                    };
+                    if emit(events, &self.token, event).await {
+                        return TurnOutcome::Cancelled;
                     }
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        () = self.token.cancelled() => return TurnOutcome::Cancelled,
+                    }
+                    assembler = Assembler::new();
+                    retries += 1;
                 }
             }
+        }
+        if let Some(error) = stop_error {
+            return TurnOutcome::Error(Text::from(error.to_string()));
         }
 
         let mut message = assembler.finish(self.provider.name(), &self.config.model);
 
-        // An empty reply is never pushed; it is an error stop.
+        // An empty reply is never pushed. A refusal with no content is still
+        // a refusal, not an "empty reply" error, and pushes nothing.
         if message.content.is_empty() {
+            if message.stop_reason == Some(StopReason::Refusal) {
+                return TurnOutcome::Stopped(StopReason::Refusal);
+            }
             if emit(events, &self.token, Event::Error(Text::from("empty reply"))).await {
                 return TurnOutcome::Cancelled;
             }
@@ -206,10 +413,18 @@ impl<'a> Agent<'a> {
                 }
             }
             // MaxTokens, Refusal, Error, or no stop at all: never run tools.
+            // A thinking block cut off before its signature cannot be sent back.
             reason => {
-                message
-                    .content
-                    .retain(|content| !matches!(content, Content::ToolCall(_)));
+                message.content.retain(|content| {
+                    !matches!(
+                        content,
+                        Content::ToolCall(_)
+                            | Content::Thinking {
+                                signature: None,
+                                ..
+                            }
+                    )
+                });
                 let reason = reason.unwrap_or(StopReason::Error);
                 if !message.content.is_empty()
                     && let Err(error) = record(Message::assistant(message), history, session).await
@@ -217,6 +432,52 @@ impl<'a> Agent<'a> {
                     return TurnOutcome::Error(error);
                 }
                 TurnOutcome::Stopped(reason)
+            }
+        }
+    }
+
+    /// Streams one provider reply into `assembler`, cancelling on the token.
+    ///
+    /// Nothing is pushed to history here; a reply is recorded only after the
+    /// whole turn ends, so a caller may retry a failed stream safely.
+    async fn consume_stream(
+        &self,
+        history: &[Message],
+        events: &mpsc::Sender<Event>,
+        assembler: &mut Assembler,
+    ) -> ConsumeOutcome {
+        let request = self.request(history);
+        let mut stream = self.provider.stream(&request);
+        loop {
+            let item = tokio::select! {
+                item = stream.next() => item,
+                () = self.token.cancelled() => return ConsumeOutcome::Cancelled,
+            };
+            let Some(item) = item else {
+                return ConsumeOutcome::Finished;
+            };
+            match item {
+                Ok(event) => {
+                    if let Some(event) = stream_event(&event)
+                        && emit(events, &self.token, event).await
+                    {
+                        return ConsumeOutcome::Cancelled;
+                    }
+                    assembler.push(event);
+                    // A finished tool call gains its name and arguments only
+                    // once the assembler has them.
+                    for ready in assembler.drain_ready() {
+                        let event = Event::ToolCallReady {
+                            id: ready.id,
+                            name: ready.name,
+                            arguments: ready.arguments,
+                        };
+                        if emit(events, &self.token, event).await {
+                            return ConsumeOutcome::Cancelled;
+                        }
+                    }
+                }
+                Err(error) => return ConsumeOutcome::StreamError(error),
             }
         }
     }
@@ -251,6 +512,50 @@ async fn record(
     Ok(())
 }
 
+/// Borrows the assistant message of the last turn and pairs its tool calls
+/// with the results that followed it.
+///
+/// The tool calls and results are cloned into owned pairs, but each one shares
+/// its `Arc` text, so no message text is copied. A no-tool turn returns an
+/// empty pair list.
+fn last_turn(history: &[Message]) -> (&AssistantMessage, Vec<(ToolCall, ToolResult)>) {
+    let assistant_index = history
+        .iter()
+        .rposition(|message| matches!(message, Message::Assistant(_)))
+        .expect("a finished turn records an assistant message");
+    let assistant = match &history[assistant_index] {
+        Message::Assistant(assistant) => assistant,
+        _ => unreachable!("rposition matched an assistant message"),
+    };
+    let mut tools = Vec::new();
+    for message in &history[assistant_index + 1..] {
+        let Message::ToolResult(result) = message else {
+            break;
+        };
+        let call = assistant.content.iter().find_map(|content| match content {
+            Content::ToolCall(call) if call.id == result.call_id => Some(call.clone()),
+            _ => None,
+        });
+        if let Some(call) = call {
+            tools.push((call, result.clone()));
+        }
+    }
+    (assistant, tools)
+}
+
+/// Appends injected text to the content of the last tool result in `history`.
+///
+/// The message is the one the provider will send next, so the share of the
+/// prompt cache before it stays valid; only this one message is re-serialized.
+fn append_to_last_tool_result(history: &mut [Message], text: &str) {
+    if let Some(Message::ToolResult(result)) = history.last_mut() {
+        let mut content = result.content.to_string();
+        content.push_str("\n\n");
+        content.push_str(text);
+        result.content = Text::from(content);
+    }
+}
+
 fn session_error(error: &std::io::Error) -> Text {
     Text::from(format!("session write failed: {error}"))
 }
@@ -265,6 +570,16 @@ impl std::fmt::Debug for Agent<'_> {
     }
 }
 
+/// The outcome of one provider stream within a turn.
+enum ConsumeOutcome {
+    /// The stream ended cleanly and `assembler` holds the finished reply.
+    Finished,
+    /// The run was cancelled (or the channel closed) mid-stream.
+    Cancelled,
+    /// The provider returned an error that might be retried.
+    StreamError(Error),
+}
+
 /// The outcome of one turn inside [`Agent::run`].
 enum TurnOutcome {
     /// A tool call was run; another provider call may follow.
@@ -273,6 +588,8 @@ enum TurnOutcome {
     Finish,
     /// The provider stopped without asking for a tool.
     Stopped(StopReason),
+    /// A max_tokens stop was answered with a note; the run goes on.
+    Recovered,
     /// The run was cancelled mid-turn.
     Cancelled,
     /// The provider, a tool or the session reported an error.
@@ -292,6 +609,10 @@ async fn emit(events: &mpsc::Sender<Event>, token: &CancellationToken, event: Ev
 }
 
 /// Maps one streamed event to its channel event, if any.
+///
+/// The completed tool call is reported by the [`Assembler`] (which knows the
+/// tool name and its assembled arguments), so `ToolCallEnd` maps to nothing
+/// here.
 fn stream_event(event: &StreamEvent) -> Option<Event> {
     Some(match event {
         StreamEvent::TextDelta(text) => Event::TextDelta(text.clone()),
@@ -300,7 +621,6 @@ fn stream_event(event: &StreamEvent) -> Option<Event> {
             id: id.clone(),
             name: name.clone(),
         },
-        StreamEvent::ToolCallEnd { id } => Event::ToolCallReady { id: id.clone() },
         StreamEvent::Usage(usage) => Event::Usage(*usage),
         _ => return None,
     })
@@ -336,6 +656,14 @@ struct OpenTool {
     args: String,
 }
 
+/// A completed tool call, reported by the assembler for the `tool_call_ready`
+/// event once its arguments are known.
+struct ToolReady {
+    id: Text,
+    name: Text,
+    arguments: Text,
+}
+
 /// Accumulates a [`StreamEvent`] sequence into an [`AssistantMessage`].
 ///
 /// Accepts a [`StreamEvent::ThinkingSignature`] that arrives without a
@@ -346,6 +674,7 @@ struct Assembler {
     text: String,
     thinking: Option<OpenThinking>,
     tools: Vec<OpenTool>,
+    ready: Vec<ToolReady>,
     stop_reason: Option<StopReason>,
     usage: Usage,
 }
@@ -357,6 +686,7 @@ impl Assembler {
             text: String::new(),
             thinking: None,
             tools: Vec::new(),
+            ready: Vec::new(),
             stop_reason: None,
             usage: Usage::default(),
         }
@@ -414,6 +744,11 @@ impl Assembler {
                     } else {
                         Text::from(tool.args)
                     };
+                    self.ready.push(ToolReady {
+                        id: Text::from(tool.id.clone()),
+                        name: Text::from(tool.name.clone()),
+                        arguments: arguments.clone(),
+                    });
                     self.content.push(Content::ToolCall(ToolCall {
                         id: tool.id,
                         name: tool.name,
@@ -461,6 +796,12 @@ impl Assembler {
                 text: Text::from(text),
             });
         }
+    }
+
+    /// The tool calls that completed since the last drain, for the
+    /// `tool_call_ready` events. Draining clears them.
+    fn drain_ready(&mut self) -> Vec<ToolReady> {
+        std::mem::take(&mut self.ready)
     }
 
     fn finish(mut self, provider: &str, model: &str) -> AssistantMessage {
@@ -674,11 +1015,13 @@ mod tests {
                 |event| matches!(event, Event::ToolStart { id, .. } if id.as_ref() == "call_1")
             )
         );
-        assert!(
-            events.iter().any(
-                |event| matches!(event, Event::ToolCallReady { id } if id.as_ref() == "call_1")
-            )
-        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::ToolCallReady { id, name, arguments }
+                if id.as_ref() == "call_1"
+                    && name.as_ref() == "echo"
+                    && arguments.as_ref() == r#"{"message":"hi"}"#
+        )));
         assert!(
             events
                 .iter()
@@ -686,7 +1029,125 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn retries_a_retryable_error_then_succeeds() {
+        let provider = FakeProvider::new(vec![]);
+        provider.push_error(Error::Http("refused".into()));
+        provider.push_reply(text_reply("done"));
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(provider.seen().len(), 2, "one retry after the failure");
+        let events = drain(tx, &mut rx);
+        let retries = events
+            .iter()
+            .filter(|event| matches!(event, Event::Retry { attempt, .. } if *attempt == 1))
+            .count();
+        assert_eq!(retries, 1, "one Retry event, events: {events:?}");
+        // The successful retry recorded its assistant message.
+        assert_eq!(history.last().map(Message::role), Some(Role::Assistant));
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn five_failures_end_the_run_with_the_error() {
+        // First attempt plus MAX_RETRIES=4 retries = 5 provider calls, then
+        // the run ends with the error.
+        let provider = FakeProvider::new(vec![]);
+        for _ in 0..5 {
+            provider.push_error(Error::Http("refused".into()));
+        }
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(
+            provider.seen().len(),
+            5,
+            "the first attempt plus four retries"
+        );
+        assert_eq!(history.len(), 1, "no assistant message on failure");
+        let events = drain(tx, &mut rx);
+        let retries = events
+            .iter()
+            .filter(|event| matches!(event, Event::Retry { .. }))
+            .count();
+        assert_eq!(retries, 4, "four retries before giving up: {events:?}");
+        assert!(
+            events.iter().any(|event| matches!(event, Event::Error(_))),
+            "the turn reports the error"
+        );
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::Error)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_non_retryable_error_is_not_retried() {
+        let provider = FakeProvider::new(vec![]);
+        provider.push_error(Error::Protocol("bad request".into()));
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(
+            provider.seen().len(),
+            1,
+            "a terminal error is never retried"
+        );
+        let events = drain(tx, &mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Retry { .. })),
+            "no Retry event: {events:?}"
+        );
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::Error)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_during_backoff_stops_the_run_as_cancelled() {
+        let provider = FakeProvider::new(vec![]);
+        provider.push_error(Error::Http("refused".into()));
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let token = CancellationToken::new();
+        let cancellation = token.clone();
+        let mut history = vec![Message::user("hello")];
+
+        let handle = tokio::spawn(async move {
+            Agent::new(&provider, &registry, config(), token)
+                .run(&mut history, None, &tx)
+                .await;
+            history
+        });
+        // Let the first attempt fail and the backoff sleep begin.
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        let history = tokio::time::timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("the loop stops after cancel")
+            .expect("runner finishes");
+        assert_eq!(
+            history.len(),
+            1,
+            "no assistant message on a cancelled retry (only the seed user message)"
+        );
+    }
+
+    // Paused time: the retries before the error ends the run sleep at once.
+    #[tokio::test(start_paused = true)]
     async fn a_stream_error_ends_the_run() {
         struct Failing {
             error: std::sync::Mutex<Option<Error>>,
@@ -931,9 +1392,10 @@ mod tests {
 
     #[tokio::test]
     async fn max_tokens_stops_without_running_tools() {
-        // A MaxTokens reply with a partial tool call and some text: the tool
-        // call is dropped, the text is kept, and no tool runs.
-        let provider = FakeProvider::new(vec![vec![
+        // A MaxTokens reply with a partial tool call and some text, 4 times
+        // so the recoveries run out: each tool call is dropped, the text is
+        // kept, and no tool runs.
+        let reply = vec![
             StreamEvent::TextDelta(Text::from("partial ")),
             StreamEvent::ToolCallStart {
                 id: Text::from("call_1"),
@@ -947,7 +1409,8 @@ mod tests {
                 id: Text::from("call_1"),
             },
             StreamEvent::Stop(StopReason::MaxTokens),
-        ]]);
+        ];
+        let provider = FakeProvider::new(vec![reply; 4]);
         let registry = registry();
         let (tx, mut rx) = mpsc::channel(64);
         let mut history = Vec::new();
@@ -956,18 +1419,21 @@ mod tests {
             .run(&mut history, None, &tx)
             .await;
 
-        // Only the text reply is kept; no tool result, no ToolResult event.
-        assert_eq!(history.len(), 1);
-        let Message::Assistant(message) = &history[0] else {
-            panic!("expected an assistant message");
-        };
-        assert_eq!(message.content.len(), 1, "the tool call is dropped");
-        assert!(
-            !message
-                .content
-                .iter()
-                .any(|content| matches!(content, Content::ToolCall(_)))
-        );
+        // Only the text replies are kept, each followed by a recovery note
+        // except the last; no tool result, no ToolResult event.
+        assert_eq!(history.len(), 7, "{history:?}");
+        for message in history.iter().step_by(2) {
+            let Message::Assistant(message) = message else {
+                panic!("expected an assistant message, got {message:?}");
+            };
+            assert_eq!(message.content.len(), 1, "the tool call is dropped");
+            assert!(
+                !message
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, Content::ToolCall(_)))
+            );
+        }
 
         let events = drain(tx, &mut rx);
         assert!(
@@ -1022,10 +1488,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refusal_with_no_content_is_a_refusal_not_an_empty_reply() {
+        // A refusal sends no text: the turn must end as a refusal, with no
+        // "empty reply" error and no assistant message pushed to history.
+        let provider = FakeProvider::new(vec![vec![StreamEvent::Stop(StopReason::Refusal)]]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(history.len(), 1, "a refusal is never pushed");
+        let events = drain(tx, &mut rx);
+        assert!(
+            !events.iter().any(
+                |event| matches!(event, Event::Error(message) if message.as_ref() == "empty reply")
+            ),
+            "a refusal reports no 'empty reply' error: {events:?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&Event::RunEnd(TurnEndReason::Stopped(StopReason::Refusal)))
+        );
+    }
+
+    #[tokio::test]
     async fn a_tool_only_max_tokens_reply_pushes_nothing() {
         // Only a tool call, stopped at max tokens: after dropping it nothing is
-        // left, so no assistant message is pushed.
-        let provider = FakeProvider::new(vec![vec![
+        // left, so no assistant message is pushed. The 4 replies use up the
+        // recoveries, so only the 3 recovery notes remain.
+        let reply = vec![
             StreamEvent::ToolCallStart {
                 id: Text::from("call_1"),
                 name: Text::from("echo"),
@@ -1034,7 +1528,8 @@ mod tests {
                 id: Text::from("call_1"),
             },
             StreamEvent::Stop(StopReason::MaxTokens),
-        ]]);
+        ];
+        let provider = FakeProvider::new(vec![reply; 4]);
         let registry = registry();
         let (tx, _rx) = mpsc::channel(64);
         let mut history = Vec::new();
@@ -1043,7 +1538,7 @@ mod tests {
             .run(&mut history, None, &tx)
             .await;
 
-        assert!(history.is_empty());
+        assert_eq!(history, vec![Message::user(MAX_TOKENS_NOTE); 3]);
     }
 
     #[tokio::test]
@@ -1332,5 +1827,118 @@ mod tests {
             .expect("read session");
         assert_eq!(text.lines().count(), history.len() - 1, "{text}");
         drop(session);
+    }
+
+    fn thinking_only_max_tokens() -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ThinkingDelta(Text::from("")),
+            StreamEvent::Stop(StopReason::MaxTokens),
+        ]
+    }
+
+    fn policy_notes(events: &[Event]) -> Vec<&Text> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::PolicyNote(text) => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn max_tokens_recovery_continues_after_a_thinking_only_reply() {
+        let provider = FakeProvider::new(vec![thinking_only_max_tokens(), text_reply("done")]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        // The cut-off thinking block has no signature, so it cannot be sent
+        // back: no assistant message is kept, and the note is a new user turn.
+        assert_eq!(history.len(), 3, "{history:?}");
+        assert_eq!(history[1], Message::user(MAX_TOKENS_NOTE));
+        assert!(matches!(&history[2], Message::Assistant(_)));
+        assert_eq!(provider.seen()[1].messages, 2);
+
+        let events = drain(tx, &mut rx);
+        assert_eq!(policy_notes(&events), vec![&Text::from(MAX_TOKENS_NOTE)]);
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
+    }
+
+    #[tokio::test]
+    async fn max_tokens_recovery_keeps_signed_thinking_and_text() {
+        let provider = FakeProvider::new(vec![
+            vec![
+                StreamEvent::ThinkingDelta(Text::from("plan")),
+                StreamEvent::ThinkingSignature(Text::from("sig")),
+                StreamEvent::TextDelta(Text::from("partial")),
+                StreamEvent::Stop(StopReason::MaxTokens),
+            ],
+            text_reply("done"),
+        ]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(history.len(), 4, "{history:?}");
+        let Message::Assistant(partial) = &history[1] else {
+            panic!("expected the partial reply, got {:?}", history[1]);
+        };
+        assert_eq!(partial.content.len(), 2, "{partial:?}");
+        assert!(partial.content[0].is_thinking());
+        assert_eq!(history[2], Message::user(MAX_TOKENS_NOTE));
+        let events = drain(tx, &mut rx);
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
+    }
+
+    #[tokio::test]
+    async fn max_tokens_recovery_stops_on_the_fourth_stop_in_a_row() {
+        let provider = FakeProvider::new(vec![thinking_only_max_tokens(); 5]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(provider.seen().len(), 4);
+        let events = drain(tx, &mut rx);
+        assert_eq!(policy_notes(&events).len(), 3);
+        assert_eq!(
+            events.last(),
+            Some(&Event::RunEnd(TurnEndReason::Stopped(
+                StopReason::MaxTokens
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn max_tokens_recovery_streak_resets_after_a_normal_turn() {
+        let mut replies = vec![thinking_only_max_tokens(); 3];
+        replies.push(tool_reply("call_1", "echo", r#"{"message":"hi"}"#));
+        replies.extend(vec![thinking_only_max_tokens(); 3]);
+        replies.push(text_reply("done"));
+        let provider = FakeProvider::new(replies);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(provider.seen().len(), 8);
+        let events = drain(tx, &mut rx);
+        assert_eq!(policy_notes(&events).len(), 6);
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
     }
 }

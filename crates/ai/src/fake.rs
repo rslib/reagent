@@ -18,25 +18,52 @@ pub struct SeenRequest {
     pub messages: usize,
 }
 
+/// One item a scripted reply can yield: an event or an error.
+#[derive(Debug)]
+enum ReplyItem {
+    Event(StreamEvent),
+    Error(Error),
+}
+
 /// Plays a scripted list of replies in order.
 #[derive(Debug, Default)]
 pub struct FakeProvider {
-    replies: Mutex<VecDeque<Vec<StreamEvent>>>,
+    replies: Mutex<VecDeque<VecDeque<ReplyItem>>>,
     seen: Mutex<Vec<SeenRequest>>,
 }
 
 impl FakeProvider {
     /// Creates a provider that plays `replies` in order.
     pub fn new(replies: Vec<Vec<StreamEvent>>) -> Self {
+        let replies: VecDeque<VecDeque<ReplyItem>> = replies
+            .into_iter()
+            .map(|events| events.into_iter().map(ReplyItem::Event).collect())
+            .collect();
         Self {
-            replies: Mutex::new(replies.into_iter().collect()),
+            replies: Mutex::new(replies),
             seen: Mutex::new(Vec::new()),
         }
     }
 
     /// Queues one more reply at the back.
     pub fn push_reply(&self, events: Vec<StreamEvent>) {
-        self.replies.lock().expect("reply lock").push_back(events);
+        let reply: VecDeque<ReplyItem> = events.into_iter().map(ReplyItem::Event).collect();
+        self.replies.lock().expect("reply lock").push_back(reply);
+    }
+
+    /// Queues one more attempted reply that fails with `error`.
+    pub fn push_error(&self, error: Error) {
+        let mut reply = VecDeque::new();
+        reply.push_back(ReplyItem::Error(error));
+        self.replies.lock().expect("reply lock").push_back(reply);
+    }
+
+    /// Queues one more attempted reply that streams `events` and then fails
+    /// with `error`, as a stream cut off mid-reply does.
+    pub fn push_failing_reply(&self, events: Vec<StreamEvent>, error: Error) {
+        let mut reply: VecDeque<ReplyItem> = events.into_iter().map(ReplyItem::Event).collect();
+        reply.push_back(ReplyItem::Error(error));
+        self.replies.lock().expect("reply lock").push_back(reply);
     }
 
     /// The requests seen so far, oldest first.
@@ -61,7 +88,10 @@ impl Provider for FakeProvider {
             .expect("reply lock")
             .pop_front()
             .unwrap_or_default();
-        Box::pin(stream::iter(reply.into_iter().map(Ok)))
+        Box::pin(stream::iter(reply.into_iter().map(|item| match item {
+            ReplyItem::Event(event) => Ok(event),
+            ReplyItem::Error(error) => Err(error),
+        })))
     }
 }
 
@@ -182,5 +212,21 @@ mod tests {
     fn an_exhausted_provider_yields_nothing() {
         let provider = FakeProvider::new(vec![]);
         assert!(drain(&mut provider.stream(&request("m", &[]))).is_empty());
+    }
+
+    #[test]
+    fn push_error_queues_a_failing_stream() {
+        let provider = FakeProvider::new(vec![]);
+        provider.push_error(Error::Transient("overloaded".into()));
+        let history = vec![Message::user("m0")];
+        let mut stream = provider.stream(&request("m", &history));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let item = stream.as_mut().poll_next(&mut cx);
+        match item {
+            std::task::Poll::Ready(Some(Err(Error::Transient(message)))) => {
+                assert_eq!(message, "overloaded")
+            }
+            other => panic!("expected a transient error, got {other:?}"),
+        }
     }
 }

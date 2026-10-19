@@ -5,12 +5,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use reagent_agent::agent_loop::{Agent, AgentConfig};
 use reagent_agent::event::{Event, TurnEndReason};
+use reagent_agent::policy::TurnPolicy;
+use reagent_agent::policy::budget::Budget;
+use reagent_agent::policy::completion::Completion;
+use reagent_agent::policy::stuck::Stuck;
 use reagent_agent::tool::Registry;
 use reagent_ai::{Provider, StopReason, Text, Usage};
 use reagent_tools::bash::Bash;
@@ -68,9 +73,6 @@ impl Out {
     }
 }
 
-/// The largest reply the headless run asks a provider for. A `write` call
-/// carries the whole file, so a low cap cuts the call and ends the run.
-const MAX_TOKENS: u32 = 32_000;
 /// The provider-call cap, so a looping model cannot run without end.
 const MAX_TURNS: u32 = 200;
 
@@ -104,8 +106,41 @@ fn fire(slot: &AtomicU8, cause: Cause, token: &CancellationToken) {
     token.cancel();
 }
 
+/// Reads the whole task from standard input (`-p -`).
+///
+/// Returns an error message for empty or non-UTF-8 input; the caller exits 2.
+async fn read_stdin_task() -> Result<String, String> {
+    let mut bytes = Vec::new();
+    let mut stdin = tokio::io::stdin();
+    stdin
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| format!("cannot read the task from stdin: {error}"))?;
+    if bytes.is_empty() {
+        return Err("the task from stdin is empty".into());
+    }
+    match String::from_utf8(bytes) {
+        Ok(task) => Ok(task),
+        Err(_) => Err("the task from stdin is not UTF-8".into()),
+    }
+}
+
 /// Runs the agent for `args` and returns the process exit code.
-pub async fn run(args: Args) -> ExitCode {
+pub async fn run(mut args: Args) -> ExitCode {
+    // Resolve the task text before anything runs: `-p -` reads the whole task
+    // from standard input, and an empty or non-UTF-8 task input exits 2.
+    // The task moves out of `args`; `args` is still borrowed below.
+    let source = std::mem::replace(&mut args.task, crate::args::TaskSource::Stdin);
+    let mut task = match source {
+        crate::args::TaskSource::Text(text) => text,
+        crate::args::TaskSource::Stdin => match read_stdin_task().await {
+            Ok(task) => task,
+            Err(message) => {
+                eprintln!("reagent: {message}");
+                return ExitCode::from(2);
+            }
+        },
+    };
     let cwd = match tokio::fs::canonicalize(&args.cwd).await {
         Ok(cwd) if tokio::fs::metadata(&cwd).await.is_ok_and(|m| m.is_dir()) => cwd,
         _ => {
@@ -131,12 +166,33 @@ pub async fn run(args: Args) -> ExitCode {
     let system = prompt::system(cwd.to_string_lossy().as_ref());
     let config = AgentConfig {
         model: args.model.clone(),
-        max_tokens: MAX_TOKENS,
+        max_tokens: args.max_tokens,
         system: Some(system),
         reasoning: None,
         cache_key: Some(Text::from("headless-v1")),
         max_turns: Some(MAX_TURNS),
     };
+
+    // The loop policies and whether to take a pre-run environment snapshot.
+    let mut policies: Vec<Box<dyn TurnPolicy>> = Vec::new();
+    let mut snapshot_enabled = false;
+    let mut mask_enabled = false;
+    for name in &args.policy {
+        match name.as_str() {
+            "completion" => policies.push(Box::new(Completion::with_task(&task))),
+            "stuck" => policies.push(Box::new(Stuck::default())),
+            "budget" => policies.push(Box::new(Budget::new(
+                args.deadline.map(Duration::from_secs),
+                Some(MAX_TURNS),
+            ))),
+            "snapshot" => snapshot_enabled = true,
+            "mask" => mask_enabled = true,
+            other => {
+                eprintln!("reagent: unknown policy: {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
 
     let cancel = CancellationToken::new();
     let cause = Arc::new(AtomicU8::new(Cause::None as u8));
@@ -159,12 +215,26 @@ pub async fn run(args: Args) -> ExitCode {
         }));
     }
 
-    let agent = Agent::new(provider.as_ref(), &registry, config, cancel);
+    let snapshot_cancel = cancel.clone();
+    let mut agent = if policies.is_empty() {
+        Agent::new(provider.as_ref(), &registry, config, cancel)
+    } else {
+        Agent::with_policies(provider.as_ref(), &registry, config, cancel, policies)
+    };
+    if mask_enabled {
+        agent = agent.with_mask();
+    }
     let (tx, rx) = mpsc::channel::<Event>(256);
     let out = Out::new();
     let writer = tokio::spawn(drain(rx, out, args.json));
 
-    let mut history = vec![reagent_ai::Message::user(args.task)];
+    if snapshot_enabled {
+        let snapshot = crate::snapshot::capture_environment(&cwd, &snapshot_cancel).await;
+        if !snapshot.trim().is_empty() {
+            task = format!("{task}\n\n{} {snapshot}", crate::snapshot::header());
+        }
+    }
+    let mut history = vec![reagent_ai::Message::user(task)];
     agent.run(&mut history, None, &tx).await;
     drop(tx);
     for timer in timers {
@@ -197,6 +267,8 @@ async fn drain(rx: mpsc::Receiver<Event>, mut out: Out, json: bool) -> TurnEndRe
                 turns += 1;
                 answer.clear();
             }
+            // A retried attempt starts the reply again, so its partial text goes.
+            Event::Retry { .. } => answer.clear(),
             Event::TextDelta(text) => answer.push_str(text),
             Event::Usage(usage) => sum(&mut total, usage),
             Event::Error(message) if !json => eprintln!("reagent: {message}"),
@@ -273,27 +345,46 @@ fn exit_code(reason: &TurnEndReason, cause: Cause) -> ExitCode {
 /// Builds the provider named on the command line, or reports why not.
 async fn build_provider(args: &Args) -> Result<Box<dyn Provider>, String> {
     #[cfg(feature = "testing")]
-    if let Some(spec) = &args.provider {
+    if let crate::args::Wire::Fake(spec) = &args.provider {
         return build_fake(spec)
             .await
             .map(|provider| Box::new(provider) as Box<dyn Provider>);
     }
-    #[cfg(not(feature = "testing"))]
-    let _ = args;
 
-    let key =
-        std::env::var("ANTHROPIC_API_KEY").map_err(|_| "missing ANTHROPIC_API_KEY".to_string())?;
-    let base =
-        std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".into());
-    Ok(Box::new(reagent_ai::anthropic::Anthropic::new(key, base)))
+    let base_url = args
+        .base_url
+        .clone()
+        .unwrap_or_else(|| args.provider.base_url());
+    let api_key_env = args
+        .api_key_env
+        .clone()
+        .unwrap_or_else(|| args.provider.default_api_key_env().to_string());
+    let api_key = std::env::var(&api_key_env)
+        .ok()
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| format!("missing {api_key_env}"))?;
+    let header = args.header.clone();
+
+    let provider: Box<dyn Provider> = match &args.provider {
+        crate::args::Wire::Anthropic => {
+            Box::new(reagent_ai::anthropic::Anthropic::new(api_key, base_url).with_headers(header))
+        }
+        crate::args::Wire::OpenAiChat => Box::new(
+            reagent_ai::openai::chat::OpenAiChat::new(api_key, base_url).with_headers(header),
+        ),
+        crate::args::Wire::OpenAiResponses => Box::new(
+            reagent_ai::openai::responses::OpenAiResponses::new(api_key, base_url)
+                .with_headers(header),
+        ),
+        #[cfg(feature = "testing")]
+        crate::args::Wire::Fake(_) => unreachable!("the testing provider is handled above"),
+    };
+    Ok(provider)
 }
 
 /// Reads a scripted FakeProvider from a JSON file, under the testing feature.
 #[cfg(feature = "testing")]
-async fn build_fake(spec: &str) -> Result<reagent_ai::fake::FakeProvider, String> {
-    let file = spec
-        .strip_prefix("fake:")
-        .ok_or_else(|| "testing provider must be `fake:<file>`".to_string())?;
+async fn build_fake(file: &str) -> Result<reagent_ai::fake::FakeProvider, String> {
     let text = tokio::fs::read_to_string(file)
         .await
         .map_err(|error| format!("cannot read {file}: {error}"))?;
@@ -307,7 +398,7 @@ mod fake {
     use serde_json::Value;
 
     use reagent_ai::fake::FakeProvider;
-    use reagent_ai::{StopReason, StreamEvent, Text};
+    use reagent_ai::{Error, StopReason, StreamEvent, Text};
 
     /// One parsed reply: assistant text, any tool calls it makes and optional
     /// token usage.
@@ -319,6 +410,14 @@ mod fake {
         calls: Vec<ScriptedCall>,
         #[serde(default)]
         usage: Option<ScriptedUsage>,
+        /// When set, the reply streams its text and then fails with this
+        /// retryable error instead of finishing.
+        #[serde(default)]
+        fail: Option<String>,
+        /// When true, the reply is a thinking block cut off by a max_tokens
+        /// stop, with no signature, text or tool call.
+        #[serde(default)]
+        max_tokens: bool,
     }
 
     /// Token counts a reply reports to exercise the usage line.
@@ -349,13 +448,31 @@ mod fake {
     impl Script {
         /// Plays the scripted replies through a FakeProvider.
         fn into_provider(self) -> FakeProvider {
-            let replies = self.replies.into_iter().map(events).collect();
-            FakeProvider::new(replies)
+            let provider = FakeProvider::default();
+            for reply in self.replies {
+                match reply.fail {
+                    Some(error) => {
+                        let mut partial = Vec::new();
+                        if !reply.text.is_empty() {
+                            partial.push(StreamEvent::TextDelta(Text::from(reply.text)));
+                        }
+                        provider.push_failing_reply(partial, Error::Transient(error));
+                    }
+                    None => provider.push_reply(events(reply)),
+                }
+            }
+            provider
         }
     }
 
     /// Builds the stream events for one scripted reply.
     fn events(reply: ScriptedReply) -> Vec<StreamEvent> {
+        if reply.max_tokens {
+            return vec![
+                StreamEvent::ThinkingDelta(Text::from("")),
+                StreamEvent::Stop(StopReason::MaxTokens),
+            ];
+        }
         let mut events = Vec::new();
         if !reply.text.is_empty() {
             events.push(StreamEvent::TextDelta(Text::from(reply.text)));

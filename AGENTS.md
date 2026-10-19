@@ -26,6 +26,14 @@ The build output goes to the global target folder `~/.cache/cargo-target`, not t
 
 A feature that does not move 1 or 2 in a measured run does not ship as a default.
 
+## Harness changes
+
+- Ship a harness change only when it fixes a mechanism (a crash, lost work, a wrong final state, wasted tokens) or follows a practice that two or more outside sources measured. Never add prompt or tool text written for one benchmark task: tuning on failed tasks did not carry to held-out Terminal-Bench tasks.
+- The system prompt and tool specs stay under `PROMPT_BUDGET` in `crates/cli/src/main.rs`. A new note in `prompts/` must pay for its tokens in a measured run.
+- Measure on the dev set with 3 trials (`bench/harbor/run.sh --dev`), then report from `bench/harbor`: `uv run python -m reagent_harbor.report <job> --against <old job> --tasks dev-tasks.txt`. Give the pass rate with its 95% interval, tokens per solved task and the failure types.
+- A dev gap under 10 points, or a difference interval that includes 0, is noise. Do not ship on it.
+- Before you call a default change a gain, confirm it on the Terminal-Bench tasks not in `bench/harbor/dev-tasks.txt` and on a second model.
+
 ## Where things go
 
 | Area | Crate | Contents |
@@ -37,7 +45,7 @@ A feature that does not move 1 or 2 in a measured run does not ship as a default
 | MCP client | `crates/mcp` (`reagent-mcp`) | depends on agent |
 | Terminal UI and markdown | `crates/tui` (`reagent-tui`) | depends on agent |
 | Binary and flags | `crates/cli` (`reagent`) | depends on all |
-| Model-facing prompt templates | none: `prompts/` at the root | baked into `crates/cli` with `include_str!` |
+| Model-facing prompt templates | none: `prompts/` at the root | baked into `crates/agent` and `crates/cli` with `include_str!` |
 | Harbor adapter | `bench/harbor` | Python, run with `uv` |
 
 Links point down this table only. Do not add a crate, and do not add a `common` or `utils` crate. Shared types go in `crates/ai`. Update this section in the change that moves an area.

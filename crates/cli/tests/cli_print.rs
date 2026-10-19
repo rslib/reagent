@@ -83,6 +83,68 @@ const SLOW_SCRIPT: &str = r#"{"replies": [{"calls": [
     {"name": "bash", "arguments": {"command": "sleep 30"}}
 ]}]}"#;
 
+/// Runs `reagent --provider fake:<f> -p -` with `input` piped to its stdin.
+async fn run_with_stdin(fake: &str, input: &[u8]) -> std::process::Output {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let mut child = Command::new(bin())
+        .args(["--provider", fake, "-p", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    child
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(input)
+        .await
+        .expect("writes stdin");
+    drop(child.stdin.take());
+    child.wait_with_output().await.expect("the run completes")
+}
+
+#[tokio::test]
+async fn a_dash_task_reads_the_task_from_stdin() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let fake = script(tmp.path(), r#"{"replies": [{"text": "from stdin"}]}"#).await;
+    let output = run_with_stdin(&fake, b"write the file\n").await;
+    assert!(
+        output.status.success(),
+        "exit {} stderr {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "from stdin\n");
+}
+
+#[tokio::test]
+async fn an_empty_stdin_task_exits_2() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let fake = script(tmp.path(), r#"{"replies": [{"text": "x"}]}"#).await;
+    let output = run_with_stdin(&fake, b"").await;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("reagent: ") && stderr.contains("empty"),
+        "stderr: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_non_utf8_stdin_task_exits_2() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let fake = script(tmp.path(), r#"{"replies": [{"text": "x"}]}"#).await;
+    let output = run_with_stdin(&fake, &[0xff, 0xfe, 0x00]).await;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("reagent: ") && stderr.contains("UTF-8"),
+        "stderr: {stderr}"
+    );
+}
+
 #[tokio::test]
 async fn bad_args_exit_2() {
     let tmp = tempfile::tempdir().expect("temp dir");
@@ -198,4 +260,31 @@ async fn the_final_text_is_the_last_turn_only() {
         .expect("write a");
     let output = run(tmp.path(), &["--provider", &fake, "-p", "hi"]).await;
     assert_eq!(String::from_utf8_lossy(&output.stdout), "the answer\n");
+}
+
+#[tokio::test]
+async fn a_retried_turn_prints_only_the_text_of_the_last_attempt() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let script = tmp.path().join("script.json");
+    // The first attempt streams text and is cut off; the retry succeeds.
+    tokio::fs::write(
+        &script,
+        r#"{"replies": [{"text": "half ", "fail": "overloaded"}, {"text": "whole answer"}]}"#,
+    )
+    .await
+    .expect("write script");
+    let script_arg = format!("fake:{}", script.display());
+    let output = Command::new(BIN)
+        .args(["--provider", &script_arg, "-p", "hi"])
+        .current_dir(tmp.path())
+        .env("ANTHROPIC_API_KEY", "sk-ant-test")
+        .output()
+        .await
+        .expect("the binary runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "whole answer\n");
 }

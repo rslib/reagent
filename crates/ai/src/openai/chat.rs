@@ -8,6 +8,7 @@ use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::Error;
+use crate::http::ExtraHeaders;
 use crate::key::ApiKey;
 use crate::openai::{BodyCache, JsonStr};
 use crate::types::{
@@ -32,6 +33,7 @@ pub struct OpenAiChat {
     api_key: ApiKey,
     base_url: String,
     options: ChatOptions,
+    headers: ExtraHeaders,
     head: Mutex<Option<Head>>,
     bodies: Mutex<BodyCache<MessageBody>>,
 }
@@ -60,9 +62,20 @@ impl OpenAiChat {
             api_key: ApiKey::new(api_key.into()),
             base_url,
             options,
+            headers: ExtraHeaders::default(),
             head: Mutex::new(None),
             bodies: Mutex::new(BodyCache::default()),
         }
+    }
+
+    /// Adds extra request headers to every request.
+    ///
+    /// A header that [`crate::check_header`] rejects is dropped, so an extra
+    /// header never replaces the credential or the body encoding. `Debug`
+    /// prints header names only, never values.
+    pub fn with_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = ExtraHeaders::new(headers);
+        self
     }
 
     /// Replaces the endpoint tuning.
@@ -127,20 +140,28 @@ impl Provider for OpenAiChat {
         let url = self.url();
         let api_key = self.api_key.reveal().to_owned();
         let client = self.client.clone();
+        let headers = self.headers.clone();
 
         let connect = futures_util::stream::once(async move {
-            let response = client
+            let request = client
                 .post(url)
                 .header("authorization", format!("Bearer {api_key}"))
-                .header("content-type", "application/json")
+                .header("content-type", "application/json");
+            let response = headers
+                .apply(request)
                 .body(body)
                 .send()
                 .await
                 .map_err(|error| Error::Http(error.to_string()))?;
             let status = response.status();
             if !status.is_success() {
+                let retry = crate::Retry::from_headers(response.headers());
                 let text = response.text().await.unwrap_or_default();
-                return Err(Error::Status(status.as_u16(), text));
+                return Err(Error::Status {
+                    code: status.as_u16(),
+                    body: text,
+                    retry,
+                });
             }
             let bytes = response
                 .bytes_stream()
@@ -476,7 +497,11 @@ impl StreamParser {
         };
         if let Some(error) = chunk.error {
             self.failed = true;
-            return Err(Error::Protocol(error.message.as_str().to_string()));
+            let message = error.message.as_str().to_string();
+            if error.kind.is_some_and(retryable) {
+                return Err(Error::Transient(message));
+            }
+            return Err(Error::Protocol(message));
         }
 
         for choice in chunk.choices.into_choices() {
@@ -717,6 +742,15 @@ struct FunctionDelta<'a> {
 struct ApiError<'a> {
     #[serde(default, borrow)]
     message: JsonStr<'a>,
+    #[serde(default, borrow, rename = "type")]
+    kind: Option<&'a str>,
+}
+
+/// Whether an OpenAI stream error is safe to retry: server or rate-limit
+/// family types are transient, everything else is not.
+fn retryable(kind: &str) -> bool {
+    let kind = kind.to_ascii_lowercase();
+    kind.contains("server") || kind.contains("rate_limit") || kind.contains("overload")
 }
 
 #[derive(Default, Deserialize)]
@@ -1092,12 +1126,21 @@ mod tests {
     }
 
     #[test]
-    fn an_error_chunk_is_a_protocol_error() {
+    fn a_rate_limit_error_chunk_is_transient() {
         let mut parser = StreamParser::new();
         let line = br#"data: {"error":{"message":"rate limited","type":"rate_limit_error"}}"#;
         let mut out = Vec::new();
         let error = parser.push_line(line, &mut out).unwrap_err();
-        assert!(matches!(error, Error::Protocol(message) if message == "rate limited"));
+        assert!(matches!(error, Error::Transient(message) if message == "rate limited"));
+    }
+
+    #[test]
+    fn a_non_retryable_error_chunk_is_a_protocol_error() {
+        let mut parser = StreamParser::new();
+        let line = br#"data: {"error":{"message":"bad request","type":"invalid_request_error"}}"#;
+        let mut out = Vec::new();
+        let error = parser.push_line(line, &mut out).unwrap_err();
+        assert!(matches!(error, Error::Protocol(message) if message == "bad request"));
     }
 
     #[test]
@@ -1188,5 +1231,32 @@ mod tests {
             .unwrap();
         assert_eq!(items.len(), 1);
         assert!(matches!(&items[0], Err(Error::Http(message)) if message == "refused"));
+    }
+
+    const EXTRA_REPLY: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    #[tokio::test]
+    async fn extra_headers_reach_the_chat_request() {
+        let (base, recorded) = crate::http::test_server::serve(EXTRA_REPLY).await;
+        let provider =
+            OpenAiChat::new("test-key", base).with_headers(vec![("x-extra".into(), "yes".into())]);
+        let request = Request {
+            model: "test-model",
+            max_tokens: 16,
+            system: None,
+            tools: &[],
+            messages: &[],
+            reasoning: None,
+            cache_key: None,
+        };
+        let events: Vec<_> = provider.stream(&request).collect().await;
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let recorded = recorded.await.expect("the server recorded the request");
+        assert_eq!(recorded.request_line, "POST /chat/completions HTTP/1.1");
+        assert_eq!(recorded.header("x-extra"), Some("yes"));
+        assert_eq!(recorded.header("authorization"), Some("Bearer test-key"));
     }
 }

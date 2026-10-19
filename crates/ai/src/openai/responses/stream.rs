@@ -144,13 +144,22 @@ impl StreamParser {
                 Ok(())
             }
             "response.failed" => {
-                let message = event
-                    .response
-                    .error
-                    .map(|error| error.message.as_str().to_string())
-                    .unwrap_or_else(|| "response failed".into());
+                let (message, transient) = match event.response.error {
+                    Some(error) => {
+                        let kind = error.kind.or(error.code);
+                        (
+                            error.message.as_str().to_string(),
+                            kind.is_some_and(retryable),
+                        )
+                    }
+                    None => ("response failed".into(), false),
+                };
                 self.failed = true;
-                Err(Error::Protocol(message))
+                if transient {
+                    Err(Error::Transient(message))
+                } else {
+                    Err(Error::Protocol(message))
+                }
             }
             "error" => {
                 self.failed = true;
@@ -159,7 +168,11 @@ impl StreamParser {
                     .as_ref()
                     .map(JsonStr::as_str)
                     .unwrap_or("stream error");
-                Err(Error::Protocol(message.to_string()))
+                if event.code.is_some_and(retryable) {
+                    Err(Error::Transient(message.to_string()))
+                } else {
+                    Err(Error::Protocol(message.to_string()))
+                }
             }
             _ => Ok(()),
         }
@@ -270,6 +283,8 @@ struct Event<'a> {
     response: ResponseObject<'a>,
     #[serde(default, borrow)]
     message: Option<JsonStr<'a>>,
+    #[serde(default, borrow)]
+    code: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -306,6 +321,17 @@ struct IncompleteDetails<'a> {
 struct ApiError<'a> {
     #[serde(default, borrow)]
     message: JsonStr<'a>,
+    #[serde(default, borrow, rename = "type")]
+    kind: Option<&'a str>,
+    #[serde(default, borrow)]
+    code: Option<&'a str>,
+}
+
+/// Whether an OpenAI Responses stream error is safe to retry: a server or
+/// rate-limit family type or code is transient, everything else is not.
+fn retryable(kind: &str) -> bool {
+    let kind = kind.to_ascii_lowercase();
+    kind.contains("server") || kind.contains("rate_limit") || kind.contains("overload")
 }
 
 #[derive(Default, Deserialize)]
@@ -431,21 +457,30 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_response_is_an_error() {
+    fn a_retryable_failed_response_is_transient() {
         let mut parser = StreamParser::new();
         let line = br#"data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"boom"}}}"#;
         let mut out = Vec::new();
         let error = parser.push_line(line, &mut out).unwrap_err();
-        assert!(matches!(error, Error::Protocol(message) if message == "boom"));
+        assert!(matches!(error, Error::Transient(message) if message == "boom"));
     }
 
     #[test]
-    fn an_error_event_stops_with_the_message() {
+    fn a_non_retryable_failed_response_is_a_protocol_error() {
+        let mut parser = StreamParser::new();
+        let line = br#"data: {"type":"response.failed","response":{"status":"failed","error":{"type":"invalid_request","message":"no"}}}"#;
+        let mut out = Vec::new();
+        let error = parser.push_line(line, &mut out).unwrap_err();
+        assert!(matches!(error, Error::Protocol(message) if message == "no"));
+    }
+
+    #[test]
+    fn a_retryable_error_event_is_transient() {
         let mut parser = StreamParser::new();
         let line = br#"data: {"type":"error","code":"overloaded","message":"Overloaded"}"#;
         let mut out = Vec::new();
         let error = parser.push_line(line, &mut out).unwrap_err();
-        assert!(matches!(error, Error::Protocol(message) if message == "Overloaded"));
+        assert!(matches!(error, Error::Transient(message) if message == "Overloaded"));
     }
 
     #[test]
@@ -474,7 +509,7 @@ mod tests {
                 &mut out,
             )
             .unwrap_err();
-        assert!(matches!(error, Error::Protocol(message) if message == "boom"));
+        assert!(matches!(error, Error::Transient(message) if message == "boom"));
         let mut late = Vec::new();
         parser
             .push_line(

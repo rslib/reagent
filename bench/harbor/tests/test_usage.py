@@ -13,6 +13,7 @@ import pytest
 from reagent_harbor.agent import parse_events
 
 FIXTURE = Path(__file__).parent / "fixtures" / "events.jsonl"
+NO_SUMMARY_FIXTURE = Path(__file__).parent / "fixtures" / "events_no_summary.jsonl"
 
 
 def test_parses_recorded_reagent_events() -> None:
@@ -81,6 +82,20 @@ def test_missing_summary_falls_back_to_usage_lines() -> None:
     assert summary.cache_read_tokens == 110
     assert summary.cache_write_tokens == 12
     assert summary.turns == 2
+
+
+def test_no_summary_fixture_sums_usage_lines_and_counts_turns() -> None:
+    """The recorded file without a summary line still reports totals from the
+    per-turn usage lines and the turn_start count."""
+    summary = parse_events(NO_SUMMARY_FIXTURE.read_text())
+
+    assert summary.input_tokens == 90
+    assert summary.output_tokens == 26
+    assert summary.cache_read_tokens == 165
+    assert summary.cache_write_tokens == 15
+    assert summary.turns == 3
+    assert summary.malformed_lines == 0
+    assert summary.total_tokens == 90 + 165 + 15
 
 
 def test_negative_or_missing_counts_are_clamped_to_zero() -> None:

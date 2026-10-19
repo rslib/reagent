@@ -65,3 +65,49 @@ def test_missing_arguments_fail_with_usage() -> None:
     result = run_script("--dry-run", "claude-sonnet-5-5", "terminal-bench/terminal-bench-2-1")
     assert result.returncode == 2
     assert "usage:" in result.stderr
+
+DEV_TASKS = Path(__file__).parent.parent / "dev-tasks.txt"
+
+
+def dev_task_names() -> list[str]:
+    return [
+        line.strip()
+        for line in DEV_TASKS.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def test_dev_includes_each_listed_task_and_the_caps() -> None:
+    result = run_script(
+        "--dry-run", "--dev", "anthropic/claude-haiku-5-5", "terminal-bench/terminal-bench-2-1", "1"
+    )
+    assert result.returncode == 0, result.stderr
+    command = result.stdout
+    names = dev_task_names()
+    assert 20 <= len(names) <= 30
+    for name in names:
+        assert f"-i {name} " in command or command.rstrip().endswith(f"-i {name}")
+    assert command.count(" -i ") == len(names)
+    assert "-n 8" in command
+    assert "--ak agent_timeout_sec=600" in command
+    assert "#" not in command
+
+
+def test_dev_extra_args_come_after_the_dev_flags() -> None:
+    result = run_script(
+        "--dry-run",
+        "--dev",
+        "anthropic/claude-haiku-5-5",
+        "terminal-bench/terminal-bench-2-1",
+        "1",
+        "--n-concurrent",
+        "2",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.index("-n 8") < result.stdout.index("--n-concurrent 2")
+
+
+def test_dev_list_names_are_unique_and_full() -> None:
+    names = dev_task_names()
+    assert len(names) == len(set(names))
+    assert all(name.startswith("terminal-bench/") for name in names)

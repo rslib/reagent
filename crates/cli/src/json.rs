@@ -18,9 +18,15 @@ pub fn event(event: &Event) -> Value {
             "id": id.as_ref(),
             "name": name.as_ref(),
         }),
-        Event::ToolCallReady { id } => json!({
+        Event::ToolCallReady {
+            id,
+            name,
+            arguments,
+        } => json!({
             "type": "tool_call_ready",
             "id": id.as_ref(),
+            "name": name.as_ref(),
+            "arguments": arguments.as_ref(),
         }),
         Event::ToolResult { id, is_error } => json!({
             "type": "tool_result",
@@ -46,6 +52,20 @@ pub fn event(event: &Event) -> Value {
         Event::Error(message) => json!({
             "type": "error",
             "message": message.as_ref(),
+        }),
+        Event::Retry {
+            attempt,
+            delay_ms,
+            error,
+        } => json!({
+            "type": "retry",
+            "attempt": attempt,
+            "delay_ms": delay_ms,
+            "error": error.as_ref(),
+        }),
+        Event::PolicyNote(text) => json!({
+            "type": "policy_note",
+            "text": text.as_ref(),
         }),
     }
 }

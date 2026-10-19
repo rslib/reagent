@@ -1,0 +1,37 @@
+# Terminal-Bench 2.1 dev set for `run.sh --dev`.
+# Picked from the 2026-10-18 Sonnet 5.5 and Haiku 5.5 runs; every task took
+# under 10 minutes there. Full runs stay the reference.
+
+# Sonnet passed, Haiku failed.
+terminal-bench/adaptive-rejection-sampler
+terminal-bench/chess-best-move
+terminal-bench/extract-elf
+terminal-bench/git-multibranch
+terminal-bench/kv-store-grpc
+terminal-bench/largest-eigenval
+terminal-bench/merge-diff-arc-agi-task
+terminal-bench/model-extraction-relu-logits
+terminal-bench/nginx-request-logging
+terminal-bench/path-tracing-reverse
+terminal-bench/protein-assembly
+terminal-bench/torch-pipeline-parallelism
+terminal-bench/video-processing
+
+# Haiku passed, Sonnet failed.
+terminal-bench/break-filter-js-from-html
+terminal-bench/configure-git-webserver
+terminal-bench/crack-7z-hash
+terminal-bench/password-recovery
+terminal-bench/vulnerable-secret
+
+# Both passed: catch regressions.
+terminal-bench/fix-git
+terminal-bench/openssl-selfsigned-cert
+terminal-bench/constraints-scheduling
+terminal-bench/regex-log
+terminal-bench/polyglot-rust-c
+terminal-bench/log-summary-date-ranges
+
+# Both failed: headroom.
+terminal-bench/db-wal-recovery
+terminal-bench/raman-fitting

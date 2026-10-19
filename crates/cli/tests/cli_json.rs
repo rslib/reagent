@@ -139,6 +139,51 @@ async fn cli_json_prints_one_line_per_event_with_usage() {
 }
 
 #[tokio::test]
+async fn cli_json_tool_call_ready_carries_name_and_arguments() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let script = tmp.path().join("script.json");
+    tokio::fs::write(
+        &script,
+        r#"{"replies": [{"text": "calling", "calls": [
+            {"name": "read", "arguments": {"path": "notes.txt"}}
+        ]}, {"text": "done"}]}"#,
+    )
+    .await
+    .expect("write script");
+    tokio::fs::write(tmp.path().join("notes.txt"), "n")
+        .await
+        .expect("write notes");
+
+    let script_arg = format!("fake:{}", script.display());
+    let output = run(
+        tmp.path(),
+        &["--json", "--provider", &script_arg, "-p", "read it"],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "exit {} stderr {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lines = json_lines(&output.stdout);
+    let ready: Vec<_> = lines
+        .iter()
+        .filter(|line| line["type"] == "tool_call_ready")
+        .collect();
+    assert_eq!(ready.len(), 1, "{lines:?}");
+    let ready = ready[0];
+    assert_eq!(ready["name"], "read", "{ready:?}");
+    // The arguments are the raw JSON string the model sent, not a parsed object.
+    assert_eq!(
+        ready["arguments"].as_str().unwrap(),
+        r#"{"path":"notes.txt"}"#,
+        "arguments stay a raw JSON string: {ready:?}"
+    );
+}
+
+#[tokio::test]
 async fn cli_json_never_prints_the_api_key_on_an_error() {
     let tmp = tempfile::tempdir().expect("temp dir");
     // One reply calls a tool and leaves nothing to answer a second turn, so the
@@ -178,6 +223,48 @@ async fn cli_json_never_prints_the_api_key_on_an_error() {
     assert!(
         !stderr.contains(FAKE_KEY),
         "stderr leaks the API key: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn cli_json_completion_policy_prints_a_policy_note() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let script = tmp.path().join("script.json");
+    // The first answer gets the completion note; the second answer ends the run.
+    tokio::fs::write(
+        &script,
+        r#"{"replies": [{"text": "first answer"}, {"text": "checked answer"}]}"#,
+    )
+    .await
+    .expect("write script");
+
+    let script_arg = format!("fake:{}", script.display());
+    let args = [
+        "--json",
+        "--policy",
+        "completion",
+        "--provider",
+        &script_arg,
+        "-p",
+        "hi",
+    ];
+    let output = run(tmp.path(), &args).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = json_lines(&output.stdout);
+    let kinds = types(&lines);
+    assert_eq!(
+        kinds.iter().filter(|kind| **kind == "policy_note").count(),
+        1,
+        "{kinds:?}"
+    );
+    assert_eq!(
+        kinds.iter().filter(|kind| **kind == "turn_start").count(),
+        2,
+        "{kinds:?}"
     );
 }
 

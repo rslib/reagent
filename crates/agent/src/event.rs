@@ -38,6 +38,10 @@ pub enum Event {
     ToolCallReady {
         /// The call id.
         id: Text,
+        /// The tool name.
+        name: Text,
+        /// The raw JSON arguments the model sent, as a string.
+        arguments: Text,
     },
     /// One tool call produced a result.
     ToolResult {
@@ -52,6 +56,21 @@ pub enum Event {
     TurnEnd(TurnEndReason),
     /// The whole run ended with a reason, once, after the last `TurnEnd`.
     RunEnd(TurnEndReason),
+    /// A loop policy injected a message into the conversation.
+    PolicyNote(Text),
     /// A provider or tool error with its message.
     Error(Text),
+    /// A failed provider call is being retried after a backoff.
+    ///
+    /// A consumer that sees this event must drop the partial text, thinking
+    /// and tool-argument deltas of the failed turn: the retry restarts the
+    /// turn from scratch, and the partial reply is discarded.
+    Retry {
+        /// The retry number, starting at 1.
+        attempt: u32,
+        /// The backoff before the retry, in milliseconds.
+        delay_ms: u64,
+        /// The error that caused the retry.
+        error: Text,
+    },
 }

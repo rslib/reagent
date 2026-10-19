@@ -23,7 +23,12 @@ workspace = true
 [dev-dependencies]
 dhat = { version = "0.3.3", default-features = false }
 divan = { version = "0.1.21", default-features = false }
+tokio = { version = "1.53.3", default-features = false, features = ["rt", "macros", "net", "io-util", "sync", "time"] }
 
 [[bench]]
 name = "providers"
 harness = false
+
+[[test]]
+name = "allocs"
+required-features = ["testing"]
