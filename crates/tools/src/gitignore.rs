@@ -6,6 +6,7 @@
 //! [`global_excludes_path`]); `core.excludesFile` is not read.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const MATCH: i8 = 0;
 const NOMATCH: i8 = 1;
@@ -130,11 +131,7 @@ impl Ignores {
     /// `parent`; returns the new innermost layer, or `parent` when `text` has
     /// no patterns.
     pub(crate) fn add(&mut self, parent: Option<usize>, base: &[u8], text: &[u8]) -> Option<usize> {
-        let text = text.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(text);
-        let patterns: Vec<Pattern> = text
-            .split(|b| *b == b'\n')
-            .filter_map(Pattern::parse)
-            .collect();
+        let patterns = parse_patterns(text);
         if patterns.is_empty() {
             return parent;
         }
@@ -156,28 +153,119 @@ impl Ignores {
         while let Some(i) = cur {
             let layer = &self.layers[i];
             cur = layer.parent;
-            let sub = if layer.base.is_empty() {
-                rel
-            } else {
-                match rel.strip_prefix(layer.base.as_slice()) {
-                    Some(rest) if rest.first() == Some(&b'/') => &rest[1..],
-                    _ => continue,
-                }
-            };
-            if let Some(p) = layer.patterns.iter().rev().find(|p| p.matches(sub, is_dir)) {
-                return !p.negate;
+            if let Some(ignored) = verdict(&layer.base, &layer.patterns, rel, is_dir) {
+                return ignored;
             }
         }
         false
     }
 }
 
+/// One `.gitignore` file of a walk that many threads share: each directory
+/// holds its innermost chain, which links to the chains of its parents.
+#[derive(Debug)]
+pub(crate) struct Chain {
+    parent: Option<Arc<Chain>>,
+    /// Directory of the `.gitignore`, relative to the walk root, no trailing slash.
+    base: Vec<u8>,
+    /// For a `.gitignore` above the walk root: the root's path relative to
+    /// the `.gitignore`'s directory, prepended to each entry before matching.
+    above: Vec<u8>,
+    patterns: Vec<Pattern>,
+}
+
+impl Chain {
+    /// Parses `text` as an ignore file for directory `base` under `parent`;
+    /// returns the new innermost chain, or `parent` when `text` has no patterns.
+    pub(crate) fn add(parent: Option<Arc<Chain>>, base: &[u8], text: &[u8]) -> Option<Arc<Chain>> {
+        let patterns = parse_patterns(text);
+        if patterns.is_empty() {
+            return parent;
+        }
+        Some(Arc::new(Chain {
+            parent,
+            base: base.to_vec(),
+            above: Vec::new(),
+            patterns,
+        }))
+    }
+
+    /// Like [`Chain::add`] for the `.gitignore` of a directory above the walk
+    /// root, where `above` is the root's path relative to that directory.
+    pub(crate) fn add_above(
+        parent: Option<Arc<Chain>>,
+        above: &[u8],
+        text: &[u8],
+    ) -> Option<Arc<Chain>> {
+        let patterns = parse_patterns(text);
+        if patterns.is_empty() {
+            return parent;
+        }
+        Some(Arc::new(Chain {
+            parent,
+            base: Vec::new(),
+            above: above.to_vec(),
+            patterns,
+        }))
+    }
+
+    /// Whether `rel` is ignored by this chain and its parents, by the rules
+    /// of [`Ignores::is_ignored`].
+    pub(crate) fn is_ignored(&self, rel: &[u8], is_dir: bool) -> bool {
+        let mut cur = Some(self);
+        let mut joined = Vec::new();
+        while let Some(chain) = cur {
+            let rel = if chain.above.is_empty() {
+                rel
+            } else {
+                joined.clear();
+                joined.extend_from_slice(&chain.above);
+                joined.push(b'/');
+                joined.extend_from_slice(rel);
+                &joined
+            };
+            if let Some(ignored) = verdict(&chain.base, &chain.patterns, rel, is_dir) {
+                return ignored;
+            }
+            cur = chain.parent.as_deref();
+        }
+        false
+    }
+}
+
+fn parse_patterns(text: &[u8]) -> Vec<Pattern> {
+    let text = text.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(text);
+    text.split(|b| *b == b'\n')
+        .filter_map(Pattern::parse)
+        .collect()
+}
+
+/// The last matching pattern of one ignore file decides: `Some(true)` when it
+/// ignores `rel`, `Some(false)` when it re-includes it, `None` when no pattern
+/// matches or `rel` lies outside `base`.
+fn verdict(base: &[u8], patterns: &[Pattern], rel: &[u8], is_dir: bool) -> Option<bool> {
+    let sub = if base.is_empty() {
+        rel
+    } else {
+        match rel.strip_prefix(base) {
+            Some(rest) if rest.first() == Some(&b'/') => &rest[1..],
+            _ => return None,
+        }
+    };
+    patterns
+        .iter()
+        .rev()
+        .find(|p| p.matches(sub, is_dir))
+        .map(|p| !p.negate)
+}
+
 fn at(s: &[u8], i: usize) -> u8 {
     s.get(i).copied().unwrap_or(0)
 }
 
-/// Git's wildmatch with `WM_PATHNAME`: `*` and `?` stop at `/`.
-fn wildmatch(pattern: &[u8], text: &[u8]) -> bool {
+/// Matches `text` against the glob `pattern` as git does for paths: `*` and
+/// `?` stop at `/`, and `**/` matches zero or more folders.
+pub(crate) fn wildmatch(pattern: &[u8], text: &[u8]) -> bool {
     dowild(pattern, 0, text, 0) == MATCH
 }
 

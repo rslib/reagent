@@ -13,6 +13,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use reagent_agent::agent_loop::{Agent, AgentConfig};
+use reagent_agent::archive::{Archive, Expand};
+use reagent_agent::compact::Compact;
 use reagent_agent::event::{Event, TurnEndReason};
 use reagent_agent::policy::TurnPolicy;
 use reagent_agent::policy::budget::Budget;
@@ -23,6 +25,8 @@ use reagent_agent::workspace::Workspace;
 use reagent_ai::{Provider, StopReason, Text, Usage};
 use reagent_tools::bash::Bash;
 use reagent_tools::edit::Edit;
+use reagent_tools::find::Find;
+use reagent_tools::grep::Grep;
 use reagent_tools::read::Read;
 use reagent_tools::write::Write;
 
@@ -169,11 +173,13 @@ pub async fn run(mut args: Args) -> ExitCode {
         }
     };
 
-    let mut registry = Registry::new();
-    registry.add(Read::new(cwd.clone()));
-    registry.add(Write::new(cwd.clone()));
-    registry.add(Edit::new(cwd.clone()));
-    registry.add(Bash::new(cwd.clone()));
+    // Masking and compaction keep removed outputs for the expand tool.
+    let archive = args
+        .policy
+        .iter()
+        .any(|name| name == "mask" || name == "compact")
+        .then(Archive::new);
+    let registry = tools(&cwd, archive.as_ref());
 
     let system = prompt::system(cwd.to_string_lossy().as_ref());
     let config = AgentConfig {
@@ -190,6 +196,7 @@ pub async fn run(mut args: Args) -> ExitCode {
     let mut snapshot_enabled = false;
     let mut mask_enabled = false;
     let mut completion_enabled = false;
+    let mut compact_enabled = false;
     for name in &args.policy {
         match name.as_str() {
             "completion" => {
@@ -203,6 +210,7 @@ pub async fn run(mut args: Args) -> ExitCode {
             ))),
             "snapshot" => snapshot_enabled = true,
             "mask" => mask_enabled = true,
+            "compact" => compact_enabled = true,
             other => {
                 eprintln!("reagent: unknown policy: {other}");
                 return ExitCode::from(2);
@@ -238,8 +246,14 @@ pub async fn run(mut args: Args) -> ExitCode {
     } else {
         Agent::with_policies(provider.as_ref(), &registry, config, cancel, policies)
     };
+    if let Some(archive) = &archive {
+        agent = agent.with_archive(Arc::clone(archive));
+    }
     if mask_enabled {
         agent = agent.with_mask();
+    }
+    if compact_enabled {
+        agent = agent.with_compact(Compact::new(cwd.clone()));
     }
     if completion_enabled {
         agent = agent.with_workspace(&folder);
@@ -540,5 +554,39 @@ mod fake {
         let script: Script =
             serde_json::from_str(text).map_err(|error| format!("invalid fake script: {error}"))?;
         Ok(script.into_provider())
+    }
+}
+
+/// The tools a headless run offers, all rooted at `cwd`.
+fn tools(cwd: &std::path::Path, archive: Option<&Arc<Archive>>) -> Registry {
+    let mut registry = Registry::new();
+    registry.add(Read::new(cwd));
+    registry.add(Write::new(cwd));
+    registry.add(Edit::new(cwd));
+    registry.add(Bash::new(cwd));
+    registry.add(Grep::new(cwd));
+    registry.add(Find::new(cwd));
+    if let Some(archive) = archive {
+        registry.add(Expand::new(Arc::clone(archive)));
+    }
+    registry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_are_bash_edit_find_grep_read_and_write() {
+        let registry = tools(std::path::Path::new("."), None);
+        let names: Vec<&str> = registry.names().collect();
+        assert_eq!(names, ["bash", "edit", "find", "grep", "read", "write"]);
+    }
+
+    #[test]
+    fn compact_policy_offers_expand() {
+        let archive = Archive::new();
+        let registry = tools(std::path::Path::new("."), Some(&archive));
+        assert!(registry.names().any(|name| name == "expand"));
     }
 }

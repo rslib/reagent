@@ -364,3 +364,52 @@ async fn cli_json_a_transport_error_never_prints_the_api_key() {
         "stderr leaks the API key: {stderr}"
     );
 }
+
+#[tokio::test]
+async fn cli_json_prints_a_compacted_line() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let work = tempfile::tempdir().expect("work dir");
+    // 70 tool turns of 4 KB each with a prompt at the budget, then an answer:
+    // once 150 KB lie past the 80 KB tail, the run compacts, and only once.
+    let turn = r#"{"text": "listing", "usage": {"input": 150000, "output": 1, "cache_read": 0, "cache_write": 0, "reasoning": 0}, "calls": [
+        {"name": "bash", "arguments": {"command": "head -c 4000 /dev/zero | tr '\\0' x"}}
+    ]}"#;
+    let mut replies: Vec<&str> = vec![turn; 70];
+    replies.push(r#"{"text": "done"}"#);
+    let script = tmp.path().join("script.json");
+    tokio::fs::write(
+        &script,
+        format!(r#"{{"replies": [{}]}}"#, replies.join(",")),
+    )
+    .await
+    .expect("write script");
+
+    let script_arg = format!("fake:{}", script.display());
+    let work_arg = work.path().display().to_string();
+    let args = [
+        "--json",
+        "--policy",
+        "compact",
+        "--cwd",
+        &work_arg,
+        "--provider",
+        &script_arg,
+        "-p",
+        "hi",
+    ];
+    let output = run(tmp.path(), &args).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = json_lines(&output.stdout);
+    let compacted: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["type"] == "compacted")
+        .collect();
+    assert_eq!(compacted.len(), 1, "{:?}", types(&lines));
+    assert_eq!(compacted[0]["before"], 150000);
+    assert!(compacted[0]["replaced"].as_u64().is_some_and(|n| n > 0));
+    assert!(compacted[0]["bytes"].as_u64().is_some_and(|n| n > 0));
+}

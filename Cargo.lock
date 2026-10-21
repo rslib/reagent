@@ -821,9 +821,11 @@ name = "reagent-tools"
 version = "0.0.0"
 dependencies = [
  "futures-util",
+ "memchr",
  "nix",
  "reagent-agent",
  "reagent-ai",
+ "regex-lite",
  "serde",
  "serde_json",
  "tempfile",

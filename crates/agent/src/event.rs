@@ -75,4 +75,13 @@ pub enum Event {
         /// The error that caused the retry.
         error: Text,
     },
+    /// Older turns were replaced by a checkpoint before the next request.
+    Compacted {
+        /// The prompt size, in tokens, that triggered it.
+        before: u64,
+        /// How many messages the checkpoint replaced.
+        replaced: u32,
+        /// The size of the checkpoint, in bytes.
+        bytes: u32,
+    },
 }

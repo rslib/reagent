@@ -1,13 +1,16 @@
-//! Native tools: read, write, edit, bash.
+//! Native tools: read, write, edit, bash, grep, find.
 
 use std::path::{Path, PathBuf};
 
 mod atomic;
 mod gitignore;
 mod process_group;
+mod walk;
 
 pub mod bash;
 pub mod edit;
+pub mod find;
+pub mod grep;
 pub mod read;
 pub mod workspace;
 pub mod write;

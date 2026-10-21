@@ -1,0 +1,1 @@
+Earlier turns of this session were replaced by this checkpoint to save context. It lists the user's messages, your notes and every tool call by id. Files marked "not in context" must be read again before you use them. To see a removed tool output, call expand with its id.

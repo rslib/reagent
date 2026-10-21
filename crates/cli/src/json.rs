@@ -54,6 +54,11 @@ enum Line<'a> {
     PolicyNote {
         text: &'a str,
     },
+    Compacted {
+        before: u64,
+        replaced: u32,
+        bytes: u32,
+    },
     Summary {
         turns: u32,
         exit: &'static str,
@@ -116,6 +121,15 @@ pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
             error,
         },
         Event::PolicyNote(text) => Line::PolicyNote { text },
+        Event::Compacted {
+            before,
+            replaced,
+            bytes,
+        } => Line::Compacted {
+            before: *before,
+            replaced: *replaced,
+            bytes: *bytes,
+        },
     };
     push(buf, &line);
 }

@@ -1,6 +1,7 @@
 //! The agent loop: stream a reply, run its tool calls, repeat.
 
 use futures_util::StreamExt;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -9,12 +10,37 @@ use reagent_ai::{
     StreamEvent, Text, ToolCall, ToolResult, Usage,
 };
 
+use crate::archive::Archive;
+use crate::compact::Compact;
 use crate::event::{Event, TurnEndReason};
 use crate::mask::Mask;
 use crate::policy::{PolicyRun, TurnPolicy, TurnView};
 use crate::session::Session;
 use crate::tool::Registry;
 use crate::workspace::Workspace;
+
+/// Renames a tool call whose id an earlier call already used, so each call
+/// keeps its own archive id. Hosts that send no ids get `call_0` from the
+/// parser on every one-call reply.
+fn unique_call_ids(message: &mut AssistantMessage, archive: &Archive) {
+    let mut fresh = archive.len();
+    for at in 0..message.content.len() {
+        let Content::ToolCall(call) = &message.content[at] else {
+            continue;
+        };
+        let repeated = archive.id_of(&call.id).is_some()
+            || message.content[..at]
+                .iter()
+                .any(|earlier| matches!(earlier, Content::ToolCall(other) if other.id == call.id));
+        if repeated {
+            fresh += 1;
+            let renamed = Text::from(format!("{}_{fresh}", call.id));
+            if let Content::ToolCall(call) = &mut message.content[at] {
+                call.id = renamed;
+            }
+        }
+    }
+}
 
 /// How many times an empty reply is requested again before the run stops.
 const EMPTY_RETRIES: u32 = 2;
@@ -54,6 +80,8 @@ pub struct Agent<'a> {
     token: CancellationToken,
     policies: Vec<Box<dyn TurnPolicy>>,
     mask: Option<Mask>,
+    archive: Option<Arc<Archive>>,
+    compact: Option<Compact>,
     workspace: Option<&'a dyn Workspace>,
     fingerprint: Option<u64>,
     provider_name: Text,
@@ -75,6 +103,8 @@ impl<'a> Agent<'a> {
             token,
             policies: Vec::new(),
             mask: None,
+            archive: None,
+            compact: None,
             workspace: None,
             fingerprint: None,
             provider_name: Text::from(provider.name()),
@@ -100,6 +130,8 @@ impl<'a> Agent<'a> {
             token,
             policies,
             mask: None,
+            archive: None,
+            compact: None,
             workspace: None,
             fingerprint: None,
             provider_name: Text::from(provider.name()),
@@ -115,6 +147,24 @@ impl<'a> Agent<'a> {
     #[must_use]
     pub fn with_mask(mut self) -> Self {
         self.mask = Some(Mask);
+        self.archive.get_or_insert_with(Archive::new);
+        self
+    }
+
+    /// Turns on compaction: at its token budget, older turns become a
+    /// checkpoint (see [`Compact`]) and their outputs go to the archive.
+    #[must_use]
+    pub fn with_compact(mut self, compact: Compact) -> Self {
+        self.compact = Some(compact);
+        self.archive.get_or_insert_with(Archive::new);
+        self
+    }
+
+    /// Numbers every tool call in `archive` and keeps there the outputs that
+    /// masking or compaction remove, for the [`crate::archive::Expand`] tool.
+    #[must_use]
+    pub fn with_archive(mut self, archive: Arc<Archive>) -> Self {
+        self.archive = Some(archive);
         self
     }
 
@@ -156,8 +206,22 @@ impl<'a> Agent<'a> {
             }
             turns += 1;
 
-            if let Some(mask) = &self.mask {
-                mask.apply(history);
+            if let (Some(compact), Some(archive)) = (&self.compact, &self.archive)
+                && let Some(done) = compact.apply(history, archive).await
+            {
+                let event = Event::Compacted {
+                    before: done.before,
+                    replaced: done.replaced as u32,
+                    bytes: done.bytes as u32,
+                };
+                if emit(events, &self.token, event).await {
+                    break TurnEndReason::Cancelled;
+                }
+            }
+            if let (Some(mask), Some(archive)) = (&self.mask, &self.archive)
+                && mask.apply(history, archive) > 0
+            {
+                archive.flush().await;
             }
             let mut outcome = self.run_turn(history, &mut session, events).await;
             // Every turn end flushes, whatever ended the turn.
@@ -440,6 +504,10 @@ impl<'a> Agent<'a> {
             return TurnOutcome::Stopped(StopReason::Error);
         }
 
+        if let Some(archive) = &self.archive {
+            unique_call_ids(&mut message, archive);
+        }
+
         match message.stop_reason {
             Some(StopReason::ToolUse) => {
                 // The reply is recorded once, then borrowed back from history
@@ -451,6 +519,11 @@ impl<'a> Agent<'a> {
                     Some(Message::Assistant(assistant)) => tool_calls(assistant),
                     _ => Vec::new(),
                 };
+                if let Some(archive) = &self.archive {
+                    for call in &calls {
+                        archive.assign(&call.id);
+                    }
+                }
                 let results = crate::batch::run_all(&calls, self.registry, &self.token).await;
                 // Every result reaches history before any event is sent, so a
                 // cancel or a closed receiver cannot leave a call unanswered.
@@ -1496,6 +1569,35 @@ mod tests {
             panic!("expected a tool result");
         };
         assert!(!result.is_error, "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn repeated_call_ids_are_made_unique() {
+        let provider = FakeProvider::new(vec![
+            tool_reply("call_0", "echo", r#"{"message":"a"}"#),
+            tool_reply("call_0", "echo", r#"{"message":"b"}"#),
+            text_reply("done"),
+        ]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+        let archive = Archive::new();
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_archive(Arc::clone(&archive))
+            .run(&mut history, None, &tx)
+            .await;
+
+        let ids: Vec<String> = history
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolResult(result) => Some(result.call_id.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["call_0", "call_0_2"]);
+        assert_eq!(archive.len(), 2);
+        assert_eq!(archive.id_of("call_0_2"), Some(2));
     }
 
     #[tokio::test]

@@ -6,7 +6,14 @@ use std::path::PathBuf;
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5-5";
 
 /// The loop policy names a `--policy` value may select.
-pub const POLICY_NAMES: [&str; 5] = ["completion", "stuck", "budget", "snapshot", "mask"];
+pub const POLICY_NAMES: [&str; 6] = [
+    "completion",
+    "stuck",
+    "budget",
+    "snapshot",
+    "mask",
+    "compact",
+];
 
 /// The policies `all` selects. `stuck` is left out until a benchmark run
 /// shows it helps: a loop breaker cost 1.1 points in the Meta-Harness study.
@@ -135,7 +142,7 @@ fn usage() -> &'static str {
         "      --max-tokens <n> the reply token cap, thinking included (default: 64000)\n",
         "      --deadline <s>   stop after this many seconds\n",
         "      --cwd <dir>      the working directory for the tools (default: current dir)\n",
-        "      --policy <list>  loop policies: completion, stuck, budget, snapshot, mask;\n",
+        "      --policy <list>  loop policies: completion, stuck, budget, snapshot, mask, compact;\n",
         "                       all = completion, budget, snapshot; none = off\n",
         "                       (default: budget, plus mask on openai-chat)\n",
         "      --version        print the version and exit\n"
@@ -154,6 +161,17 @@ fn extra_usage() -> &'static str {
 
 fn bad(field: &str) -> String {
     format!("invalid value for {field}")
+}
+
+/// Whether the wire replays no reasoning that depends on earlier messages,
+/// so compaction may rewrite them. The test-only scripted wire replays none.
+fn may_compact(provider: &Wire) -> bool {
+    match provider {
+        Wire::OpenAiChat => true,
+        #[cfg(feature = "testing")]
+        Wire::Fake(_) => true,
+        _ => false,
+    }
 }
 
 /// Maps a `--provider` value to a wire, or to `fake:<file>` under testing.
@@ -340,6 +358,9 @@ fn parse_from(mut parser: lexopt::Parser) -> Result<Outcome, String> {
     if policy.iter().any(|name| name == "mask") && provider != Wire::OpenAiChat {
         return Err("--policy mask needs --provider openai-chat".into());
     }
+    if policy.iter().any(|name| name == "compact") && !may_compact(&provider) {
+        return Err("--policy compact needs --provider openai-chat".into());
+    }
 
     Ok(Outcome::Run(Box::new(Args {
         task,
@@ -486,6 +507,25 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn compact_policy_needs_the_chat_wire() {
+        let error = parse(&["-p", "task", "--policy", "compact"]).unwrap_err();
+        assert!(error.contains("openai-chat"), "{error}");
+        let chat = run(&[
+            "-p",
+            "task",
+            "--provider",
+            "openai-chat",
+            "--policy",
+            "compact",
+        ]);
+        assert_eq!(chat.policy, vec!["compact"]);
+        for wire in ["anthropic", "openai-responses"] {
+            let refused = parse(&["-p", "task", "--policy", "compact", "--provider", wire]);
+            assert!(refused.is_err(), "{wire}");
+        }
     }
 
     #[test]

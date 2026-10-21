@@ -1,12 +1,59 @@
-//! Observation masking: old large tool outputs become a fixed stub.
+//! Observation masking: old large tool outputs become a stub that names the
+//! call id, and the archive keeps the output for `expand`.
 
 use reagent_ai::{Message, Text, ToolResult};
 
-/// The stub that replaces a masked output, baked in from `prompts/mask_stub.md`.
+use crate::archive::Archive;
+
+/// The stub that replaces a masked output, baked in from `prompts/mask_stub.md`;
+/// `{id}` stands for the call id.
 const STUB: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../prompts/mask_stub.md"
 ));
+
+/// The stub for call `id`, the same bytes each time so the cache holds.
+/// It is assembled on the stack, so the only allocation is the `Text`.
+fn stub(id: Option<u32>) -> Text {
+    let mut digits = [0_u8; 10];
+    let id = match id {
+        Some(id) => decimal(id, &mut digits),
+        None => "?",
+    };
+    let mut buf = [0_u8; 256];
+    let mut len = 0;
+    for (index, part) in STUB.trim_end().split("{id}").enumerate() {
+        for piece in [if index > 0 { id } else { "" }, part] {
+            let end = len + piece.len();
+            if end > buf.len() {
+                return Text::from(STUB.trim_end().replace("{id}", id));
+            }
+            buf[len..end].copy_from_slice(piece.as_bytes());
+            len = end;
+        }
+    }
+    Text::from(std::str::from_utf8(&buf[..len]).unwrap_or("?"))
+}
+
+/// The decimal digits of `n`, written into `buf`.
+fn decimal(mut n: u32, buf: &mut [u8; 10]) -> &str {
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    std::str::from_utf8(&buf[at..]).unwrap_or("?")
+}
+
+/// Whether `text` is a stub this module wrote.
+fn is_stub(text: &str) -> bool {
+    let head = STUB.split("{id}").next().unwrap_or(STUB);
+    text.starts_with(head)
+}
 
 /// How many of the newest tool outputs are never masked.
 const KEEP: usize = 3;
@@ -33,8 +80,9 @@ impl Mask {
     /// unmasked ones of at least 800 bytes add up to 200,000 bytes or more,
     /// until at most 100,000 bytes of them stay unmasked.
     ///
-    /// Returns how many outputs it replaced.
-    pub fn apply(&self, history: &mut [Message]) -> usize {
+    /// Each masked output is kept in `archive` under its call id. Returns
+    /// how many outputs it replaced.
+    pub fn apply(&self, history: &mut [Message], archive: &Archive) -> usize {
         let mut total = 0;
         for result in old_results(history) {
             if is_candidate(result) {
@@ -44,7 +92,6 @@ impl Mask {
         if total < STEP_BYTES {
             return 0;
         }
-        let stub = Text::from(STUB);
         let mut masked = 0;
         for result in old_results(history).collect::<Vec<_>>().into_iter().rev() {
             if total <= LEFT_BYTES {
@@ -52,7 +99,11 @@ impl Mask {
             }
             if is_candidate(result) {
                 total -= result.content.len();
-                result.content = Text::clone(&stub);
+                let id = archive.id_of(&result.call_id);
+                if let Some(id) = id {
+                    archive.keep(id, Text::clone(&result.content));
+                }
+                result.content = stub(id);
                 masked += 1;
             }
         }
@@ -79,7 +130,7 @@ fn old_results(history: &mut [Message]) -> impl Iterator<Item = &mut ToolResult>
 }
 
 fn is_candidate(result: &ToolResult) -> bool {
-    result.content.len() >= MIN_BYTES && &*result.content != STUB
+    result.content.len() >= MIN_BYTES && !is_stub(&result.content)
 }
 
 #[cfg(test)]
@@ -105,8 +156,41 @@ mod tests {
         }
     }
 
+    /// Numbers the history's calls in order, as the loop does, then masks.
+    fn apply(messages: &mut [Message]) -> usize {
+        let archive = numbered(messages);
+        Mask.apply(messages, &archive)
+    }
+
+    fn numbered(messages: &[Message]) -> Archive {
+        let archive = Archive::default();
+        for message in messages {
+            if let Message::ToolResult(result) = message {
+                archive.assign(&result.call_id);
+            }
+        }
+        archive
+    }
+
+    #[test]
+    fn stubs_name_the_call_id_and_the_archive_keeps_the_output() {
+        let mut messages = history(&[5_000; 43]);
+        let archive = numbered(&messages);
+        assert_eq!(Mask.apply(&mut messages, &archive), 20);
+        assert_eq!(
+            text(&messages[0]),
+            "[Old tool output #1 removed to save context. Call expand with id 1 to see it.]"
+        );
+        assert_eq!(
+            text(&messages[19]),
+            "[Old tool output #20 removed to save context. Call expand with id 20 to see it.]"
+        );
+        assert_eq!(archive.kept_len(20), Some(5_000));
+        assert_eq!(archive.kept_len(21), None);
+    }
+
     fn masked_flags(history: &[Message]) -> Vec<bool> {
-        history.iter().map(|m| text(m) == STUB).collect()
+        history.iter().map(|m| is_stub(text(m))).collect()
     }
 
     #[test]
@@ -118,8 +202,8 @@ mod tests {
             Vec::new(),
         )));
         messages.extend((40..50).map(|index| output(index, 5_000)));
-        assert_eq!(Mask.apply(&mut messages), 20);
-        assert!(messages[..20].iter().all(|m| text(m) == STUB));
+        assert_eq!(apply(&mut messages), 20);
+        assert!(messages[..20].iter().all(|m| is_stub(text(m))));
         assert!(messages[20..40].iter().all(|m| text(m).len() == 5_000));
         assert!(messages[41..].iter().all(|m| text(m).len() == 5_000));
     }
@@ -127,14 +211,14 @@ mod tests {
     #[test]
     fn below_the_step_nothing_is_masked() {
         let mut messages = history(&[5_000; 42]);
-        assert_eq!(Mask.apply(&mut messages), 0);
+        assert_eq!(apply(&mut messages), 0);
         assert_eq!(masked_flags(&messages), vec![false; 42]);
     }
 
     #[test]
     fn masks_the_oldest_outputs_down_to_half_the_step() {
         let mut messages = history(&[5_000; 43]);
-        assert_eq!(Mask.apply(&mut messages), 20);
+        assert_eq!(apply(&mut messages), 20);
         let mut expected = vec![true; 20];
         expected.extend([false; 23]);
         assert_eq!(masked_flags(&messages), expected);
@@ -146,7 +230,7 @@ mod tests {
         let mut sizes = vec![5_000; 44];
         sizes[4] = 500;
         let mut messages = history(&sizes);
-        assert_eq!(Mask.apply(&mut messages), 20);
+        assert_eq!(apply(&mut messages), 20);
         let mut expected = vec![true; 21];
         expected[4] = false;
         expected.extend([false; 23]);
@@ -157,7 +241,7 @@ mod tests {
     #[test]
     fn small_outputs_do_not_count_toward_the_step() {
         let mut messages = history(&[799; 400]);
-        assert_eq!(Mask.apply(&mut messages), 0);
+        assert_eq!(apply(&mut messages), 0);
     }
 
     #[test]
@@ -167,26 +251,26 @@ mod tests {
         if let Message::ToolResult(result) = &mut messages[0] {
             result.is_error = true;
         }
-        assert_eq!(Mask.apply(&mut messages), 20);
-        assert_eq!(text(&messages[0]), STUB);
+        assert_eq!(apply(&mut messages), 20);
+        assert!(is_stub(text(&messages[0])));
     }
 
     #[test]
     fn the_next_step_waits_for_another_hundred_thousand_bytes() {
         let mut messages = history(&[5_000; 43]);
-        assert_eq!(Mask.apply(&mut messages), 20);
+        assert_eq!(apply(&mut messages), 20);
 
         // 20 old unmasked outputs, then 19 more: 195,000 bytes, no step.
         messages.extend(history(&[5_000; 19]));
-        assert_eq!(Mask.apply(&mut messages), 0);
+        assert_eq!(apply(&mut messages), 0);
 
         // One more makes 200,000: the 20 oldest unmasked go, stubs not recounted.
         messages.extend(history(&[5_000; 1]));
-        assert_eq!(Mask.apply(&mut messages), 20);
+        assert_eq!(apply(&mut messages), 20);
         let mut expected = vec![true; 40];
         expected.extend([false; 23]);
         assert_eq!(masked_flags(&messages), expected);
-        assert_eq!(Mask.apply(&mut messages), 0);
+        assert_eq!(apply(&mut messages), 0);
     }
 }
 
@@ -310,7 +394,7 @@ mod loop_tests {
         let last = &requests[45];
         assert_eq!(last.len(), 45);
         // The step ran at 43 outputs (40 old) and masked the oldest 20.
-        assert!(last[..20].iter().all(|text| &**text == STUB));
+        assert!(last[..20].iter().all(|text| is_stub(text)));
         assert!(last[20..].iter().all(|text| text.len() == 5_000));
         // An earlier request is still whole: the step had not been reached.
         assert!(requests[42].iter().all(|text| text.len() == 5_000));

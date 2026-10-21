@@ -8,23 +8,10 @@ use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 use crate::gitignore::{self, Ignores};
+use crate::walk::SKIP_DIRS;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ENTRIES: usize = 20_000;
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "target",
-    "node_modules",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".venv",
-    "venv",
-    ".tox",
-    ".cache",
-    "dist",
-    "build",
-];
 
 /// Hashes the file state under `root`; two calls differ when a file was
 /// created, deleted or changed. `None` when the state cannot be read. Inside a

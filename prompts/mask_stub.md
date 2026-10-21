@@ -1,1 +1,1 @@
-[Old tool output removed to save context. Run the tool again if you need it.]
+[Old tool output #{id} removed to save context. Call expand with id {id} to see it.]
