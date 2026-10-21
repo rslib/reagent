@@ -26,6 +26,7 @@ def add_trial(
     exception: str | None = None,
     usage: list[tuple[int, int, int, int]] = (),
     stop: str | None = None,
+    extra: list[dict] = (),
 ) -> None:
     """Writes one trial folder the way Harbor and reagent lay it out."""
     trial = job / f"{name}__{len(list(job.glob(name + '__*')))}"
@@ -48,6 +49,7 @@ def add_trial(
                 "output": output,
             }
         )
+    lines.extend(extra)
     if stop is not None:
         lines.append({"type": "summary", "stop": stop, "exit": "stopped"})
     (trial / "agent" / "reagent_events.jsonl").write_text(
@@ -156,3 +158,80 @@ def test_main_json_and_task_filter(job: Path, tmp_path: Path, capsys) -> None:
 def test_main_against_prints_the_paired_difference(job: Path, capsys) -> None:
     assert main([str(job), "--against", str(job)]) == 0
     assert "difference" in capsys.readouterr().out
+
+
+_END = {"type": "summary", "exit": "end_turn"}
+_CHECK = {"type": "policy_note", "text": "You changed files and ran nothing after."}
+_BASH = {"type": "tool_call_ready", "name": "bash", "arguments": "{}"}
+_READ = {"type": "tool_call_ready", "name": "read", "arguments": "{}"}
+
+
+def test_trial_exit_comes_from_summary_or_run_end(tmp_path: Path) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    add_trial(job, "a", 1.0, extra=[_END])
+    add_trial(job, "b", 0.0, extra=[{"type": "run_end", "reason": "max_turns"}])
+    add_trial(job, "c", 0.0)
+    exits = {t.task: t.exit for t in load_job(job)}
+    assert exits == {
+        "terminal-bench/a": "end_turn",
+        "terminal-bench/b": "max_turns",
+        "terminal-bench/c": None,
+    }
+
+
+def test_false_done_counts_normal_ends_that_failed(tmp_path: Path) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    add_trial(job, "a", 1.0, extra=[_END])
+    add_trial(job, "b", 0.0, extra=[_END])
+    add_trial(job, "c", 0.0, extra=[_END])
+    add_trial(job, "d", 0.0, extra=[{"type": "summary", "exit": "max_turns"}])
+    add_trial(job, "e", 0.0)
+    summary = summarize(load_job(job))
+    assert summary["false_done"] == {"count": 2, "ended_normally": 3, "rate": 2 / 3}
+
+
+def test_false_done_rate_is_none_without_normal_ends(job: Path) -> None:
+    assert summarize(load_job(job))["false_done"]["rate"] is None
+
+
+def test_policy_note_counts_check_notes_and_follow_up_bash(tmp_path: Path) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    # Bash only before the note does not count as a follow-up.
+    add_trial(job, "a", 1.0, extra=[_BASH, _CHECK, _BASH, _END])
+    add_trial(job, "b", 0.0, extra=[_CHECK, _READ, _END])
+    add_trial(job, "c", 0.0, extra=[_BASH, _CHECK, _END])
+    add_trial(job, "d", 1.0, extra=[_END])
+    notes = summarize(load_job(job))["policy_notes"]
+    assert notes["counts"] == {"check": 3}
+    assert notes["check"] == {"trials": 3, "ran_bash_after": 1, "solved": 1}
+
+
+def test_policy_note_kinds_are_classified_by_text(tmp_path: Path) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    texts = [
+        "You changed files, check them.",
+        "You have 5 minutes left.",
+        "Only 2 turns remain.",
+        "Something else.",
+    ]
+    add_trial(job, "a", 0.0, extra=[{"type": "policy_note", "text": t} for t in texts])
+    notes = summarize(load_job(job))["policy_notes"]
+    assert notes["counts"] == {"budget": 2, "check": 1, "other": 1}
+
+
+def test_main_prints_false_done_and_policy_notes(tmp_path: Path, capsys) -> None:
+    job = tmp_path / "job"
+    job.mkdir()
+    add_trial(job, "a", 0.0, extra=[_CHECK, _BASH, _END])
+    assert main([str(job)]) == 0
+    out = capsys.readouterr().out
+    assert "false done 1 of 1" in out
+    assert "policy notes" in out
+    assert main([str(job), "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["false_done"]["count"] == 1
+    assert data["policy_notes"]["check"]["ran_bash_after"] == 1

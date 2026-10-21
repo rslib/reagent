@@ -3,13 +3,13 @@
 use std::time::Duration;
 
 /// How many times a failed turn is retried after its first failure.
-pub const MAX_RETRIES: u32 = 4;
+pub const MAX_RETRIES: u32 = 10;
 /// The cap on a provider's `retry-after` delay.
 const MAX_PROVIDER_WAIT: Duration = Duration::from_secs(60);
 /// The exponential backoff base: half a second.
 const BASE: Duration = Duration::from_millis(500);
 /// The cap on the exponentiated backoff before jitter.
-const MAX_BACKOFF: Duration = Duration::from_secs(8);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// The low end of the jitter factor.
 const JITTER_MIN: f64 = 0.75;
 
@@ -17,12 +17,19 @@ const JITTER_MIN: f64 = 0.75;
 /// `provider_wait` is the delay the provider asked for, if any, and `jitter` a
 /// factor in 0.75..=1.0.
 ///
-/// A provider-sent delay wins and is capped at 60 s. Otherwise the delay is
-/// `0.5 s * 2^attempt`, capped at 8 s, times `jitter`.
+/// The delay is the longer of the provider's delay, capped at 60 s, and the
+/// backoff `0.5 s * 2^attempt`, capped at 30 s and scaled by `jitter`.
+/// A short `retry-after` never shortens the backoff: a concurrency limit
+/// often says 1 s but lasts minutes.
 pub fn delay(attempt: u32, provider_wait: Option<Duration>, jitter: f64) -> Duration {
-    if let Some(wait) = provider_wait {
-        return wait.min(MAX_PROVIDER_WAIT);
+    let backoff = backoff(attempt, jitter);
+    match provider_wait {
+        Some(wait) => wait.min(MAX_PROVIDER_WAIT).max(backoff),
+        None => backoff,
     }
+}
+
+fn backoff(attempt: u32, jitter: f64) -> Duration {
     let factor = 2_u32.saturating_pow(attempt);
     let base = BASE
         .checked_mul(factor)
@@ -48,14 +55,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retries_are_capped_at_four() {
-        assert_eq!(MAX_RETRIES, 4);
+    fn retries_are_capped_at_ten() {
+        assert_eq!(MAX_RETRIES, 10);
     }
 
     #[test]
-    fn provider_wait_wins_and_is_capped_at_a_minute() {
+    fn provider_wait_never_shortens_the_backoff() {
         assert_eq!(
-            delay(2, Some(Duration::from_secs(3)), 1.0),
+            delay(5, Some(Duration::from_secs(1)), 1.0),
+            Duration::from_secs(16)
+        );
+        assert_eq!(
+            delay(0, Some(Duration::from_secs(3)), 1.0),
             Duration::from_secs(3)
         );
         assert_eq!(
@@ -66,12 +77,12 @@ mod tests {
     }
 
     #[test]
-    fn backoff_doubles_and_caps_at_eight_seconds() {
+    fn backoff_doubles_and_caps_at_thirty_seconds() {
         assert_eq!(delay(0, None, 1.0), Duration::from_millis(500));
         assert_eq!(delay(1, None, 1.0), Duration::from_millis(1000));
-        assert_eq!(delay(2, None, 1.0), Duration::from_millis(2000));
-        assert_eq!(delay(3, None, 1.0), Duration::from_millis(4000));
-        assert_eq!(delay(10, None, 1.0), Duration::from_secs(8));
+        assert_eq!(delay(5, None, 1.0), Duration::from_secs(16));
+        assert_eq!(delay(6, None, 1.0), Duration::from_secs(30));
+        assert_eq!(delay(40, None, 1.0), Duration::from_secs(30));
     }
 
     #[test]

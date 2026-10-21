@@ -157,6 +157,7 @@ mod tests {
             ran_tools: true,
             assistant: a,
             tools: &[],
+            changed_files: None,
         }
     }
 

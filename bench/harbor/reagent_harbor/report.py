@@ -15,9 +15,10 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import sys
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 _EVENTS = Path("agent") / "reagent_events.jsonl"
@@ -38,30 +39,73 @@ class Trial:
     output_tokens: int
     turns: int
     stop: str | None
+    # How the run ended: the summary exit, else the run_end reason, else None.
+    exit: str | None = None
+    # The text of every policy note the loop injected.
+    policy_notes: tuple[str, ...] = ()
+    # Whether a bash tool call came after the first "check" note.
+    bash_after_check: bool = False
 
 
-def _read_events(path: Path) -> tuple[int, int, int, str | None]:
-    prompt = output = turns = 0
-    stop = None
+def note_kind(text: str) -> str:
+    """Classifies a policy note by its text.
+
+    "check" starts with "You changed files". "budget" mentions minutes or
+    turns as a word. Anything else is "other".
+    """
+    if text.startswith("You changed files"):
+        return "check"
+    if re.search(r"\b(min(ute)?s?|turns?)\b", text.lower()):
+        return "budget"
+    return "other"
+
+
+@dataclass
+class _Events:
+    prompt: int = 0
+    output: int = 0
+    turns: int = 0
+    stop: str | None = None
+    exit: str | None = None
+    notes: list[str] = field(default_factory=list)
+    bash_after_check: bool = False
+
+
+def _read_events(path: Path) -> _Events:
+    events = _Events()
     if not path.exists():
-        return prompt, output, turns, stop
+        return events
+    run_end = None
+    summary_exit = None
+    checked = False
     for line in path.read_text().splitlines():
         if not line.strip():
             continue
         event = json.loads(line)
         kind = event.get("type")
         if kind == "turn_start":
-            turns += 1
+            events.turns += 1
+        elif kind == "policy_note":
+            text = event.get("text") or ""
+            events.notes.append(text)
+            checked = checked or note_kind(text) == "check"
+        elif kind == "tool_call_ready":
+            if checked and event.get("name") == "bash":
+                events.bash_after_check = True
+        elif kind == "run_end":
+            run_end = event.get("reason")
         elif kind == "usage":
-            prompt += (
+            events.prompt += (
                 event.get("input", 0)
                 + event.get("cache_read", 0)
                 + event.get("cache_write", 0)
             )
-            output += event.get("output", 0)
+            events.output += event.get("output", 0)
         elif kind == "summary":
-            stop = event.get("stop") or event.get("exit")
-    return prompt, output, turns, stop
+            events.stop = event.get("stop") or event.get("exit")
+            summary_exit = event.get("exit")
+    events.exit = summary_exit or run_end
+    return events
 
 
 def load_job(job: Path) -> list[Trial]:
@@ -72,16 +116,19 @@ def load_job(job: Path) -> list[Trial]:
         rewards = (result.get("verifier_result") or {}).get("rewards") or {}
         reward = rewards.get("reward")
         exception = (result.get("exception_info") or {}).get("exception_type")
-        prompt, output, turns, stop = _read_events(result_path.parent / _EVENTS)
+        events = _read_events(result_path.parent / _EVENTS)
         trials.append(
             Trial(
                 task=result.get("task_name") or result_path.parent.name.rsplit("__", 1)[0],
                 reward=float(reward) if reward is not None else 0.0,
                 exception=exception,
-                prompt_tokens=prompt,
-                output_tokens=output,
-                turns=turns,
-                stop=stop,
+                prompt_tokens=events.prompt,
+                output_tokens=events.output,
+                turns=events.turns,
+                stop=events.stop,
+                exit=events.exit,
+                policy_notes=tuple(events.notes),
+                bash_after_check=events.bash_after_check,
             )
         )
     return trials
@@ -149,6 +196,14 @@ def summarize(trials: list[Trial]) -> dict:
     failures = Counter(
         failure_type(trial) for trial in trials if failure_type(trial) != "passed"
     )
+    normal = [trial for trial in trials if trial.exit == "end_turn"]
+    false_done = sum(1 for trial in normal if trial.reward == 0.0)
+    kinds = Counter(note_kind(text) for trial in trials for text in trial.policy_notes)
+    checked = [
+        trial
+        for trial in trials
+        if any(note_kind(text) == "check" for text in trial.policy_notes)
+    ]
     return {
         "tasks": len(_by_task(trials)),
         "trials": len(trials),
@@ -159,6 +214,19 @@ def summarize(trials: list[Trial]) -> dict:
         "output_tokens": sum(trial.output_tokens for trial in trials),
         "tokens_per_solved": tokens / solved if solved else None,
         "failures": dict(sorted(failures.items())),
+        "false_done": {
+            "count": false_done,
+            "ended_normally": len(normal),
+            "rate": false_done / len(normal) if normal else None,
+        },
+        "policy_notes": {
+            "counts": dict(sorted(kinds.items())),
+            "check": {
+                "trials": len(checked),
+                "ran_bash_after": sum(1 for t in checked if t.bash_after_check),
+                "solved": sum(1 for t in checked if t.reward >= 1.0),
+            },
+        },
     }
 
 
@@ -185,6 +253,20 @@ def _print_summary(summary: dict) -> None:
     )
     for kind, count in summary["failures"].items():
         print(f"  {kind}: {count}")
+    done = summary["false_done"]
+    rate = f"{done['rate']:.1%}" if done["rate"] is not None else "n/a"
+    print(
+        f"false done {done['count']} of {done['ended_normally']} "
+        f"trials that ended normally ({rate})"
+    )
+    notes = summary["policy_notes"]
+    counts = ", ".join(f"{k} {n}" for k, n in notes["counts"].items()) or "none"
+    check = notes["check"]
+    print(f"policy notes: {counts}")
+    print(
+        f"check notes: {check['trials']} trials, {check['ran_bash_after']} ran bash "
+        f"after, {check['solved']} solved"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

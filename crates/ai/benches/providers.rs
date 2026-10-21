@@ -87,7 +87,7 @@ fn history() -> Vec<Message> {
             vec![
                 Content::text(format!("step {index} reads a file")),
                 Content::ToolCall(ToolCall {
-                    id: format!("call_{index}"),
+                    id: format!("call_{index}").into(),
                     name: "read".into(),
                     arguments: "{\"path\":\"a.rs\"}".into(),
                 }),

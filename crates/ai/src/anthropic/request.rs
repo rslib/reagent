@@ -285,8 +285,8 @@ fn serialize_content(content: &Content) -> Result<Bytes, Error> {
                 })?
             };
             return Ok(to_bytes(&Block::ToolUse {
-                id: call.id.as_str(),
-                name: call.name.as_str(),
+                id: &call.id,
+                name: &call.name,
                 input: &input,
             }));
         }
@@ -306,7 +306,7 @@ fn serialize_assistant(assistant: &AssistantMessage, provider: &str) -> Result<V
 
 fn serialize_tool_result(result: &ToolResult) -> Bytes {
     to_bytes(&Block::ToolResult {
-        tool_use_id: result.call_id.as_str(),
+        tool_use_id: &result.call_id,
         content: result.content.as_ref(),
         is_error: result.is_error.then_some(true),
     })

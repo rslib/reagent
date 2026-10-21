@@ -1,5 +1,7 @@
 //! Runs one headless agent session and produces its output.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -17,6 +19,7 @@ use reagent_agent::policy::budget::Budget;
 use reagent_agent::policy::completion::Completion;
 use reagent_agent::policy::stuck::Stuck;
 use reagent_agent::tool::Registry;
+use reagent_agent::workspace::Workspace;
 use reagent_ai::{Provider, StopReason, Text, Usage};
 use reagent_tools::bash::Bash;
 use reagent_tools::edit::Edit;
@@ -25,6 +28,15 @@ use reagent_tools::write::Write;
 
 use crate::args::Args;
 use crate::prompt;
+
+/// The tools' working folder, fingerprinted for the completion policy.
+struct Folder(std::path::PathBuf);
+
+impl Workspace for Folder {
+    fn fingerprint(&self) -> Pin<Box<dyn Future<Output = Option<u64>> + Send + '_>> {
+        Box::pin(reagent_tools::workspace::fingerprint(&self.0))
+    }
+}
 
 /// An async line writer over the process stdout. A write that fails (for
 /// example a closed pipe) stops further writes instead of panicking, so a
@@ -177,9 +189,13 @@ pub async fn run(mut args: Args) -> ExitCode {
     let mut policies: Vec<Box<dyn TurnPolicy>> = Vec::new();
     let mut snapshot_enabled = false;
     let mut mask_enabled = false;
+    let mut completion_enabled = false;
     for name in &args.policy {
         match name.as_str() {
-            "completion" => policies.push(Box::new(Completion::with_task(&task))),
+            "completion" => {
+                completion_enabled = true;
+                policies.push(Box::new(Completion::new()));
+            }
             "stuck" => policies.push(Box::new(Stuck::default())),
             "budget" => policies.push(Box::new(Budget::new(
                 args.deadline.map(Duration::from_secs),
@@ -215,6 +231,7 @@ pub async fn run(mut args: Args) -> ExitCode {
         }));
     }
 
+    let folder = Folder(cwd.clone());
     let snapshot_cancel = cancel.clone();
     let mut agent = if policies.is_empty() {
         Agent::new(provider.as_ref(), &registry, config, cancel)
@@ -223,6 +240,9 @@ pub async fn run(mut args: Args) -> ExitCode {
     };
     if mask_enabled {
         agent = agent.with_mask();
+    }
+    if completion_enabled {
+        agent = agent.with_workspace(&folder);
     }
     let (tx, rx) = mpsc::channel::<Event>(256);
     let out = Out::new();
@@ -261,6 +281,7 @@ async fn drain(rx: mpsc::Receiver<Event>, mut out: Out, json: bool) -> TurnEndRe
     let mut ended = false;
 
     let mut rx = rx;
+    let mut buf = Vec::with_capacity(512);
     while let Some(event) = rx.recv().await {
         match &event {
             Event::TurnStart => {
@@ -281,8 +302,9 @@ async fn drain(rx: mpsc::Receiver<Event>, mut out: Out, json: bool) -> TurnEndRe
             _ => {}
         }
         if json {
-            let line = serde_json::to_string(&crate::json::event(&event)).unwrap();
-            let _ = out.line(&line).await;
+            buf.clear();
+            crate::json::write_event(&mut buf, &event);
+            let _ = out.write(&buf).await;
         }
         if ended {
             break;
@@ -290,9 +312,9 @@ async fn drain(rx: mpsc::Receiver<Event>, mut out: Out, json: bool) -> TurnEndRe
     }
 
     if json {
-        let line =
-            serde_json::to_string(&crate::json::summary(&total, turns, &reason, stop)).unwrap();
-        let _ = out.line(&line).await;
+        buf.clear();
+        crate::json::write_summary(&mut buf, &total, turns, &reason, stop);
+        let _ = out.write(&buf).await;
     } else {
         let _ = out.line(&answer).await;
     }

@@ -12,6 +12,8 @@ cargo nextest run -p reagent --features testing   # cli end-to-end tests; skippe
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo build --profile min -p reagent             # size build for footprint checks
+cargo nextest run --release -p reagent-agent --test budget                    # loop heap and CPU budgets
+cargo nextest run --release -p reagent --features testing --test footprint    # process RSS and CPU budgets
 cargo run -q -p reagent -- --version
 ```
 
@@ -73,6 +75,7 @@ Design decisions and their reasons: `docs/plans/architecture.md` (local only, ig
 - A bug fix lands with a test that fails before the fix.
 - Task checks use `cargo nextest run`, not `cargo test <filter>`. `cargo test` passes when the filter matches no test.
 - Tools are tested on temp folders (`tempfile`), never on the repo.
+- CPU budgets are tight only in release builds, so a change to the loop, a provider or the output path runs the two budget commands with `--release`. Raise a budget only with the new measured number in the commit body.
 
 ## Boundaries
 

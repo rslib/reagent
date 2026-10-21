@@ -14,8 +14,12 @@ const KEEP: usize = 3;
 /// Outputs under this many bytes are never masked and never counted.
 const MIN_BYTES: usize = 800;
 
-/// The bytes of old unmasked outputs that trigger a masking step.
-const STEP_BYTES: usize = 80_000;
+/// The bytes of old unmasked outputs that trigger a masking step. A small
+/// step hides code the model still needs, and it reads the code again.
+const STEP_BYTES: usize = 200_000;
+
+/// The most bytes of old outputs that a step leaves unmasked.
+const LEFT_BYTES: usize = STEP_BYTES / 2;
 
 /// Replaces old large tool outputs in the history with a stub, in steps.
 ///
@@ -25,8 +29,9 @@ const STEP_BYTES: usize = 80_000;
 pub struct Mask;
 
 impl Mask {
-    /// Masks the outputs older than the newest three when the unmasked ones
-    /// of at least 800 bytes add up to 80,000 bytes or more.
+    /// Masks the oldest outputs older than the newest three when the
+    /// unmasked ones of at least 800 bytes add up to 200,000 bytes or more,
+    /// until at most 100,000 bytes of them stay unmasked.
     ///
     /// Returns how many outputs it replaced.
     pub fn apply(&self, history: &mut [Message]) -> usize {
@@ -41,8 +46,12 @@ impl Mask {
         }
         let stub = Text::from(STUB);
         let mut masked = 0;
-        for result in old_results(history) {
+        for result in old_results(history).collect::<Vec<_>>().into_iter().rev() {
+            if total <= LEFT_BYTES {
+                break;
+            }
             if is_candidate(result) {
+                total -= result.content.len();
                 result.content = Text::clone(&stub);
                 masked += 1;
             }
@@ -102,80 +111,81 @@ mod tests {
 
     #[test]
     fn the_newest_turn_is_never_masked() {
-        let mut messages = history(&[10_000; 9]);
+        let mut messages = history(&[5_000; 40]);
         messages.push(Message::assistant(reagent_ai::AssistantMessage::new(
             "fake",
             "fake",
             Vec::new(),
         )));
-        messages.extend((9..19).map(|index| output(index, 10_000)));
-        assert_eq!(Mask.apply(&mut messages), 9);
-        assert!(messages[..9].iter().all(|m| text(m) == STUB));
-        assert!(messages[10..].iter().all(|m| text(m).len() == 10_000));
+        messages.extend((40..50).map(|index| output(index, 5_000)));
+        assert_eq!(Mask.apply(&mut messages), 20);
+        assert!(messages[..20].iter().all(|m| text(m) == STUB));
+        assert!(messages[20..40].iter().all(|m| text(m).len() == 5_000));
+        assert!(messages[41..].iter().all(|m| text(m).len() == 5_000));
     }
 
     #[test]
     fn below_the_step_nothing_is_masked() {
-        let mut messages = history(&[10_000; 5]);
+        let mut messages = history(&[5_000; 42]);
         assert_eq!(Mask.apply(&mut messages), 0);
-        assert_eq!(masked_flags(&messages), vec![false; 5]);
+        assert_eq!(masked_flags(&messages), vec![false; 42]);
     }
 
     #[test]
-    fn masks_the_old_outputs_and_keeps_the_newest_three() {
-        let mut messages = history(&[10_000; 12]);
-        assert_eq!(Mask.apply(&mut messages), 9);
-        let mut expected = vec![true; 9];
-        expected.extend([false; 3]);
+    fn masks_the_oldest_outputs_down_to_half_the_step() {
+        let mut messages = history(&[5_000; 43]);
+        assert_eq!(Mask.apply(&mut messages), 20);
+        let mut expected = vec![true; 20];
+        expected.extend([false; 23]);
         assert_eq!(masked_flags(&messages), expected);
-        assert!(messages[9..].iter().all(|m| text(m).len() == 10_000));
+        assert!(messages[20..].iter().all(|m| text(m).len() == 5_000));
     }
 
     #[test]
     fn a_small_old_output_is_never_masked() {
-        let mut sizes = vec![10_000; 12];
+        let mut sizes = vec![5_000; 44];
         sizes[4] = 500;
         let mut messages = history(&sizes);
-        assert_eq!(Mask.apply(&mut messages), 8);
-        let mut expected = vec![true; 9];
+        assert_eq!(Mask.apply(&mut messages), 20);
+        let mut expected = vec![true; 21];
         expected[4] = false;
-        expected.extend([false; 3]);
+        expected.extend([false; 23]);
         assert_eq!(masked_flags(&messages), expected);
         assert_eq!(text(&messages[4]).len(), 500);
     }
 
     #[test]
     fn small_outputs_do_not_count_toward_the_step() {
-        let mut messages = history(&[799; 200]);
+        let mut messages = history(&[799; 400]);
         assert_eq!(Mask.apply(&mut messages), 0);
     }
 
     #[test]
     fn newest_three_count_all_sizes_and_errors_are_masked() {
-        let mut messages = history(&[10_000; 9]);
+        let mut messages = history(&[5_000; 40]);
         messages.extend(history(&[10, 10, 10]));
         if let Message::ToolResult(result) = &mut messages[0] {
             result.is_error = true;
         }
-        assert_eq!(Mask.apply(&mut messages), 9);
+        assert_eq!(Mask.apply(&mut messages), 20);
         assert_eq!(text(&messages[0]), STUB);
     }
 
     #[test]
-    fn a_later_step_waits_for_the_next_eighty_thousand_bytes() {
-        let mut messages = history(&[10_000; 12]);
-        assert_eq!(Mask.apply(&mut messages), 9);
+    fn the_next_step_waits_for_another_hundred_thousand_bytes() {
+        let mut messages = history(&[5_000; 43]);
+        assert_eq!(Mask.apply(&mut messages), 20);
 
-        // The old unmasked total is 3 x 10,000 after these 3 more outputs.
-        messages.extend(history(&[10_000; 3]));
+        // 20 old unmasked outputs, then 19 more: 195,000 bytes, no step.
+        messages.extend(history(&[5_000; 19]));
         assert_eq!(Mask.apply(&mut messages), 0);
-        let mut expected = vec![true; 9];
-        expected.extend([false; 6]);
-        assert_eq!(masked_flags(&messages), expected);
 
-        // 8 old unmasked outputs make 80,000 bytes: masked, stub not recounted.
-        messages.extend(history(&[10_000; 5]));
-        assert_eq!(Mask.apply(&mut messages), 8);
+        // One more makes 200,000: the 20 oldest unmasked go, stubs not recounted.
+        messages.extend(history(&[5_000; 1]));
+        assert_eq!(Mask.apply(&mut messages), 20);
+        let mut expected = vec![true; 40];
+        expected.extend([false; 23]);
+        assert_eq!(masked_flags(&messages), expected);
         assert_eq!(Mask.apply(&mut messages), 0);
     }
 }
@@ -214,7 +224,7 @@ mod loop_tests {
             _args: &'a str,
             _cancel: &'a CancellationToken,
         ) -> BoxFuture<'a, ToolOutput> {
-            Box::pin(async { ToolOutput::ok("y".repeat(10_000)) })
+            Box::pin(async { ToolOutput::ok("y".repeat(5_000)) })
         }
     }
 
@@ -260,7 +270,7 @@ mod loop_tests {
     }
 
     async fn run(masked: bool) -> Vec<Vec<Text>> {
-        let mut replies: Vec<_> = (0..12).map(tool_turn).collect();
+        let mut replies: Vec<_> = (0..45).map(tool_turn).collect();
         replies.push(vec![
             StreamEvent::TextDelta(Text::from("done")),
             StreamEvent::Stop(StopReason::EndTurn),
@@ -285,7 +295,7 @@ mod loop_tests {
             cache_key: None,
             max_turns: None,
         };
-        let (tx, _rx) = mpsc::channel(256);
+        let (tx, _rx) = mpsc::channel(4096);
         let mut history = vec![Message::user("go")];
         let agent = Agent::new(&provider, &registry, config, CancellationToken::new());
         let mut agent = if masked { agent.with_mask() } else { agent };
@@ -296,19 +306,19 @@ mod loop_tests {
     #[tokio::test]
     async fn the_request_carries_the_stub_for_old_outputs() {
         let requests = run(true).await;
-        assert_eq!(requests.len(), 13);
-        let last = &requests[12];
-        assert_eq!(last.len(), 12);
-        // The step ran at 11 outputs (8 old); the 12th is below a new step.
-        assert!(last[..8].iter().all(|text| &**text == STUB));
-        assert!(last[8..].iter().all(|text| text.len() == 10_000));
+        assert_eq!(requests.len(), 46);
+        let last = &requests[45];
+        assert_eq!(last.len(), 45);
+        // The step ran at 43 outputs (40 old) and masked the oldest 20.
+        assert!(last[..20].iter().all(|text| &**text == STUB));
+        assert!(last[20..].iter().all(|text| text.len() == 5_000));
         // An earlier request is still whole: the step had not been reached.
-        assert!(requests[5].iter().all(|text| text.len() == 10_000));
+        assert!(requests[42].iter().all(|text| text.len() == 5_000));
     }
 
     #[tokio::test]
     async fn without_masking_the_request_is_untouched() {
         let requests = run(false).await;
-        assert!(requests[12].iter().all(|text| text.len() == 10_000));
+        assert!(requests[45].iter().all(|text| text.len() == 5_000));
     }
 }

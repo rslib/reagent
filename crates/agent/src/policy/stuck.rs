@@ -105,7 +105,7 @@ impl TurnPolicy for Stuck {
             }
 
             // edit/write on the same path repeated.
-            if matches!(call.name.as_str(), "edit" | "write")
+            if matches!(&*call.name, "edit" | "write")
                 && let Some(path) = path_of(&call.arguments)
             {
                 let path_key = key("file", &[&path]);
@@ -198,6 +198,7 @@ mod tests {
             ran_tools: true,
             assistant: a,
             tools,
+            changed_files: None,
         };
         policy.after_turn(&view)
     }

@@ -88,6 +88,8 @@ Full runs stay the reference for a result you report.
 
 `reagent_harbor.report` prints the pass rate with a 95% interval, tokens per solved task and the failure types of a job.
 The interval resamples tasks, not trials, because trials of one task are correlated.
+False done counts the trials that ended normally (`end_turn`) and failed, over all trials that ended normally: the agent said it was done and was not.
+Policy notes counts the loop's notes by kind (`check`, `budget` or `other`), and for `check` notes how many trials got one, then ran a bash call, and were solved.
 `--against` gives the paired difference with an older job on the shared tasks.
 
 ```bash
@@ -114,8 +116,8 @@ Harbor passes options to an installed agent as `--ak name=value`.
 - `policy`: a string.
   The loop policies to enable, passed to the binary as `--policy <value>`.
   One value, for example `completion,budget`.
-  Without it, the binary runs only `budget`. `none` turns every policy off.
-  `mask` replaces old large tool outputs with a short stub; it needs the `openai-chat` wire.
+  Without it, the binary runs `budget`, plus `mask` on the `openai-chat` wire. `none` turns every policy off.
+  `mask` replaces old large tool outputs with a short stub; it runs only on the `openai-chat` wire.
 
   ```bash
   ./run.sh anthropic/claude-sonnet-5-5 terminal-bench/terminal-bench-2-1 3 \

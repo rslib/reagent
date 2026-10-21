@@ -330,7 +330,7 @@ class ReagentOptions(InstalledAgentOptions):
         description=(
             "Loop policies to enable, passed to reagent as --policy <value>, "
             "for example `completion,budget`. Unset runs reagent's default "
-            "(budget); `none` turns every policy off."
+            "(budget, plus mask on the openai-chat wire); `none` turns every policy off."
         ),
     )
     max_tokens: int | None = Field(

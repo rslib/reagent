@@ -23,7 +23,7 @@ impl MessageBody {
             Message::User { content } => user_items(content),
             Message::Assistant(assistant) => assistant_items(assistant, provider),
             Message::ToolResult(result) => vec![to_bytes(&InputItem::FunctionCallOutput {
-                call_id: result.call_id.as_str(),
+                call_id: &result.call_id,
                 output: result.content.as_ref(),
             })],
         };
@@ -210,8 +210,8 @@ fn assistant_items(assistant: &AssistantMessage, provider: &str) -> Vec<Bytes> {
                     call.arguments.as_ref()
                 };
                 items.push(to_bytes(&InputItem::FunctionCall {
-                    call_id: call.id.as_str(),
-                    name: call.name.as_str(),
+                    call_id: &call.id,
+                    name: &call.name,
                     arguments,
                 }));
             }

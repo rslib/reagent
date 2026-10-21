@@ -14,6 +14,10 @@ use crate::mask::Mask;
 use crate::policy::{PolicyRun, TurnPolicy, TurnView};
 use crate::session::Session;
 use crate::tool::Registry;
+use crate::workspace::Workspace;
+
+/// How many times an empty reply is requested again before the run stops.
+const EMPTY_RETRIES: u32 = 2;
 
 /// The note added after a max_tokens stop, baked in from `prompts/max_tokens.md`.
 const MAX_TOKENS_NOTE: &str = include_str!(concat!(
@@ -50,6 +54,10 @@ pub struct Agent<'a> {
     token: CancellationToken,
     policies: Vec<Box<dyn TurnPolicy>>,
     mask: Option<Mask>,
+    workspace: Option<&'a dyn Workspace>,
+    fingerprint: Option<u64>,
+    provider_name: Text,
+    model: Text,
 }
 
 impl<'a> Agent<'a> {
@@ -64,10 +72,14 @@ impl<'a> Agent<'a> {
         Self {
             provider,
             registry,
-            config,
             token,
             policies: Vec::new(),
             mask: None,
+            workspace: None,
+            fingerprint: None,
+            provider_name: Text::from(provider.name()),
+            model: Text::from(config.model.as_str()),
+            config,
         }
     }
 
@@ -85,10 +97,14 @@ impl<'a> Agent<'a> {
         Self {
             provider,
             registry,
-            config,
             token,
             policies,
             mask: None,
+            workspace: None,
+            fingerprint: None,
+            provider_name: Text::from(provider.name()),
+            model: Text::from(config.model.as_str()),
+            config,
         }
     }
 
@@ -99,6 +115,14 @@ impl<'a> Agent<'a> {
     #[must_use]
     pub fn with_mask(mut self) -> Self {
         self.mask = Some(Mask);
+        self
+    }
+
+    /// Watches `workspace` so policies learn whether a turn changed files
+    /// (see [`TurnView::changed_files`]). Off by default.
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: &'a dyn Workspace) -> Self {
+        self.workspace = Some(workspace);
         self
     }
 
@@ -119,6 +143,10 @@ impl<'a> Agent<'a> {
         let started = std::time::Instant::now();
         let mut turns: u32 = 0;
         let mut max_tokens_streak: u32 = 0;
+        self.fingerprint = match self.workspace {
+            Some(workspace) if !self.policies.is_empty() => workspace.fingerprint().await,
+            _ => None,
+        };
         let mut run_reason = loop {
             if self.config.max_turns.is_some_and(|cap| turns >= cap) {
                 break TurnEndReason::MaxTurns;
@@ -267,6 +295,20 @@ impl<'a> Agent<'a> {
             };
         }
 
+        let changed_files = match self.workspace {
+            None => None,
+            Some(_) if !ran_tools => Some(false),
+            Some(workspace) => {
+                let now = workspace.fingerprint().await;
+                let changed = match (self.fingerprint, now) {
+                    (Some(prev), Some(now)) => Some(prev != now),
+                    _ => None,
+                };
+                self.fingerprint = now;
+                changed
+            }
+        };
+
         let elapsed = started.elapsed();
         let (injected, notes, continue_run) = {
             let (assistant, tools) = last_turn(history);
@@ -276,6 +318,7 @@ impl<'a> Agent<'a> {
                 ran_tools,
                 assistant,
                 tools: &tools,
+                changed_files,
             };
             let run = PolicyRun::new(&mut self.policies, &view);
             let continue_run = run.continue_run();
@@ -317,44 +360,73 @@ impl<'a> Agent<'a> {
         let mut assembler = Assembler::new();
         // How many retries already ran, capped at [`crate::retry::MAX_RETRIES`].
         let mut retries: u32 = 0;
-        // None when the stream ended cleanly, else the error that stopped it
-        // and, on the last allowed attempt, ends the turn.
-        let mut stop_error: Option<Error> = None;
-        loop {
-            let outcome = self.consume_stream(history, events, &mut assembler).await;
-            match outcome {
-                ConsumeOutcome::Cancelled | ConsumeOutcome::Finished => break,
-                ConsumeOutcome::StreamError(error) => {
-                    if retries >= crate::retry::MAX_RETRIES || error.retry_hint().is_none() {
-                        stop_error = Some(error);
-                        break;
+        // How many empty replies were already requested again.
+        let mut empty_retries: u32 = 0;
+        let mut message = loop {
+            // None when the stream ended cleanly, else the error that stopped it
+            // and, on the last allowed attempt, ends the turn.
+            let mut stop_error: Option<Error> = None;
+            loop {
+                let outcome = self.consume_stream(history, events, &mut assembler).await;
+                match outcome {
+                    ConsumeOutcome::Cancelled | ConsumeOutcome::Finished => break,
+                    ConsumeOutcome::StreamError(error) => {
+                        if retries >= crate::retry::MAX_RETRIES || error.retry_hint().is_none() {
+                            stop_error = Some(error);
+                            break;
+                        }
+                        // A retry resets the partial reply but pushes nothing to
+                        // history, so a retry never re-sends a finished message.
+                        let wait = error.retry_hint().flatten();
+                        let delay = crate::retry::delay(retries, wait, crate::retry::jitter());
+                        let event = Event::Retry {
+                            attempt: retries + 1,
+                            delay_ms: delay.as_millis() as u64,
+                            error: Text::from(error.to_string()),
+                        };
+                        if emit(events, &self.token, event).await {
+                            return TurnOutcome::Cancelled;
+                        }
+                        tokio::select! {
+                            () = tokio::time::sleep(delay) => {}
+                            () = self.token.cancelled() => return TurnOutcome::Cancelled,
+                        }
+                        assembler = Assembler::new();
+                        retries += 1;
                     }
-                    // A retry resets the partial reply but pushes nothing to
-                    // history, so a retry never re-sends a finished message.
-                    let wait = error.retry_hint().flatten();
-                    let delay = crate::retry::delay(retries, wait, crate::retry::jitter());
-                    let event = Event::Retry {
-                        attempt: retries + 1,
-                        delay_ms: delay.as_millis() as u64,
-                        error: Text::from(error.to_string()),
-                    };
-                    if emit(events, &self.token, event).await {
-                        return TurnOutcome::Cancelled;
-                    }
-                    tokio::select! {
-                        () = tokio::time::sleep(delay) => {}
-                        () = self.token.cancelled() => return TurnOutcome::Cancelled,
-                    }
-                    assembler = Assembler::new();
-                    retries += 1;
                 }
             }
-        }
-        if let Some(error) = stop_error {
-            return TurnOutcome::Error(Text::from(error.to_string()));
-        }
+            if let Some(error) = stop_error {
+                return TurnOutcome::Error(Text::from(error.to_string()));
+            }
 
-        let mut message = assembler.finish(self.provider.name(), &self.config.model);
+            let message = assembler.finish(self.provider_name.clone(), self.model.clone());
+            // Gateways now and then send a reply with no content at all, though
+            // they bill output tokens for it. The same request usually answers.
+            if message.content.is_empty()
+                && message.stop_reason != Some(StopReason::Refusal)
+                && empty_retries < EMPTY_RETRIES
+                && !self.token.is_cancelled()
+            {
+                let delay = crate::retry::delay(empty_retries, None, crate::retry::jitter());
+                let event = Event::Retry {
+                    attempt: empty_retries + 1,
+                    delay_ms: delay.as_millis() as u64,
+                    error: Text::from("empty reply"),
+                };
+                if emit(events, &self.token, event).await {
+                    return TurnOutcome::Cancelled;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    () = self.token.cancelled() => return TurnOutcome::Cancelled,
+                }
+                assembler = Assembler::new();
+                empty_retries += 1;
+                continue;
+            }
+            break message;
+        };
 
         // An empty reply is never pushed. A refusal with no content is still
         // a refusal, not an "empty reply" error, and pushes nothing.
@@ -394,8 +466,9 @@ impl<'a> Agent<'a> {
                 }
                 for (call, result) in calls.iter().zip(&results) {
                     let event = Event::ToolResult {
-                        id: Text::from(call.id.clone()),
+                        id: call.id.clone(),
                         is_error: tool_error(result),
+                        bytes: tool_bytes(result),
                     };
                     if emit(events, &self.token, event).await {
                         return TurnOutcome::Cancelled;
@@ -642,6 +715,13 @@ fn tool_error(message: &Message) -> bool {
     matches!(message, Message::ToolResult(result) if result.is_error)
 }
 
+fn tool_bytes(message: &Message) -> usize {
+    match message {
+        Message::ToolResult(result) => result.content.len(),
+        _ => 0,
+    }
+}
+
 /// A thinking block being assembled, which may carry only a signature.
 #[derive(Default)]
 struct OpenThinking {
@@ -651,8 +731,8 @@ struct OpenThinking {
 
 /// One tool call being assembled from its argument deltas.
 struct OpenTool {
-    id: String,
-    name: String,
+    id: Text,
+    name: Text,
     args: String,
 }
 
@@ -713,18 +793,17 @@ impl Assembler {
             StreamEvent::ToolCallStart { id, name } => {
                 self.close_aux();
                 self.tools.push(OpenTool {
-                    id: id.to_string(),
-                    name: name.to_string(),
+                    id,
+                    name,
                     args: String::new(),
                 });
             }
             StreamEvent::ToolCallDelta { id, partial_json } => {
-                let id = id.to_string();
                 // An empty id delta means the current call in some providers.
                 let index = self
                     .tools
                     .iter()
-                    .rposition(|tool| tool.id == id)
+                    .rposition(|tool| *tool.id == *id)
                     .or_else(|| {
                         id.is_empty()
                             .then(|| self.tools.len().checked_sub(1))
@@ -735,18 +814,17 @@ impl Assembler {
                 }
             }
             StreamEvent::ToolCallEnd { id } => {
-                let id = id.to_string();
-                if let Some(index) = self.tools.iter().position(|tool| tool.id == id) {
+                if let Some(index) = self.tools.iter().position(|tool| *tool.id == *id) {
                     let tool = self.tools.remove(index);
                     // A call with no or only-whitespace arguments is an empty object.
                     let arguments = if tool.args.trim().is_empty() {
                         Text::from("{}")
                     } else {
-                        Text::from(tool.args)
+                        Text::from(crate::repair::arguments(tool.args))
                     };
                     self.ready.push(ToolReady {
-                        id: Text::from(tool.id.clone()),
-                        name: Text::from(tool.name.clone()),
+                        id: tool.id.clone(),
+                        name: tool.name.clone(),
                         arguments: arguments.clone(),
                     });
                     self.content.push(Content::ToolCall(ToolCall {
@@ -804,12 +882,12 @@ impl Assembler {
         std::mem::take(&mut self.ready)
     }
 
-    fn finish(mut self, provider: &str, model: &str) -> AssistantMessage {
+    fn finish(mut self, provider: Text, model: Text) -> AssistantMessage {
         self.close_aux();
         AssistantMessage {
             content: self.content,
-            provider: provider.into(),
-            model: model.into(),
+            provider,
+            model,
             stop_reason: self.stop_reason,
             usage: self.usage,
         }
@@ -978,7 +1056,7 @@ mod tests {
         );
         let calls = tool_calls(&message);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "echo");
+        assert_eq!(&*calls[0].name, "echo");
     }
 
     #[tokio::test]
@@ -1025,7 +1103,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, Event::ToolResult { id, is_error } if id.as_ref() == "call_1" && !is_error))
+                .any(|event| matches!(event, Event::ToolResult { id, is_error, .. } if id.as_ref() == "call_1" && !is_error))
         );
     }
 
@@ -1055,11 +1133,11 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn five_failures_end_the_run_with_the_error() {
-        // First attempt plus MAX_RETRIES=4 retries = 5 provider calls, then
+    async fn eleven_failures_end_the_run_with_the_error() {
+        // First attempt plus MAX_RETRIES=10 retries = 11 provider calls, then
         // the run ends with the error.
         let provider = FakeProvider::new(vec![]);
-        for _ in 0..5 {
+        for _ in 0..11 {
             provider.push_error(Error::Http("refused".into()));
         }
         let registry = registry();
@@ -1072,8 +1150,8 @@ mod tests {
 
         assert_eq!(
             provider.seen().len(),
-            5,
-            "the first attempt plus four retries"
+            11,
+            "the first attempt plus ten retries"
         );
         assert_eq!(history.len(), 1, "no assistant message on failure");
         let events = drain(tx, &mut rx);
@@ -1081,7 +1159,7 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, Event::Retry { .. }))
             .count();
-        assert_eq!(retries, 4, "four retries before giving up: {events:?}");
+        assert_eq!(retries, 10, "ten retries before giving up: {events:?}");
         assert!(
             events.iter().any(|event| matches!(event, Event::Error(_))),
             "the turn reports the error"
@@ -1383,6 +1461,90 @@ mod tests {
                 |event| matches!(event, Event::Error(message) if message.as_ref() == "empty reply")
             ),
             "an empty reply reports 'empty reply'"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&Event::RunEnd(TurnEndReason::Stopped(StopReason::Error)))
+        );
+    }
+
+    #[tokio::test]
+    async fn repaired_arguments_go_into_history() {
+        let provider = FakeProvider::new(vec![
+            tool_reply("c1", "echo", r#""{\"message\":\"hi\"}""#),
+            vec![
+                StreamEvent::TextDelta(Text::from("done")),
+                StreamEvent::Stop(StopReason::EndTurn),
+            ],
+        ]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        let Message::Assistant(message) = &history[1] else {
+            panic!("expected an assistant message");
+        };
+        let Content::ToolCall(call) = &message.content[0] else {
+            panic!("expected a tool call");
+        };
+        assert_eq!(call.arguments.as_ref(), r#"{"message":"hi"}"#);
+        let Message::ToolResult(result) = &history[2] else {
+            panic!("expected a tool result");
+        };
+        assert!(!result.is_error, "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn an_empty_reply_is_retried_then_answers() {
+        let provider = FakeProvider::new(vec![
+            vec![],
+            vec![
+                StreamEvent::TextDelta(Text::from("done")),
+                StreamEvent::Stop(StopReason::EndTurn),
+            ],
+        ]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(provider.seen().len(), 2);
+        assert_eq!(history.len(), 2, "only the answer is pushed");
+        let events = drain(tx, &mut rx);
+        let retries = events
+            .iter()
+            .filter(|event| matches!(event, Event::Retry { error, .. } if error.as_ref() == "empty reply"))
+            .count();
+        assert_eq!(retries, 1, "events: {events:?}");
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
+    }
+
+    #[tokio::test]
+    async fn three_empty_replies_stop_the_run() {
+        let provider = FakeProvider::new(vec![vec![], vec![], vec![], vec![]]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(provider.seen().len(), 3);
+        assert_eq!(history.len(), 1);
+        let events = drain(tx, &mut rx);
+        assert!(
+            events.iter().any(
+                |event| matches!(event, Event::Error(message) if message.as_ref() == "empty reply")
+            ),
+            "events: {events:?}"
         );
         assert_eq!(
             events.last(),
@@ -1788,7 +1950,7 @@ mod tests {
             let results: Vec<_> = history
                 .iter()
                 .filter_map(|message| match message {
-                    Message::ToolResult(result) => Some(result.call_id.as_str()),
+                    Message::ToolResult(result) => Some(&*result.call_id),
                     _ => None,
                 })
                 .collect();
@@ -1940,5 +2102,74 @@ mod tests {
         let events = drain(tx, &mut rx);
         assert_eq!(policy_notes(&events).len(), 6);
         assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
+    }
+
+    /// A workspace whose fingerprint is 0 on the first call and 1 after.
+    struct ChangesOnSecondCall {
+        calls: std::sync::atomic::AtomicU64,
+    }
+
+    impl Workspace for ChangesOnSecondCall {
+        fn fingerprint(&self) -> BoxFuture<'_, Option<u64>> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Some(call.min(1)) })
+        }
+    }
+
+    /// A policy that records `changed_files` for each turn.
+    struct Recorder {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Option<bool>>>>,
+    }
+
+    impl TurnPolicy for Recorder {
+        fn after_turn(&mut self, turn: &TurnView<'_>) -> crate::policy::Decision {
+            self.seen.lock().unwrap().push(turn.changed_files);
+            crate::policy::Decision::Continue
+        }
+    }
+
+    async fn changed_files_per_turn(workspace: Option<&dyn Workspace>) -> Vec<Option<bool>> {
+        let provider = FakeProvider::new(vec![
+            tool_reply("call_1", "echo", r#"{"message":"a"}"#),
+            tool_reply("call_2", "echo", r#"{"message":"b"}"#),
+            text_reply("done"),
+        ]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let policies: Vec<Box<dyn TurnPolicy>> = vec![Box::new(Recorder { seen: seen.clone() })];
+
+        let mut agent = Agent::with_policies(
+            &provider,
+            &registry,
+            config(),
+            CancellationToken::new(),
+            policies,
+        );
+        if let Some(workspace) = workspace {
+            agent = agent.with_workspace(workspace);
+        }
+        agent.run(&mut history, None, &tx).await;
+
+        seen.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn turn_view_reports_changed_files() {
+        let workspace = ChangesOnSecondCall {
+            calls: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        let seen = changed_files_per_turn(Some(&workspace)).await;
+
+        assert_eq!(seen, vec![Some(true), Some(false), Some(false)]);
+    }
+
+    #[tokio::test]
+    async fn turn_view_without_a_workspace() {
+        let seen = changed_files_per_turn(None).await;
+
+        assert_eq!(seen, vec![None, None, None]);
     }
 }

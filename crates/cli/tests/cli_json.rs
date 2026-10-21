@@ -227,22 +227,27 @@ async fn cli_json_never_prints_the_api_key_on_an_error() {
 }
 
 #[tokio::test]
-async fn cli_json_completion_policy_prints_a_policy_note() {
+async fn cli_json_completion_policy_notes_unchecked_changes() {
     let tmp = tempfile::tempdir().expect("temp dir");
+    let work = tempfile::tempdir().expect("work dir");
     let script = tmp.path().join("script.json");
-    // The first answer gets the completion note; the second answer ends the run.
     tokio::fs::write(
         &script,
-        r#"{"replies": [{"text": "first answer"}, {"text": "checked answer"}]}"#,
+        r#"{"replies": [{"text": "writing", "calls": [
+            {"name": "write", "arguments": {"path": "out.txt", "content": "hi"}}
+        ]}, {"text": "first answer"}, {"text": "checked answer"}]}"#,
     )
     .await
     .expect("write script");
 
     let script_arg = format!("fake:{}", script.display());
+    let work_arg = work.path().display().to_string();
     let args = [
         "--json",
         "--policy",
         "completion",
+        "--cwd",
+        &work_arg,
         "--provider",
         &script_arg,
         "-p",
@@ -255,16 +260,53 @@ async fn cli_json_completion_policy_prints_a_policy_note() {
         String::from_utf8_lossy(&output.stderr)
     );
     let lines = json_lines(&output.stdout);
-    let kinds = types(&lines);
-    assert_eq!(
-        kinds.iter().filter(|kind| **kind == "policy_note").count(),
-        1,
-        "{kinds:?}"
+    let notes: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["type"] == "policy_note")
+        .collect();
+    assert_eq!(notes.len(), 1, "{:?}", types(&lines));
+    assert!(
+        notes[0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("You changed files")),
+        "{:?}",
+        notes[0]
     );
-    assert_eq!(
-        kinds.iter().filter(|kind| **kind == "turn_start").count(),
-        2,
-        "{kinds:?}"
+}
+
+#[tokio::test]
+async fn cli_json_completion_policy_is_quiet_without_changes() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let work = tempfile::tempdir().expect("work dir");
+    let script = tmp.path().join("script.json");
+    tokio::fs::write(&script, r#"{"replies": [{"text": "plain answer"}]}"#)
+        .await
+        .expect("write script");
+
+    let script_arg = format!("fake:{}", script.display());
+    let work_arg = work.path().display().to_string();
+    let args = [
+        "--json",
+        "--policy",
+        "completion",
+        "--cwd",
+        &work_arg,
+        "--provider",
+        &script_arg,
+        "-p",
+        "hi",
+    ];
+    let output = run(tmp.path(), &args).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = json_lines(&output.stdout);
+    assert!(
+        !types(&lines).contains(&"policy_note"),
+        "{:?}",
+        types(&lines)
     );
 }
 
@@ -290,20 +332,27 @@ async fn cli_json_without_json_flag_prints_plain_final_text() {
 async fn cli_json_a_transport_error_never_prints_the_api_key() {
     let tmp = tempfile::tempdir().expect("temp dir");
     // The real Anthropic provider against a closed local port: the request
-    // fails, and neither the error line nor stderr may hold the key.
+    // fails, and neither the retry lines nor stderr may hold the key. The
+    // deadline ends the run during the retry backoff, which lasts minutes.
     let output = Command::new(BIN)
-        .args(["--json", "-p", "hi"])
+        .args(["--json", "-p", "hi", "--deadline", "3"])
         .current_dir(tmp.path())
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
         .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
         .output()
         .await
         .expect("the binary runs");
-    assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let retry_errors: Vec<_> = json_lines(&output.stdout)
+        .into_iter()
+        .filter(|line| line["type"] == "retry")
+        .filter_map(|line| line["error"].as_str().map(str::to_owned))
+        .collect();
     assert!(
-        types(&json_lines(&output.stdout)).contains(&"error"),
+        retry_errors
+            .iter()
+            .any(|error| error.contains("http error")),
         "{stdout}"
     );
     assert!(

@@ -1,73 +1,150 @@
 //! JSON line rendering for `--json` mode.
 
-use serde_json::{Value, json};
+use serde::Serialize;
 
 use reagent_agent::event::{Event, TurnEndReason};
 use reagent_ai::Usage;
 
-/// Renders one agent event as a single JSON object.
-pub fn event(event: &Event) -> Value {
-    match event {
-        Event::TurnStart => json!({ "type": "turn_start" }),
-        Event::TextDelta(text) => json!({ "type": "text_delta", "text": text.as_ref() }),
-        Event::ThinkingDelta(text) => {
-            json!({ "type": "thinking_delta", "text": text.as_ref() })
-        }
-        Event::ToolStart { id, name } => json!({
-            "type": "tool_start",
-            "id": id.as_ref(),
-            "name": name.as_ref(),
-        }),
+/// One `--json` line, borrowed from the event so no text is copied.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Line<'a> {
+    TurnStart,
+    TextDelta {
+        text: &'a str,
+    },
+    ThinkingDelta {
+        text: &'a str,
+    },
+    ToolStart {
+        id: &'a str,
+        name: &'a str,
+    },
+    ToolCallReady {
+        id: &'a str,
+        name: &'a str,
+        arguments: &'a str,
+    },
+    ToolResult {
+        id: &'a str,
+        is_error: bool,
+        bytes: usize,
+    },
+    Usage {
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cache_hit_rate: f64,
+    },
+    TurnEnd {
+        reason: &'static str,
+    },
+    RunEnd {
+        reason: &'static str,
+    },
+    Error {
+        message: &'a str,
+    },
+    Retry {
+        attempt: u32,
+        delay_ms: u64,
+        error: &'a str,
+    },
+    PolicyNote {
+        text: &'a str,
+    },
+    Summary {
+        turns: u32,
+        exit: &'static str,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cache_hit_rate: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop: Option<&'static str>,
+    },
+}
+
+/// Appends one agent event to `buf` as a JSON object and a newline.
+pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
+    let line = match event {
+        Event::TurnStart => Line::TurnStart,
+        Event::TextDelta(text) => Line::TextDelta { text },
+        Event::ThinkingDelta(text) => Line::ThinkingDelta { text },
+        Event::ToolStart { id, name } => Line::ToolStart { id, name },
         Event::ToolCallReady {
             id,
             name,
             arguments,
-        } => json!({
-            "type": "tool_call_ready",
-            "id": id.as_ref(),
-            "name": name.as_ref(),
-            "arguments": arguments.as_ref(),
-        }),
-        Event::ToolResult { id, is_error } => json!({
-            "type": "tool_result",
-            "id": id.as_ref(),
-            "is_error": is_error,
-        }),
-        Event::Usage(usage) => json!({
-            "type": "usage",
-            "input": usage.input_tokens,
-            "output": usage.output_tokens,
-            "cache_read": usage.cache_read_tokens,
-            "cache_write": usage.cache_write_tokens,
-            "cache_hit_rate": cache_hit_rate(usage),
-        }),
-        Event::TurnEnd(reason) => json!({
-            "type": "turn_end",
-            "reason": turn_reason(reason),
-        }),
-        Event::RunEnd(reason) => json!({
-            "type": "run_end",
-            "reason": turn_reason(reason),
-        }),
-        Event::Error(message) => json!({
-            "type": "error",
-            "message": message.as_ref(),
-        }),
+        } => Line::ToolCallReady {
+            id,
+            name,
+            arguments,
+        },
+        Event::ToolResult {
+            id,
+            is_error,
+            bytes,
+        } => Line::ToolResult {
+            id,
+            is_error: *is_error,
+            bytes: *bytes,
+        },
+        Event::Usage(usage) => Line::Usage {
+            input: usage.input_tokens,
+            output: usage.output_tokens,
+            cache_read: usage.cache_read_tokens,
+            cache_write: usage.cache_write_tokens,
+            cache_hit_rate: cache_hit_rate(usage),
+        },
+        Event::TurnEnd(reason) => Line::TurnEnd {
+            reason: turn_reason(reason),
+        },
+        Event::RunEnd(reason) => Line::RunEnd {
+            reason: turn_reason(reason),
+        },
+        Event::Error(message) => Line::Error { message },
         Event::Retry {
             attempt,
             delay_ms,
             error,
-        } => json!({
-            "type": "retry",
-            "attempt": attempt,
-            "delay_ms": delay_ms,
-            "error": error.as_ref(),
-        }),
-        Event::PolicyNote(text) => json!({
-            "type": "policy_note",
-            "text": text.as_ref(),
-        }),
-    }
+        } => Line::Retry {
+            attempt: *attempt,
+            delay_ms: *delay_ms,
+            error,
+        },
+        Event::PolicyNote(text) => Line::PolicyNote { text },
+    };
+    push(buf, &line);
+}
+
+/// Appends the final summary line to `buf`: total usage, turns and stop reason.
+pub fn write_summary(
+    buf: &mut Vec<u8>,
+    usage: &Usage,
+    turns: u32,
+    reason: &TurnEndReason,
+    stop: Option<&'static str>,
+) {
+    let line = Line::Summary {
+        turns,
+        exit: turn_reason(reason),
+        input: usage.input_tokens,
+        output: usage.output_tokens,
+        cache_read: usage.cache_read_tokens,
+        cache_write: usage.cache_write_tokens,
+        cache_hit_rate: cache_hit_rate(usage),
+        stop,
+    };
+    push(buf, &line);
+}
+
+fn push(buf: &mut Vec<u8>, line: &Line<'_>) {
+    // A Vec writer cannot fail, and every field serializes.
+    serde_json::to_writer(&mut *buf, line).expect("a json line serializes");
+    buf.push(b'\n');
 }
 
 /// The prompt cache hit rate: cached tokens over every non-output token.
@@ -93,25 +170,150 @@ fn turn_reason(reason: &TurnEndReason) -> &'static str {
     }
 }
 
-/// The final summary line: total usage, turns and stop reason.
-pub fn summary(
-    usage: &Usage,
-    turns: u32,
-    reason: &TurnEndReason,
-    stop: Option<&'static str>,
-) -> Value {
-    let mut summary = json!({
-        "type": "summary",
-        "turns": turns,
-        "exit": turn_reason(reason),
-        "input": usage.input_tokens,
-        "output": usage.output_tokens,
-        "cache_read": usage.cache_read_tokens,
-        "cache_write": usage.cache_write_tokens,
-        "cache_hit_rate": cache_hit_rate(usage),
-    });
-    if let Some(stop) = stop {
-        summary["stop"] = Value::from(stop);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn line(event: &Event) -> Value {
+        let mut buf = Vec::new();
+        write_event(&mut buf, event);
+        parse_line(&buf)
     }
-    summary
+
+    fn parse_line(buf: &[u8]) -> Value {
+        let text = std::str::from_utf8(buf).unwrap();
+        let body = text.strip_suffix('\n').expect("a line ends with a newline");
+        assert!(!body.contains('\n'));
+        serde_json::from_str(body).unwrap()
+    }
+
+    fn usage() -> Usage {
+        Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 30,
+            cache_write_tokens: 0,
+            reasoning_tokens: 2,
+        }
+    }
+
+    #[test]
+    fn every_event_line_has_the_same_keys_and_values() {
+        let cases = [
+            (Event::TurnStart, json!({ "type": "turn_start" })),
+            (
+                Event::TextDelta("a \"q\"\n".into()),
+                json!({ "type": "text_delta", "text": "a \"q\"\n" }),
+            ),
+            (
+                Event::ThinkingDelta("hm".into()),
+                json!({ "type": "thinking_delta", "text": "hm" }),
+            ),
+            (
+                Event::ToolStart {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                },
+                json!({ "type": "tool_start", "id": "c1", "name": "bash" }),
+            ),
+            (
+                Event::ToolCallReady {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: "{\"cmd\":\"ls\"}".into(),
+                },
+                json!({
+                    "type": "tool_call_ready",
+                    "id": "c1",
+                    "name": "bash",
+                    "arguments": "{\"cmd\":\"ls\"}",
+                }),
+            ),
+            (
+                Event::ToolResult {
+                    id: "c1".into(),
+                    is_error: true,
+                    bytes: 1234,
+                },
+                json!({ "type": "tool_result", "id": "c1", "is_error": true, "bytes": 1234 }),
+            ),
+            (
+                Event::Usage(usage()),
+                json!({
+                    "type": "usage",
+                    "input": 10,
+                    "output": 5,
+                    "cache_read": 30,
+                    "cache_write": 0,
+                    "cache_hit_rate": 0.75,
+                }),
+            ),
+            (
+                Event::TurnEnd(TurnEndReason::MaxTurns),
+                json!({ "type": "turn_end", "reason": "max_turns" }),
+            ),
+            (
+                Event::RunEnd(TurnEndReason::Cancelled),
+                json!({ "type": "run_end", "reason": "cancelled" }),
+            ),
+            (
+                Event::Error("boom".into()),
+                json!({ "type": "error", "message": "boom" }),
+            ),
+            (
+                Event::Retry {
+                    attempt: 2,
+                    delay_ms: 500,
+                    error: "429".into(),
+                },
+                json!({ "type": "retry", "attempt": 2, "delay_ms": 500, "error": "429" }),
+            ),
+            (
+                Event::PolicyNote("note".into()),
+                json!({ "type": "policy_note", "text": "note" }),
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(line(&event), expected, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn summary_line_has_the_same_keys_and_values() {
+        let mut buf = Vec::new();
+        write_summary(
+            &mut buf,
+            &usage(),
+            7,
+            &TurnEndReason::EndTurn,
+            Some("max_tokens"),
+        );
+        let expected = json!({
+            "type": "summary",
+            "turns": 7,
+            "exit": "end_turn",
+            "input": 10,
+            "output": 5,
+            "cache_read": 30,
+            "cache_write": 0,
+            "cache_hit_rate": 0.75,
+            "stop": "max_tokens",
+        });
+        assert_eq!(parse_line(&buf), expected);
+
+        buf.clear();
+        write_summary(&mut buf, &usage(), 7, &TurnEndReason::EndTurn, None);
+        assert!(parse_line(&buf).get("stop").is_none());
+    }
+
+    #[test]
+    fn a_line_is_one_json_object_and_a_newline() {
+        let mut buf = Vec::new();
+        write_event(&mut buf, &Event::TextDelta("x\ny".into()));
+        write_event(&mut buf, &Event::TurnStart);
+        let text = std::str::from_utf8(&buf).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.ends_with('\n'));
+    }
 }

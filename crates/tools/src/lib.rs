@@ -3,11 +3,13 @@
 use std::path::{Path, PathBuf};
 
 mod atomic;
+mod gitignore;
 mod process_group;
 
 pub mod bash;
 pub mod edit;
 pub mod read;
+pub mod workspace;
 pub mod write;
 
 /// Resolves a tool path: an absolute path as is, a relative one under

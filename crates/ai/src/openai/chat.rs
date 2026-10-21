@@ -213,7 +213,7 @@ impl MessageBody {
             Message::Assistant(assistant) => assistant_message(assistant, provider),
             Message::ToolResult(result) => Some(to_bytes(&ToolOut {
                 role: "tool",
-                tool_call_id: result.call_id.as_str(),
+                tool_call_id: &result.call_id,
                 content: result.content.as_ref(),
             })),
         };
@@ -396,10 +396,10 @@ fn assistant_message(assistant: &AssistantMessage, provider: &str) -> Option<Byt
             }
             Content::RedactedThinking { .. } => {}
             Content::ToolCall(call) => tool_calls.push(ToolCallOut {
-                id: call.id.as_str(),
+                id: &call.id,
                 kind: "function",
                 function: FunctionCallOut {
-                    name: call.name.as_str(),
+                    name: &call.name,
                     arguments: if call.arguments.trim().is_empty() {
                         "{}"
                     } else {

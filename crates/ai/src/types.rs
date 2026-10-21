@@ -51,9 +51,9 @@ pub enum ReasoningLevel {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Provider-assigned call id, echoed back with the result.
-    pub id: String,
+    pub id: Text,
     /// The tool name.
-    pub name: String,
+    pub name: Text,
     /// Raw JSON arguments as the model emitted them.
     pub arguments: Text,
 }
@@ -103,7 +103,7 @@ impl Content {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
     /// The call id this result answers.
-    pub call_id: String,
+    pub call_id: Text,
     /// The text the tool produced.
     pub content: Text,
     /// Whether the tool failed.
@@ -184,11 +184,7 @@ impl Message {
     }
 
     /// Builds the result of one tool call.
-    pub fn tool_result(
-        call_id: impl Into<String>,
-        content: impl Into<Text>,
-        is_error: bool,
-    ) -> Self {
+    pub fn tool_result(call_id: impl Into<Text>, content: impl Into<Text>, is_error: bool) -> Self {
         Message::ToolResult(ToolResult {
             call_id: call_id.into(),
             content: content.into(),

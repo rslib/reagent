@@ -38,6 +38,9 @@ pub struct TurnView<'a> {
     pub assistant: &'a AssistantMessage,
     /// The tool calls the reply made and their result messages, in call order.
     pub tools: &'a [(ToolCall, ToolResult)],
+    /// Whether the turn changed files; `None` when the loop has no workspace
+    /// or a fingerprint failed.
+    pub changed_files: Option<bool>,
 }
 
 /// What a policy wants the loop to do after a turn.
@@ -176,6 +179,7 @@ mod tests {
             ran_tools,
             assistant: assistant_,
             tools,
+            changed_files: None,
         }
     }
 
@@ -491,45 +495,56 @@ mod tests {
         assert!(result.content.starts_with("hi"), "echo output is kept");
     }
 
-    #[tokio::test]
-    async fn the_completion_policy_injects_then_ends_the_run() {
-        // Two end-turn replies. The completion policy turns the first into an
-        // injected checklist and continues; the second stops the run.
-        let provider = FakeProvider::new(vec![text_reply("first"), text_reply("second")]);
-        let registry = registry();
-        let (tx, _rx) = mpsc::channel(64);
-        let mut history = vec![Message::user("hello")];
-        let policies: Vec<Box<dyn TurnPolicy>> =
-            vec![Box::new(crate::policy::completion::Completion::new())];
+    /// A workspace whose fingerprint is 0 on the first call and 1 after.
+    struct ChangesOnSecondCall(std::sync::atomic::AtomicU64);
 
-        Agent::with_policies(
-            &provider,
-            &registry,
-            config(),
-            CancellationToken::new(),
-            policies,
-        )
-        .run(&mut history, None, &tx)
-        .await;
+    impl crate::workspace::Workspace for ChangesOnSecondCall {
+        fn fingerprint(&self) -> BoxFuture<'_, Option<u64>> {
+            let call = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Some(call.min(1)) })
+        }
+    }
 
-        // The first end-turn was not enough: the injected checklist appears as
-        // a user message and a second provider call ran.
-        assert_eq!(provider.seen().len(), 2, "two provider calls");
-        let injected = history.iter().find(|m| matches!(
+    fn note_count(history: &[Message]) -> usize {
+        history.iter().filter(|m| matches!(
             m,
-            Message::User { content } if content.iter().any(|c| matches!(c, Content::Text { text } if text.contains("original task")))
-        ));
-        assert!(
-            injected.is_some(),
-            "the checklist was injected once: {history:?}"
-        );
+            Message::User { content } if content.iter().any(|c| matches!(c, Content::Text { text } if text.starts_with("You changed files")))
+        )).count()
     }
 
     #[tokio::test]
-    async fn the_completion_policy_stops_after_two_end_turns() {
-        // With three end-turns worth of replies, the run still ends after two:
-        // turn 1 injects and continues, turn 2 stops.
-        let provider = FakeProvider::new(vec![text_reply("a"), text_reply("b"), text_reply("c")]);
+    async fn the_completion_policy_injects_once_after_unchecked_changes() {
+        let provider = FakeProvider::new(vec![
+            tool_reply("call_1", r#"{"message":"hi"}"#),
+            text_reply("first"),
+            text_reply("second"),
+            text_reply("third"),
+        ]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+        let policies: Vec<Box<dyn TurnPolicy>> =
+            vec![Box::new(crate::policy::completion::Completion::new())];
+        let workspace = ChangesOnSecondCall(std::sync::atomic::AtomicU64::new(0));
+
+        Agent::with_policies(
+            &provider,
+            &registry,
+            config(),
+            CancellationToken::new(),
+            policies,
+        )
+        .with_workspace(&workspace)
+        .run(&mut history, None, &tx)
+        .await;
+
+        assert_eq!(provider.seen().len(), 3, "the second end-turn ends the run");
+        assert_eq!(note_count(&history), 1, "{history:?}");
+    }
+
+    #[tokio::test]
+    async fn the_completion_policy_is_quiet_when_nothing_changed() {
+        let provider = FakeProvider::new(vec![text_reply("a"), text_reply("b")]);
         let registry = registry();
         let (tx, _rx) = mpsc::channel(64);
         let mut history = vec![Message::user("hello")];
@@ -546,17 +561,8 @@ mod tests {
         .run(&mut history, None, &tx)
         .await;
 
-        // Only two provider calls happen: the third reply is never requested.
-        assert_eq!(
-            provider.seen().len(),
-            2,
-            "the second end-turn stops the run"
-        );
-        let injects = history.iter().filter(|m| matches!(
-            m,
-            Message::User { content } if content.iter().any(|c| matches!(c, Content::Text { text } if text.contains("original task")))
-        )).count();
-        assert_eq!(injects, 1, "the checklist is injected exactly once");
+        assert_eq!(provider.seen().len(), 1);
+        assert_eq!(note_count(&history), 0);
     }
 
     use reagent_ai::StopReason;

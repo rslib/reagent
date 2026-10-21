@@ -116,6 +116,25 @@ impl Registry {
         self.tools.get(name).map(Box::as_ref)
     }
 
+    /// Looks up the tool a model's call means: the exact name, else the one
+    /// name equal after trimming, dropping a leading `functions.` and
+    /// ignoring ASCII case. Open models and their hosts send such names.
+    pub fn resolve(&self, name: &str) -> Option<&dyn Tool> {
+        if let Some(tool) = self.get(name) {
+            return Some(tool);
+        }
+        let trimmed = name.trim();
+        let wanted = trimmed.strip_prefix("functions.").unwrap_or(trimmed);
+        let mut found = self
+            .tools
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(wanted));
+        match (found.next(), found.next()) {
+            (Some((_, tool)), None) => Some(tool.as_ref()),
+            _ => None,
+        }
+    }
+
     /// The number of registered tools.
     pub fn len(&self) -> usize {
         self.tools.len()

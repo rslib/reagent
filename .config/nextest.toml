@@ -1,0 +1,10 @@
+# Docs: https://nexte.st/docs/configuration/
+
+# The budget tests read process-wide CPU and memory counters, so a test running
+# beside another one in this group gives a wrong number.
+[test-groups]
+serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "binary_id(reagent-agent::budget) + binary_id(reagent::footprint)"
+test-group = "serial"

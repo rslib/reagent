@@ -1,29 +1,29 @@
 //! The completion check policy.
 //!
-//! The first time the model ends a turn without calling a tool, it usually
-//! means it thinks the task is done. Small models in particular stop early:
-//! they answer before running the program or checking the tests. This policy
-//! injects a short checklist the first time that happens, and ends the run on
-//! the next end-turn, so a wrong "done" gets one more chance to verify.
-//! When the task is known, the checklist repeats it, so the model checks its
-//! work against the task and not against its own code.
+//! Small models often end a run right after they change files, before they
+//! run the program or the tests. When the model ends a turn without a tool
+//! call and files changed with no check after the last change, this policy
+//! injects a short note once. A run that changed nothing, or checked its
+//! change, ends without a note.
 
 use reagent_ai::Text;
 
 use super::{Decision, TurnPolicy, TurnView};
 
-/// The checklist template, baked in at build time from `prompts/completion.md`.
+/// The note, baked in at build time from `prompts/completion.md`.
 const TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../prompts/completion.md"
 ));
 
-/// Injects the completion checklist once, then stops on the next end-turn.
+/// Injects the check note once, after the model ends with unchecked changes.
 #[derive(Debug)]
 pub struct Completion {
-    /// The checklist message, shared.
+    /// The note message, shared.
     text: Text,
-    /// Whether the checklist has been injected this run.
+    /// Whether files changed with no check after the last change.
+    dirty: bool,
+    /// Whether the note has been injected this run.
     asked: bool,
 }
 
@@ -31,39 +31,37 @@ impl Default for Completion {
     fn default() -> Self {
         Self {
             text: Text::from(TEMPLATE),
+            dirty: false,
             asked: false,
         }
     }
 }
 
 impl Completion {
-    /// A completion policy with the default checklist.
+    /// A completion policy with the default note.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// A completion policy whose checklist repeats `task` above it.
-    pub fn with_task(task: &str) -> Self {
-        Self {
-            text: Text::from(format!("Original task:\n{task}\n\n{TEMPLATE}")),
-            asked: false,
-        }
     }
 }
 
 impl TurnPolicy for Completion {
     fn after_turn(&mut self, turn: &TurnView<'_>) -> Decision {
         if turn.ran_tools {
-            // A tool turn is not an attempted finish; keep going quietly.
+            let ran = |name: &str| turn.tools.iter().any(|(call, _)| &*call.name == name);
+            // A write or edit counts even when the fingerprint saw nothing: the
+            // folder walk skips build and cache folders the model may write to.
+            if turn.changed_files == Some(true) || ran("write") || ran("edit") {
+                self.dirty = true;
+            } else if ran("bash") {
+                self.dirty = false;
+            }
             return Decision::Continue;
         }
-        if self.asked {
-            // A second end-turn after the checklist: the model had its chance.
-            Decision::Stop
-        } else {
+        if self.dirty && !self.asked {
             self.asked = true;
-            Decision::Inject(self.text.clone())
+            return Decision::Inject(self.text.clone());
         }
+        Decision::Continue
     }
 }
 
@@ -76,114 +74,147 @@ mod tests {
     use super::super::{Decision, TurnView};
     use super::*;
 
-    fn assistant() -> AssistantMessage {
-        AssistantMessage::new("fake", "m", vec![Content::text("done")])
+    fn tool_turn(names: &[&str], changed_files: Option<bool>) -> TurnView<'static> {
+        let a: &'static AssistantMessage = Box::leak(Box::new(AssistantMessage::new(
+            "fake",
+            "m",
+            vec![Content::text("working")],
+        )));
+        let tools: Vec<(ToolCall, ToolResult)> = names
+            .iter()
+            .map(|name| {
+                (
+                    ToolCall {
+                        id: "call_1".into(),
+                        name: (*name).into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolResult {
+                        call_id: "call_1".into(),
+                        content: "ok".into(),
+                        is_error: false,
+                    },
+                )
+            })
+            .collect();
+        let tools: &'static [(ToolCall, ToolResult)] = Box::leak(tools.into_boxed_slice());
+        TurnView {
+            index: 1,
+            elapsed: Duration::from_secs(1),
+            ran_tools: true,
+            assistant: a,
+            tools,
+            changed_files,
+        }
     }
 
     fn end_turn() -> TurnView<'static> {
-        let a = assistant();
-        // Leak a fresh assistant so the view outlives the test.
-        let a: &'static AssistantMessage = Box::leak(Box::new(a));
+        let a: &'static AssistantMessage = Box::leak(Box::new(AssistantMessage::new(
+            "fake",
+            "m",
+            vec![Content::text("done")],
+        )));
         TurnView {
             index: 1,
             elapsed: Duration::from_secs(1),
             ran_tools: false,
             assistant: a,
             tools: &[],
+            changed_files: Some(false),
         }
     }
 
     #[test]
-    fn a_tool_turn_never_triggers_the_checklist() {
-        let a = assistant();
-        let a: &'static AssistantMessage = Box::leak(Box::new(a));
-        let tools = [(
-            ToolCall {
-                id: "call_1".into(),
-                name: "read".into(),
-                arguments: "{}".into(),
-            },
-            ToolResult {
-                call_id: "call_1".into(),
-                content: "ok".into(),
-                is_error: false,
-            },
-        )];
-        let view = TurnView {
-            index: 1,
-            elapsed: Duration::from_secs(1),
-            ran_tools: true,
-            assistant: a,
-            tools: &tools,
-        };
+    fn changed_then_end_injects_once() {
         let mut policy = Completion::new();
+        assert_eq!(
+            policy.after_turn(&tool_turn(&["edit"], Some(true))),
+            Decision::Continue
+        );
 
-        assert_eq!(policy.after_turn(&view), Decision::Continue);
-        assert_eq!(policy.after_turn(&view), Decision::Continue);
-    }
-
-    #[test]
-    fn the_first_end_turn_injects_the_checklist() {
-        let mut policy = Completion::new();
-
-        let decision = policy.after_turn(&end_turn());
-
-        match decision {
-            Decision::Inject(text) => {
-                assert!(text.contains("original task"), "{text}");
-                assert!(text.contains("tests pass"), "{text}");
-                assert!(!text.starts_with("Original task:"), "{text}");
-            }
+        match policy.after_turn(&end_turn()) {
+            Decision::Inject(text) => assert_eq!(&*text, TEMPLATE),
             other => panic!("expected an injection, got {other:?}"),
         }
+        assert_eq!(policy.after_turn(&end_turn()), Decision::Continue);
     }
 
     #[test]
-    fn the_second_end_turn_stops_the_run() {
+    fn changed_then_bash_check_then_end_does_not_inject() {
         let mut policy = Completion::new();
-        let _ = policy.after_turn(&end_turn());
+        let _ = policy.after_turn(&tool_turn(&["edit"], Some(true)));
+        let _ = policy.after_turn(&tool_turn(&["bash"], Some(false)));
 
-        assert_eq!(policy.after_turn(&end_turn()), Decision::Stop);
+        assert_eq!(policy.after_turn(&end_turn()), Decision::Continue);
     }
 
     #[test]
-    fn only_one_checklist_is_injected_per_run() {
+    fn nothing_changed_does_not_inject() {
         let mut policy = Completion::new();
-        let injected = matches!(policy.after_turn(&end_turn()), Decision::Inject(_));
+        let _ = policy.after_turn(&tool_turn(&["read"], Some(false)));
 
-        assert!(injected);
-        // Tool turns in between do not add another checklist.
-        let _ = {
-            let a = assistant();
-            let a: &'static AssistantMessage = Box::leak(Box::new(a));
-            let view = TurnView {
-                index: 2,
-                elapsed: Duration::from_secs(2),
-                ran_tools: true,
-                assistant: a,
-                tools: &[],
-            };
-            policy.after_turn(&view)
-        };
-        assert_eq!(policy.after_turn(&end_turn()), Decision::Stop);
+        assert_eq!(policy.after_turn(&end_turn()), Decision::Continue);
     }
 
     #[test]
-    fn the_template_is_baked_in() {
-        assert!(!TEMPLATE.is_empty());
-        assert!(TEMPLATE.contains("graded"));
+    fn once_per_run() {
+        let mut policy = Completion::new();
+        let _ = policy.after_turn(&tool_turn(&["write"], Some(true)));
+        assert!(matches!(
+            policy.after_turn(&end_turn()),
+            Decision::Inject(_)
+        ));
+
+        let _ = policy.after_turn(&tool_turn(&["edit"], Some(true)));
+
+        assert_eq!(policy.after_turn(&end_turn()), Decision::Continue);
     }
 
     #[test]
-    fn with_task_repeats_the_task_above_the_checklist() {
-        let mut policy = Completion::with_task("build the thing");
-        let Decision::Inject(text) = policy.after_turn(&end_turn()) else {
-            panic!("expected the checklist");
-        };
-        assert!(
-            text.starts_with("Original task:\nbuild the thing\n\n"),
-            "{text}"
-        );
-        assert!(text.ends_with(TEMPLATE), "{text}");
+    fn bash_write_counts_as_a_change() {
+        let mut policy = Completion::new();
+        let _ = policy.after_turn(&tool_turn(&["bash"], Some(true)));
+
+        assert!(matches!(
+            policy.after_turn(&end_turn()),
+            Decision::Inject(_)
+        ));
+    }
+
+    #[test]
+    fn a_turn_that_changed_files_and_ran_bash_stays_dirty() {
+        let mut policy = Completion::new();
+        let _ = policy.after_turn(&tool_turn(&["edit", "bash"], Some(true)));
+
+        assert!(matches!(
+            policy.after_turn(&end_turn()),
+            Decision::Inject(_)
+        ));
+    }
+
+    #[test]
+    fn fallback_without_workspace_uses_tool_names() {
+        let mut policy = Completion::new();
+        let _ = policy.after_turn(&tool_turn(&["edit"], None));
+        let _ = policy.after_turn(&tool_turn(&["bash"], None));
+        assert_eq!(policy.after_turn(&end_turn()), Decision::Continue);
+
+        let mut policy = Completion::new();
+        let _ = policy.after_turn(&tool_turn(&["bash"], None));
+        let _ = policy.after_turn(&tool_turn(&["write"], None));
+        assert!(matches!(
+            policy.after_turn(&end_turn()),
+            Decision::Inject(_)
+        ));
+    }
+
+    #[test]
+    fn a_write_the_fingerprint_missed_still_counts() {
+        let mut policy = Completion::new();
+        let _ = policy.after_turn(&tool_turn(&["write"], Some(false)));
+        assert!(matches!(
+            policy.after_turn(&end_turn()),
+            Decision::Inject(_)
+        ));
     }
 }

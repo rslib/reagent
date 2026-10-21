@@ -1,4 +1,5 @@
 //! Killing a whole process group, needed to stop `bash -c` and its children.
+#![allow(unsafe_code)]
 
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
@@ -12,7 +13,7 @@ pub struct GroupGuard {
 }
 
 impl GroupGuard {
-    /// Guards the group led by `pgid`, a child spawned with `process_group(0)`.
+    /// Guards the group led by `pgid`, a child spawned with [`new_session`].
     pub fn new(pgid: i32) -> Self {
         Self { pgid: Some(pgid) }
     }
@@ -41,4 +42,21 @@ impl Drop for GroupGuard {
 #[cfg(test)]
 pub fn alive(pid: i32) -> bool {
     nix::sys::signal::kill(Pid::from_raw(pid), None).is_ok()
+}
+
+/// Starts the command's child in a new session, which also makes it the
+/// leader of a new process group.
+///
+/// A new session has no controlling terminal, so a prompt that opens
+/// /dev/tty (ssh, sudo, git credentials) fails instead of waiting.
+pub fn new_session(command: &mut tokio::process::Command) {
+    // SAFETY: the hook runs in the forked child before exec and calls only
+    // setsid, which is async-signal-safe and allocates nothing.
+    unsafe {
+        command.pre_exec(|| {
+            nix::unistd::setsid()
+                .map(drop)
+                .map_err(std::io::Error::from)
+        });
+    }
 }

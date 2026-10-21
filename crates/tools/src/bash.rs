@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use reagent_agent::tool::{Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
-use crate::process_group::GroupGuard;
+use crate::process_group::{self, GroupGuard};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -32,6 +32,17 @@ const SPILL_CAP: u64 = 64 * 1024 * 1024;
 /// How long to keep reading after the shell ends. A background child that
 /// holds the pipe open would otherwise block the call until it exits.
 const GRACE: Duration = Duration::from_millis(250);
+/// Settings that stop common tools from waiting for a person: pagers,
+/// credential prompts, editors and package-manager dialogs.
+const NON_INTERACTIVE: [(&str, &str); 7] = [
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("MANPAGER", "cat"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GCM_INTERACTIVE", "never"),
+    ("GIT_EDITOR", "true"),
+    ("DEBIAN_FRONTEND", "noninteractive"),
+];
 
 /// Arguments for one `bash` call.
 #[derive(Debug, Deserialize)]
@@ -124,11 +135,12 @@ fn shell(program: &str, working_dir: &Path, command: &str) -> Command {
         .arg("-c")
         .arg(command)
         .current_dir(working_dir)
+        .envs(NON_INTERACTIVE)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
         .kill_on_drop(true);
+    process_group::new_session(&mut shell);
     shell
 }
 
@@ -458,6 +470,32 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let output = run(&tmp, r#"{"command":"[[ 1 == 1 ]] && echo yes"}"#).await;
         assert_eq!(output.content.as_ref(), "yes\nexit code: 0");
+    }
+
+    #[tokio::test]
+    async fn a_command_runs_in_its_own_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        // bash may exec the last command, so the leader is the process or its parent.
+        let output = run(
+            &tmp,
+            r#"{"command":"python3 -c 'import os; print(os.getsid(0) in (os.getpid(), os.getppid()))'"}"#,
+        )
+        .await;
+        assert_eq!(output.content.as_ref(), "True\nexit code: 0");
+    }
+
+    #[tokio::test]
+    async fn non_interactive_variables_are_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = run(
+            &tmp,
+            r#"{"command":"echo $PAGER $GIT_PAGER $MANPAGER $GIT_TERMINAL_PROMPT $GCM_INTERACTIVE $GIT_EDITOR $DEBIAN_FRONTEND"}"#,
+        )
+        .await;
+        assert_eq!(
+            output.content.as_ref(),
+            "cat cat cat 0 never true noninteractive\nexit code: 0"
+        );
     }
 
     #[tokio::test]

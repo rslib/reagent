@@ -69,10 +69,17 @@ impl std::fmt::Debug for ExtraHeaders {
     }
 }
 
+/// reqwest is built without a crypto provider, so ring must be the process
+/// default before a client is built. A second install is a no-op error.
+fn install_ring() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Builds the client with the system root certificates, or with Mozilla's
 /// bundled roots when the system has none. Minimal task containers often ship
 /// without `ca-certificates`, and reqwest's default builder panics there.
 pub(crate) fn client() -> reqwest::Client {
+    install_ring();
     match reqwest::Client::builder().build() {
         Ok(client) => client,
         Err(_) => bundled_client(),
@@ -80,6 +87,7 @@ pub(crate) fn client() -> reqwest::Client {
 }
 
 fn bundled_client() -> reqwest::Client {
+    install_ring();
     let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
         .iter()
         .filter_map(|der| reqwest::Certificate::from_der(der).ok());
@@ -116,7 +124,7 @@ mod tests {
         assert!(!text.contains("injected"), "{text}");
 
         let request = headers
-            .apply(reqwest::Client::new().post("http://example.invalid"))
+            .apply(client().post("http://example.invalid"))
             .build()
             .expect("build the request");
         assert_eq!(

@@ -25,12 +25,14 @@ pub async fn run_all<'a>(
     // An unknown tool is not read-only, so it forces reply order.
     let parallel = calls
         .iter()
-        .all(|call| registry.get(&call.name).is_some_and(Tool::read_only));
+        .all(|call| registry.resolve(&call.name).is_some_and(Tool::read_only));
 
-    let outputs: Vec<Option<ToolOutput>> = if parallel {
+    let outputs: Vec<Option<ToolOutput>> = if let [call] = calls {
+        vec![run_one(registry, call, token).await]
+    } else if parallel {
         let futures: Vec<BoxFuture<'a, Option<ToolOutput>>> = calls
             .iter()
-            .map(|call| run_one(registry.get(&call.name), call.arguments.as_ref(), token))
+            .map(|call| run_one(registry, call, token))
             .collect();
         futures_util::future::join_all(futures).await
     } else {
@@ -39,7 +41,7 @@ pub async fn run_all<'a>(
             if token.is_cancelled() {
                 break;
             }
-            outputs.push(run_one(registry.get(&call.name), call.arguments.as_ref(), token).await);
+            outputs.push(run_one(registry, call, token).await);
         }
         while outputs.len() < calls.len() {
             outputs.push(None);
@@ -59,18 +61,22 @@ pub async fn run_all<'a>(
 
 /// Runs one call, giving up with `None` when the token fires.
 fn run_one<'a>(
-    tool: Option<&'a dyn Tool>,
-    args: &'a str,
+    registry: &'a Registry,
+    call: &'a ToolCall,
     token: &'a CancellationToken,
 ) -> BoxFuture<'a, Option<ToolOutput>> {
-    match tool {
+    match registry.resolve(&call.name) {
         Some(tool) => Box::pin(async move {
             tokio::select! {
-                output = tool.run(args, token) => Some(output),
+                output = tool.run(call.arguments.as_ref(), token) => Some(output),
                 () = token.cancelled() => None,
             }
         }),
-        None => Box::pin(async { Some(ToolOutput::error("unknown tool")) }),
+        None => {
+            let names = registry.names().collect::<Vec<_>>().join(", ");
+            let error = format!("unknown tool `{}`; the tools are: {names}", call.name);
+            Box::pin(async move { Some(ToolOutput::error(error)) })
+        }
     }
 }
 
@@ -162,6 +168,39 @@ mod tests {
             panic!("expected a tool result");
         };
         result.content.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_near_miss_name_runs_the_tool() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::new();
+        add_tool(&mut registry, "bash", false, 0, &log);
+        add_tool(&mut registry, "read", true, 0, &log);
+        let calls = vec![call("c1", "Bash"), call("c2", " functions.read ")];
+
+        let results = run_all(&calls, &registry, &CancellationToken::new()).await;
+
+        assert_eq!(content_of(&results[0]), "bash");
+        assert_eq!(content_of(&results[1]), "read");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_tool_error_lists_the_tools() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::new();
+        add_tool(&mut registry, "bash", false, 0, &log);
+        add_tool(&mut registry, "read", true, 0, &log);
+
+        let results = run_all(&[call("c1", "shell")], &registry, &CancellationToken::new()).await;
+
+        let Message::ToolResult(result) = &results[0] else {
+            panic!("expected a tool result");
+        };
+        assert!(result.is_error);
+        assert_eq!(
+            result.content.as_ref(),
+            "unknown tool `shell`; the tools are: bash, read"
+        );
     }
 
     #[tokio::test(start_paused = true)]

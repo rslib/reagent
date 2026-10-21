@@ -49,6 +49,8 @@ pub enum Event {
         id: Text,
         /// Whether the tool reported an error.
         is_error: bool,
+        /// The UTF-8 length of the output text the model receives.
+        bytes: usize,
     },
     /// Running token counts for this turn.
     Usage(Usage),
