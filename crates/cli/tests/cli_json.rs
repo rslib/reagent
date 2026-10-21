@@ -16,6 +16,8 @@ const FAKE_KEY: &str = "sk-ant-test-sentinel-1234567890abcdef";
 
 async fn run(tmp: &Path, args: &[&str]) -> std::process::Output {
     Command::new(BIN)
+        // The user's real config must not change the test.
+        .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
         .args(args)
         .current_dir(tmp)
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
@@ -335,6 +337,8 @@ async fn cli_json_a_transport_error_never_prints_the_api_key() {
     // fails, and neither the retry lines nor stderr may hold the key. The
     // deadline ends the run during the retry backoff, which lasts minutes.
     let output = Command::new(BIN)
+        // The user's real config must not change the test.
+        .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
         .args(["--json", "-p", "hi", "--deadline", "3"])
         .current_dir(tmp.path())
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
@@ -412,4 +416,58 @@ async fn cli_json_prints_a_compacted_line() {
     assert_eq!(compacted[0]["before"], 150000);
     assert!(compacted[0]["replaced"].as_u64().is_some_and(|n| n > 0));
     assert!(compacted[0]["bytes"].as_u64().is_some_and(|n| n > 0));
+}
+
+#[tokio::test]
+async fn cli_json_a_denied_call_names_the_rule() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let work = tempfile::tempdir().expect("work dir");
+    let config = tmp.path().join("xdg/reagent");
+    tokio::fs::create_dir_all(&config)
+        .await
+        .expect("config dir");
+    tokio::fs::write(
+        config.join("config.toml"),
+        "[permissions]\ndeny = [\"Bash(git push:*)\"]\n",
+    )
+    .await
+    .expect("write config");
+    let script = tmp.path().join("script.json");
+    tokio::fs::write(
+        &script,
+        r#"{"replies": [{"text": "pushing", "calls": [
+            {"name": "bash", "arguments": {"command": "echo hi > ran.txt; git push"}}
+        ]}, {"text": "done"}]}"#,
+    )
+    .await
+    .expect("write script");
+
+    let output = Command::new(BIN)
+        .args(["--json", "--cwd"])
+        .arg(work.path())
+        .arg("--provider")
+        .arg(format!("fake:{}", script.display()))
+        .args(["-p", "hi"])
+        .current_dir(tmp.path())
+        .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
+        .env("ANTHROPIC_API_KEY", FAKE_KEY)
+        .output()
+        .await
+        .expect("the binary runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = json_lines(&output.stdout);
+    let result = lines
+        .iter()
+        .find(|line| line["type"] == "tool_result")
+        .expect("a tool result");
+    assert_eq!(result["is_error"], true, "{result:?}");
+    assert!(
+        !work.path().join("ran.txt").exists(),
+        "no part of a denied command runs"
+    );
+    assert!(lines.iter().any(|line| line["type"] == "run_end"));
 }

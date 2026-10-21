@@ -2,6 +2,7 @@
 //! call id, and the archive keeps the output for `expand`.
 
 use reagent_ai::{Message, Text, ToolResult};
+use reagent_util::decimal;
 
 use crate::archive::Archive;
 
@@ -15,9 +16,9 @@ const STUB: &str = include_str!(concat!(
 /// The stub for call `id`, the same bytes each time so the cache holds.
 /// It is assembled on the stack, so the only allocation is the `Text`.
 fn stub(id: Option<u32>) -> Text {
-    let mut digits = [0_u8; 10];
+    let mut digits = [0_u8; 20];
     let id = match id {
-        Some(id) => decimal(id, &mut digits),
+        Some(id) => decimal::write(u64::from(id), &mut digits),
         None => "?",
     };
     let mut buf = [0_u8; 256];
@@ -33,20 +34,6 @@ fn stub(id: Option<u32>) -> Text {
         }
     }
     Text::from(std::str::from_utf8(&buf[..len]).unwrap_or("?"))
-}
-
-/// The decimal digits of `n`, written into `buf`.
-fn decimal(mut n: u32, buf: &mut [u8; 10]) -> &str {
-    let mut at = buf.len();
-    loop {
-        at -= 1;
-        buf[at] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
-    }
-    std::str::from_utf8(&buf[at..]).unwrap_or("?")
 }
 
 /// Whether `text` is a stub this module wrote.

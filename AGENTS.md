@@ -40,9 +40,11 @@ A feature that does not move 1 or 2 in a measured run does not ship as a default
 
 | Area | Crate | Contents |
 |---|---|---|
+| Small helpers with no domain types: text cuts, number writing, path normalizing, borrowed JSON reading | `crates/util` (`reagent-util`) | no other reagent crate |
+| Config files, providers and models, permission rules and their shell lexer and glob | `crates/config` (`reagent-config`) | depends on util |
 | Message types, providers, SSE, `FakeProvider` | `crates/ai` (`reagent-ai`) | no other reagent crate |
-| Loop, events, session, context policy, `Tool` trait | `crates/agent` (`reagent-agent`) | depends on ai |
-| Native tools | `crates/tools` (`reagent-tools`) | depends on agent |
+| Loop, events, session, context policy, `Tool` trait, the permission guard | `crates/agent` (`reagent-agent`) | depends on ai, config and util |
+| Native tools | `crates/tools` (`reagent-tools`) | depends on agent, config and util |
 | QuickJS plugins and `execute(code)` | `crates/script` (`reagent-script`) | depends on agent |
 | MCP client | `crates/mcp` (`reagent-mcp`) | depends on agent |
 | Terminal UI and markdown | `crates/tui` (`reagent-tui`) | depends on agent |
@@ -50,7 +52,7 @@ A feature that does not move 1 or 2 in a measured run does not ship as a default
 | Model-facing prompt templates | none: `prompts/` at the root | baked into `crates/agent` and `crates/cli` with `include_str!` |
 | Harbor adapter | `bench/harbor` | Python, run with `uv` |
 
-Links point down this table only. Do not add a crate, and do not add a `common` or `utils` crate. Shared types go in `crates/ai`. Update this section in the change that moves an area.
+Links point down this table only. Do not add a crate without updating this table. `crates/util` holds only small helpers that two or more crates use and that carry no domain types; anything with a domain meaning goes in the crate that owns that domain, and shared message types go in `crates/ai`. Update this section in the change that moves an area.
 
 Design decisions and their reasons: `docs/plans/architecture.md` (local only, ignored by git).
 

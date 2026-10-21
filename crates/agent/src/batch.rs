@@ -4,6 +4,7 @@ use futures_util::future::BoxFuture;
 
 use reagent_ai::{Message, ToolCall};
 
+use crate::guard::Guard;
 use crate::tool::{Registry, Tool, ToolOutput};
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +20,17 @@ pub async fn run_all<'a>(
     registry: &'a Registry,
     token: &'a CancellationToken,
 ) -> Vec<Message> {
+    run_all_guarded(calls, registry, None, token).await
+}
+
+/// [`run_all`] with each call first checked by `guard`; a refused call gets
+/// the guard's error as its result and does not run.
+pub async fn run_all_guarded<'a>(
+    calls: &'a [ToolCall],
+    registry: &'a Registry,
+    guard: Option<&'a Guard>,
+    token: &'a CancellationToken,
+) -> Vec<Message> {
     if token.is_cancelled() {
         return calls.iter().map(cancelled_message).collect();
     }
@@ -28,11 +40,11 @@ pub async fn run_all<'a>(
         .all(|call| registry.resolve(&call.name).is_some_and(Tool::read_only));
 
     let outputs: Vec<Option<ToolOutput>> = if let [call] = calls {
-        vec![run_one(registry, call, token).await]
+        vec![run_one(registry, guard, call, token).await]
     } else if parallel {
         let futures: Vec<BoxFuture<'a, Option<ToolOutput>>> = calls
             .iter()
-            .map(|call| run_one(registry, call, token))
+            .map(|call| run_one(registry, guard, call, token))
             .collect();
         futures_util::future::join_all(futures).await
     } else {
@@ -41,7 +53,7 @@ pub async fn run_all<'a>(
             if token.is_cancelled() {
                 break;
             }
-            outputs.push(run_one(registry, call, token).await);
+            outputs.push(run_one(registry, guard, call, token).await);
         }
         while outputs.len() < calls.len() {
             outputs.push(None);
@@ -62,11 +74,17 @@ pub async fn run_all<'a>(
 /// Runs one call, giving up with `None` when the token fires.
 fn run_one<'a>(
     registry: &'a Registry,
+    guard: Option<&'a Guard>,
     call: &'a ToolCall,
     token: &'a CancellationToken,
 ) -> BoxFuture<'a, Option<ToolOutput>> {
     match registry.resolve(&call.name) {
         Some(tool) => Box::pin(async move {
+            if let Some(refused) =
+                guard.and_then(|guard| guard.check(tool, &call.name, call.arguments.as_ref()))
+            {
+                return Some(refused);
+            }
             tokio::select! {
                 output = tool.run(call.arguments.as_ref(), token) => Some(output),
                 () = token.cancelled() => None,

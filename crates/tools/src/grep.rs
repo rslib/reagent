@@ -15,12 +15,13 @@ use serde::Deserialize;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
+use reagent_util::{decimal, text};
 
 use crate::gitignore::wildmatch;
 use crate::resolve;
-use crate::walk::{File, MAX_FILES, walk};
+use crate::walk::{File, MAX_FILES, Skip, walk};
 
 /// Files per blocking task.
 const BATCH: usize = 64;
@@ -55,6 +56,7 @@ pub struct Args<'a> {
 pub struct Grep {
     spec: ToolSpec,
     working_dir: PathBuf,
+    skip: Skip,
 }
 
 impl Grep {
@@ -63,7 +65,15 @@ impl Grep {
         Self {
             spec: spec(),
             working_dir: working_dir.into(),
+            skip: Skip::default(),
         }
+    }
+
+    /// Also skips folders with these names, on top of the built-in list.
+    #[must_use]
+    pub fn with_skip(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.skip = Skip::new(names);
+        self
     }
 
     async fn run_inner(&self, args: &Args<'_>, cancel: &CancellationToken) -> ToolOutput {
@@ -93,7 +103,7 @@ impl Grep {
             let rel = args.path.as_deref().unwrap_or_default().to_string();
             vec![File { rel, path: root }]
         } else {
-            let Ok(listing) = walk(&root, cancel).await else {
+            let Ok(listing) = walk(&root, &self.skip, cancel).await else {
                 return ToolOutput::error("cancelled");
             };
             truncated = listing.truncated;
@@ -118,6 +128,27 @@ impl Grep {
 impl Tool for Grep {
     fn spec(&self) -> &ToolSpec {
         &self.spec
+    }
+
+    fn main_arg(&self) -> Option<&'static str> {
+        Some("path")
+    }
+
+    fn effects(&self, args: &str) -> Effects {
+        let Ok(arguments) = parse_args::<Args<'_>>(args) else {
+            return Effects::default();
+        };
+        let path = match arguments.path.as_deref() {
+            Some(path) => match resolve(&self.working_dir, path) {
+                Ok(path) => path,
+                Err(_) => return Effects::default(),
+            },
+            None => self.working_dir.clone(),
+        };
+        Effects {
+            reads: vec![path],
+            ..Effects::default()
+        }
     }
 
     fn read_only(&self) -> bool {
@@ -270,9 +301,10 @@ fn search_text(prefix: Option<&str>, rel: &str, bytes: &[u8], matcher: &Matcher,
                 }
                 hits.text.push_str(rel);
                 hits.text.push(':');
-                hits.text.push_str(itoa(number, &mut [0; 20]));
+                hits.text
+                    .push_str(decimal::write(number as u64, &mut [0; 20]));
                 hits.text.push(':');
-                hits.text.push_str(cut(line));
+                hits.text.push_str(text::head(line, LINE_CAP));
                 hits.text.push('\n');
             }
             hits.count += 1;
@@ -281,32 +313,6 @@ fn search_text(prefix: Option<&str>, rel: &str, bytes: &[u8], matcher: &Matcher,
             }
         }
     }
-}
-
-/// The text cut to `LINE_CAP` bytes on a char boundary.
-fn cut(text: &str) -> &str {
-    if text.len() <= LINE_CAP {
-        return text;
-    }
-    let mut end = LINE_CAP;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-
-/// The decimal digits of `n`, written into `buf`.
-fn itoa(mut n: usize, buf: &mut [u8; 20]) -> &str {
-    let mut at = buf.len();
-    loop {
-        at -= 1;
-        buf[at] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
-    }
-    std::str::from_utf8(&buf[at..]).unwrap_or("0")
 }
 
 fn render(hits: &[Hits], truncated: bool) -> String {
@@ -852,5 +858,23 @@ mod tests {
             .await;
         assert!(output.is_error);
         assert_eq!(output.content.as_ref(), "cancelled");
+    }
+
+    #[test]
+    fn grep_effects_default_to_the_working_dir() {
+        let grep = Grep::new("/work");
+        assert_eq!(grep.main_arg(), Some("path"));
+        assert_eq!(
+            grep.effects(r#"{"pattern":"x"}"#).reads,
+            vec![PathBuf::from("/work")]
+        );
+        let effects = grep.effects(r#"{"pattern":"x","path":"src"}"#);
+        assert_eq!(effects.reads, vec![PathBuf::from("/work/src")]);
+        assert!(effects.writes.is_empty());
+    }
+
+    #[test]
+    fn grep_bad_args_have_no_effects() {
+        assert_eq!(Grep::new("/work").effects("nope"), Effects::default());
     }
 }

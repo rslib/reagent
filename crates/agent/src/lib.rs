@@ -6,6 +6,7 @@ pub mod batch;
 pub mod checkpoint;
 pub mod compact;
 pub mod event;
+pub mod guard;
 pub mod mask;
 pub mod policy;
 pub mod repair;

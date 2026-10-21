@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 
 use reagent_ai::{Content, Message, Text, ToolCall};
+use reagent_util::text;
 
 use crate::archive::Archive;
 
@@ -72,7 +73,7 @@ pub fn build(number: u32, messages: &[Message], archive: &Archive) -> Checkpoint
                 for block in &reply.content {
                     match block {
                         Content::Text { text: body } => {
-                            let _ = write!(text, "\nAssistant: {}", cut_head(body, TEXT_BYTES));
+                            let _ = write!(text, "\nAssistant: {}", text::head(body, TEXT_BYTES));
                             if body.len() > TEXT_BYTES {
                                 text.push_str(" [cut]");
                             }
@@ -146,7 +147,7 @@ fn id_label(archive: &Archive, call: &ToolCall) -> String {
 }
 
 fn short_args(call: &ToolCall) -> String {
-    cut_head(&call.arguments, ARGS_BYTES).replace('\n', " ")
+    text::head(&call.arguments, ARGS_BYTES).replace('\n', " ")
 }
 
 /// The status of a call, its original output size and its result text, when it has a result.
@@ -233,21 +234,7 @@ fn tail(output: &str) -> &str {
             }
         }
     }
-    let output = output[start..].trim_end_matches('\n');
-    let mut start = output.len().saturating_sub(FAILURE_BYTES);
-    while !output.is_char_boundary(start) {
-        start += 1;
-    }
-    &output[start..]
-}
-
-/// The first `max` bytes of `text`, ended on a char boundary.
-fn cut_head(text: &str, max: usize) -> &str {
-    let mut end = max.min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
+    text::tail(output[start..].trim_end_matches('\n'), FAILURE_BYTES)
 }
 
 #[cfg(test)]

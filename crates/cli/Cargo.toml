@@ -26,9 +26,13 @@ tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 tempfile = { version = "3.27.0", default-features = false, optional = true }
+reagent-config.workspace = true
+reagent-util.workspace = true
+birdcage = "0.8"
 
 [dev-dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["resource"] }
+tempfile = { version = "3.27.0", default-features = false }
 tokio = { version = "1.53.3", default-features = false, features = ["rt", "macros", "process", "io-std", "io-util", "time", "sync"] }
 
 [lints]

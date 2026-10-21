@@ -13,6 +13,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use reagent_ai::{Text, ToolSpec};
+use reagent_util::text;
 
 use crate::tool::{Tool, ToolOutput, parse_args};
 
@@ -275,20 +276,10 @@ fn capped(output: &Text) -> Text {
     if output.len() <= 2 * CAP {
         return Text::clone(output);
     }
-    let mut head = CAP;
-    while !output.is_char_boundary(head) {
-        head -= 1;
-    }
-    let mut tail = output.len() - CAP;
-    while !output.is_char_boundary(tail) {
-        tail += 1;
-    }
-    let cut = tail - head;
-    Text::from(format!(
-        "{}\n[{cut} bytes cut]\n{}",
-        &output[..head],
-        &output[tail..]
-    ))
+    let head = text::head(output, CAP);
+    let tail = text::tail(output, CAP);
+    let cut = output.len() - head.len() - tail.len();
+    Text::from(format!("{head}\n[{cut} bytes cut]\n{tail}"))
 }
 
 /// The `expand` tool spec.
@@ -423,5 +414,15 @@ mod tests {
         let output = expand(&archive, r#"{"id": 1}"#).await;
         assert!(output.is_error);
         assert!(output.content.contains("still in the context"));
+    }
+
+    #[test]
+    fn expand_has_no_main_arg() {
+        let expand = Expand::new(Archive::new());
+        assert_eq!(expand.main_arg(), None);
+        assert_eq!(
+            expand.effects(r#"{"id":1}"#),
+            crate::tool::Effects::default()
+        );
     }
 }

@@ -80,7 +80,10 @@ fn install_ring() {
 /// without `ca-certificates`, and reqwest's default builder panics there.
 pub(crate) fn client() -> reqwest::Client {
     install_ring();
-    match reqwest::Client::builder().build() {
+    match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
         Ok(client) => client,
         Err(_) => bundled_client(),
     }
@@ -92,6 +95,7 @@ fn bundled_client() -> reqwest::Client {
         .iter()
         .filter_map(|der| reqwest::Certificate::from_der(der).ok());
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .tls_certs_only(roots)
         .build()
         .expect("the bundled root certificates build a client")

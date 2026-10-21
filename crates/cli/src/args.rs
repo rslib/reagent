@@ -1,6 +1,9 @@
 //! Command line argument parsing with `lexopt`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use reagent_config::permissions::Rules;
+use reagent_config::{Layer, Model, Provider, Secret, Settings};
 
 /// The default model for headless runs.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5-5";
@@ -92,6 +95,10 @@ pub struct Args {
     /// The name of the environment variable holding the API key, or the
     /// provider default when absent.
     pub api_key_env: Option<String>,
+    /// The API key from the provider table of the config, if any.
+    pub api_key: Option<Secret>,
+    /// The config or built-in provider name from `--model name/id`, if any.
+    pub provider_name: Option<String>,
     /// Extra request headers from `--header`, in order.
     pub header: Vec<(String, String)>,
     /// The cap on reply tokens, thinking included.
@@ -102,6 +109,86 @@ pub struct Args {
     pub cwd: PathBuf,
     /// The loop policies to enable, expanded and de-duplicated.
     pub policy: Vec<String>,
+    /// Folder names from the config that searches leave out.
+    pub skip: Vec<String>,
+    /// The permission rules of the config files.
+    pub rules: Rules,
+    /// The context window of the model in tokens, from its config table.
+    pub context_window: Option<u64>,
+    /// How bash commands are fenced in.
+    pub sandbox: SandboxMode,
+    /// Whether sandboxed commands may use the network.
+    pub network: bool,
+    /// Folders sandboxed commands may write, besides the working and temp
+    /// folders.
+    pub write: Vec<PathBuf>,
+}
+
+/// One provider the `models` command lists.
+#[derive(Debug)]
+pub struct Target {
+    /// The provider name, as in `--model name/id`.
+    pub name: String,
+    /// The provider wire.
+    pub wire: Wire,
+    /// The endpoint URL, or the wire default when absent.
+    pub base_url: Option<String>,
+    /// The environment variable holding the API key, or the wire default.
+    pub api_key_env: Option<String>,
+    /// The API key from the provider table of the config, if any.
+    pub api_key: Option<Secret>,
+    /// Extra request headers from the provider table.
+    pub header: Vec<(String, String)>,
+    /// A built-in provider with no config table, listed with no name only when
+    /// it has a key.
+    pub implicit: bool,
+}
+
+/// The `models` command.
+#[derive(Debug)]
+pub struct ModelsArgs {
+    /// The providers to list.
+    pub targets: Vec<Target>,
+    /// Fetch even when the cache is fresh.
+    pub refresh: bool,
+}
+
+/// The `sandbox.mode` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    /// Run bash directly.
+    Off,
+    /// Sandbox bash when the sandbox can start, else run it directly.
+    Auto,
+    /// Sandbox bash or refuse to run it.
+    On,
+}
+
+/// Reads the sandbox settings, expanding a leading `~/` in the write folders
+/// with `home`.
+fn resolve_sandbox(
+    sandbox: &reagent_config::Sandbox,
+    home: Option<&Path>,
+) -> Result<(SandboxMode, bool, Vec<PathBuf>), String> {
+    let mode = match sandbox.mode.as_deref() {
+        None | Some("off") => SandboxMode::Off,
+        Some("auto") => SandboxMode::Auto,
+        Some("on") => SandboxMode::On,
+        Some(other) => {
+            return Err(format!(
+                "config: sandbox.mode must be off, auto or on, not \"{other}\""
+            ));
+        }
+    };
+    let write = sandbox
+        .write
+        .iter()
+        .map(|dir| match (dir.strip_prefix("~/"), home) {
+            (Some(rest), Some(home)) => home.join(rest),
+            _ => PathBuf::from(dir),
+        })
+        .collect();
+    Ok((mode, sandbox.network.unwrap_or(false), write))
 }
 
 /// Where the task text comes from.
@@ -118,6 +205,8 @@ pub enum TaskSource {
 pub enum Outcome {
     /// Run the agent with these arguments.
     Run(Box<Args>),
+    /// List the models of the providers.
+    Models(Box<ModelsArgs>),
     /// Print the help text and exit cleanly.
     Help,
     /// Print the version and exit cleanly.
@@ -145,7 +234,10 @@ fn usage() -> &'static str {
         "      --policy <list>  loop policies: completion, stuck, budget, snapshot, mask, compact;\n",
         "                       all = completion, budget, snapshot; none = off\n",
         "                       (default: budget, plus mask on openai-chat)\n",
-        "      --version        print the version and exit\n"
+        "      --version        print the version and exit\n",
+        "\n",
+        "Commands:\n",
+        "  models [name] [--refresh]  list the models of a provider, or of all with a key\n"
     )
 }
 
@@ -211,7 +303,7 @@ fn parse_header(text: &str) -> Result<(String, String), String> {
 /// policy names. `all` expands to [`ALL_POLICIES`] and `none`, valid only
 /// alone, to no policy. An unknown name is an error, which the binary reports
 /// by exiting 2.
-fn parse_policy(value: &str) -> Result<Vec<String>, String> {
+pub fn parse_policy(value: &str) -> Result<Vec<String>, String> {
     if value.trim() == "none" {
         return Ok(Vec::new());
     }
@@ -231,24 +323,144 @@ fn parse_policy(value: &str) -> Result<Vec<String>, String> {
 
 /// Parses the process arguments, or returns an exit decision.
 pub fn parse() -> Result<Outcome, String> {
-    parse_from(lexopt::Parser::from_env())
+    parse_from(lexopt::Parser::from_env(), &load_settings)
 }
 
+/// Replaces the policy names of `layer` with their expanded form, naming the
+/// file when one is wrong.
+fn expand_policies(layer: &mut Layer) -> Result<(), String> {
+    let path = layer.path.display().to_string();
+    let expand = |names: &mut Option<Vec<String>>| -> Result<(), String> {
+        if let Some(list) = names {
+            *list = parse_policy(&list.join(",")).map_err(|error| format!("{path}: {error}"))?;
+        }
+        Ok(())
+    };
+    expand(&mut layer.settings.policy)?;
+    for provider in layer.settings.providers.values_mut() {
+        for model in provider.models.values_mut() {
+            expand(&mut model.policy)?;
+        }
+    }
+    Ok(())
+}
+
+/// Loads the config files for `cwd`, checks their policy names and merges
+/// them, and parses their permission rules.
+fn load_settings(cwd: &Path) -> Result<(Settings, Rules), String> {
+    settings_from(reagent_config::load_for(cwd)?, cwd)
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the config is read before the runtime starts"
+)]
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn settings_from(mut layers: Vec<Layer>, cwd: &Path) -> Result<(Settings, Rules), String> {
+    for layer in &mut layers {
+        expand_policies(layer)?;
+    }
+    // The tools resolve paths from the real folder, so the rules must too,
+    // or a symlinked --cwd would make every relative path rule miss.
+    let cwd = canonical(cwd);
+    let home = std::env::var_os("HOME").map(|home| canonical(Path::new(&home)));
+    let rules = Rules::from_layers(&layers, &cwd, home.as_deref())?;
+    Ok((reagent_config::merge(&layers), rules))
+}
+
+/// The provider a name selects when no config table defines it.
+fn built_in_provider(name: &str) -> Option<(Wire, &'static str)> {
+    match name {
+        "anthropic" => Some((Wire::Anthropic, "ANTHROPIC_API_KEY")),
+        "openai" => Some((Wire::OpenAiResponses, "OPENAI_API_KEY")),
+        _ => None,
+    }
+}
+
+/// Splits the model text at its first `/` when the part before it names a
+/// built-in or configured provider.
+fn split_model<'a>(text: &'a str, settings: &Settings) -> Option<(&'a str, &'a str)> {
+    let (name, id) = text.split_once('/')?;
+    (settings.providers.contains_key(name) || built_in_provider(name).is_some())
+        .then_some((name, id))
+}
+
+/// The providers `models` lists: the one `name` selects, else every config
+/// table and every built-in provider.
+fn model_targets(settings: &Settings, name: Option<&str>) -> Result<Vec<Target>, String> {
+    let mut names: Vec<&str> = settings.providers.keys().map(String::as_str).collect();
+    for built_in in ["anthropic", "openai"] {
+        if !names.contains(&built_in) {
+            names.push(built_in);
+        }
+    }
+    if let Some(name) = name {
+        let Some(chosen) = names.iter().copied().find(|known| *known == name) else {
+            return Err(format!("unknown provider: {name}"));
+        };
+        names = vec![chosen];
+    }
+    let name_given = name;
+    names
+        .into_iter()
+        .map(|name| {
+            let table = settings.providers.get(name).cloned().unwrap_or_default();
+            let built_in = built_in_provider(name);
+            let wire = match (&table.wire, &built_in) {
+                (Some(wire), _) => {
+                    parse_provider(wire).map_err(|error| format!("config: {error}"))?
+                }
+                (None, Some((wire, _))) => wire.clone(),
+                (None, None) => Wire::Anthropic,
+            };
+            let mut header = Vec::new();
+            for (key, value) in &table.headers {
+                reagent_ai::check_header(key, value).map_err(|error| format!("config: {error}"))?;
+                header.push((key.clone(), value.clone()));
+            }
+            Ok(Target {
+                name: name.to_string(),
+                wire,
+                base_url: table.base_url,
+                api_key_env: table
+                    .api_key_env
+                    .or_else(|| built_in.map(|(_, key)| key.to_string())),
+                api_key: table.api_key,
+                header,
+                implicit: name_given.is_none() && !settings.providers.contains_key(name),
+            })
+        })
+        .collect()
+}
+
+/// Reads the merged settings and the permission rules for a working folder.
+type LoadSettings<'a> = dyn Fn(&Path) -> Result<(Settings, Rules), String> + 'a;
+
 /// Parses `args` (the arguments after the program name) into an outcome.
-fn parse_from(mut parser: lexopt::Parser) -> Result<Outcome, String> {
+/// `load` reads the settings for the working directory; a flag beats them.
+fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome, String> {
     let mut task: Option<TaskSource> = None;
     let mut json = false;
     let mut model = None;
-    let mut provider = Wire::Anthropic;
+    let mut provider = None;
     let mut base_url = None;
     let mut api_key_env = None;
     let mut header = Vec::new();
-    let mut max_tokens = DEFAULT_MAX_TOKENS;
+    let mut max_tokens = None;
     let mut deadline = None;
     let mut cwd = None;
     let mut policy: Option<Vec<String>> = None;
+    let mut models: Option<Option<String>> = None;
+    let mut refresh = false;
+    let mut first = true;
 
     while let Some(arg) = parser.next().map_err(|error| error.to_string())? {
+        let at_start = std::mem::take(&mut first);
         match arg {
             lexopt::Arg::Short('p') | lexopt::Arg::Long("print") => {
                 let value = parser
@@ -277,7 +489,7 @@ fn parse_from(mut parser: lexopt::Parser) -> Result<Outcome, String> {
                     .value()
                     .map_err(|_| "missing value for --provider".to_string())?;
                 let text = value.into_string().map_err(|_| bad("--provider"))?;
-                provider = parse_provider(&text)?;
+                provider = Some(parse_provider(&text)?);
             }
             lexopt::Arg::Long("base-url") => {
                 let value = parser
@@ -303,11 +515,12 @@ fn parse_from(mut parser: lexopt::Parser) -> Result<Outcome, String> {
                     .value()
                     .map_err(|_| "missing value for --max-tokens".to_string())?;
                 let text = value.into_string().map_err(|_| bad("--max-tokens"))?;
-                max_tokens = text
-                    .parse()
-                    .ok()
-                    .filter(|cap| *cap > 0)
-                    .ok_or_else(|| bad("--max-tokens"))?;
+                max_tokens = Some(
+                    text.parse()
+                        .ok()
+                        .filter(|cap| *cap > 0)
+                        .ok_or_else(|| bad("--max-tokens"))?,
+                );
             }
             lexopt::Arg::Long("deadline") => {
                 let value = parser
@@ -332,6 +545,15 @@ fn parse_from(mut parser: lexopt::Parser) -> Result<Outcome, String> {
                     .map_err(|_| "missing value for --cwd".to_string())?;
                 cwd = Some(PathBuf::from(value));
             }
+            lexopt::Arg::Long("refresh") => refresh = true,
+            lexopt::Arg::Value(value) if models.is_some() || (at_start && value == "models") => {
+                let text = value.into_string().map_err(|_| bad("argument"))?;
+                match &mut models {
+                    None => models = Some(None),
+                    Some(name @ None) => *name = Some(text),
+                    Some(Some(_)) => return Err(format!("unexpected argument: {text}")),
+                }
+            }
             lexopt::Arg::Long("help") => return Ok(Outcome::Help),
             lexopt::Arg::Short('h') => return Ok(Outcome::Help),
             lexopt::Arg::Long("version") => return Ok(Outcome::Version),
@@ -339,20 +561,75 @@ fn parse_from(mut parser: lexopt::Parser) -> Result<Outcome, String> {
         }
     }
 
+    if let Some(name) = models {
+        if task.is_some()
+            || json
+            || model.is_some()
+            || provider.is_some()
+            || base_url.is_some()
+            || api_key_env.is_some()
+            || !header.is_empty()
+            || max_tokens.is_some()
+            || deadline.is_some()
+            || policy.is_some()
+        {
+            return Err("the models command takes no run flags".into());
+        }
+        let (settings, _) = load(&cwd.unwrap_or_else(|| PathBuf::from(".")))?;
+        let targets = model_targets(&settings, name.as_deref())?;
+        return Ok(Outcome::Models(Box::new(ModelsArgs { targets, refresh })));
+    }
+    if refresh {
+        return Err("--refresh needs the models command".into());
+    }
     let Some(task) = task else {
         if json {
             return Err("the --json flag needs a task; use -p <task>".into());
         }
         return Err("missing task; use -p <task>".into());
     };
-    let policy = policy.unwrap_or_else(|| {
-        let names: &[&str] = if provider == Wire::OpenAiChat {
-            &DEFAULT_CHAT_POLICIES
-        } else {
-            &DEFAULT_POLICIES
-        };
-        names.iter().map(ToString::to_string).collect()
-    });
+    let cwd = cwd.unwrap_or_else(|| PathBuf::from("."));
+    let (settings, rules) = load(&cwd)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let (sandbox, network, write) = resolve_sandbox(&settings.sandbox, home.as_deref())?;
+    let model_text = model
+        .or_else(|| settings.model.clone())
+        .unwrap_or_else(|| DEFAULT_MODEL.into());
+    let (provider_name, model_id) = match split_model(&model_text, &settings) {
+        Some((name, id)) => (Some(name), id.to_string()),
+        None => (None, model_text.clone()),
+    };
+    let table = provider_name.and_then(|name| settings.providers.get(name));
+    let built_in = provider_name.and_then(built_in_provider);
+    let table = table.cloned().unwrap_or_else(Provider::default);
+    let model_table = table
+        .models
+        .get(&model_id)
+        .cloned()
+        .unwrap_or_else(Model::default);
+    let provider = match (provider, &table.wire) {
+        (Some(wire), _) => wire,
+        (None, Some(name)) => parse_provider(name).map_err(|error| format!("config: {error}"))?,
+        (None, None) => built_in.clone().map_or(Wire::Anthropic, |(wire, _)| wire),
+    };
+    let mut config_header = Vec::new();
+    for (name, value) in &table.headers {
+        reagent_ai::check_header(name, value).map_err(|error| format!("config: {error}"))?;
+        config_header.push((name.clone(), value.clone()));
+    }
+    config_header.extend(header);
+    let header = config_header;
+    let policy = policy
+        .or(model_table.policy)
+        .or(settings.policy)
+        .unwrap_or_else(|| {
+            let names: &[&str] = if provider == Wire::OpenAiChat {
+                &DEFAULT_CHAT_POLICIES
+            } else {
+                &DEFAULT_POLICIES
+            };
+            names.iter().map(ToString::to_string).collect()
+        });
     // Editing old tool results breaks the reasoning the Anthropic and
     // Responses wires replay, so masking runs only on the chat wire.
     if policy.iter().any(|name| name == "mask") && provider != Wire::OpenAiChat {
@@ -365,15 +642,28 @@ fn parse_from(mut parser: lexopt::Parser) -> Result<Outcome, String> {
     Ok(Outcome::Run(Box::new(Args {
         task,
         json,
-        model: model.unwrap_or_else(|| DEFAULT_MODEL.into()),
+        model: model_id,
         provider,
-        base_url,
-        api_key_env,
+        base_url: base_url.or(table.base_url),
+        api_key: table.api_key,
+        provider_name: provider_name.map(str::to_string),
+        api_key_env: api_key_env
+            .or(table.api_key_env)
+            .or_else(|| built_in.map(|(_, key)| key.to_string())),
         header,
-        max_tokens,
+        max_tokens: max_tokens
+            .or(model_table.max_tokens)
+            .or(settings.max_tokens)
+            .unwrap_or(DEFAULT_MAX_TOKENS),
         deadline,
-        cwd: cwd.unwrap_or_else(|| PathBuf::from(".")),
+        cwd,
         policy,
+        skip: settings.skip,
+        rules,
+        context_window: model_table.context_window,
+        sandbox,
+        network,
+        write,
     })))
 }
 
@@ -389,8 +679,79 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Outcome, String> {
+        parse_with(args, Settings::default())
+    }
+
+    fn parse_with(args: &[&str], settings: Settings) -> Result<Outcome, String> {
         let argv = args.iter().map(std::ffi::OsString::from);
-        parse_from(lexopt::Parser::from_args(argv))
+        parse_from(lexopt::Parser::from_args(argv), &|_| {
+            Ok((settings.clone(), Rules::none()))
+        })
+    }
+
+    fn run_with(args: &[&str], settings: Settings) -> Args {
+        match parse_with(args, settings) {
+            Ok(Outcome::Run(args)) => *args,
+            other => panic!("expected a run outcome for {args:?}, got {other:?}"),
+        }
+    }
+
+    fn sandbox_table(mode: Option<&str>, write: &[&str]) -> reagent_config::Sandbox {
+        reagent_config::Sandbox {
+            mode: mode.map(str::to_string),
+            network: Some(true),
+            write: write.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn sandbox_mode_is_off_auto_or_on() {
+        let home = Some(Path::new("/home/u"));
+        for (text, mode) in [
+            (None, SandboxMode::Off),
+            (Some("off"), SandboxMode::Off),
+            (Some("auto"), SandboxMode::Auto),
+            (Some("on"), SandboxMode::On),
+        ] {
+            let (got, network, _) =
+                resolve_sandbox(&sandbox_table(text, &[]), home).expect("resolves");
+            assert_eq!((got, network), (mode, true));
+        }
+        let error = resolve_sandbox(&sandbox_table(Some("maybe"), &[]), home).unwrap_err();
+        assert_eq!(
+            error,
+            "config: sandbox.mode must be off, auto or on, not \"maybe\""
+        );
+    }
+
+    #[test]
+    fn sandbox_write_folders_expand_a_leading_home() {
+        let table = sandbox_table(Some("on"), &["~/.cache", "/data", "rel"]);
+        let (_, _, write) = resolve_sandbox(&table, Some(Path::new("/home/u"))).expect("resolves");
+        assert_eq!(
+            write,
+            [
+                PathBuf::from("/home/u/.cache"),
+                PathBuf::from("/data"),
+                PathBuf::from("rel")
+            ]
+        );
+    }
+
+    #[test]
+    fn sandbox_settings_reach_the_args() {
+        let settings = Settings {
+            sandbox: sandbox_table(Some("auto"), &["/data"]),
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "x"], settings);
+        assert_eq!(args.sandbox, SandboxMode::Auto);
+        assert!(args.network);
+        assert_eq!(args.write, [PathBuf::from("/data")]);
+    }
+
+    fn providers(provider: Provider) -> std::collections::BTreeMap<String, Provider> {
+        [("fi".to_string(), provider)].into()
     }
 
     fn run(args: &[&str]) -> Args {
@@ -676,5 +1037,299 @@ mod tests {
         assert!(parse(&["-p", "task", "--max-tokens"]).is_err());
         assert!(parse(&["-p", "task", "--max-tokens", "0"]).is_err());
         assert!(parse(&["-p", "task", "--max-tokens", "many"]).is_err());
+    }
+
+    #[test]
+    fn flags_beat_the_config() {
+        let settings = Settings {
+            model: Some("glm".into()),
+            max_tokens: Some(1000),
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "task"], settings.clone());
+        assert_eq!(args.model, "glm");
+        assert_eq!(args.max_tokens, 1000);
+        let args = run_with(
+            &["-p", "task", "--model", "qwen", "--max-tokens", "2000"],
+            settings,
+        );
+        assert_eq!(args.model, "qwen");
+        assert_eq!(args.max_tokens, 2000);
+    }
+
+    #[test]
+    fn a_config_policy_replaces_the_default() {
+        let settings = Settings {
+            model: Some("fi/glm".into()),
+            policy: Some(vec!["stuck".into()]),
+            skip: vec!["data".into()],
+            providers: providers(Provider {
+                wire: Some("openai-chat".into()),
+                ..Provider::default()
+            }),
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "task"], settings.clone());
+        assert_eq!(args.provider, Wire::OpenAiChat);
+        assert_eq!(args.policy, vec!["stuck"]);
+        assert_eq!(args.skip, vec!["data"]);
+        let args = run_with(&["-p", "task", "--policy", "budget"], settings);
+        assert_eq!(args.policy, vec!["budget"]);
+    }
+
+    #[test]
+    fn a_bad_config_policy_name_names_the_file() {
+        let model = reagent_config::Model {
+            policy: Some(vec!["nope".into()]),
+            ..reagent_config::Model::default()
+        };
+        let mut provider = Provider::default();
+        provider.models.insert("glm".into(), model);
+        let mut layer = reagent_config::Layer {
+            path: std::path::PathBuf::from("/home/u/.config/reagent/config.toml"),
+            settings: Settings {
+                providers: providers(provider),
+                ..Settings::default()
+            },
+        };
+        let error = expand_policies(&mut layer).unwrap_err();
+        assert!(
+            error.starts_with("/home/u/.config/reagent/config.toml: "),
+            "{error}"
+        );
+        assert!(error.contains("nope"), "{error}");
+    }
+
+    #[test]
+    fn config_policy_names_are_expanded() {
+        let mut layer = reagent_config::Layer {
+            path: std::path::PathBuf::from("config.toml"),
+            settings: Settings {
+                policy: Some(vec!["all".into()]),
+                ..Settings::default()
+            },
+        };
+        expand_policies(&mut layer).unwrap();
+        assert_eq!(
+            layer.settings.policy,
+            Some(vec![
+                "budget".into(),
+                "completion".into(),
+                "snapshot".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn permissions_come_from_the_config() {
+        let layer = Layer {
+            path: std::path::PathBuf::from("/g/config.toml"),
+            settings: Settings {
+                permissions: reagent_config::permissions::Lists {
+                    deny: vec!["Bash(git push:*)".into()],
+                    ..Default::default()
+                },
+                ..Settings::default()
+            },
+        };
+        let (_, rules) = settings_from(vec![layer], Path::new("/work")).unwrap();
+        assert!(!rules.is_open());
+        let bad = Layer {
+            path: std::path::PathBuf::from("/g/config.toml"),
+            settings: Settings {
+                permissions: reagent_config::permissions::Lists {
+                    deny: vec!["Bash(".into()],
+                    ..Default::default()
+                },
+                ..Settings::default()
+            },
+        };
+        let error = settings_from(vec![bad], Path::new("/work")).unwrap_err();
+        assert!(error.starts_with("/g/config.toml"), "{error}");
+    }
+
+    #[test]
+    fn a_config_error_ends_the_parse() {
+        let argv = ["-p", "task"].iter().map(std::ffi::OsString::from);
+        let error = parse_from(lexopt::Parser::from_args(argv), &|_| Err("bad".into()));
+        assert_eq!(error.unwrap_err(), "bad");
+    }
+
+    #[test]
+    fn models_command_takes_a_name_and_refresh() {
+        let settings = Settings {
+            providers: providers(Provider::default()),
+            ..Settings::default()
+        };
+        let parsed = parse_with(&["models", "fi", "--refresh"], settings.clone());
+        let Ok(Outcome::Models(models)) = parsed else {
+            panic!("expected a models outcome, got {parsed:?}");
+        };
+        assert!(models.refresh);
+        assert_eq!(models.targets.len(), 1);
+        assert_eq!(models.targets[0].name, "fi");
+        assert!(!models.targets[0].implicit);
+        let parsed = parse_with(&["models"], settings.clone());
+        let Ok(Outcome::Models(models)) = parsed else {
+            panic!("expected a models outcome, got {parsed:?}");
+        };
+        let names: Vec<&str> = models.targets.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["fi", "anthropic", "openai"]);
+        assert!(parse_with(&["models", "nope"], settings.clone()).is_err());
+        assert!(parse_with(&["--refresh", "-p", "x"], settings.clone()).is_err());
+        assert!(parse_with(&["models", "-p", "x"], settings.clone()).is_err());
+        assert!(parse_with(&["models", "--model", "fi/m"], settings.clone()).is_err());
+        assert!(parse_with(&["-p", "x", "models"], settings).is_err());
+    }
+
+    #[test]
+    fn args_debug_hides_the_api_key() {
+        let settings = Settings {
+            providers: [(
+                "fi".to_string(),
+                Provider {
+                    api_key: Some("sk-test-123".into()),
+                    ..Provider::default()
+                },
+            )]
+            .into(),
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "task", "--model", "fi/m"], settings);
+        assert!(args.api_key.is_some());
+        let text = format!("{args:?}");
+        assert!(text.contains("***"), "{text}");
+        assert!(!text.contains("sk-test-123"), "{text}");
+    }
+
+    #[test]
+    fn a_provider_prefix_picks_the_provider() {
+        let settings = Settings {
+            providers: [(
+                "freeinference".to_string(),
+                Provider {
+                    wire: Some("openai-chat".into()),
+                    base_url: Some("https://fi.example/v1".into()),
+                    api_key_env: Some("FI_KEY".into()),
+                    headers: [("x-team".to_string(), "a".to_string())].into(),
+                    ..Provider::default()
+                },
+            )]
+            .into(),
+            ..Settings::default()
+        };
+        let args = run_with(
+            &[
+                "-p",
+                "task",
+                "--model",
+                "freeinference/glm-5.3-flash",
+                "--header",
+                "x-team:b",
+            ],
+            settings,
+        );
+        assert_eq!(args.provider, Wire::OpenAiChat);
+        assert_eq!(args.base_url.as_deref(), Some("https://fi.example/v1"));
+        assert_eq!(args.api_key_env.as_deref(), Some("FI_KEY"));
+        assert_eq!(args.model, "glm-5.3-flash");
+        assert_eq!(
+            args.header,
+            vec![
+                ("x-team".to_string(), "a".to_string()),
+                ("x-team".to_string(), "b".to_string())
+            ]
+        );
+        assert_eq!(args.policy, vec!["budget", "mask"]);
+    }
+
+    #[test]
+    fn a_model_id_keeps_its_slashes() {
+        let settings = Settings {
+            providers: [("commandcode".to_string(), Provider::default())].into(),
+            ..Settings::default()
+        };
+        let args = run_with(
+            &[
+                "-p",
+                "task",
+                "--model",
+                "commandcode/deepseek/deepseek-v4-flash",
+            ],
+            settings,
+        );
+        assert_eq!(args.model, "deepseek/deepseek-v4-flash");
+    }
+
+    #[test]
+    fn a_name_without_a_provider_is_the_model_id() {
+        let args = run(&["-p", "task", "--model", "claude-sonnet-5-5"]);
+        assert_eq!(args.model, "claude-sonnet-5-5");
+        assert_eq!(args.provider, Wire::Anthropic);
+        let args = run(&["-p", "task", "--model", "meta/llama"]);
+        assert_eq!(args.model, "meta/llama");
+        let args = run(&["-p", "task", "--model", "openai/gpt-5"]);
+        assert_eq!(args.model, "gpt-5");
+        assert_eq!(args.provider, Wire::OpenAiResponses);
+        assert_eq!(args.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn model_settings_beat_top_level_ones() {
+        let settings = Settings {
+            model: Some("fi/glm".into()),
+            max_tokens: Some(32_000),
+            policy: Some(vec!["stuck".into()]),
+            providers: providers(Provider {
+                models: [(
+                    "glm".to_string(),
+                    Model {
+                        max_tokens: Some(16_000),
+                        context_window: Some(128_000),
+                        policy: Some(vec!["snapshot".into()]),
+                    },
+                )]
+                .into(),
+                ..Provider::default()
+            }),
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "task"], settings.clone());
+        assert_eq!(args.max_tokens, 16_000);
+        assert_eq!(args.context_window, Some(128_000));
+        assert_eq!(args.policy, vec!["snapshot"]);
+        let args = run_with(&["-p", "task", "--max-tokens", "8000"], settings);
+        assert_eq!(args.max_tokens, 8000);
+    }
+
+    #[test]
+    fn flags_beat_provider_settings() {
+        let settings = Settings {
+            providers: providers(Provider {
+                wire: Some("openai-chat".into()),
+                base_url: Some("https://fi.example/v1".into()),
+                api_key_env: Some("FI_KEY".into()),
+                ..Provider::default()
+            }),
+            ..Settings::default()
+        };
+        let args = run_with(
+            &[
+                "-p",
+                "task",
+                "--model",
+                "fi/glm",
+                "--base-url",
+                "http://localhost:1",
+                "--api-key-env",
+                "MINE",
+                "--provider",
+                "anthropic",
+            ],
+            settings,
+        );
+        assert_eq!(args.base_url.as_deref(), Some("http://localhost:1"));
+        assert_eq!(args.api_key_env.as_deref(), Some("MINE"));
+        assert_eq!(args.provider, Wire::Anthropic);
     }
 }

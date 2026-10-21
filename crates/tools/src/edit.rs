@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
 use crate::{atomic, resolve};
@@ -269,6 +269,23 @@ fn multiple_matches_at(path: &Path, lines: &[usize]) -> String {
 impl Tool for Edit {
     fn spec(&self) -> &ToolSpec {
         &self.spec
+    }
+
+    fn main_arg(&self) -> Option<&'static str> {
+        Some("path")
+    }
+
+    fn effects(&self, args: &str) -> Effects {
+        let Ok(arguments) = parse_args::<Args<'_>>(args) else {
+            return Effects::default();
+        };
+        let Ok(path) = resolve(&self.working_dir, &arguments.path) else {
+            return Effects::default();
+        };
+        Effects {
+            writes: vec![path],
+            ..Effects::default()
+        }
     }
 
     fn run<'a>(
@@ -752,5 +769,19 @@ mod tests {
             "{}",
             output.content
         );
+    }
+
+    #[test]
+    fn edit_effects_are_a_write() {
+        let edit = Edit::new("/work");
+        assert_eq!(edit.main_arg(), Some("path"));
+        let effects = edit.effects(r#"{"path":"a.txt","old_string":"a","new_string":"b"}"#);
+        assert_eq!(effects.writes, vec![PathBuf::from("/work/a.txt")]);
+        assert!(effects.reads.is_empty());
+    }
+
+    #[test]
+    fn edit_bad_args_have_no_effects() {
+        assert_eq!(Edit::new("/work").effects("{}"), Effects::default());
     }
 }

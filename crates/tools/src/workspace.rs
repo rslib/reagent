@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 use crate::gitignore::{self, Ignores};
-use crate::walk::SKIP_DIRS;
+use crate::walk::Skip;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ENTRIES: usize = 20_000;
@@ -18,18 +18,26 @@ const MAX_ENTRIES: usize = 20_000;
 /// git repository only git's view is used, so a hash is never compared with
 /// one from the folder walk.
 pub async fn fingerprint(root: &Path) -> Option<u64> {
+    fingerprint_with_skip(root, &[]).await
+}
+
+/// Like [`fingerprint`], and the folder walk also skips folders named in
+/// `extra`, on top of the built-in list. Inside a git repository `extra` has
+/// no effect: git's own status is used, and it already follows `.gitignore`.
+pub async fn fingerprint_with_skip(root: &Path, extra: &[String]) -> Option<u64> {
     match git_fingerprint(root).await {
         GitState::Hash(hash) => return Some(hash),
         GitState::Failed => return None,
         GitState::NotRepo => {}
     }
     let root = root.to_path_buf();
+    let skip = Skip::new(extra.iter().cloned());
     let global = match gitignore::global_excludes_path() {
         Some(path) => tokio::fs::read(path).await.ok(),
         None => None,
     };
     tokio::task::spawn_blocking(move || {
-        walk_fingerprint(&root, MAX_ENTRIES, SKIP_DIRS, global.as_deref())
+        walk_fingerprint(&root, MAX_ENTRIES, &skip, global.as_deref())
     })
     .await
     .ok()
@@ -139,10 +147,10 @@ async fn git_status_hash(root: &Path, top: &[u8]) -> Option<u64> {
 }
 
 /// Walks `root` the way git would without a repository: directories named in
-/// `skip` and entries matched by `.gitignore` files (and the `global` excludes
+/// the built-in list or `skip` and entries matched by `.gitignore` files (and the `global` excludes
 /// text) are left out.
 #[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]
-fn walk_fingerprint(root: &Path, cap: usize, skip: &[&str], global: Option<&[u8]>) -> Option<u64> {
+fn walk_fingerprint(root: &Path, cap: usize, skip: &Skip, global: Option<&[u8]>) -> Option<u64> {
     let mut ignores = Ignores::default();
     let global_tip = global.and_then(|text| ignores.add(None, b"", text));
     let mut entries: Vec<(PathBuf, u64, Option<Duration>)> = Vec::new();
@@ -169,7 +177,7 @@ fn walk_fingerprint(root: &Path, cap: usize, skip: &[&str], global: Option<&[u8]
             }
             rel.extend_from_slice(name.as_encoded_bytes());
             if kind.is_dir() {
-                if !skip.iter().any(|s| name == *s) && !ignores.is_ignored(tip, &rel, true) {
+                if !skip.is_skipped(&name) && !ignores.is_ignored(tip, &rel, true) {
                     stack.push((entry.path(), rel.clone(), tip));
                 }
             } else if kind.is_file() && !ignores.is_ignored(tip, &rel, false) {
@@ -216,9 +224,11 @@ mod tests {
 
     async fn walk(dir: &Path) -> Option<u64> {
         let dir = dir.to_path_buf();
-        tokio::task::spawn_blocking(move || walk_fingerprint(&dir, MAX_ENTRIES, SKIP_DIRS, None))
-            .await
-            .unwrap()
+        tokio::task::spawn_blocking(move || {
+            walk_fingerprint(&dir, MAX_ENTRIES, &Skip::default(), None)
+        })
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -294,17 +304,36 @@ mod tests {
     fn caller_skip_list_and_global_rules_apply() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "one").unwrap();
-        let base = walk_fingerprint(dir.path(), 100, &[], Some(b"*.bak\n"));
+        let vendor = Skip::new(["vendor".to_string()]);
+        let base = walk_fingerprint(dir.path(), 100, &Skip::default(), Some(b"*.bak\n"));
         std::fs::create_dir(dir.path().join("vendor")).unwrap();
         std::fs::write(dir.path().join("vendor").join("v.txt"), "x").unwrap();
         std::fs::write(dir.path().join("c.bak"), "x").unwrap();
 
-        let skipping = walk_fingerprint(dir.path(), 100, &["vendor"], Some(b"*.bak\n"));
+        let skipping = walk_fingerprint(dir.path(), 100, &vendor, Some(b"*.bak\n"));
         assert_eq!(base, skipping);
         assert_ne!(
             base,
-            walk_fingerprint(dir.path(), 100, &[], Some(b"*.bak\n"))
+            walk_fingerprint(dir.path(), 100, &Skip::default(), Some(b"*.bak\n"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_configured_skip_folder_is_not_hashed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("data")).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one").unwrap();
+        std::fs::write(dir.path().join("data").join("d.txt"), "one").unwrap();
+        let extra = ["data".to_string()];
+        let before = fingerprint_with_skip(dir.path(), &extra).await;
+        assert!(before.is_some());
+
+        std::fs::write(dir.path().join("data").join("d.txt"), "changed").unwrap();
+        std::fs::write(dir.path().join("data").join("e.txt"), "new").unwrap();
+        assert_eq!(before, fingerprint_with_skip(dir.path(), &extra).await);
+
+        std::fs::write(dir.path().join("a.txt"), "changed").unwrap();
+        assert_ne!(before, fingerprint_with_skip(dir.path(), &extra).await);
     }
 
     #[test]
@@ -322,8 +351,11 @@ mod tests {
             std::fs::write(dir.path().join(format!("{i}.txt")), "x").unwrap();
         }
 
-        assert_eq!(walk_fingerprint(dir.path(), 3, SKIP_DIRS, None), None);
-        assert!(walk_fingerprint(dir.path(), 5, SKIP_DIRS, None).is_some());
+        assert_eq!(
+            walk_fingerprint(dir.path(), 3, &Skip::default(), None),
+            None
+        );
+        assert!(walk_fingerprint(dir.path(), 5, &Skip::default(), None).is_some());
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
 use crate::resolve;
@@ -108,6 +108,23 @@ impl Read {
 impl Tool for Read {
     fn spec(&self) -> &ToolSpec {
         &self.spec
+    }
+
+    fn main_arg(&self) -> Option<&'static str> {
+        Some("path")
+    }
+
+    fn effects(&self, args: &str) -> Effects {
+        let Ok(arguments) = parse_args::<Args<'_>>(args) else {
+            return Effects::default();
+        };
+        let Ok(path) = resolve(&self.working_dir, &arguments.path) else {
+            return Effects::default();
+        };
+        Effects {
+            reads: vec![path],
+            ..Effects::default()
+        }
     }
 
     fn read_only(&self) -> bool {
@@ -513,5 +530,21 @@ mod tests {
             "2002\tlast line\n",
             "expected the last line near the end of the sparse file"
         );
+    }
+
+    #[test]
+    fn read_effects_are_the_joined_path() {
+        let read = Read::new("/work");
+        assert_eq!(read.main_arg(), Some("path"));
+        let effects = read.effects(r#"{"path":"a/b.txt"}"#);
+        assert_eq!(effects.reads, vec![PathBuf::from("/work/a/b.txt")]);
+        assert!(effects.writes.is_empty());
+    }
+
+    #[test]
+    fn read_bad_args_have_no_effects() {
+        let read = Read::new("/work");
+        assert_eq!(read.effects("not json"), Effects::default());
+        assert_eq!(read.effects(r#"{"path":""}"#), Effects::default());
     }
 }

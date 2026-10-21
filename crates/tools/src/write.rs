@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
 use crate::resolve;
@@ -60,6 +60,23 @@ impl Write {
 impl Tool for Write {
     fn spec(&self) -> &ToolSpec {
         &self.spec
+    }
+
+    fn main_arg(&self) -> Option<&'static str> {
+        Some("path")
+    }
+
+    fn effects(&self, args: &str) -> Effects {
+        let Ok(arguments) = parse_args::<Args<'_>>(args) else {
+            return Effects::default();
+        };
+        let Ok(path) = resolve(&self.working_dir, &arguments.path) else {
+            return Effects::default();
+        };
+        Effects {
+            writes: vec![path],
+            ..Effects::default()
+        }
     }
 
     fn run<'a>(
@@ -177,5 +194,19 @@ mod tests {
         }
         names.sort();
         assert_eq!(names, vec!["f.txt".to_string()], "{names:?}");
+    }
+
+    #[test]
+    fn write_effects_are_a_write() {
+        let write = Write::new("/work");
+        assert_eq!(write.main_arg(), Some("path"));
+        let effects = write.effects(r#"{"path":"a.txt","content":"x"}"#);
+        assert_eq!(effects.writes, vec![PathBuf::from("/work/a.txt")]);
+        assert!(effects.reads.is_empty());
+    }
+
+    #[test]
+    fn write_bad_args_have_no_effects() {
+        assert_eq!(Write::new("/work").effects("{}"), Effects::default());
     }
 }

@@ -2,8 +2,10 @@
 
 mod args;
 mod json;
+mod models;
 mod prompt;
 mod run;
+mod sandbox;
 mod snapshot;
 
 /// The estimated-token budget for the system prompt and tool specs.
@@ -11,6 +13,10 @@ mod snapshot;
 const PROMPT_BUDGET: usize = 1000;
 
 fn main() -> std::process::ExitCode {
+    let mut argv = std::env::args_os().skip(1);
+    if argv.next().is_some_and(|arg| arg == "--sandbox-exec") {
+        return sandbox::helper(argv);
+    }
     let outcome = match args::parse() {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -27,14 +33,18 @@ fn main() -> std::process::ExitCode {
             println!("reagent {}", env!("CARGO_PKG_VERSION"));
             return std::process::ExitCode::SUCCESS;
         }
+        args::Outcome::Models(models) => return runtime().block_on(models::run(*models)),
         args::Outcome::Run(args) => *args,
     };
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    runtime().block_on(run::run(args))
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("builds the tokio runtime");
-    runtime.block_on(run::run(args))
+        .expect("builds the tokio runtime")
 }
 
 /// The serialized tool specs plus the filled system prompt, in bytes.
@@ -46,9 +56,12 @@ fn budget_bytes() -> usize {
         reagent_tools::edit::spec(),
         reagent_tools::write::spec(),
         reagent_tools::bash::spec(),
+        reagent_tools::grep::spec(),
+        reagent_tools::find::spec(),
+        reagent_agent::archive::spec(),
     ];
     let serialized = serde_json::to_string(&specs).expect("tool specs serialize");
-    let prompt = prompt::system("examples/");
+    let prompt = prompt::system_with("examples/", "");
     serialized.len() + prompt.len()
 }
 

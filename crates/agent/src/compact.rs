@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 
 use reagent_ai::{Content, Message, Text};
+use reagent_util::text;
 
 use crate::archive::Archive;
 use crate::checkpoint;
@@ -134,7 +135,7 @@ impl Compact {
                 continue;
             };
             let body = String::from_utf8_lossy(&bytes);
-            let cut = cut(&body, FILE_CAP);
+            let cut = text::head(&body, FILE_CAP);
             text.push_str("\n\n== ");
             text.push_str(path);
             text.push_str(" ==\n");
@@ -249,17 +250,6 @@ fn merge_if_large(kept: &mut Vec<Message>, limit: usize) {
     }
     kept.truncate(1);
     kept.push(Message::user(text));
-}
-
-fn cut(text: &str, cap: usize) -> &str {
-    if text.len() <= cap {
-        return text;
-    }
-    let mut end = cap;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }
 
 #[cfg(test)]

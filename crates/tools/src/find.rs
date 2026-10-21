@@ -6,12 +6,12 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
 use crate::gitignore::wildmatch;
 use crate::resolve;
-use crate::walk::{self, Cancelled, MAX_FILES};
+use crate::walk::{self, Cancelled, MAX_FILES, Skip};
 
 /// At most this many paths are printed.
 const MAX_PRINTED: usize = 200;
@@ -30,6 +30,7 @@ pub struct Args<'a> {
 pub struct Find {
     spec: ToolSpec,
     working_dir: PathBuf,
+    skip: Skip,
 }
 
 impl Find {
@@ -38,7 +39,15 @@ impl Find {
         Self {
             spec: spec(),
             working_dir: working_dir.into(),
+            skip: Skip::default(),
         }
+    }
+
+    /// Also skips folders with these names, on top of the built-in list.
+    #[must_use]
+    pub fn with_skip(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.skip = Skip::new(names);
+        self
     }
 
     async fn run_inner(
@@ -57,7 +66,7 @@ impl Find {
             let shown = args.path.as_deref().unwrap_or(".");
             return Err(format!("not a folder: {shown}"));
         }
-        let listing = match walk::walk(&root, cancel).await {
+        let listing = match walk::walk(&root, &self.skip, cancel).await {
             Ok(listing) => listing,
             Err(Cancelled) => return Err("cancelled".into()),
         };
@@ -105,6 +114,27 @@ impl Find {
 impl Tool for Find {
     fn spec(&self) -> &ToolSpec {
         &self.spec
+    }
+
+    fn main_arg(&self) -> Option<&'static str> {
+        Some("path")
+    }
+
+    fn effects(&self, args: &str) -> Effects {
+        let Ok(arguments) = parse_args::<Args<'_>>(args) else {
+            return Effects::default();
+        };
+        let path = match arguments.path.as_deref() {
+            Some(path) => match resolve(&self.working_dir, path) {
+                Ok(path) => path,
+                Err(_) => return Effects::default(),
+            },
+            None => self.working_dir.clone(),
+        };
+        Effects {
+            reads: vec![path],
+            ..Effects::default()
+        }
     }
 
     fn read_only(&self) -> bool {
@@ -183,6 +213,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_skips_configured_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "data/x.rs");
+        write(tmp.path(), "src/a.rs");
+        let output = Find::new(tmp.path())
+            .with_skip(["data".to_string()])
+            .run(r#"{"pattern":"**/*.rs"}"#, &CancellationToken::new())
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(output.content.as_ref(), "src/a.rs\n");
+    }
+
+    #[tokio::test]
     async fn a_star_glob_stays_in_one_folder() {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "src/a.rs");
@@ -254,5 +297,23 @@ mod tests {
         let output = find(&tmp, r#"{"pattern":"a","path":"a.rs"}"#).await;
         assert!(output.is_error);
         assert_eq!(output.content.as_ref(), "not a folder: a.rs");
+    }
+
+    #[test]
+    fn find_effects_read_the_folder() {
+        let find = Find::new("/work");
+        assert_eq!(find.main_arg(), Some("path"));
+        assert_eq!(
+            find.effects(r#"{"pattern":"x"}"#).reads,
+            vec![PathBuf::from("/work")]
+        );
+        let effects = find.effects(r#"{"pattern":"x","path":"src"}"#);
+        assert_eq!(effects.reads, vec![PathBuf::from("/work/src")]);
+        assert!(effects.writes.is_empty());
+    }
+
+    #[test]
+    fn find_bad_args_have_no_effects() {
+        assert_eq!(Find::new("/work").effects("nope"), Effects::default());
     }
 }

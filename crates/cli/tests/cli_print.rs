@@ -19,6 +19,8 @@ fn bin() -> &'static str {
 /// Runs `reagent` with the given arguments and returns its output.
 async fn run(tmp: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin())
+        // The user's real config must not change the test.
+        .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
         .args(args)
         .current_dir(tmp)
         .output()
@@ -88,6 +90,8 @@ async fn run_with_stdin(fake: &str, input: &[u8]) -> std::process::Output {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
     let mut child = Command::new(bin())
+        // The user's real config must not change the test.
+        .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
         .args(["--provider", fake, "-p", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -176,6 +180,8 @@ async fn a_missing_cwd_exits_2() {
 async fn a_missing_key_exits_2() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let output = Command::new(bin())
+        // The user's real config must not change the test.
+        .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
         .args(["-p", "hi"])
         .current_dir(tmp.path())
         .env_remove("ANTHROPIC_API_KEY")
@@ -208,6 +214,8 @@ async fn ctrl_c_exits_130() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let fake = script(tmp.path(), SLOW_SCRIPT).await;
     let child = Command::new(bin())
+        // The user's real config must not change the test.
+        .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
         .args(["--provider", &fake, "-p", "hi"])
         .current_dir(tmp.path())
         .stdout(std::process::Stdio::null())
@@ -275,6 +283,8 @@ async fn a_retried_turn_prints_only_the_text_of_the_last_attempt() {
     .expect("write script");
     let script_arg = format!("fake:{}", script.display());
     let output = Command::new(BIN)
+        // The user's real config must not change the test.
+        .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
         .args(["--provider", &script_arg, "-p", "hi"])
         .current_dir(tmp.path())
         .env("ANTHROPIC_API_KEY", "sk-ant-test")

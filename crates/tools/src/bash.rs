@@ -7,7 +7,7 @@ use std::io;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -75,12 +75,38 @@ impl Outcome {
     }
 }
 
+const UNAVAILABLE: &str = "reagent: sandbox unavailable: ";
+/// The exit code with which a launcher says it could not start.
+const UNAVAILABLE_CODE: i32 = 125;
+
+/// What the bash tool does when the sandbox helper reports it cannot start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fallback {
+    /// Run this and later commands without the helper, warning once on stderr.
+    Auto,
+    /// Refuse the command.
+    Required,
+}
+
+/// A program that runs `bash -c <command>` for the tool, such as the sandbox helper.
+#[derive(Debug, Clone)]
+pub struct Launcher {
+    /// The program to start in place of bash.
+    pub program: PathBuf,
+    /// Arguments placed before `-- bash -c <command>`.
+    pub args: Vec<String>,
+    /// What to do when the launcher cannot start.
+    pub fallback: Fallback,
+}
+
 /// Runs a `bash -c` command (`sh -c` when bash is missing) with a hard
 /// timeout and output capping.
 #[derive(Debug)]
 pub struct Bash {
     spec: ToolSpec,
     working_dir: PathBuf,
+    launcher: Option<Launcher>,
+    disabled: AtomicBool,
 }
 
 impl Bash {
@@ -89,7 +115,15 @@ impl Bash {
         Self {
             spec: spec(),
             working_dir: working_dir.into(),
+            launcher: None,
+            disabled: AtomicBool::new(false),
         }
+    }
+
+    /// Runs commands through `launcher` instead of starting bash directly.
+    pub fn with_launcher(mut self, launcher: Launcher) -> Self {
+        self.launcher = Some(launcher);
+        self
     }
 
     async fn run_inner(&self, args: &Args<'_>, cancel: &CancellationToken) -> ToolOutput {
@@ -97,18 +131,68 @@ impl Bash {
             .timeout_ms
             .unwrap_or(DEFAULT_TIMEOUT_MS)
             .clamp(1, MAX_TIMEOUT_MS);
-        let mut child = match spawn(&self.working_dir, &args.command) {
+        let launcher = self
+            .launcher
+            .as_ref()
+            .filter(|_| !self.disabled.load(Ordering::Relaxed));
+        let Some(launcher) = launcher else {
+            return self.execute(None, args, timeout_ms, cancel).await.output;
+        };
+        let ran = self.execute(Some(launcher), args, timeout_ms, cancel).await;
+        let Some(reason) = ran.unavailable else {
+            return ran.output;
+        };
+        match launcher.fallback {
+            Fallback::Required => ToolOutput::error(format!(
+                "the sandbox could not start ({reason}); the command did not run"
+            )),
+            Fallback::Auto => {
+                if !self.disabled.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "reagent: the sandbox is not available here ({reason}); bash commands run without it"
+                    );
+                }
+                self.execute(None, args, timeout_ms, cancel).await.output
+            }
+        }
+    }
+
+    async fn execute(
+        &self,
+        launcher: Option<&Launcher>,
+        args: &Args<'_>,
+        timeout_ms: u64,
+        cancel: &CancellationToken,
+    ) -> Ran {
+        let spawned = match launcher {
+            Some(launcher) => launch(launcher, &self.working_dir, &args.command),
+            None => spawn(&self.working_dir, &args.command),
+        };
+        let mut child = match spawned {
             Ok(child) => child,
-            Err(error) => return ToolOutput::error(format!("cannot start the command: {error}")),
+            Err(error) => {
+                return Ran::plain(ToolOutput::error(format!(
+                    "cannot start the command: {error}"
+                )));
+            }
         };
         let Some(pid) = child.id() else {
-            return ToolOutput::error("cannot start the command: no process id");
+            return Ran::plain(ToolOutput::error("cannot start the command: no process id"));
         };
         let mut group = GroupGuard::new(pid as i32);
         let (outcome, mut collect, pipe_held) =
             run_and_collect(&mut child, &mut group, timeout_ms, cancel).await;
 
         let mut text = collect.view();
+        let unavailable = match &outcome {
+            Outcome::Exited(status)
+                if status.code() == Some(UNAVAILABLE_CODE) && launcher.is_some() =>
+            {
+                text.strip_prefix(UNAVAILABLE)
+                    .map(|rest| rest.lines().next().unwrap_or_default().to_string())
+            }
+            _ => None,
+        };
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }
@@ -116,8 +200,38 @@ impl Bash {
             text.push_str("[a background process still holds the output pipe; its later output is not shown]\n");
         }
         text.push_str(&outcome.summary());
-        ToolOutput::ok(text)
+        Ran {
+            output: ToolOutput::ok(text),
+            unavailable,
+        }
     }
+}
+
+/// The result of one run, and the reason when the launcher could not start.
+struct Ran {
+    output: ToolOutput,
+    unavailable: Option<String>,
+}
+
+impl Ran {
+    fn plain(output: ToolOutput) -> Self {
+        Self {
+            output,
+            unavailable: None,
+        }
+    }
+}
+
+fn launch(launcher: &Launcher, working_dir: &Path, command: &str) -> io::Result<Child> {
+    let mut start = Command::new(&launcher.program);
+    start
+        .args(&launcher.args)
+        .arg("--")
+        .arg("bash")
+        .arg("-c")
+        .arg(command);
+    configure(&mut start, working_dir);
+    start.spawn()
 }
 
 fn spawn(working_dir: &Path, command: &str) -> io::Result<Child> {
@@ -131,17 +245,20 @@ fn spawn(working_dir: &Path, command: &str) -> io::Result<Child> {
 
 fn shell(program: &str, working_dir: &Path, command: &str) -> Command {
     let mut shell = Command::new(program);
+    shell.arg("-c").arg(command);
+    configure(&mut shell, working_dir);
     shell
-        .arg("-c")
-        .arg(command)
+}
+
+fn configure(command: &mut Command, working_dir: &Path) {
+    command
         .current_dir(working_dir)
         .envs(NON_INTERACTIVE)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    process_group::new_session(&mut shell);
-    shell
+    process_group::new_session(command);
 }
 
 /// Drains both pipes while it waits for the shell, and kills the group on
@@ -392,6 +509,10 @@ pub fn spec() -> ToolSpec {
 impl Tool for Bash {
     fn spec(&self) -> &ToolSpec {
         &self.spec
+    }
+
+    fn main_arg(&self) -> Option<&'static str> {
+        Some("command")
     }
 
     fn run<'a>(
@@ -701,10 +822,102 @@ mod tests {
         assert_eq!(collect.whole(CUT_AT), bytes);
     }
 
+    async fn fake_launcher(tmp: &tempfile::TempDir, script: &str, fallback: Fallback) -> Launcher {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp.path().join("launcher.sh");
+        tokio::fs::write(&path, format!("#!/bin/sh\n{script}\n"))
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+        Launcher {
+            program: path,
+            args: vec!["--flag".into()],
+            fallback,
+        }
+    }
+
+    const UNAVAILABLE_SCRIPT: &str =
+        "echo 'reagent: sandbox unavailable: test reason' >&2\nexit 125";
+
+    #[tokio::test]
+    async fn a_launcher_wraps_the_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let launcher = fake_launcher(
+            &tmp,
+            "echo \"launched $1\"\nshift\n[ \"$1\" = -- ] && shift\nexec \"$@\"",
+            Fallback::Required,
+        )
+        .await;
+        let bash = tool(&tmp).with_launcher(launcher);
+        let output = bash
+            .run(r#"{"command":"echo inner"}"#, &CancellationToken::new())
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(
+            output.content.as_ref(),
+            "launched --flag\ninner\nexit code: 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_sandbox_falls_back_once_in_auto() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bash =
+            tool(&tmp).with_launcher(fake_launcher(&tmp, UNAVAILABLE_SCRIPT, Fallback::Auto).await);
+        assert!(!bash.disabled.load(Ordering::Relaxed));
+        let cancel = CancellationToken::new();
+        let first = bash.run(r#"{"command":"echo one"}"#, &cancel).await;
+        assert_eq!(first.content.as_ref(), "one\nexit code: 0");
+        assert!(bash.disabled.load(Ordering::Relaxed));
+        let second = bash.run(r#"{"command":"echo two"}"#, &cancel).await;
+        assert_eq!(second.content.as_ref(), "two\nexit code: 0");
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_sandbox_refuses_in_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bash = tool(&tmp)
+            .with_launcher(fake_launcher(&tmp, UNAVAILABLE_SCRIPT, Fallback::Required).await);
+        let output = bash
+            .run(r#"{"command":"touch marker"}"#, &CancellationToken::new())
+            .await;
+        assert!(output.is_error);
+        assert_eq!(
+            output.content.as_ref(),
+            "the sandbox could not start (test reason); the command did not run"
+        );
+        assert!(!tmp.path().join("marker").exists());
+    }
+
+    #[tokio::test]
+    async fn no_launcher_runs_bash_directly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bash = tool(&tmp);
+        assert!(bash.launcher.is_none());
+        let output = bash
+            .run(r#"{"command":"exit 125"}"#, &CancellationToken::new())
+            .await;
+        assert!(!output.is_error);
+        assert_eq!(output.content.as_ref(), "exit code: 125");
+    }
+
     #[tokio::test]
     async fn bad_args_are_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         let output = run(&tmp, "not json").await;
         assert!(output.is_error);
+    }
+
+    #[test]
+    fn bash_main_arg_is_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bash = tool(&tmp);
+        assert_eq!(bash.main_arg(), Some("command"));
+        assert_eq!(
+            bash.effects(r#"{"command":"ls"}"#),
+            reagent_agent::tool::Effects::default()
+        );
     }
 }

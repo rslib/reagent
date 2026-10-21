@@ -12,6 +12,8 @@ memchr = "2.8.3"
 nix = { version = "0.31.3", default-features = false, features = ["signal", "process"] }
 reagent-agent.workspace = true
 reagent-ai.workspace = true
+reagent-config.workspace = true
+reagent-util.workspace = true
 regex-lite = "0.1.9"
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }

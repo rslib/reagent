@@ -57,6 +57,8 @@ async fn a_long_scripted_run_stays_within_the_footprint_budget() {
 
     let before = getrusage(UsageWho::RUSAGE_CHILDREN).expect("getrusage before");
     let output = Command::new(BIN)
+        // The user's real config must not change the test.
+        .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
         .args(["-p", "task", "--json", "--provider"])
         .arg(format!("fake:{}", script.display()))
         .arg("--cwd")

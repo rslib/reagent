@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::PathBuf;
 
 use futures_util::future::BoxFuture;
 
@@ -48,6 +49,17 @@ where
         .map_err(|error| ToolOutput::error(format!("invalid arguments: {error}")))
 }
 
+/// The files a tool call reads and writes.
+///
+/// Paths are joined to the tool's working folder and not yet normalized.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Effects {
+    /// The files the call reads.
+    pub reads: Vec<PathBuf>,
+    /// The files the call writes.
+    pub writes: Vec<PathBuf>,
+}
+
 /// A named tool the model can call.
 pub trait Tool: Send + Sync {
     /// The spec offered to the provider.
@@ -56,6 +68,16 @@ pub trait Tool: Send + Sync {
     /// Whether the tool only reads state, so a batch of calls may run together.
     fn read_only(&self) -> bool {
         false
+    }
+
+    /// The argument a permission rule's pattern matches, such as `command` or `path`; `None` when no pattern applies.
+    fn main_arg(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The files a call with these arguments reads and writes, as paths joined to the tool's working folder (not yet normalized). Default: none.
+    fn effects(&self, _args: &str) -> Effects {
+        Effects::default()
     }
 
     /// Runs one call. `cancel` fires when the caller asks the loop to stop.
@@ -317,6 +339,16 @@ mod tests {
         };
         assert!(!tool.read_only());
         assert!(echo().read_only());
+    }
+
+    #[test]
+    fn default_main_arg_and_effects_are_empty() {
+        let tool = Named {
+            spec: spec("n"),
+            read_only: false,
+        };
+        assert_eq!(tool.main_arg(), None);
+        assert_eq!(tool.effects("{}"), Effects::default());
     }
 
     #[tokio::test]

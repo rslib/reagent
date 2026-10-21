@@ -1,6 +1,7 @@
 //! Message types, tool specs and streaming LLM providers.
 
 pub mod anthropic;
+pub mod catalog;
 pub(crate) mod cross_provider;
 #[cfg(feature = "testing")]
 pub mod fake;

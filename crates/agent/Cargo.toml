@@ -9,7 +9,9 @@ publish.workspace = true
 [dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 reagent-ai.workspace = true
-serde = { version = "1.0.229", default-features = false, features = ["std"] }
+reagent-config.workspace = true
+reagent-util.workspace = true
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 tokio = { version = "1.53.3", default-features = false, features = ["rt", "time", "sync", "fs", "io-util", "macros"] }
 tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }

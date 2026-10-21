@@ -21,6 +21,8 @@ async fn run(tmp: &Path, script: &str) -> std::process::Output {
     tokio::fs::write(&path, script).await.expect("write script");
     let provider = format!("fake:{}", path.display());
     Command::new(BIN)
+        // The user's real config must not change the test.
+        .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
         .args(["--json", "--provider", &provider, "-p", "hi"])
         .current_dir(tmp)
         .env("ANTHROPIC_API_KEY", "test-key")

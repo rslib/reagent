@@ -13,6 +13,7 @@ use reagent_ai::{
 use crate::archive::Archive;
 use crate::compact::Compact;
 use crate::event::{Event, TurnEndReason};
+use crate::guard::Guard;
 use crate::mask::Mask;
 use crate::policy::{PolicyRun, TurnPolicy, TurnView};
 use crate::session::Session;
@@ -82,6 +83,7 @@ pub struct Agent<'a> {
     mask: Option<Mask>,
     archive: Option<Arc<Archive>>,
     compact: Option<Compact>,
+    guard: Option<Guard>,
     workspace: Option<&'a dyn Workspace>,
     fingerprint: Option<u64>,
     provider_name: Text,
@@ -105,6 +107,7 @@ impl<'a> Agent<'a> {
             mask: None,
             archive: None,
             compact: None,
+            guard: None,
             workspace: None,
             fingerprint: None,
             provider_name: Text::from(provider.name()),
@@ -132,6 +135,7 @@ impl<'a> Agent<'a> {
             mask: None,
             archive: None,
             compact: None,
+            guard: None,
             workspace: None,
             fingerprint: None,
             provider_name: Text::from(provider.name()),
@@ -148,6 +152,13 @@ impl<'a> Agent<'a> {
     pub fn with_mask(mut self) -> Self {
         self.mask = Some(Mask);
         self.archive.get_or_insert_with(Archive::new);
+        self
+    }
+
+    /// Checks every tool call with `guard` before it runs (see [`Guard`]).
+    #[must_use]
+    pub fn with_guard(mut self, guard: Guard) -> Self {
+        self.guard = Some(guard);
         self
     }
 
@@ -524,7 +535,13 @@ impl<'a> Agent<'a> {
                         archive.assign(&call.id);
                     }
                 }
-                let results = crate::batch::run_all(&calls, self.registry, &self.token).await;
+                let results = crate::batch::run_all_guarded(
+                    &calls,
+                    self.registry,
+                    self.guard.as_ref(),
+                    &self.token,
+                )
+                .await;
                 // Every result reaches history before any event is sent, so a
                 // cancel or a closed receiver cannot leave a call unanswered.
                 let mut failure = None;

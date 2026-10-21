@@ -5,6 +5,7 @@
 //! `stat`: the file type comes with the directory entry.
 
 use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -28,6 +29,24 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     "dist",
     "build",
 ];
+
+/// Extra folder names to skip, on top of [`SKIP_DIRS`]. A name matches a
+/// folder of that exact name at any depth. Clones share one list.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Skip(Arc<[Box<str>]>);
+
+impl Skip {
+    /// Builds a skip list of the given extra folder names.
+    pub(crate) fn new(names: impl IntoIterator<Item = String>) -> Self {
+        Self(names.into_iter().map(String::into_boxed_str).collect())
+    }
+
+    /// Whether a folder with this name is never entered.
+    pub(crate) fn is_skipped(&self, name: &OsStr) -> bool {
+        SKIP_DIRS.iter().any(|skip| name == OsStr::new(skip))
+            || self.0.iter().any(|skip| name == OsStr::new(&**skip))
+    }
+}
 
 /// The most directories read at once. It hides network latency without
 /// flooding a metadata server that other users share.
@@ -58,6 +77,7 @@ pub(crate) struct Listing {
 pub(crate) struct Cancelled;
 
 struct Dir {
+    skip: Skip,
     path: PathBuf,
     rel: Vec<u8>,
     ignores: Option<Arc<Chain>>,
@@ -70,10 +90,14 @@ struct DirOutput {
 }
 
 /// Lists the files under `root` that git would not ignore: entries named in
-/// [`SKIP_DIRS`] and entries that a `.gitignore` or the global excludes
+/// [`SKIP_DIRS`] or `skip` and entries that a `.gitignore` or the global excludes
 /// match are left out, and ignored folders are never entered. Symbolic links
 /// are skipped, as ripgrep does by default.
-pub(crate) async fn walk(root: &Path, cancel: &CancellationToken) -> Result<Listing, Cancelled> {
+pub(crate) async fn walk(
+    root: &Path,
+    skip: &Skip,
+    cancel: &CancellationToken,
+) -> Result<Listing, Cancelled> {
     let global = match gitignore::global_excludes_path() {
         Some(path) => tokio::fs::read(path).await.ok(),
         None => None,
@@ -83,6 +107,7 @@ pub(crate) async fn walk(root: &Path, cancel: &CancellationToken) -> Result<List
         ignores = Chain::add_above(ignores, &above, &text);
     }
     let mut queue = VecDeque::from([Dir {
+        skip: skip.clone(),
         path: root.to_path_buf(),
         rel: Vec::new(),
         ignores,
@@ -194,8 +219,9 @@ fn read_dir(dir: Dir) -> DirOutput {
                 .is_some_and(|chain| chain.is_ignored(&rel, is_dir))
         };
         if kind.is_dir() {
-            if !SKIP_DIRS.iter().any(|skip| name == *skip) && !ignored(true) {
+            if !dir.skip.is_skipped(&name) && !ignored(true) {
                 output.dirs.push(Dir {
+                    skip: dir.skip.clone(),
                     path: entry.path(),
                     rel: rel.clone(),
                     ignores: ignores.clone(),
@@ -227,7 +253,9 @@ mod tests {
     }
 
     async fn list(root: &Path) -> Listing {
-        walk(root, &CancellationToken::new()).await.unwrap()
+        walk(root, &Skip::default(), &CancellationToken::new())
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -238,6 +266,19 @@ mod tests {
         write(tmp.path(), "c.log", "");
         write(tmp.path(), ".gitignore", "*.log\n");
         assert_eq!(names(&list(tmp.path()).await), [".gitignore", "a.rs"]);
+    }
+
+    #[tokio::test]
+    async fn configured_skip_folders_are_not_entered() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "data/x.rs", "");
+        write(tmp.path(), "src/a.rs", "");
+        write(tmp.path(), "src/data/y.rs", "");
+        let skip = Skip::new(["data".to_string()]);
+        let listing = walk(tmp.path(), &skip, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(names(&listing), ["src/a.rs"]);
     }
 
     #[tokio::test]
@@ -286,7 +327,12 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let started = std::time::Instant::now();
-        assert_eq!(walk(tmp.path(), &cancel).await.unwrap_err(), Cancelled);
+        assert_eq!(
+            walk(tmp.path(), &Skip::default(), &cancel)
+                .await
+                .unwrap_err(),
+            Cancelled
+        );
         assert!(started.elapsed() < std::time::Duration::from_millis(200));
     }
 
