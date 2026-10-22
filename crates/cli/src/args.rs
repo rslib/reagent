@@ -2,8 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
+use reagent_ai::{Compat, CompatOverride, MaxTokensField, Preset};
 use reagent_config::permissions::Rules;
-use reagent_config::{Layer, Model, Provider, Secret, Settings};
+use reagent_config::{Layer, Layers, Model, Provider, Secret, Settings};
+use serde::Deserialize;
+use serde::de::IntoDeserializer;
 
 /// The default model for headless runs.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5-5";
@@ -50,14 +53,24 @@ pub enum Wire {
 }
 
 impl Wire {
+    /// The wire of a preset.
+    fn from_ai(wire: reagent_ai::Wire) -> Self {
+        match wire {
+            reagent_ai::Wire::Anthropic => Wire::Anthropic,
+            reagent_ai::Wire::OpenAiChat => Wire::OpenAiChat,
+            reagent_ai::Wire::OpenAiResponses => Wire::OpenAiResponses,
+        }
+    }
+
     /// The environment variable holding the API key when `--api-key-env` is
     /// absent.
     pub fn default_api_key_env(&self) -> &'static str {
         match self {
-            Wire::Anthropic => "ANTHROPIC_API_KEY",
-            Wire::OpenAiChat | Wire::OpenAiResponses => "OPENAI_API_KEY",
+            Wire::Anthropic => reagent_ai::Wire::Anthropic.default_api_key_env(),
+            Wire::OpenAiChat => reagent_ai::Wire::OpenAiChat.default_api_key_env(),
+            Wire::OpenAiResponses => reagent_ai::Wire::OpenAiResponses.default_api_key_env(),
             #[cfg(feature = "testing")]
-            Wire::Fake(_) => "ANTHROPIC_API_KEY",
+            Wire::Fake(_) => reagent_ai::Wire::Anthropic.default_api_key_env(),
         }
     }
 
@@ -92,6 +105,9 @@ pub struct Args {
     pub provider: Wire,
     /// The endpoint URL, or the provider default when absent.
     pub base_url: Option<String>,
+    /// The compat flags of a preset or a `compat` table, or the plain wire
+    /// when absent.
+    pub compat: Option<Compat>,
     /// The name of the environment variable holding the API key, or the
     /// provider default when absent.
     pub api_key_env: Option<String>,
@@ -99,10 +115,17 @@ pub struct Args {
     pub api_key: Option<Secret>,
     /// The config or built-in provider name from `--model name/id`, if any.
     pub provider_name: Option<String>,
+    /// The preset the provider takes its defaults from, if any.
+    pub preset: Option<&'static Preset>,
+    /// The saved login this provider signs in with, if it has a name.
+    pub login: Option<String>,
     /// Extra request headers from `--header`, in order.
     pub header: Vec<(String, String)>,
     /// The cap on reply tokens, thinking included.
     pub max_tokens: u32,
+    /// How much reasoning the provider may spend, in its own words: a level
+    /// text or a token budget, as written.
+    pub reasoning: Option<String>,
     /// A hard deadline in seconds, if any.
     pub deadline: Option<u64>,
     /// The working directory the tools run in.
@@ -111,10 +134,14 @@ pub struct Args {
     pub policy: Vec<String>,
     /// Folder names from the config that searches leave out.
     pub skip: Vec<String>,
+    /// The profile file the run read, if any.
+    pub profile: Option<String>,
     /// The permission rules of the config files.
     pub rules: Rules,
     /// The context window of the model in tokens, from its config table.
     pub context_window: Option<u64>,
+    /// What the model costs, from its config table.
+    pub price: Option<reagent_config::ModelPrice>,
     /// How bash commands are fenced in.
     pub sandbox: SandboxMode,
     /// Whether sandboxed commands may use the network.
@@ -129,6 +156,10 @@ pub struct Args {
 pub struct Target {
     /// The provider name, as in `--model name/id`.
     pub name: String,
+    /// The saved login this provider signs in with: its `login`, else its name.
+    pub login: String,
+    /// The preset the provider takes its defaults from, if any.
+    pub preset: Option<&'static Preset>,
     /// The provider wire.
     pub wire: Wire,
     /// The endpoint URL, or the wire default when absent.
@@ -142,6 +173,11 @@ pub struct Target {
     /// A built-in provider with no config table, listed with no name only when
     /// it has a key.
     pub implicit: bool,
+    /// The model list path under the base URL.
+    pub models_path: &'static str,
+    /// The models.dev provider id its list is filled from, when the config
+    /// names one.
+    pub models_dev: Option<String>,
 }
 
 /// The `models` command.
@@ -151,6 +187,8 @@ pub struct ModelsArgs {
     pub targets: Vec<Target>,
     /// Fetch even when the cache is fresh.
     pub refresh: bool,
+    /// The profile file the command read, if any.
+    pub profile: Option<String>,
 }
 
 /// The `sandbox.mode` setting.
@@ -224,20 +262,28 @@ fn usage() -> &'static str {
         "      --json           print one JSON object per event on stdout\n",
         "      --model <id>     the provider model id\n",
         "      --provider <wire>  anthropic, openai-chat or openai-responses (default: anthropic)\n",
+        "                       --model <name>/<id> picks a preset: anthropic, openai, chatgpt,\n",
+        "                       openrouter, opencode-go, commandcode, deepseek or freeinference\n",
         "      --base-url <url>   the endpoint; default from the provider env, else built in\n",
         "      --api-key-env <name>  the env var holding the API key; never the key itself\n",
         "      --header <name:value>  an extra request header; repeatable; reserved names\n",
         "                       (authorization, x-api-key, content-type, anthropic-version) are errors\n",
         "      --max-tokens <n> the reply token cap, thinking included (default: 64000)\n",
+        "      --reasoning <text>  the provider's reasoning level, or a token budget; off = none\n",
         "      --deadline <s>   stop after this many seconds\n",
         "      --cwd <dir>      the working directory for the tools (default: current dir)\n",
+        "      --profile <name>  read <config dir>/profiles/<name>.toml over the global config;\n",
+        "                       REAGENT_PROFILE names one too\n",
         "      --policy <list>  loop policies: completion, stuck, budget, snapshot, mask, compact;\n",
         "                       all = completion, budget, snapshot; none = off\n",
         "                       (default: budget, plus mask on openai-chat)\n",
         "      --version        print the version and exit\n",
         "\n",
         "Commands:\n",
-        "  models [name] [--refresh]  list the models of a provider, or of all with a key\n"
+        "  models [name] [--refresh]  list the models of a provider, or of all with a key\n",
+        "  login <provider> [--as <name>] [--no-browser]  save a login for a provider;\n",
+        "                       openrouter, chatgpt\n",
+        "  logout <provider>  drop a saved login\n"
     )
 }
 
@@ -268,11 +314,10 @@ fn may_compact(provider: &Wire) -> bool {
 
 /// Maps a `--provider` value to a wire, or to `fake:<file>` under testing.
 fn parse_provider(value: &str) -> Result<Wire, String> {
-    match value {
-        "anthropic" => Ok(Wire::Anthropic),
-        "openai-chat" => Ok(Wire::OpenAiChat),
-        "openai-responses" => Ok(Wire::OpenAiResponses),
-        other => {
+    match reagent_ai::Wire::parse(value) {
+        Some(wire) => Ok(Wire::from_ai(wire)),
+        None => {
+            let other = value;
             #[cfg(feature = "testing")]
             if let Some(spec) = other.strip_prefix("fake:") {
                 return Ok(Wire::Fake(spec.to_string()));
@@ -345,10 +390,10 @@ fn expand_policies(layer: &mut Layer) -> Result<(), String> {
     Ok(())
 }
 
-/// Loads the config files for `cwd`, checks their policy names and merges
-/// them, and parses their permission rules.
-fn load_settings(cwd: &Path) -> Result<(Settings, Rules), String> {
-    settings_from(reagent_config::load_for(cwd)?, cwd)
+/// Loads the config files for `cwd` and the profile `profile`, checks their
+/// policy names and merges them, and parses their permission rules.
+fn load_settings(cwd: &Path, profile: Option<&str>) -> Result<(Settings, Rules), String> {
+    settings_from(reagent_config::load_for(cwd, profile)?, cwd)
 }
 
 #[expect(
@@ -361,29 +406,131 @@ fn canonical(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn settings_from(mut layers: Vec<Layer>, cwd: &Path) -> Result<(Settings, Rules), String> {
-    for layer in &mut layers {
+fn settings_from(mut layers: Layers, cwd: &Path) -> Result<(Settings, Rules), String> {
+    for layer in [&mut layers.global, &mut layers.profile, &mut layers.repo]
+        .into_iter()
+        .flatten()
+    {
         expand_policies(layer)?;
     }
     // The tools resolve paths from the real folder, so the rules must too,
     // or a symlinked --cwd would make every relative path rule miss.
     let cwd = canonical(cwd);
     let home = std::env::var_os("HOME").map(|home| canonical(Path::new(&home)));
-    let rules = Rules::from_layers(&layers, &cwd, home.as_deref())?;
-    Ok((reagent_config::merge(&layers), rules))
+    let rules = Rules::from_layers(&layers.ordered(), &cwd, home.as_deref())?;
+    Ok((reagent_config::merge_all(&layers), rules))
 }
 
-/// The provider a name selects when no config table defines it.
-fn built_in_provider(name: &str) -> Option<(Wire, &'static str)> {
-    match name {
-        "anthropic" => Some((Wire::Anthropic, "ANTHROPIC_API_KEY")),
-        "openai" => Some((Wire::OpenAiResponses, "OPENAI_API_KEY")),
-        _ => None,
+/// The preset a name selects, whose fields a config table may override.
+fn built_in_provider(name: &str) -> Option<&'static Preset> {
+    reagent_ai::providers::get(name)
+}
+
+/// The preset a table takes its defaults from: its `preset`, else the preset
+/// named like the table.
+fn preset_for(
+    name: &str,
+    table: Option<&reagent_config::Provider>,
+) -> Result<Option<&'static Preset>, String> {
+    let Some(preset_name) = table.and_then(|table| table.preset.as_deref()) else {
+        return Ok(built_in_provider(name));
+    };
+    reagent_ai::providers::get(preset_name)
+        .map(Some)
+        .ok_or_else(|| {
+            let names: Vec<&str> = reagent_ai::providers::ALL
+                .iter()
+                .map(|preset| preset.name)
+                .collect();
+            format!(
+                "config: [providers.{name}]: unknown preset {preset_name}; presets: {}",
+                names.join(", ")
+            )
+        })
+}
+
+/// The rule a provider table name and a `login` value share: letters, digits,
+/// `-` and `_` only, which a login file name and a cache file name both take.
+pub fn check_account_name(name: &str) -> Result<(), String> {
+    if reagent_config::valid_name(name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "provider name {name}: use letters, digits, - and _ only, not starting with -"
+        ))
     }
 }
 
+/// The profile a run reads: the flag, else `REAGENT_PROFILE` when it is set
+/// and not empty.
+fn profile_from(flag: Option<String>, env: Option<String>) -> Option<String> {
+    flag.or_else(|| env.filter(|name| !name.is_empty()))
+}
+
+/// The profile name rule, which the provider name rule already gives: a name
+/// is a file name too.
+fn check_profile_name(name: &str) -> Result<(), String> {
+    check_account_name(name).map_err(|_| {
+        format!("invalid profile {name}: use letters, digits, - and _ only, not starting with -")
+    })
+}
+
+/// Checks every provider table name and `login` value, and that every
+/// `preset` names a known preset, so a typo fails before any run.
+fn check_provider_names(settings: &Settings) -> Result<(), String> {
+    for (name, table) in &settings.providers {
+        check_account_name(name).map_err(|error| format!("config: {error}"))?;
+        if let Some(login) = &table.login {
+            check_account_name(login).map_err(|error| format!("config: {error}"))?;
+        }
+        preset_for(name, Some(table))?;
+    }
+    Ok(())
+}
+
+/// The compat flags of a run: the config flags over the preset's, or over the
+/// host rule of the endpoint when there is no preset. `None` when neither
+/// sets any.
+fn resolve_compat(
+    name: Option<&str>,
+    table: Option<&reagent_config::Table>,
+    preset: Option<&Preset>,
+    base_url: &str,
+) -> Result<Option<Compat>, String> {
+    let over = match table {
+        Some(table) => {
+            CompatOverride::deserialize(table.clone().into_deserializer()).map_err(|error| {
+                format!(
+                    "config: [providers.{}.compat]: {error}",
+                    name.unwrap_or_default()
+                )
+            })?
+        }
+        None => CompatOverride::default(),
+    };
+    // A preset's flags describe its own endpoint; another URL gets the host rule.
+    let base = match (preset, table) {
+        (Some(preset), _) if base_url.trim_end_matches('/') == preset.base_url => preset.compat,
+        (Some(_), _) | (None, Some(_)) => {
+            let field = if base_url.contains("api.openai.com") {
+                MaxTokensField::MaxCompletionTokens
+            } else {
+                MaxTokensField::MaxTokens
+            };
+            CompatOverride {
+                max_tokens_field: Some(field),
+                reasoning_field: None,
+                reasoning_off: None,
+            }
+            .apply(Compat::DEFAULT)
+        }
+        (None, None) => return Ok(None),
+    };
+    Ok(Some(over.apply(base)))
+}
+
 /// Splits the model text at its first `/` when the part before it names a
-/// built-in or configured provider.
+/// preset or configured provider.
 fn split_model<'a>(text: &'a str, settings: &Settings) -> Option<(&'a str, &'a str)> {
     let (name, id) = text.split_once('/')?;
     (settings.providers.contains_key(name) || built_in_provider(name).is_some())
@@ -394,9 +541,9 @@ fn split_model<'a>(text: &'a str, settings: &Settings) -> Option<(&'a str, &'a s
 /// table and every built-in provider.
 fn model_targets(settings: &Settings, name: Option<&str>) -> Result<Vec<Target>, String> {
     let mut names: Vec<&str> = settings.providers.keys().map(String::as_str).collect();
-    for built_in in ["anthropic", "openai"] {
-        if !names.contains(&built_in) {
-            names.push(built_in);
+    for preset in reagent_ai::providers::ALL {
+        if !names.contains(&preset.name) {
+            names.push(preset.name);
         }
     }
     if let Some(name) = name {
@@ -410,12 +557,13 @@ fn model_targets(settings: &Settings, name: Option<&str>) -> Result<Vec<Target>,
         .into_iter()
         .map(|name| {
             let table = settings.providers.get(name).cloned().unwrap_or_default();
-            let built_in = built_in_provider(name);
+            let built_in = preset_for(name, settings.providers.get(name))?;
+            let login = table.login.clone().unwrap_or_else(|| name.to_string());
             let wire = match (&table.wire, &built_in) {
                 (Some(wire), _) => {
                     parse_provider(wire).map_err(|error| format!("config: {error}"))?
                 }
-                (None, Some((wire, _))) => wire.clone(),
+                (None, Some(preset)) => Wire::from_ai(preset.wire),
                 (None, None) => Wire::Anthropic,
             };
             let mut header = Vec::new();
@@ -425,21 +573,28 @@ fn model_targets(settings: &Settings, name: Option<&str>) -> Result<Vec<Target>,
             }
             Ok(Target {
                 name: name.to_string(),
+                login,
+                preset: built_in,
                 wire,
-                base_url: table.base_url,
+                base_url: table
+                    .base_url
+                    .or_else(|| built_in.map(|preset| preset.endpoint())),
                 api_key_env: table
                     .api_key_env
-                    .or_else(|| built_in.map(|(_, key)| key.to_string())),
+                    .or_else(|| built_in.map(|preset| preset.api_key_env.to_string())),
                 api_key: table.api_key,
                 header,
                 implicit: name_given.is_none() && !settings.providers.contains_key(name),
+                models_path: built_in.map_or("/models", |preset| preset.models_path),
+                models_dev: table.models_dev,
             })
         })
         .collect()
 }
 
-/// Reads the merged settings and the permission rules for a working folder.
-type LoadSettings<'a> = dyn Fn(&Path) -> Result<(Settings, Rules), String> + 'a;
+/// Reads the merged settings and the permission rules for a working folder
+/// and a profile.
+type LoadSettings<'a> = dyn Fn(&Path, Option<&str>) -> Result<(Settings, Rules), String> + 'a;
 
 /// Parses `args` (the arguments after the program name) into an outcome.
 /// `load` reads the settings for the working directory; a flag beats them.
@@ -452,11 +607,13 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
     let mut api_key_env = None;
     let mut header = Vec::new();
     let mut max_tokens = None;
+    let mut reasoning = None;
     let mut deadline = None;
     let mut cwd = None;
     let mut policy: Option<Vec<String>> = None;
     let mut models: Option<Option<String>> = None;
     let mut refresh = false;
+    let mut profile = None;
     let mut first = true;
 
     while let Some(arg) = parser.next().map_err(|error| error.to_string())? {
@@ -522,6 +679,17 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
                         .ok_or_else(|| bad("--max-tokens"))?,
                 );
             }
+            lexopt::Arg::Long("reasoning") => {
+                let value = parser
+                    .value()
+                    .map_err(|_| "missing value for --reasoning".to_string())?;
+                let text = value.into_string().map_err(|_| bad("--reasoning"))?;
+                let text = text.trim();
+                if text.is_empty() {
+                    return Err(bad("--reasoning"));
+                }
+                reasoning = Some(text.to_string());
+            }
             lexopt::Arg::Long("deadline") => {
                 let value = parser
                     .value()
@@ -545,6 +713,12 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
                     .map_err(|_| "missing value for --cwd".to_string())?;
                 cwd = Some(PathBuf::from(value));
             }
+            lexopt::Arg::Long("profile") => {
+                let value = parser
+                    .value()
+                    .map_err(|_| "missing value for --profile".to_string())?;
+                profile = Some(value.into_string().map_err(|_| bad("--profile"))?);
+            }
             lexopt::Arg::Long("refresh") => refresh = true,
             lexopt::Arg::Value(value) if models.is_some() || (at_start && value == "models") => {
                 let text = value.into_string().map_err(|_| bad("argument"))?;
@@ -561,6 +735,11 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
         }
     }
 
+    let profile = profile_from(profile, std::env::var("REAGENT_PROFILE").ok());
+    if let Some(name) = &profile {
+        check_profile_name(name)?;
+    }
+
     if let Some(name) = models {
         if task.is_some()
             || json
@@ -570,14 +749,23 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
             || api_key_env.is_some()
             || !header.is_empty()
             || max_tokens.is_some()
+            || reasoning.is_some()
             || deadline.is_some()
             || policy.is_some()
         {
             return Err("the models command takes no run flags".into());
         }
-        let (settings, _) = load(&cwd.unwrap_or_else(|| PathBuf::from(".")))?;
+        let (settings, _) = load(
+            &cwd.unwrap_or_else(|| PathBuf::from(".")),
+            profile.as_deref(),
+        )?;
+        check_provider_names(&settings)?;
         let targets = model_targets(&settings, name.as_deref())?;
-        return Ok(Outcome::Models(Box::new(ModelsArgs { targets, refresh })));
+        return Ok(Outcome::Models(Box::new(ModelsArgs {
+            targets,
+            refresh,
+            profile,
+        })));
     }
     if refresh {
         return Err("--refresh needs the models command".into());
@@ -589,7 +777,8 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
         return Err("missing task; use -p <task>".into());
     };
     let cwd = cwd.unwrap_or_else(|| PathBuf::from("."));
-    let (settings, rules) = load(&cwd)?;
+    let (settings, rules) = load(&cwd, profile.as_deref())?;
+    check_provider_names(&settings)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let (sandbox, network, write) = resolve_sandbox(&settings.sandbox, home.as_deref())?;
     let model_text = model
@@ -600,7 +789,10 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
         None => (None, model_text.clone()),
     };
     let table = provider_name.and_then(|name| settings.providers.get(name));
-    let built_in = provider_name.and_then(built_in_provider);
+    let built_in = match provider_name {
+        Some(name) => preset_for(name, table)?,
+        None => None,
+    };
     let table = table.cloned().unwrap_or_else(Provider::default);
     let model_table = table
         .models
@@ -610,7 +802,7 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
     let provider = match (provider, &table.wire) {
         (Some(wire), _) => wire,
         (None, Some(name)) => parse_provider(name).map_err(|error| format!("config: {error}"))?,
-        (None, None) => built_in.clone().map_or(Wire::Anthropic, |(wire, _)| wire),
+        (None, None) => built_in.map_or(Wire::Anthropic, |preset| Wire::from_ai(preset.wire)),
     };
     let mut config_header = Vec::new();
     for (name, value) in &table.headers {
@@ -639,28 +831,53 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
         return Err("--policy compact needs --provider openai-chat".into());
     }
 
+    let base_url = base_url
+        .or(table.base_url)
+        .or_else(|| built_in.map(|preset| preset.endpoint()));
+    let compat = resolve_compat(
+        provider_name,
+        table.compat.as_ref(),
+        built_in,
+        base_url
+            .clone()
+            .unwrap_or_else(|| provider.base_url())
+            .as_str(),
+    )?;
+
     Ok(Outcome::Run(Box::new(Args {
         task,
         json,
         model: model_id,
         provider,
-        base_url: base_url.or(table.base_url),
+        profile,
+        base_url,
+        compat,
         api_key: table.api_key,
         provider_name: provider_name.map(str::to_string),
+        preset: built_in,
+        login: provider_name.map(|name| table.login.clone().unwrap_or_else(|| name.to_string())),
         api_key_env: api_key_env
             .or(table.api_key_env)
-            .or_else(|| built_in.map(|(_, key)| key.to_string())),
+            .or_else(|| built_in.map(|preset| preset.api_key_env.to_string())),
         header,
         max_tokens: max_tokens
             .or(model_table.max_tokens)
             .or(settings.max_tokens)
             .unwrap_or(DEFAULT_MAX_TOKENS),
+        // An empty value in a config table counts as unset.
+        reasoning: reasoning.or_else(|| {
+            [model_table.reasoning, table.reasoning, settings.reasoning]
+                .into_iter()
+                .flatten()
+                .find(|text| !text.trim().is_empty())
+        }),
         deadline,
         cwd,
         policy,
         skip: settings.skip,
         rules,
         context_window: model_table.context_window,
+        price: model_table.price,
         sandbox,
         network,
         write,
@@ -684,7 +901,7 @@ mod tests {
 
     fn parse_with(args: &[&str], settings: Settings) -> Result<Outcome, String> {
         let argv = args.iter().map(std::ffi::OsString::from);
-        parse_from(lexopt::Parser::from_args(argv), &|_| {
+        parse_from(lexopt::Parser::from_args(argv), &|_, _| {
             Ok((settings.clone(), Rules::none()))
         })
     }
@@ -752,6 +969,92 @@ mod tests {
 
     fn providers(provider: Provider) -> std::collections::BTreeMap<String, Provider> {
         [("fi".to_string(), provider)].into()
+    }
+
+    /// The settings of a config with one table per `(name, preset, login)`.
+    fn account_settings(tables: &[(&str, Option<&str>, Option<&str>)]) -> Settings {
+        let providers = tables
+            .iter()
+            .map(|(name, preset, login)| {
+                (
+                    name.to_string(),
+                    Provider {
+                        preset: preset.map(str::to_string),
+                        login: login.map(str::to_string),
+                        ..Provider::default()
+                    },
+                )
+            })
+            .collect();
+        Settings {
+            providers,
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn named_account_tables_resolve_their_own_preset_wire_and_compat() {
+        let settings = account_settings(&[
+            ("codex-sub", Some("chatgpt"), None),
+            ("codex-api", Some("openai"), None),
+        ]);
+        let sub = run_with(
+            &["-p", "task", "--model", "codex-sub/gpt-x"],
+            settings.clone(),
+        );
+        assert_eq!(sub.model, "gpt-x");
+        assert_eq!(sub.provider, Wire::OpenAiResponses);
+        assert_eq!(sub.base_url.as_deref(), Some("https://api.openai.com/v1"));
+        assert_eq!(sub.login.as_deref(), Some("codex-sub"));
+        assert_eq!(sub.preset.map(|preset| preset.name), Some("chatgpt"));
+        assert_eq!(
+            sub.compat.map(|compat| compat.max_tokens_field),
+            Some(MaxTokensField::Omit)
+        );
+        let api = run_with(&["-p", "task", "--model", "codex-api/gpt-x"], settings);
+        assert_eq!(api.provider, Wire::OpenAiResponses);
+        assert_eq!(api.preset.map(|preset| preset.name), Some("openai"));
+        assert_eq!(
+            api.compat.map(|compat| compat.max_tokens_field),
+            Some(MaxTokensField::MaxCompletionTokens)
+        );
+    }
+
+    #[test]
+    fn named_account_a_table_login_names_the_saved_account() {
+        let settings = account_settings(&[("codex-api", Some("openai"), Some("codex-sub"))]);
+        let args = run_with(&["-p", "task", "--model", "codex-api/gpt-x"], settings);
+        assert_eq!(args.login.as_deref(), Some("codex-sub"));
+    }
+
+    #[test]
+    fn named_account_bad_names_are_refused() {
+        for name in ["codex/sub", "a.b"] {
+            let settings = account_settings(&[(name, Some("openai"), None)]);
+            let error = parse_with(&["-p", "task"], settings).unwrap_err();
+            assert!(error.contains("provider name"), "{error}");
+        }
+        let settings = account_settings(&[("codex-api", Some("openai"), Some("a.b"))]);
+        let error = parse_with(&["models"], settings).unwrap_err();
+        assert!(error.contains("provider name a.b"), "{error}");
+    }
+
+    #[test]
+    fn named_account_a_leading_dash_is_refused() {
+        assert!(check_account_name("--no-browser").is_err());
+        assert!(check_account_name("-").is_err());
+        assert!(check_account_name("or-work").is_ok());
+    }
+
+    #[test]
+    fn named_account_unknown_preset_is_refused() {
+        let settings = account_settings(&[("codex-sub", Some("nope"), None)]);
+        let error = parse_with(&["-p", "task"], settings).unwrap_err();
+        assert!(
+            error.contains("config: [providers.codex-sub]: unknown preset nope"),
+            "{error}"
+        );
+        assert!(error.contains("presets: anthropic"), "{error}");
     }
 
     fn run(args: &[&str]) -> Args {
@@ -1132,7 +1435,14 @@ mod tests {
                 ..Settings::default()
             },
         };
-        let (_, rules) = settings_from(vec![layer], Path::new("/work")).unwrap();
+        let (_, rules) = settings_from(
+            Layers {
+                global: Some(layer),
+                ..Layers::default()
+            },
+            Path::new("/work"),
+        )
+        .unwrap();
         assert!(!rules.is_open());
         let bad = Layer {
             path: std::path::PathBuf::from("/g/config.toml"),
@@ -1144,14 +1454,108 @@ mod tests {
                 ..Settings::default()
             },
         };
-        let error = settings_from(vec![bad], Path::new("/work")).unwrap_err();
+        let error = settings_from(
+            Layers {
+                global: Some(bad),
+                ..Layers::default()
+            },
+            Path::new("/work"),
+        )
+        .unwrap_err();
         assert!(error.starts_with("/g/config.toml"), "{error}");
+    }
+
+    #[test]
+    fn profile_layer_the_flag_beats_the_env_var() {
+        let some = |name: &str| Some(name.to_string());
+        assert_eq!(profile_from(some("work"), some("env")), some("work"));
+        assert_eq!(profile_from(None, some("env")), some("env"));
+        assert_eq!(profile_from(None, Some(String::new())), None);
+        assert_eq!(profile_from(None, None), None);
+    }
+
+    #[test]
+    fn profile_layer_a_bad_name_is_refused() {
+        for name in ["a/b", "a.b", "-work", ""] {
+            let error = parse(&["--profile", name, "-p", "task"]).unwrap_err();
+            assert!(error.contains("invalid profile"), "{name}: {error}");
+        }
+        assert!(check_profile_name("work-1_x").is_ok());
+    }
+
+    #[test]
+    fn profile_layer_reaches_the_loader_of_both_commands() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let parse = |args: &[&str]| {
+            let argv = args.iter().map(std::ffi::OsString::from);
+            parse_from(
+                lexopt::Parser::from_args(argv),
+                &|_: &Path, profile: Option<&str>| {
+                    seen.borrow_mut().push(profile.map(str::to_string));
+                    Ok((Settings::default(), Rules::none()))
+                },
+            )
+        };
+        let models = parse(&["models", "--profile", "work"]).expect("parses");
+        match models {
+            Outcome::Models(models) => assert_eq!(models.profile.as_deref(), Some("work")),
+            other => panic!("expected the models command, got {other:?}"),
+        }
+        let run = parse(&["-p", "task", "--profile", "work"]).expect("parses");
+        match run {
+            Outcome::Run(args) => assert_eq!(args.profile.as_deref(), Some("work")),
+            other => panic!("expected a run outcome, got {other:?}"),
+        }
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [Some("work".into()), Some("work".into())]
+        );
+    }
+
+    #[test]
+    fn profile_layer_the_models_command_refuses_a_run_flag() {
+        let error = parse(&["models", "--profile", "work", "--model", "x"]).unwrap_err();
+        assert_eq!(error, "the models command takes no run flags");
+    }
+
+    #[test]
+    fn profile_layer_a_provider_table_from_the_profile_reaches_the_args() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let global = Layer {
+            path: dir.path().join("config.toml"),
+            settings: Settings {
+                model: Some("fi/glm".into()),
+                ..Settings::default()
+            },
+        };
+        let profile = Layer {
+            path: dir.path().join("profiles/work.toml"),
+            settings: Settings {
+                providers: providers(Provider {
+                    api_key_env: Some("WORK_KEY".into()),
+                    ..Provider::default()
+                }),
+                ..Settings::default()
+            },
+        };
+        let layers = Layers {
+            global: Some(global),
+            profile: Some(profile),
+            repo: None,
+        };
+        let (settings, _) = settings_from(layers, dir.path()).expect("settings");
+        let args = run_with(&["-p", "task"], settings.clone());
+        assert_eq!(args.model, "glm");
+        assert_eq!(args.api_key_env.as_deref(), Some("WORK_KEY"));
+        // The model flag still beats the profile's model.
+        let args = run_with(&["-p", "task", "--model", "other"], settings);
+        assert_eq!(args.model, "other");
     }
 
     #[test]
     fn a_config_error_ends_the_parse() {
         let argv = ["-p", "task"].iter().map(std::ffi::OsString::from);
-        let error = parse_from(lexopt::Parser::from_args(argv), &|_| Err("bad".into()));
+        let error = parse_from(lexopt::Parser::from_args(argv), &|_, _| Err("bad".into()));
         assert_eq!(error.unwrap_err(), "bad");
     }
 
@@ -1174,7 +1578,20 @@ mod tests {
             panic!("expected a models outcome, got {parsed:?}");
         };
         let names: Vec<&str> = models.targets.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, ["fi", "anthropic", "openai"]);
+        assert_eq!(
+            names,
+            [
+                "fi",
+                "anthropic",
+                "openai",
+                "chatgpt",
+                "openrouter",
+                "opencode-go",
+                "commandcode",
+                "deepseek",
+                "freeinference"
+            ]
+        );
         assert!(parse_with(&["models", "nope"], settings.clone()).is_err());
         assert!(parse_with(&["--refresh", "-p", "x"], settings.clone()).is_err());
         assert!(parse_with(&["models", "-p", "x"], settings.clone()).is_err());
@@ -1287,6 +1704,7 @@ mod tests {
                         max_tokens: Some(16_000),
                         context_window: Some(128_000),
                         policy: Some(vec!["snapshot".into()]),
+                        ..Model::default()
                     },
                 )]
                 .into(),
@@ -1300,6 +1718,82 @@ mod tests {
         assert_eq!(args.policy, vec!["snapshot"]);
         let args = run_with(&["-p", "task", "--max-tokens", "8000"], settings);
         assert_eq!(args.max_tokens, 8000);
+    }
+
+    #[test]
+    fn reasoning_text_empty_in_a_table_counts_as_unset() {
+        let settings = Settings {
+            model: Some("fi/glm".into()),
+            reasoning: Some("top".into()),
+            providers: providers(Provider {
+                wire: Some("openai-chat".into()),
+                reasoning: Some("  ".into()),
+                ..Provider::default()
+            }),
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "task"], settings);
+        assert_eq!(args.reasoning.as_deref(), Some("top"));
+    }
+
+    #[test]
+    fn reasoning_text_resolves_flag_model_provider_then_top_level() {
+        let settings = Settings {
+            model: Some("fi/glm".into()),
+            reasoning: Some("top".into()),
+            providers: providers(Provider {
+                wire: Some("openai-chat".into()),
+                reasoning: Some("provider".into()),
+                models: [(
+                    "glm".to_string(),
+                    Model {
+                        reasoning: Some("model".into()),
+                        ..Model::default()
+                    },
+                )]
+                .into(),
+                ..Provider::default()
+            }),
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "task"], settings.clone());
+        assert_eq!(args.reasoning.as_deref(), Some("model"));
+
+        let args = run_with(&["-p", "task", "--reasoning", "xhigh"], settings.clone());
+        assert_eq!(args.reasoning.as_deref(), Some("xhigh"));
+
+        let mut provider_only = settings.clone();
+        provider_only
+            .providers
+            .get_mut("fi")
+            .expect("the provider table")
+            .models
+            .clear();
+        let args = run_with(&["-p", "task"], provider_only);
+        assert_eq!(args.reasoning.as_deref(), Some("provider"));
+
+        let mut top_only = settings;
+        let provider = top_only
+            .providers
+            .get_mut("fi")
+            .expect("the provider table");
+        provider.reasoning = None;
+        provider.models.clear();
+        let args = run_with(&["-p", "task"], top_only);
+        assert_eq!(args.reasoning.as_deref(), Some("top"));
+    }
+
+    #[test]
+    fn the_reasoning_text_flag_needs_a_value() {
+        assert_eq!(run(&["-p", "task"]).reasoning, None);
+        assert_eq!(
+            run(&["-p", "task", "--reasoning", " 4096 "])
+                .reasoning
+                .as_deref(),
+            Some("4096")
+        );
+        assert!(parse(&["-p", "task", "--reasoning"]).is_err());
+        assert!(parse(&["-p", "task", "--reasoning", " "]).is_err());
     }
 
     #[test]
@@ -1331,5 +1825,148 @@ mod tests {
         assert_eq!(args.base_url.as_deref(), Some("http://localhost:1"));
         assert_eq!(args.api_key_env.as_deref(), Some("MINE"));
         assert_eq!(args.provider, Wire::Anthropic);
+    }
+
+    #[test]
+    fn preset_name_selects_its_wire_url_and_key_env() {
+        let args = run(&["-p", "task", "--model", "opencode-go/glm-5"]);
+        assert_eq!(args.model, "glm-5");
+        assert_eq!(args.provider, Wire::OpenAiChat);
+        assert_eq!(
+            args.base_url.as_deref(),
+            Some("https://opencode.ai/zen/go/v1")
+        );
+        assert_eq!(args.api_key_env.as_deref(), Some("OPENCODE_API_KEY"));
+        assert_eq!(args.policy, vec!["budget", "mask"]);
+    }
+
+    #[test]
+    fn a_config_table_overrides_one_preset_field() {
+        let settings = Settings {
+            providers: [(
+                "openrouter".to_string(),
+                Provider {
+                    base_url: Some("http://localhost:1/v1".into()),
+                    ..Provider::default()
+                },
+            )]
+            .into(),
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "task", "--model", "openrouter/x"], settings);
+        assert_eq!(args.provider, Wire::OpenAiChat);
+        assert_eq!(args.base_url.as_deref(), Some("http://localhost:1/v1"));
+        assert_eq!(args.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
+    }
+
+    #[test]
+    fn preset_compat_applies_only_to_the_preset_endpoint() {
+        let settings = |base_url: Option<&str>| Settings {
+            providers: [(
+                "openai".to_string(),
+                Provider {
+                    wire: Some("openai-chat".into()),
+                    base_url: base_url.map(str::to_owned),
+                    ..Provider::default()
+                },
+            )]
+            .into(),
+            ..Settings::default()
+        };
+        let field = |base_url| {
+            run_with(&["-p", "task", "--model", "openai/x"], settings(base_url))
+                .compat
+                .expect("a compat")
+                .max_tokens_field
+        };
+        assert_eq!(field(None), MaxTokensField::MaxCompletionTokens);
+        assert_eq!(
+            field(Some("http://localhost:11434/v1")),
+            MaxTokensField::MaxTokens
+        );
+    }
+
+    #[test]
+    fn preset_compat_override_refuses_an_unknown_flag() {
+        let settings = |compat: &str| Settings {
+            providers: [(
+                "openrouter".to_string(),
+                Provider {
+                    compat: Some(
+                        compat
+                            .parse::<reagent_config::Table>()
+                            .expect("a toml table"),
+                    ),
+                    ..Provider::default()
+                },
+            )]
+            .into(),
+            ..Settings::default()
+        };
+        let error = parse_with(
+            &["-p", "task", "--model", "openrouter/x"],
+            settings("nope = true"),
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("config: [providers.openrouter.compat]: "),
+            "{error}"
+        );
+        let args = run_with(
+            &["-p", "task", "--model", "openrouter/x"],
+            settings("max_tokens_field = \"max_completion_tokens\""),
+        );
+        assert_eq!(
+            args.compat.map(|compat| compat.max_tokens_field),
+            Some(reagent_ai::MaxTokensField::MaxCompletionTokens)
+        );
+    }
+
+    #[test]
+    fn a_compat_override_sets_the_reasoning_text_field() {
+        let settings = Settings {
+            providers: [(
+                "openrouter".to_string(),
+                Provider {
+                    compat: Some(
+                        "reasoning_field = \"reasoning\""
+                            .parse::<reagent_config::Table>()
+                            .expect("a toml table"),
+                    ),
+                    ..Provider::default()
+                },
+            )]
+            .into(),
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "task", "--model", "openrouter/x"], settings);
+        assert_eq!(
+            args.compat.map(|compat| compat.reasoning_field),
+            Some(reagent_ai::ReasoningField::EffortObject)
+        );
+    }
+
+    #[test]
+    fn reasoning_off_a_config_word_sets_the_off_word() {
+        let settings = Settings {
+            providers: [(
+                "openrouter".to_string(),
+                Provider {
+                    compat: Some(
+                        "reasoning_off = \"disabled\""
+                            .parse::<reagent_config::Table>()
+                            .expect("a toml table"),
+                    ),
+                    ..Provider::default()
+                },
+            )]
+            .into(),
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "task", "--model", "openrouter/x"], settings);
+        assert_eq!(
+            args.compat.map(|compat| compat.reasoning_off),
+            Some(Some("disabled"))
+        );
     }
 }

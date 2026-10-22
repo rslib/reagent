@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 reagent-util.workspace = true
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde"] }
 
 [dev-dependencies]

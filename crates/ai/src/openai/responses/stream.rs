@@ -146,11 +146,20 @@ impl StreamParser {
             "response.failed" => {
                 let (message, transient) = match event.response.error {
                     Some(error) => {
-                        let kind = error.kind.or(error.code);
-                        (
-                            error.message.as_str().to_string(),
-                            kind.is_some_and(retryable),
-                        )
+                        // A plan error names its own cause and is never retried.
+                        match error
+                            .code
+                            .and_then(|code| super::plan_error(code, error.param))
+                        {
+                            Some(message) => (message, false),
+                            None => {
+                                let kind = error.kind.or(error.code);
+                                (
+                                    error.message.as_str().to_string(),
+                                    kind.is_some_and(retryable),
+                                )
+                            }
+                        }
                     }
                     None => ("response failed".into(), false),
                 };
@@ -255,6 +264,7 @@ fn usage_of(json: UsageJson) -> Usage {
         cache_read_tokens: cached,
         cache_write_tokens: 0,
         reasoning_tokens: json.output_tokens_details.reasoning_tokens,
+        cost: None,
     }
 }
 
@@ -325,6 +335,8 @@ struct ApiError<'a> {
     kind: Option<&'a str>,
     #[serde(default, borrow)]
     code: Option<&'a str>,
+    #[serde(default, borrow)]
+    param: Option<&'a str>,
 }
 
 /// Whether an OpenAI Responses stream error is safe to retry: a server or
@@ -453,6 +465,32 @@ mod tests {
         assert_eq!(
             parser.finish().unwrap().unwrap(),
             StreamEvent::Stop(StopReason::MaxTokens)
+        );
+    }
+
+    #[test]
+    fn plan_error_a_failed_response_names_the_usage_limit() {
+        let mut parser = StreamParser::new();
+        let line = br#"data: {"type":"response.failed","response":{"status":"failed","error":{"code":"subscription_sharing_usage_limit_exceeded","message":"detail"}}}"#;
+        let mut out = Vec::new();
+        let error = parser.push_line(line, &mut out).unwrap_err();
+        assert_eq!(error.retry_hint(), None);
+        assert!(
+            matches!(&error, Error::Protocol(message) if message.contains("https://chatgpt.com/settings/usage")),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("detail"), "{error}");
+    }
+
+    #[test]
+    fn plan_error_unsupported_capability_names_the_param() {
+        let mut parser = StreamParser::new();
+        let line = br#"data: {"type":"response.failed","response":{"status":"failed","error":{"code":"subscription_sharing_unsupported_capability","param":"web_search"}}}"#;
+        let mut out = Vec::new();
+        let error = parser.push_line(line, &mut out).unwrap_err();
+        assert!(
+            matches!(&error, Error::Protocol(message) if message == "the ChatGPT plan does not support web_search"),
+            "{error}"
         );
     }
 

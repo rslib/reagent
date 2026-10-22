@@ -109,7 +109,7 @@ pub fn spec() -> ToolSpec {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Path of the file, relative to the working directory." },
+                "path": { "type": "string", "description": "Path of the file." },
                 "content": { "type": "string", "description": "The full content to write." }
             },
             "required": ["path", "content"]

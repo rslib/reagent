@@ -53,6 +53,11 @@ impl ExtraHeaders {
         Self(pairs)
     }
 
+    /// Whether `name` is already set by the caller, whose value then wins.
+    pub(crate) fn has(&self, name: &HeaderName) -> bool {
+        self.0.iter().any(|(seen, _)| seen == name)
+    }
+
     /// Adds every header to `builder`.
     pub(crate) fn apply(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         for (name, value) in &self.0 {
@@ -69,6 +74,10 @@ impl std::fmt::Debug for ExtraHeaders {
     }
 }
 
+/// The user agent every request carries. Some gateways answer 403 to a request
+/// without one.
+const USER_AGENT: &str = concat!("reagent/", env!("CARGO_PKG_VERSION"));
+
 /// reqwest is built without a crypto provider, so ring must be the process
 /// default before a client is built. A second install is a no-op error.
 fn install_ring() {
@@ -81,6 +90,7 @@ fn install_ring() {
 pub(crate) fn client() -> reqwest::Client {
     install_ring();
     match reqwest::Client::builder()
+        .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
     {
@@ -95,6 +105,7 @@ fn bundled_client() -> reqwest::Client {
         .iter()
         .filter_map(|der| reqwest::Certificate::from_der(der).ok());
     reqwest::Client::builder()
+        .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
         .tls_certs_only(roots)
         .build()
@@ -109,6 +120,20 @@ mod tests {
     fn the_bundled_roots_build_a_client() {
         assert!(!webpki_root_certs::TLS_SERVER_ROOT_CERTS.is_empty());
         let _ = bundled_client();
+    }
+
+    #[tokio::test]
+    async fn gateway_requests_send_a_reagent_user_agent() {
+        let (base, recorded) = test_server::serve("").await;
+        let response = client()
+            .post(format!("{base}/v1/models"))
+            .send()
+            .await
+            .expect("the test server answers");
+        assert!(response.status().is_success());
+        let recorded = recorded.await.expect("the server recorded the request");
+        let agent = recorded.header("user-agent").expect("a user agent");
+        assert!(agent.starts_with("reagent/"), "{agent}");
     }
 
     #[test]
@@ -163,8 +188,8 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod test_server {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-    use tokio::sync::oneshot;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{mpsc, oneshot};
 
     /// One HTTP request the test server recorded.
     #[derive(Debug)]
@@ -195,40 +220,73 @@ pub(crate) mod test_server {
         let (sender, receiver) = oneshot::channel();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("accept a connection");
-            let mut buffer = Vec::new();
-            let mut chunk = [0u8; 1024];
-            loop {
-                match socket.read(&mut chunk).await {
-                    Ok(0) => break,
-                    Ok(read) => {
-                        buffer.extend_from_slice(&chunk[..read]);
-                        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            let text = String::from_utf8_lossy(&buffer);
-            let mut lines = text.split("\r\n");
-            let request_line = lines.next().unwrap_or_default().to_owned();
-            let headers = lines
-                .take_while(|line| !line.is_empty())
-                .filter_map(|line| line.split_once(": "))
-                .map(|(name, value)| (name.to_ascii_lowercase(), value.to_owned()))
-                .collect();
-            let _ = sender.send(Recorded {
-                request_line,
-                headers,
-            });
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = socket.write_all(response.as_bytes()).await;
-            let _ = socket.shutdown().await;
+            let recorded = read_request(&mut socket).await;
+            let _ = sender.send(recorded);
+            answer(&mut socket, body).await;
         });
         (format!("http://{address}"), receiver)
+    }
+
+    /// Serves `count` requests in order, each with `body` as an SSE reply.
+    ///
+    /// Returns the base URL and a receiver for the recorded requests. Every
+    /// reply closes the connection, so each request arrives on its own socket.
+    pub(crate) async fn serve_many(
+        count: usize,
+        body: &'static str,
+    ) -> (String, mpsc::Receiver<Recorded>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a port");
+        let address = listener.local_addr().expect("the bound address");
+        let (sender, receiver) = mpsc::channel(count);
+        tokio::spawn(async move {
+            for _ in 0..count {
+                let (mut socket, _) = listener.accept().await.expect("accept a connection");
+                let recorded = read_request(&mut socket).await;
+                let _ = sender.send(recorded).await;
+                answer(&mut socket, body).await;
+            }
+        });
+        (format!("http://{address}"), receiver)
+    }
+
+    /// Reads one request head off `socket`.
+    async fn read_request(socket: &mut TcpStream) -> Recorded {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match socket.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(read) => {
+                    buffer.extend_from_slice(&chunk[..read]);
+                    if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&buffer);
+        let mut lines = text.split("\r\n");
+        let request_line = lines.next().unwrap_or_default().to_owned();
+        let headers = lines
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(": "))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.to_owned()))
+            .collect();
+        Recorded {
+            request_line,
+            headers,
+        }
+    }
+
+    /// Answers `socket` with `body` as an SSE reply and closes it.
+    async fn answer(socket: &mut TcpStream, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+        let _ = socket.shutdown().await;
     }
 }

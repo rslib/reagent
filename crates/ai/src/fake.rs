@@ -16,6 +16,8 @@ pub struct SeenRequest {
     pub model: String,
     /// How many messages the request carried.
     pub messages: usize,
+    /// The reasoning text the request carried, if any.
+    pub reasoning: Option<String>,
 }
 
 /// One item a scripted reply can yield: an event or an error.
@@ -81,6 +83,7 @@ impl Provider for FakeProvider {
         self.seen.lock().expect("seen lock").push(SeenRequest {
             model: request.model.to_string(),
             messages: request.messages.len(),
+            reasoning: request.reasoning.map(str::to_string),
         });
         let reply = self
             .replies
@@ -131,7 +134,7 @@ pub fn parse_chunks(wire: Wire, chunks: Vec<Bytes>) -> Vec<Result<StreamEvent, E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Message, ReasoningLevel, StopReason};
+    use crate::types::{Message, StopReason};
 
     fn request<'a>(model: &'a str, history: &'a [Message]) -> Request<'a> {
         Request {
@@ -140,7 +143,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: history,
-            reasoning: Some(ReasoningLevel::Low),
+            reasoning: Some("low"),
             cache_key: None,
         }
     }
@@ -188,10 +191,12 @@ mod tests {
                 SeenRequest {
                     model: "fake-model".into(),
                     messages: 2,
+                    reasoning: Some("low".into()),
                 },
                 SeenRequest {
                     model: "fake-model".into(),
                     messages: 2,
+                    reasoning: Some("low".into()),
                 },
             ]
         );

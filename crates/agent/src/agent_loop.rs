@@ -6,8 +6,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use reagent_ai::{
-    AssistantMessage, Content, Error, Message, Provider, ReasoningLevel, Request, StopReason,
-    StreamEvent, Text, ToolCall, ToolResult, Usage,
+    AssistantMessage, Content, Error, Message, Provider, Request, StopReason, StreamEvent, Text,
+    ToolCall, ToolResult, Usage,
 };
 
 use crate::archive::Archive;
@@ -64,8 +64,9 @@ pub struct AgentConfig {
     pub max_tokens: u32,
     /// The system prompt, if any.
     pub system: Option<Text>,
-    /// How much reasoning the provider may spend.
-    pub reasoning: Option<ReasoningLevel>,
+    /// How much reasoning the provider may spend, in its own words: a level
+    /// text or a token budget.
+    pub reasoning: Option<String>,
     /// A stable key for the cached prompt prefix of this session.
     pub cache_key: Option<Text>,
     /// The maximum number of provider calls, after which the run stops.
@@ -652,7 +653,7 @@ impl<'a> Agent<'a> {
             system: self.config.system.as_ref(),
             tools: self.registry.specs(),
             messages: history,
-            reasoning: self.config.reasoning,
+            reasoning: self.config.reasoning.as_deref(),
             cache_key: self.config.cache_key.as_ref(),
         }
     }
@@ -1147,6 +1148,38 @@ mod tests {
         let calls = tool_calls(&message);
         assert_eq!(calls.len(), 1);
         assert_eq!(&*calls[0].name, "echo");
+    }
+
+    #[tokio::test]
+    async fn the_request_carries_the_reasoning_text() {
+        let provider = FakeProvider::new(vec![text_reply("done")]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+        let config = AgentConfig {
+            reasoning: Some("xhigh".into()),
+            ..config()
+        };
+
+        Agent::new(&provider, &registry, config, CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(provider.seen()[0].reasoning.as_deref(), Some("xhigh"));
+    }
+
+    #[tokio::test]
+    async fn a_run_without_a_reasoning_text_sends_none() {
+        let provider = FakeProvider::new(vec![text_reply("done")]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(provider.seen()[0].reasoning, None);
     }
 
     #[tokio::test]

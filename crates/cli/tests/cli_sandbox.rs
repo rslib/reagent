@@ -92,6 +92,90 @@ async fn sandbox_off_is_unchanged() {
 }
 
 #[tokio::test]
+async fn sandbox_exec_keeps_the_helper_pid() {
+    // The helper hands its process to the program with `exec`, so the program
+    // prints the helper's own pid, not a child's.
+    let child = Command::new(BIN)
+        .args(["--sandbox-exec", "--", "sh", "-c", "echo $$"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    let id = child.id();
+    let output = child.wait_with_output().await.expect("the binary exits");
+    if unavailable(&output) {
+        return;
+    }
+    let printed: u32 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("a pid on stdout");
+    assert_eq!(
+        Some(printed),
+        id,
+        "the program did not keep the helper's pid"
+    );
+
+    let output = Command::new(BIN)
+        .args(["--sandbox-exec", "--", "sh", "-c", "exit 7"])
+        .output()
+        .await
+        .expect("the binary runs");
+    if unavailable(&output) {
+        return;
+    }
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "the program's exit code did not reach the caller: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn sandbox_exec_keeps_the_helper_pid_on_a_signal() {
+    // With `exec` a killed program kills the helper's own process, so the
+    // caller sees the signal itself, as it does without a sandbox.
+    use std::os::unix::process::ExitStatusExt;
+    let output = Command::new(BIN)
+        .args(["--sandbox-exec", "--", "sh", "-c", "kill -9 $$"])
+        .output()
+        .await
+        .expect("the binary runs");
+    if unavailable(&output) {
+        return;
+    }
+    assert_eq!(output.status.signal(), Some(9), "{:?}", output.status);
+}
+
+#[tokio::test]
+async fn sandbox_exec_runs_a_program_copied_into_a_write_folder() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let output = Command::new(BIN)
+        .args(["--sandbox-exec", "--write"])
+        .arg(tmp.path())
+        .args([
+            "--",
+            "sh",
+            "-c",
+            "printf '#!/bin/sh\\necho built\\n' > ./e && chmod +x ./e && ./e",
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .await
+        .expect("the binary runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match output.status.code() {
+        Some(0) => assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "built"),
+        Some(125) => assert!(
+            stderr.starts_with("reagent: sandbox unavailable:"),
+            "{stderr}"
+        ),
+        other => panic!("exit {other:?}: {stderr}"),
+    }
+}
+
+#[tokio::test]
 async fn sandbox_helper_runs_a_program() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let output = Command::new(BIN)
@@ -110,4 +194,83 @@ async fn sandbox_helper_runs_a_program() {
         ),
         other => panic!("exit {other:?} stderr {stderr}"),
     }
+}
+
+/// Runs `script` with `sh -c` in the helper, allowed to write only `write`.
+async fn helper(write: &Path, script: &str) -> std::process::Output {
+    Command::new(BIN)
+        .args(["--sandbox-exec", "--write"])
+        .arg(write)
+        .args(["--", "sh", "-c", script])
+        .current_dir(write)
+        .output()
+        .await
+        .expect("the binary runs")
+}
+
+/// True when the helper reported that the sandbox could not start here.
+fn unavailable(output: &std::process::Output) -> bool {
+    output.status.code() == Some(125)
+        && String::from_utf8_lossy(&output.stderr).starts_with("reagent: sandbox unavailable:")
+}
+
+#[tokio::test]
+async fn sandbox_backend_lets_a_command_signal_its_child() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let output = helper(tmp.path(), "sleep 30 & kill -INT $! && echo killed").await;
+    if unavailable(&output) {
+        return;
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "killed",
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn sandbox_backend_refuses_a_write_outside_the_write_folders() {
+    let allowed = tempfile::tempdir().expect("allowed dir");
+    let other = tempfile::tempdir().expect("other dir");
+    let target = other.path().join("escape.txt");
+    let script = format!("echo x > '{}'; echo inside > ok.txt", target.display());
+    let output = helper(allowed.path(), &script).await;
+    if unavailable(&output) {
+        return;
+    }
+    assert!(!target.exists(), "the write outside went through");
+    assert!(
+        allowed.path().join("ok.txt").exists(),
+        "the write inside failed"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_backend_links_no_gpl_crate() {
+    let output = Command::new(env!("CARGO"))
+        .args(["metadata", "--format-version", "1", "--locked"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .await
+        .expect("cargo metadata runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("metadata is JSON");
+    let gpl: Vec<String> = metadata["packages"]
+        .as_array()
+        .expect("a package list")
+        .iter()
+        .filter(|package| {
+            package["license"]
+                .as_str()
+                .is_some_and(|license| license.contains("GPL") && !license.contains("LGPL"))
+        })
+        .map(|package| package["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(gpl.is_empty(), "GPL crates: {gpl:?}");
 }

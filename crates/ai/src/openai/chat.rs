@@ -5,35 +5,30 @@ use std::sync::Mutex;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures_util::TryStreamExt;
 use futures_util::stream::BoxStream;
+use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, value::RawValue};
 
 use crate::Error;
 use crate::http::ExtraHeaders;
-use crate::key::ApiKey;
+use crate::key::Credential;
 use crate::openai::{BodyCache, JsonStr};
-use crate::types::{
-    AssistantMessage, Content, Message, ReasoningLevel, StopReason, Text, ToolSpec,
-};
+use crate::providers::{Compat, MaxTokensField, ReasoningField};
+use crate::types::{AssistantMessage, Content, Message, Reasoning, StopReason, Text, ToolSpec};
 use crate::{Provider, Request, StreamEvent, Usage};
 
 /// The provider name recorded on assistant messages.
 const PROVIDER: &str = "openai-chat";
 
-/// Tuning for a Chat Completions endpoint.
-#[derive(Debug, Clone, Copy)]
-pub struct ChatOptions {
-    /// Send `max_completion_tokens` instead of `max_tokens`.
-    pub max_completion_tokens: bool,
-}
-
 /// Talks to an OpenAI-compatible Chat Completions endpoint over HTTP.
 #[derive(Debug)]
 pub struct OpenAiChat {
     client: reqwest::Client,
-    api_key: ApiKey,
+    credential: Result<Credential, String>,
     base_url: String,
-    options: ChatOptions,
+    compat: Compat,
     headers: ExtraHeaders,
+    session: Option<(HeaderName, HeaderValue)>,
     head: Mutex<Option<Head>>,
     bodies: Mutex<BodyCache<MessageBody>>,
 }
@@ -43,7 +38,7 @@ struct Head {
     model: String,
     max_tokens: u32,
     system: Option<Text>,
-    reasoning: Option<ReasoningLevel>,
+    reasoning: Option<String>,
     tools: Vec<ToolSpec>,
     builder: RequestBuilder,
 }
@@ -51,18 +46,25 @@ struct Head {
 impl OpenAiChat {
     /// Creates a provider for `base_url`, for example `http://localhost:11434/v1`.
     ///
-    /// `max_completion_tokens` is on for `api.openai.com` and off elsewhere.
+    /// The cap field is `max_completion_tokens` for `api.openai.com` and
+    /// `max_tokens` elsewhere, until [`OpenAiChat::with_compat`] sets it.
     pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         let base_url = base_url.into();
-        let options = ChatOptions {
-            max_completion_tokens: base_url.contains("api.openai.com"),
+        let compat = Compat {
+            max_tokens_field: if base_url.contains("api.openai.com") {
+                MaxTokensField::MaxCompletionTokens
+            } else {
+                MaxTokensField::MaxTokens
+            },
+            ..Compat::DEFAULT
         };
         Self {
             client: crate::http::client(),
-            api_key: ApiKey::new(api_key.into()),
+            credential: Credential::bearer(&api_key.into()),
             base_url,
-            options,
+            compat,
             headers: ExtraHeaders::default(),
+            session: None,
             head: Mutex::new(None),
             bodies: Mutex::new(BodyCache::default()),
         }
@@ -78,9 +80,22 @@ impl OpenAiChat {
         self
     }
 
-    /// Replaces the endpoint tuning.
-    pub fn with_options(mut self, options: ChatOptions) -> Self {
-        self.options = options;
+    /// Replaces how the request proves who sends it, for example with a saved
+    /// ChatGPT login that refreshes its token.
+    pub fn with_credential(mut self, credential: Credential) -> Self {
+        self.credential = Ok(credential);
+        self
+    }
+
+    /// Replaces how the endpoint differs from the plain wire.
+    ///
+    /// A compat that names a session header gets one id for the life of this
+    /// provider value, so every request of the run carries the same id and the
+    /// prompt cache stays warm.
+    pub fn with_compat(mut self, compat: Compat) -> Self {
+        self.compat = compat;
+        self.session = compat.session_header.and_then(session_header);
+        self.head = Mutex::new(None);
         self
     }
 
@@ -91,13 +106,12 @@ impl OpenAiChat {
 
     /// Serializes the request body, reusing the bytes of unchanged messages.
     pub(crate) fn request_body(&self, request: &Request<'_>) -> Result<Bytes, Error> {
-        let reasoning = request.reasoning;
         let mut head = self.head.lock().expect("head cache lock");
         let reuse = head.as_ref().is_some_and(|cached| {
             cached.model == request.model
                 && cached.max_tokens == request.max_tokens
                 && cached.system.as_deref() == request.system.map(|system| &**system)
-                && cached.reasoning == reasoning
+                && cached.reasoning.as_deref() == request.reasoning
                 && cached.tools.as_slice() == request.tools
         });
         if !reuse {
@@ -105,15 +119,15 @@ impl OpenAiChat {
                 model: request.model.to_string(),
                 max_tokens: request.max_tokens,
                 system: request.system.cloned(),
-                reasoning,
+                reasoning: request.reasoning.map(str::to_string),
                 tools: request.tools.to_vec(),
-                builder: RequestBuilder::new(
+                builder: RequestBuilder::with_compat(
                     request.model,
                     request.max_tokens,
                     request.system.map(|system| &**system),
-                    reasoning,
+                    request.reasoning,
                     request.tools,
-                    self.options.max_completion_tokens,
+                    self.compat,
                 ),
             });
         }
@@ -138,15 +152,24 @@ impl Provider for OpenAiChat {
             Err(error) => return Box::pin(futures_util::stream::iter([Err(error)])),
         };
         let url = self.url();
-        let api_key = self.api_key.reveal().to_owned();
         let client = self.client.clone();
         let headers = self.headers.clone();
+        let session = self.session.clone();
+        let credential = self.credential.clone();
 
         let connect = futures_util::stream::once(async move {
+            let (key_name, key_value) = match credential {
+                Ok(credential) => credential.header().await.map_err(Error::Protocol)?,
+                Err(message) => return Err(Error::Protocol(message)),
+            };
             let request = client
                 .post(url)
-                .header("authorization", format!("Bearer {api_key}"))
+                .header(key_name, key_value)
                 .header("content-type", "application/json");
+            let request = match &session {
+                Some((name, value)) if !headers.has(name) => request.header(name, value),
+                _ => request,
+            };
             let response = headers
                 .apply(request)
                 .body(body)
@@ -223,7 +246,7 @@ impl MessageBody {
 
 /// Builds a Chat Completions body from a stable head and reusable messages.
 ///
-/// The head holds the model, the reasoning effort, the token cap, the tools and
+/// The head holds the model, the reasoning level, the token cap, the tools and
 /// the system prompt. Tools are sorted by name.
 #[derive(Debug)]
 pub struct RequestBuilder {
@@ -232,29 +255,95 @@ pub struct RequestBuilder {
 }
 
 impl RequestBuilder {
-    /// Serializes the request head once.
+    /// Serializes the request head once, for the plain wire.
     pub fn new(
         model: &str,
         max_tokens: u32,
         system: Option<&str>,
-        reasoning: Option<ReasoningLevel>,
+        reasoning: Option<&str>,
         tools: &[ToolSpec],
-        max_completion_tokens: bool,
+        max_tokens_field: MaxTokensField,
+        reasoning_field: ReasoningField,
     ) -> Self {
+        Self::with_compat(
+            model,
+            max_tokens,
+            system,
+            reasoning,
+            tools,
+            Compat {
+                max_tokens_field,
+                reasoning_field,
+                ..Compat::DEFAULT
+            },
+        )
+    }
+
+    /// Serializes the request head once, for an endpoint described by `compat`.
+    pub fn with_compat(
+        model: &str,
+        max_tokens: u32,
+        system: Option<&str>,
+        reasoning: Option<&str>,
+        tools: &[ToolSpec],
+        compat: Compat,
+    ) -> Self {
+        let reasoning_field = compat.reasoning_field;
+        let reasoning_off = compat.reasoning_off;
         let mut out = BytesMut::new();
         out.put_slice(b"{\"model\":");
         out.put_slice(json_string(model).as_bytes());
-        if let Some(level) = reasoning {
-            out.put_slice(b",\"reasoning_effort\":");
-            out.put_slice(json_string(reasoning_effort(level)).as_bytes());
+        if let Some(text) = reasoning {
+            let reasoning = Reasoning::parse(text);
+            if reasoning.is_off() {
+                if let Some(word) = reasoning_off {
+                    match reasoning_field {
+                        ReasoningField::Effort => {
+                            out.put_slice(b",\"reasoning_effort\":");
+                            out.put_slice(json_string(word).as_bytes());
+                        }
+                        ReasoningField::EffortObject => {
+                            out.put_slice(b",\"reasoning\":{\"effort\":");
+                            out.put_slice(json_string(word).as_bytes());
+                            out.put_slice(b"}");
+                        }
+                    }
+                }
+            } else {
+                match reasoning_field {
+                    ReasoningField::Effort => {
+                        let effort = reasoning.text();
+                        out.put_slice(b",\"reasoning_effort\":");
+                        out.put_slice(json_string(&effort).as_bytes());
+                    }
+                    ReasoningField::EffortObject => {
+                        out.put_slice(b",\"reasoning\":");
+                        match reasoning {
+                            Reasoning::Budget(budget) => {
+                                out.put_slice(b"{\"max_tokens\":");
+                                out.put_slice(budget.to_string().as_bytes());
+                                out.put_slice(b"}");
+                            }
+                            Reasoning::Level(level) => {
+                                out.put_slice(b"{\"effort\":");
+                                out.put_slice(json_string(level).as_bytes());
+                                out.put_slice(b"}");
+                            }
+                        }
+                    }
+                }
+            }
         }
-        let budget = reasoning.map_or(0, reasoning_budget);
-        if max_completion_tokens {
-            out.put_slice(b",\"max_completion_tokens\":");
-        } else {
-            out.put_slice(b",\"max_tokens\":");
+        match compat.max_tokens_field {
+            MaxTokensField::MaxCompletionTokens => {
+                out.put_slice(b",\"max_completion_tokens\":");
+            }
+            MaxTokensField::MaxTokens => out.put_slice(b",\"max_tokens\":"),
+            MaxTokensField::Omit => {}
         }
-        out.put_slice(max_tokens.saturating_add(budget).to_string().as_bytes());
+        if compat.max_tokens_field != MaxTokensField::Omit {
+            out.put_slice(max_tokens.to_string().as_bytes());
+        }
         out.put_slice(b",\"stream\":true,\"stream_options\":{\"include_usage\":true}");
         if tools.is_empty() {
             out.put_slice(b",\"messages\":[");
@@ -363,6 +452,10 @@ struct AssistantOut<'a> {
     content: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+    /// The thinking signature replayed as the provider's own JSON array, so a
+    /// signed reasoning item survives unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_details: Option<&'a RawValue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<ToolCallOut<'a>>,
 }
@@ -385,13 +478,20 @@ fn assistant_message(assistant: &AssistantMessage, provider: &str) -> Option<Byt
     let keep_thinking = assistant.provider.as_ref() == provider;
     let mut text = String::new();
     let mut reasoning = String::new();
+    let mut details: Option<&RawValue> = None;
     let mut tool_calls = Vec::new();
     for content in &assistant.content {
         match content {
             Content::Text { text: value } => text.push_str(value),
-            Content::Thinking { thinking, .. } => {
+            Content::Thinking {
+                thinking,
+                signature,
+            } => {
                 if keep_thinking {
                     reasoning.push_str(thinking);
+                    if details.is_none() {
+                        details = signature.as_deref().and_then(details_of);
+                    }
                 }
             }
             Content::RedactedThinking { .. } => {}
@@ -409,7 +509,7 @@ fn assistant_message(assistant: &AssistantMessage, provider: &str) -> Option<Byt
             }),
         }
     }
-    if text.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
+    if text.is_empty() && reasoning.is_empty() && tool_calls.is_empty() && details.is_none() {
         return None;
     }
     let content = (!text.is_empty()).then_some(text.as_str());
@@ -418,24 +518,16 @@ fn assistant_message(assistant: &AssistantMessage, provider: &str) -> Option<Byt
         role: "assistant",
         content,
         reasoning_content,
+        reasoning_details: details,
         tool_calls,
     }))
 }
 
-fn reasoning_budget(level: ReasoningLevel) -> u32 {
-    match level {
-        ReasoningLevel::Low => 1_024,
-        ReasoningLevel::Medium => 4_096,
-        ReasoningLevel::High => 16_384,
-    }
-}
-
-fn reasoning_effort(level: ReasoningLevel) -> &'static str {
-    match level {
-        ReasoningLevel::Low => "low",
-        ReasoningLevel::Medium => "medium",
-        ReasoningLevel::High => "high",
-    }
+/// The provider's reasoning details, when `signature` holds a JSON array of
+/// them. Any other signature is not replayable and is skipped.
+fn details_of(signature: &str) -> Option<&RawValue> {
+    let details: &RawValue = serde_json::from_str(signature).ok()?;
+    details.get().starts_with('[').then_some(details)
 }
 
 fn json_string(value: &str) -> String {
@@ -450,11 +542,13 @@ fn to_bytes(value: &impl Serialize) -> Bytes {
 ///
 /// Tool call deltas carry an index instead of an id, so the parser maps each
 /// index to the call id it first saw. Event fields borrow from the line handed
-/// to [`StreamParser::push_line`].
+/// to [`StreamParser::push_line`]. Reasoning details leave as one signature
+/// when the stream ends; text and summary pieces merge into one item first.
 #[derive(Debug, Default)]
 pub struct StreamParser {
     usage: Usage,
     tool_ids: Vec<(u32, Text)>,
+    reasoning_details: Vec<ReasoningDetail>,
     stop_reason: Option<StopReason>,
     done: bool,
     failed: bool,
@@ -476,6 +570,9 @@ impl StreamParser {
         };
         if data == b"[DONE]" {
             self.done = true;
+            if let Some(signature) = self.take_details() {
+                out.push(StreamEvent::ThinkingSignature(signature));
+            }
             out.push(StreamEvent::Stop(
                 self.stop_reason.take().unwrap_or(StopReason::EndTurn),
             ));
@@ -505,15 +602,25 @@ impl StreamParser {
         }
 
         for choice in chunk.choices.into_choices() {
-            if let Some(reasoning) = choice.delta.reasoning_content {
+            let delta = choice.delta;
+            if let Some(reasoning) = delta
+                .reasoning_content
+                .as_ref()
+                .or(delta.reasoning.as_ref())
+            {
                 out.push(StreamEvent::ThinkingDelta(Text::from(reasoning.as_str())));
             }
-            if let Some(content) = choice.delta.content
+            if let Some(details) = delta.reasoning_details {
+                for detail in details {
+                    self.accept_detail(detail);
+                }
+            }
+            if let Some(content) = delta.content
                 && !content.as_str().is_empty()
             {
                 out.push(StreamEvent::TextDelta(Text::from(content.as_str())));
             }
-            for call in choice.delta.tool_calls {
+            for call in delta.tool_calls {
                 self.accept_tool_call(call, out);
             }
             if let Some(reason) = choice.finish_reason {
@@ -581,6 +688,65 @@ impl StreamParser {
         }
     }
 
+    /// Folds one streamed reasoning detail into the items held for the
+    /// signature.
+    ///
+    /// Only a text or summary item is parsed, and only so the next piece of the
+    /// same kind can fold into it. Every other item keeps its bytes.
+    fn accept_detail(&mut self, raw: Box<RawValue>) {
+        let Some(kind) = detail_kind(&raw) else {
+            self.reasoning_details.push(ReasoningDetail::Raw(raw));
+            return;
+        };
+        let map = match serde_json::from_str::<Map<String, Value>>(raw.get()) {
+            Ok(map) => map,
+            Err(_) => {
+                self.reasoning_details.push(ReasoningDetail::Raw(raw));
+                return;
+            }
+        };
+        if let Some(ReasoningDetail::Piece(last)) = self.reasoning_details.last_mut()
+            && last.kind == kind
+        {
+            last.merge(map);
+            return;
+        }
+        self.reasoning_details
+            .push(ReasoningDetail::Piece(DetailPiece {
+                kind,
+                map,
+                raw,
+                merged: false,
+            }));
+    }
+
+    /// The reasoning details as one JSON array, taken off the parser.
+    ///
+    /// An item that never merged keeps the bytes the provider wrote, because a
+    /// signed item only replays unchanged. A merged item is written again from
+    /// its fields.
+    fn take_details(&mut self) -> Option<Text> {
+        let details = std::mem::take(&mut self.reasoning_details);
+        if details.is_empty() {
+            return None;
+        }
+        let capacity = details
+            .iter()
+            .map(|detail| detail.raw_len() + 1)
+            .sum::<usize>()
+            + 1;
+        let mut out = String::with_capacity(capacity);
+        out.push('[');
+        for (index, detail) in details.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            detail.write_into(&mut out);
+        }
+        out.push(']');
+        Some(Text::from(out))
+    }
+
     fn next_index(&self) -> u32 {
         self.tool_ids
             .iter()
@@ -602,6 +768,111 @@ impl StreamParser {
     }
 }
 
+/// One reasoning detail held while the stream runs.
+///
+/// OpenRouter streams a text or summary item per small piece, so those merge
+/// into one item as they arrive. Any other kind, such as a signed-encrypted
+/// item, cannot be rebuilt and keeps the provider's bytes.
+#[derive(Debug)]
+enum ReasoningDetail {
+    /// An item replayed byte for byte.
+    Raw(Box<RawValue>),
+    /// A text or summary item, with room for the pieces that follow it.
+    Piece(DetailPiece),
+}
+
+impl ReasoningDetail {
+    /// The length of the bytes this item started from, for sizing the array.
+    fn raw_len(&self) -> usize {
+        match self {
+            Self::Raw(raw) => raw.get().len(),
+            Self::Piece(piece) => piece.raw.get().len(),
+        }
+    }
+
+    /// Appends this item's JSON to `out`.
+    fn write_into(&self, out: &mut String) {
+        match self {
+            Self::Raw(raw) => out.push_str(raw.get()),
+            Self::Piece(piece) if !piece.merged => out.push_str(piece.raw.get()),
+            Self::Piece(piece) => out
+                .push_str(&serde_json::to_string(&piece.map).expect("a parsed detail serializes")),
+        }
+    }
+}
+
+/// A text or summary item parsed into its fields.
+#[derive(Debug)]
+struct DetailPiece {
+    kind: DetailKind,
+    map: Map<String, Value>,
+    raw: Box<RawValue>,
+    /// Whether a later piece folded into this one.
+    merged: bool,
+}
+
+impl DetailPiece {
+    /// Folds `next` into this item, the way pi folds streamed pieces.
+    ///
+    /// The content field grows. A field this item already holds wins, and a
+    /// field it lacks is filled from `next`, so the signature of a later piece
+    /// lands on the item that carries the whole text.
+    fn merge(&mut self, mut next: Map<String, Value>) {
+        let field = self.kind.field();
+        if let Some(Value::String(more)) = next.remove(field) {
+            match self.map.get_mut(field) {
+                Some(Value::String(last)) => last.push_str(&more),
+                _ => {
+                    self.map.insert(field.to_string(), Value::String(more));
+                }
+            }
+        }
+        for (key, value) in next {
+            if self.map.get(&key).is_none_or(Value::is_null) {
+                self.map.insert(key, value);
+            }
+        }
+        self.merged = true;
+    }
+}
+
+/// The kinds of reasoning detail that arrive as pieces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailKind {
+    Text,
+    Summary,
+}
+
+impl DetailKind {
+    fn of(kind: &str) -> Option<Self> {
+        match kind {
+            "reasoning.text" => Some(Self::Text),
+            "reasoning.summary" => Some(Self::Summary),
+            _ => None,
+        }
+    }
+
+    /// The field that carries the piece's content.
+    fn field(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Summary => "summary",
+        }
+    }
+}
+
+/// The `type` of a reasoning detail, read without parsing the rest of it.
+#[derive(Deserialize)]
+struct DetailType<'a> {
+    #[serde(default, borrow, rename = "type")]
+    kind: Option<&'a str>,
+}
+
+fn detail_kind(raw: &RawValue) -> Option<DetailKind> {
+    let detail: DetailType<'_> = serde_json::from_str(raw.get()).ok()?;
+    DetailKind::of(detail.kind?)
+}
+
 impl crate::openai::EventParser for StreamParser {
     fn push_line(&mut self, line: &[u8], out: &mut Vec<StreamEvent>) -> Result<(), Error> {
         StreamParser::push_line(self, line, out)
@@ -611,7 +882,7 @@ impl crate::openai::EventParser for StreamParser {
         StreamParser::fail(self);
     }
 
-    /// This parser emits nothing at the end of a clean stream.
+    /// The reasoning details already left as one signature, with `[DONE]`.
     fn finish(&mut self, _out: &mut Vec<StreamEvent>) -> Result<(), Error> {
         StreamParser::finish(self)
     }
@@ -628,14 +899,59 @@ fn stop_reason(reason: &str) -> StopReason {
 }
 
 fn usage_of(json: UsageJson) -> Usage {
-    let cached = json.prompt_tokens_details.cached_tokens;
+    let details = json.prompt_tokens_details;
+    // Some gateways send several names at once with only one filled in, so the
+    // largest count wins.
+    let cache_read = [
+        details.cached_tokens,
+        details.cache_read_input_tokens,
+        json.cache_read_tokens,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or_default();
+    let cache_write = [
+        details.cache_write_tokens,
+        details.cache_creation_input_tokens,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or_default();
+    // An OpenAI-style `prompt_tokens` counts the tokens that the cache served
+    // and the tokens it wrote, so both come off the plain input count.
     Usage {
-        input_tokens: json.prompt_tokens.saturating_sub(cached),
-        output_tokens: json.completion_tokens,
-        cache_read_tokens: cached,
-        cache_write_tokens: 0,
-        reasoning_tokens: json.completion_tokens_details.reasoning_tokens,
+        input_tokens: json
+            .prompt_tokens
+            .unwrap_or_default()
+            .saturating_sub(cache_read)
+            .saturating_sub(cache_write),
+        output_tokens: json.completion_tokens.unwrap_or_default(),
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        reasoning_tokens: json
+            .completion_tokens_details
+            .reasoning_tokens
+            .unwrap_or_default(),
+        cost: json.cost,
     }
+}
+
+/// Builds the one session header this provider sends, under `name`.
+///
+/// The id is the current time in nanoseconds and the process id as lowercase
+/// hex. A name or an id the HTTP layer rejects drops the header.
+fn session_header(name: &str) -> Option<(HeaderName, HeaderValue)> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let id = format!("reagent-{nanos:x}{:x}", std::process::id());
+    Some((
+        HeaderName::from_bytes(name.as_bytes()).ok()?,
+        HeaderValue::from_str(&id).ok()?,
+    ))
 }
 
 fn data_of(line: &[u8]) -> Option<&[u8]> {
@@ -717,6 +1033,10 @@ struct Delta<'a> {
     #[serde(default, borrow)]
     reasoning_content: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
+    reasoning: Option<JsonStr<'a>>,
+    #[serde(default)]
+    reasoning_details: Option<Vec<Box<RawValue>>>,
+    #[serde(default, borrow)]
     tool_calls: Vec<ToolCallDelta<'a>>,
 }
 
@@ -756,25 +1076,45 @@ fn retryable(kind: &str) -> bool {
 #[derive(Default, Deserialize)]
 struct UsageJson {
     #[serde(default)]
-    prompt_tokens: u64,
+    prompt_tokens: Option<u64>,
     #[serde(default)]
-    completion_tokens: u64,
+    completion_tokens: Option<u64>,
+    /// The cache read count some gateways put at the top level.
+    #[serde(default)]
+    cache_read_tokens: Option<u64>,
+    /// The USD cost of the reply. OpenRouter reports it, most do not.
+    #[serde(default)]
+    cost: Option<f64>,
     #[serde(default)]
     prompt_tokens_details: PromptDetails,
     #[serde(default)]
     completion_tokens_details: CompletionDetails,
 }
 
+/// The prompt token counts, under every name a gateway uses for them.
+///
+/// Each count is an `Option`, so a missing field and an explicit null both
+/// read as absent.
 #[derive(Default, Deserialize)]
 struct PromptDetails {
+    /// The OpenAI name.
     #[serde(default)]
-    cached_tokens: u64,
+    cached_tokens: Option<u64>,
+    /// The commandcode name for the same count.
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    /// The commandcode name for tokens written to the cache.
+    #[serde(default)]
+    cache_write_tokens: Option<u64>,
+    /// The Anthropic name for tokens written to the cache.
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 #[derive(Default, Deserialize)]
 struct CompletionDetails {
     #[serde(default)]
-    reasoning_tokens: u64,
+    reasoning_tokens: Option<u64>,
 }
 
 #[cfg(test)]
@@ -803,9 +1143,10 @@ mod tests {
             "glm-4.6",
             1024,
             Some("You are a careful coding agent."),
-            Some(ReasoningLevel::Medium),
+            Some("medium"),
             &tools,
-            false,
+            MaxTokensField::MaxTokens,
+            ReasoningField::Effort,
         )
     }
 
@@ -858,6 +1199,39 @@ mod tests {
         }
         parser.finish().expect("[DONE] was seen");
         events
+    }
+
+    /// The usage event one `data:` line carries.
+    fn usage_event(line: &[u8]) -> Usage {
+        let mut parser = StreamParser::new();
+        parse_line(&mut parser, line)
+            .into_iter()
+            .find_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .expect("a usage event")
+    }
+
+    /// A request over `history` for the local test server.
+    fn request_for(history: &[Message]) -> Request<'_> {
+        Request {
+            model: "test-model",
+            max_tokens: 16,
+            system: None,
+            tools: &[],
+            messages: history,
+            reasoning: None,
+            cache_key: None,
+        }
+    }
+
+    /// A compat that asks for a session header under `name`.
+    fn session_compat(name: &'static str) -> Compat {
+        Compat {
+            session_header: Some(name),
+            ..Compat::DEFAULT
+        }
     }
 
     #[test]
@@ -974,12 +1348,149 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_preset_chat_wire_writes_no_cap_field() {
+        let builder = RequestBuilder::new(
+            "m",
+            128,
+            None,
+            None,
+            &[],
+            MaxTokensField::Omit,
+            ReasoningField::Effort,
+        );
+        let head = std::str::from_utf8(builder.head()).unwrap();
+        assert!(!head.contains("max_tokens"), "{head}");
+        assert!(!head.contains("max_completion_tokens"), "{head}");
+        assert!(head.contains(r#""stream":true"#), "{head}");
+    }
+
+    #[test]
     fn a_request_without_reasoning_has_no_reasoning_fields() {
-        let builder = RequestBuilder::new("m", 128, None, None, &[], false);
+        let builder = RequestBuilder::new(
+            "m",
+            128,
+            None,
+            None,
+            &[],
+            MaxTokensField::MaxTokens,
+            ReasoningField::Effort,
+        );
         let head = std::str::from_utf8(builder.head()).unwrap();
         assert!(head.contains(r#""max_tokens":128"#));
         assert!(!head.contains("reasoning_effort"));
+        assert!(!head.contains(r#""reasoning""#));
         assert!(!head.contains("tools"));
+    }
+
+    /// The head one request over `reasoning` and `field` sends, with no off word.
+    fn head_for(reasoning: &str, field: ReasoningField) -> String {
+        head_for_off(reasoning, field, None)
+    }
+
+    /// The head one request over `reasoning` and `field` sends, for an endpoint
+    /// whose word for reasoning off is `off`.
+    fn head_for_off(reasoning: &str, field: ReasoningField, off: Option<&'static str>) -> String {
+        let builder = RequestBuilder::with_compat(
+            "m",
+            1024,
+            None,
+            Some(reasoning),
+            &[],
+            Compat {
+                reasoning_field: field,
+                reasoning_off: off,
+                ..Compat::DEFAULT
+            },
+        );
+        std::str::from_utf8(builder.head()).unwrap().to_string()
+    }
+
+    #[test]
+    fn a_level_reasoning_text_is_written_as_reasoning_effort() {
+        let head = head_for("xhigh", ReasoningField::Effort);
+        assert!(head.contains(r#""reasoning_effort":"xhigh""#), "{head}");
+        assert!(!head.contains(r#""reasoning":"#), "{head}");
+        assert!(head.contains(r#""max_tokens":1024"#), "{head}");
+    }
+
+    #[test]
+    fn a_budget_reasoning_text_is_written_as_the_effort_on_the_plain_field() {
+        let head = head_for("4096", ReasoningField::Effort);
+        assert!(head.contains(r#""reasoning_effort":"4096""#), "{head}");
+        assert!(
+            head.contains(r#""max_tokens":1024"#),
+            "the cap does not grow: {head}"
+        );
+    }
+
+    #[test]
+    fn a_level_reasoning_text_is_written_as_an_effort_object() {
+        let head = head_for("high", ReasoningField::EffortObject);
+        assert!(head.contains(r#""reasoning":{"effort":"high"}"#), "{head}");
+        assert!(!head.contains("reasoning_effort"), "{head}");
+        assert!(head.contains(r#""max_tokens":1024"#), "{head}");
+    }
+
+    #[test]
+    fn a_budget_reasoning_text_is_written_as_a_max_tokens_object() {
+        let head = head_for("4096", ReasoningField::EffortObject);
+        assert!(
+            head.contains(r#""reasoning":{"max_tokens":4096}"#),
+            "{head}"
+        );
+        assert!(
+            head.contains(r#""max_tokens":1024"#),
+            "the cap does not grow: {head}"
+        );
+    }
+
+    #[test]
+    fn a_none_reasoning_text_turns_reasoning_off() {
+        let head = head_for_off("none", ReasoningField::EffortObject, Some("none"));
+        assert!(head.contains(r#""reasoning":{"effort":"none"}"#), "{head}");
+        let head = head_for("none", ReasoningField::Effort);
+        assert!(!head.contains("reasoning"), "{head}");
+        let head = head_for("off", ReasoningField::Effort);
+        assert!(!head.contains("reasoning"), "{head}");
+    }
+
+    #[test]
+    fn reasoning_off_effort_field_writes_the_off_word() {
+        let head = head_for_off("off", ReasoningField::Effort, Some("off"));
+        assert!(head.contains(r#""reasoning_effort":"off""#), "{head}");
+        assert!(!head.contains(r#""reasoning":"#), "{head}");
+    }
+
+    #[test]
+    fn reasoning_off_effort_field_without_a_word_writes_no_reasoning() {
+        let head = head_for_off("none", ReasoningField::Effort, None);
+        assert!(!head.contains("reasoning"), "{head}");
+        assert!(head.contains(r#""max_tokens":1024"#), "{head}");
+    }
+
+    #[test]
+    fn reasoning_off_effort_object_writes_the_off_word() {
+        let head = head_for_off("0", ReasoningField::EffortObject, Some("none"));
+        assert!(head.contains(r#""reasoning":{"effort":"none"}"#), "{head}");
+        assert!(!head.contains("reasoning_effort"), "{head}");
+    }
+
+    #[test]
+    fn reasoning_off_effort_object_without_a_word_writes_no_reasoning() {
+        let head = head_for_off("off", ReasoningField::EffortObject, None);
+        assert!(!head.contains(r#""reasoning""#), "{head}");
+    }
+
+    #[test]
+    fn reasoning_off_does_not_change_a_level_that_is_on() {
+        let head = head_for_off("high", ReasoningField::Effort, Some("off"));
+        assert!(head.contains(r#""reasoning_effort":"high""#), "{head}");
+    }
+
+    #[test]
+    fn a_quoted_reasoning_text_is_escaped() {
+        let head = head_for(r#"a"b"#, ReasoningField::Effort);
+        assert!(head.contains(r#""reasoning_effort":"a\"b""#), "{head}");
     }
 
     #[test]
@@ -996,17 +1507,47 @@ mod tests {
         };
 
         let openai = OpenAiChat::new("key", "https://api.openai.com/v1");
-        assert!(openai.options.max_completion_tokens);
+        assert!(openai.compat.max_tokens_field == MaxTokensField::MaxCompletionTokens);
         let bytes = openai.request_body(&request).unwrap();
         let body = std::str::from_utf8(&bytes).unwrap();
         assert!(body.contains(r#""max_completion_tokens":128"#));
         assert!(!body.contains(r#""max_tokens""#));
 
         let other = OpenAiChat::new("key", "http://localhost:11434/v1");
-        assert!(!other.options.max_completion_tokens);
+        assert!(other.compat == Compat::DEFAULT);
         let bytes = other.request_body(&request).unwrap();
         let body = std::str::from_utf8(&bytes).unwrap();
         assert!(body.contains(r#""max_tokens":128"#));
+        assert!(!body.contains("max_completion_tokens"));
+    }
+
+    #[test]
+    fn compat_max_completion_tokens_is_written() {
+        let history = vec![Message::user("hi")];
+        let request = Request {
+            model: "m",
+            max_tokens: 64,
+            system: None,
+            tools: &[],
+            messages: &history,
+            reasoning: None,
+            cache_key: None,
+        };
+        let compat = Compat {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            ..Compat::DEFAULT
+        };
+        let chat = OpenAiChat::new("key", "http://localhost:11434/v1").with_compat(compat);
+        let bytes = chat.request_body(&request).unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(body.contains(r#""max_completion_tokens":64"#));
+        assert!(!body.contains(r#""max_tokens""#));
+
+        let plain =
+            OpenAiChat::new("key", "http://localhost:11434/v1").with_compat(Compat::DEFAULT);
+        let bytes = plain.request_body(&request).unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(body.contains(r#""max_tokens":64"#));
         assert!(!body.contains("max_completion_tokens"));
     }
 
@@ -1046,6 +1587,96 @@ mod tests {
     }
 
     #[test]
+    fn usage_cost_is_parsed_from_the_chat_usage() {
+        let mut parser = StreamParser::new();
+        let events = parse_line(
+            &mut parser,
+            br#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"cost":0.0123}}"#,
+        );
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(*usage),
+                _ => None,
+            })
+            .expect("a usage event");
+        assert_eq!(usage.cost, Some(0.0123));
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn usage_cost_is_none_when_the_chat_usage_has_none() {
+        let mut parser = StreamParser::new();
+        let events = parse_line(
+            &mut parser,
+            br#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
+        );
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(*usage),
+                _ => None,
+            })
+            .expect("a usage event");
+        assert_eq!(usage.cost, None);
+    }
+
+    #[test]
+    fn gateway_usage_takes_the_filled_name_when_several_are_sent() {
+        let usage = usage_event(
+            br#"data: {"choices":[],"usage":{"prompt_tokens":200,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":0,"cache_read_input_tokens":120,"cache_write_tokens":30,"cache_creation_input_tokens":0}}}"#,
+        );
+        assert_eq!(usage.cache_read_tokens, 120);
+        assert_eq!(usage.cache_write_tokens, 30);
+        assert_eq!(usage.input_tokens, 50);
+    }
+
+    #[test]
+    fn gateway_usage_reads_commandcode_cache_names() {
+        let usage = usage_event(
+            br#"data: {"choices":[],"usage":{"prompt_tokens":200,"completion_tokens":20,"prompt_tokens_details":{"cache_read_input_tokens":120,"cache_write_tokens":30}}}"#,
+        );
+        assert_eq!(usage.cache_read_tokens, 120);
+        assert_eq!(usage.cache_write_tokens, 30);
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.output_tokens, 20);
+    }
+
+    #[test]
+    fn gateway_usage_reads_the_anthropic_cache_write_name() {
+        let usage = usage_event(
+            br#"data: {"choices":[],"usage":{"prompt_tokens":90,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":30,"cache_creation_input_tokens":20}}}"#,
+        );
+        assert_eq!(usage.cache_read_tokens, 30);
+        assert_eq!(usage.cache_write_tokens, 20);
+        assert_eq!(usage.input_tokens, 40);
+    }
+
+    #[test]
+    fn gateway_usage_reads_a_top_level_cache_read() {
+        let usage = usage_event(
+            br#"data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"cache_read_tokens":60}}"#,
+        );
+        assert_eq!(usage.cache_read_tokens, 60);
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.input_tokens, 40);
+    }
+
+    #[test]
+    fn gateway_usage_accepts_null_cache_fields() {
+        let usage = usage_event(
+            br#"data: {"choices":[],"usage":{"prompt_tokens":15,"completion_tokens":8,"total_tokens":23,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":null},"completion_tokens_details":{"reasoning_tokens":8}}}"#,
+        );
+        assert_eq!(usage.input_tokens, 15);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.reasoning_tokens, 8);
+        assert_eq!(usage.cost, None);
+    }
+
+    #[test]
     fn maps_reasoning_content_to_thinking_deltas() {
         let mut parser = StreamParser::new();
         let line = br#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"hmm"},"finish_reason":null}]}"#;
@@ -1053,6 +1684,186 @@ mod tests {
             parse_line(&mut parser, line),
             vec![StreamEvent::ThinkingDelta("hmm".into())]
         );
+    }
+
+    /// Folds stream events into the thinking block an assistant message keeps.
+    fn assembled_thinking(events: &[StreamEvent]) -> Content {
+        let mut thinking = String::new();
+        let mut signature = None;
+        for event in events {
+            match event {
+                StreamEvent::ThinkingDelta(delta) => thinking.push_str(delta),
+                StreamEvent::ThinkingSignature(sig) => signature = Some(sig.clone()),
+                _ => {}
+            }
+        }
+        Content::Thinking {
+            thinking: thinking.into(),
+            signature,
+        }
+    }
+
+    /// The signature the stream left on its thinking block.
+    fn signature_of(events: &[StreamEvent]) -> String {
+        events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ThinkingSignature(signature) => Some(signature.to_string()),
+                _ => None,
+            })
+            .expect("the stream carried a signature")
+    }
+
+    /// The signature parsed back as its array of detail items.
+    fn signature_items(events: &[StreamEvent]) -> Vec<serde_json::Value> {
+        serde_json::from_str(&signature_of(events)).expect("the signature is a JSON array")
+    }
+
+    #[test]
+    fn chat_thinking_reads_the_reasoning_field() {
+        let mut parser = StreamParser::new();
+        let line =
+            br#"data: {"choices":[{"index":0,"delta":{"reasoning":"hm"},"finish_reason":null}]}"#;
+        assert_eq!(
+            parse_line(&mut parser, line),
+            vec![StreamEvent::ThinkingDelta("hm".into())]
+        );
+    }
+
+    #[test]
+    fn chat_thinking_prefers_reasoning_content_when_both_are_present() {
+        let mut parser = StreamParser::new();
+        let line = br#"data: {"choices":[{"index":0,"delta":{"reasoning":"loose","reasoning_content":"kept"},"finish_reason":null}]}"#;
+        assert_eq!(
+            parse_line(&mut parser, line),
+            vec![StreamEvent::ThinkingDelta("kept".into())]
+        );
+    }
+
+    #[test]
+    fn chat_thinking_keeps_reasoning_details_as_the_signature() {
+        let events = parse(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"hm\",\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"hm\",\"signature\":\"sig-1\",\"format\":\"openai\",\"index\":0}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.encrypted\",\"data\":\"abc\"}]},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        ));
+        let signature = concat!(
+            r#"[{"type":"reasoning.text","text":"hm","signature":"sig-1","format":"openai","index":0},"#,
+            r#"{"type":"reasoning.encrypted","data":"abc"}]"#
+        );
+        assert_eq!(
+            assembled_thinking(&events),
+            Content::Thinking {
+                thinking: "hm".into(),
+                signature: Some(signature.into()),
+            }
+        );
+
+        let events = parse(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.summary\",\"summary\":\"done\"}]},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        ));
+        assert_eq!(
+            assembled_thinking(&events),
+            Content::Thinking {
+                thinking: "".into(),
+                signature: Some(r#"[{"type":"reasoning.summary","summary":"done"}]"#.into()),
+            }
+        );
+    }
+
+    #[test]
+    fn chat_thinking_merges_text_pieces() {
+        let events = parse(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"a\",\"index\":0}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"b\",\"index\":0}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"c\",\"index\":0,\"signature\":\"sig-1\"}]},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        ));
+        let items = signature_items(&events);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["type"], "reasoning.text");
+        assert_eq!(items[0]["text"], "abc");
+        assert_eq!(items[0]["signature"], "sig-1");
+        assert_eq!(items[0]["index"], 0);
+    }
+
+    #[test]
+    fn chat_thinking_keeps_encrypted_items_apart() {
+        let encrypted = r#"{"type":"reasoning.encrypted","data":"abc"}"#;
+        let events = parse(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"a\"}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.encrypted\",\"data\":\"abc\"}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.text\",\"text\":\"b\"}]},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        ));
+        let signature = signature_of(&events);
+        let items = signature_items(&events);
+        assert_eq!(items.len(), 3, "{signature}");
+        assert_eq!(items[0]["text"], "a");
+        assert_eq!(items[2]["text"], "b");
+        assert!(
+            signature.contains(encrypted),
+            "the encrypted item keeps its bytes: {signature}"
+        );
+    }
+
+    #[test]
+    fn chat_thinking_merges_summary_pieces() {
+        let events = parse(concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.summary\",\"summary\":\"one\"}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.summary\",\"summary\":\" two\",\"format\":\"openai\"}]},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n"
+        ));
+        let items = signature_items(&events);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["type"], "reasoning.summary");
+        assert_eq!(items[0]["summary"], "one two");
+        assert_eq!(items[0]["format"], "openai");
+    }
+
+    #[test]
+    fn chat_thinking_replays_reasoning_details() {
+        let signature = concat!(
+            r#"[{"type":"reasoning.text","text":"hm","signature":"sig-1","format":"openai","index":0},"#,
+            r#"{"type":"reasoning.encrypted","data":"abc"}]"#
+        );
+        let assistant = AssistantMessage::new(
+            PROVIDER,
+            "glm-4.6",
+            vec![
+                Content::Thinking {
+                    thinking: "hm".into(),
+                    signature: Some(signature.into()),
+                },
+                Content::text("hi"),
+            ],
+        );
+        let body = body_of(&[Message::assistant(assistant)]);
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains(&format!(r#""reasoning_details":{signature}"#)));
+        assert!(body.contains(r#""reasoning_content":"hm""#));
+    }
+
+    #[test]
+    fn chat_thinking_skips_an_invalid_details_signature() {
+        for signature in ["not json", r#"{"type":"reasoning.text"}"#] {
+            let assistant = AssistantMessage::new(
+                PROVIDER,
+                "glm-4.6",
+                vec![
+                    Content::Thinking {
+                        thinking: "hm".into(),
+                        signature: Some(signature.into()),
+                    },
+                    Content::text("hi"),
+                ],
+            );
+            let body = body_of(&[Message::assistant(assistant)]);
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(!body.contains("reasoning_details"), "{body}");
+            assert!(body.contains(r#""reasoning_content":"hm""#));
+        }
     }
 
     #[test]
@@ -1258,5 +2069,65 @@ mod tests {
         assert_eq!(recorded.request_line, "POST /chat/completions HTTP/1.1");
         assert_eq!(recorded.header("x-extra"), Some("yes"));
         assert_eq!(recorded.header("authorization"), Some("Bearer test-key"));
+    }
+
+    #[tokio::test]
+    async fn gateway_session_header_is_sent_and_stable() {
+        let (base, mut recorded) = crate::http::test_server::serve_many(2, EXTRA_REPLY).await;
+        let provider =
+            OpenAiChat::new("test-key", base).with_compat(session_compat("x-opencode-session"));
+        let history = vec![Message::user("hi")];
+        let request = request_for(&history);
+        for _ in 0..2 {
+            let events: Vec<_> = provider.stream(&request).collect().await;
+            assert!(events.iter().all(Result::is_ok), "{events:?}");
+        }
+        let mut values = Vec::new();
+        for _ in 0..2 {
+            let recorded = recorded
+                .recv()
+                .await
+                .expect("the server recorded the request");
+            let value = recorded
+                .header("x-opencode-session")
+                .expect("a session header")
+                .to_owned();
+            assert!(value.starts_with("reagent-"), "{value}");
+            assert!(value.len() > "reagent-".len(), "{value}");
+            values.push(value);
+        }
+        assert_eq!(values[0], values[1], "one id for the whole run");
+    }
+
+    #[tokio::test]
+    async fn gateway_no_session_header_by_default() {
+        let (base, recorded) = crate::http::test_server::serve(EXTRA_REPLY).await;
+        let provider = OpenAiChat::new("test-key", base);
+        let history = vec![Message::user("hi")];
+        let request = request_for(&history);
+        let events: Vec<_> = provider.stream(&request).collect().await;
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let recorded = recorded.await.expect("the server recorded the request");
+        assert_eq!(recorded.header("x-opencode-session"), None);
+    }
+
+    #[tokio::test]
+    async fn gateway_a_user_header_wins_over_the_session_id() {
+        let (base, recorded) = crate::http::test_server::serve(EXTRA_REPLY).await;
+        let provider = OpenAiChat::new("test-key", base)
+            .with_headers(vec![("x-opencode-session".into(), "user-id".into())])
+            .with_compat(session_compat("x-opencode-session"));
+        let history = vec![Message::user("hi")];
+        let request = request_for(&history);
+        let events: Vec<_> = provider.stream(&request).collect().await;
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let recorded = recorded.await.expect("the server recorded the request");
+        let values: Vec<&str> = recorded
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "x-opencode-session")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(values, vec!["user-id"]);
     }
 }

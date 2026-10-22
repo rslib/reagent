@@ -12,8 +12,8 @@ use futures_util::stream::BoxStream;
 use self::request::{BodyCache, RequestBuilder};
 use self::stream::StreamParser;
 use crate::http::ExtraHeaders;
-use crate::key::ApiKey;
-use crate::{Error, Provider, ReasoningLevel, Request, StreamEvent, Text, ToolSpec};
+use crate::key::Credential;
+use crate::{Error, Provider, Request, StreamEvent, Text, ToolSpec};
 
 /// The provider name recorded on assistant messages and used to keep thinking.
 pub(crate) const PROVIDER: &str = "anthropic";
@@ -22,7 +22,7 @@ pub(crate) const PROVIDER: &str = "anthropic";
 #[derive(Debug)]
 pub struct Anthropic {
     client: reqwest::Client,
-    api_key: ApiKey,
+    credential: Result<Credential, String>,
     base_url: String,
     headers: ExtraHeaders,
     head: Mutex<Option<Head>>,
@@ -34,7 +34,7 @@ struct Head {
     model: String,
     max_tokens: u32,
     system: Option<Text>,
-    reasoning: Option<ReasoningLevel>,
+    reasoning: Option<String>,
     tools: Vec<ToolSpec>,
     builder: RequestBuilder,
 }
@@ -44,7 +44,7 @@ impl Anthropic {
     pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             client: crate::http::client(),
-            api_key: ApiKey::new(api_key.into()),
+            credential: Credential::x_api_key(&api_key.into()),
             base_url: base_url.into(),
             headers: ExtraHeaders::default(),
             head: Mutex::new(None),
@@ -62,6 +62,13 @@ impl Anthropic {
         self
     }
 
+    /// Replaces how the request proves who sends it, for example with a saved
+    /// ChatGPT login that refreshes its token.
+    pub fn with_credential(mut self, credential: Credential) -> Self {
+        self.credential = Ok(credential);
+        self
+    }
+
     pub(crate) fn request_body(&self, request: &Request<'_>) -> Result<Bytes, Error> {
         let reasoning = crate::cross_provider::anthropic_reasoning(request);
         let mut head = self.head.lock().expect("head cache lock");
@@ -69,7 +76,7 @@ impl Anthropic {
             cached.model == request.model
                 && cached.max_tokens == request.max_tokens
                 && cached.system.as_deref() == request.system.map(|system| &**system)
-                && cached.reasoning == reasoning
+                && cached.reasoning.as_deref() == reasoning
                 && cached.tools.as_slice() == request.tools
         });
         if !reuse {
@@ -77,7 +84,7 @@ impl Anthropic {
                 model: request.model.to_string(),
                 max_tokens: request.max_tokens,
                 system: request.system.cloned(),
-                reasoning,
+                reasoning: reasoning.map(str::to_string),
                 tools: request.tools.to_vec(),
                 builder: RequestBuilder::new(
                     request.model,
@@ -107,14 +114,18 @@ impl Provider for Anthropic {
             Err(error) => return Box::pin(futures_util::stream::iter([Err(error)])),
         };
         let url = format!("{}/v1/messages", self.base_url);
-        let api_key = self.api_key.reveal().to_owned();
         let client = self.client.clone();
         let headers = self.headers.clone();
+        let credential = self.credential.clone();
 
         let connect = futures_util::stream::once(async move {
+            let (key_name, key_value) = match credential {
+                Ok(credential) => credential.header().await.map_err(Error::Protocol)?,
+                Err(message) => return Err(Error::Protocol(message)),
+            };
             let request = client
                 .post(url)
-                .header("x-api-key", api_key)
+                .header(key_name, key_value)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json");
             let response = headers

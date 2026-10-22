@@ -1,11 +1,12 @@
 //! `read`: stream a text file, numbering each line from an offset.
 
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
 use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
@@ -18,6 +19,9 @@ const BINARY_PROBE: usize = 8 * 1024;
 /// Each line is cut at this many bytes, with a trailing mark.
 const LINE_CAP: usize = 2000;
 const DEFAULT_LIMIT: usize = 2000;
+/// The most bytes one read returns, so one large file does not fill the
+/// context of every later turn.
+const BYTE_CAP: usize = 32 * 1024;
 
 /// Arguments for one `read` call.
 #[derive(Debug, Deserialize)]
@@ -65,8 +69,9 @@ impl Read {
                 path.display()
             ));
         }
-        file.seek(io::SeekFrom::Start(0)).await.map_err(failed)?;
-        let mut feed = LineFeed::new(BufReader::new(file));
+        // The probe bytes are the start of the file, so the reader takes them
+        // from the slice already in hand instead of seeking back for them.
+        let mut feed = LineFeed::new(BufReader::new((&probe[..probe_len]).chain(file)));
 
         let mut number: u64 = 1;
         while number < offset {
@@ -76,17 +81,14 @@ impl Read {
             number += 1;
         }
 
-        let mut out = String::new();
+        let mut out = String::with_capacity(out_capacity(size));
         let mut printed = 0;
-        while printed < limit {
-            match feed.next().await.map_err(failed)? {
-                Some(line) => {
-                    line.push_to(&mut out, number);
-                    number += 1;
-                    printed += 1;
-                }
-                None => break,
+        while printed < limit && out.len() < BYTE_CAP {
+            if !feed.push_next(&mut out, number).await.map_err(failed)? {
+                break;
             }
+            number += 1;
+            printed += 1;
         }
         if printed == 0 {
             return Ok(match number - 1 {
@@ -157,6 +159,9 @@ impl Tool for Read {
 struct LineFeed<R> {
     reader: R,
     consumed: u64,
+    /// The line being read, emptied and refilled for every line so that a read
+    /// costs no allocation per line.
+    line: Line,
 }
 
 impl<R: AsyncBufRead + Unpin> LineFeed<R> {
@@ -164,27 +169,33 @@ impl<R: AsyncBufRead + Unpin> LineFeed<R> {
         Self {
             reader,
             consumed: 0,
+            line: Line::default(),
         }
     }
 
-    /// Reads the next line, or `None` at the end of the stream.
-    async fn next(&mut self) -> io::Result<Option<Line>> {
-        let mut line = Line::default();
-        Ok(self.scan(Some(&mut line)).await?.then_some(line))
+    /// Reads the next line and appends it to `out` as `{number}\t{text}\n`.
+    /// Returns false at the end of the stream.
+    async fn push_next(&mut self, out: &mut String, number: u64) -> io::Result<bool> {
+        self.line.reset();
+        if !self.scan(true).await? {
+            return Ok(false);
+        }
+        self.line.push_to(out, number);
+        Ok(true)
     }
 
     /// Skips the next line. Returns false at the end of the stream.
     async fn skip(&mut self) -> io::Result<bool> {
-        self.scan(None).await
+        self.scan(false).await
     }
 
     async fn has_more(&mut self) -> io::Result<bool> {
         Ok(!self.reader.fill_buf().await?.is_empty())
     }
 
-    /// Consumes one line, copying it into `keep` when given. Returns false
-    /// when the stream had already ended.
-    async fn scan(&mut self, mut keep: Option<&mut Line>) -> io::Result<bool> {
+    /// Consumes one line, copying it into the line buffer when `keep`. Returns
+    /// false when the stream had already ended.
+    async fn scan(&mut self, keep: bool) -> io::Result<bool> {
         let mut any = false;
         loop {
             let buf = self.reader.fill_buf().await?;
@@ -194,8 +205,8 @@ impl<R: AsyncBufRead + Unpin> LineFeed<R> {
             any = true;
             let newline = buf.iter().position(|&byte| byte == b'\n');
             let part = &buf[..newline.unwrap_or(buf.len())];
-            if let Some(line) = keep.as_deref_mut() {
-                line.adopt(part);
+            if keep {
+                self.line.adopt(part);
             }
             let used = newline.map_or(buf.len(), |at| at + 1);
             self.reader.consume(used);
@@ -215,6 +226,12 @@ struct Line {
 }
 
 impl Line {
+    /// Empties the buffer for the next line, keeping its allocation.
+    fn reset(&mut self) {
+        self.bytes.clear();
+        self.cut = false;
+    }
+
     fn adopt(&mut self, part: &[u8]) {
         if self.cut {
             return;
@@ -234,14 +251,21 @@ impl Line {
             Some(bytes) if !self.cut => bytes,
             _ => &self.bytes,
         };
-        out.push_str(&number.to_string());
-        out.push('\t');
+        // The number goes into `out` directly, without a String of its own.
+        let _ = write!(out, "{number}\t");
         out.push_str(&String::from_utf8_lossy(bytes));
         if self.cut {
             out.push_str("[line cut; more]");
         }
         out.push('\n');
     }
+}
+
+/// The starting capacity of the output: the file size bounded by the byte
+/// cap, plus room for the line numbers and for one line over the cap so that a
+/// normal read does not grow the buffer again.
+fn out_capacity(size: u64) -> usize {
+    size.min(BYTE_CAP as u64) as usize + LINE_CAP + 32
 }
 
 fn open_error(path: &Path, error: &io::Error) -> String {
@@ -262,14 +286,14 @@ pub fn spec() -> ToolSpec {
         name: NAME.into(),
         description: concat!(
             "Read a text file. Each line is printed as `N<TAB>text`. ",
-            "At most `limit` lines are shown (default 2000); use `offset` to continue. ",
+            "At most `limit` lines (default 2000) or 32 KB are shown; use `offset` to continue. ",
             "Lines over 2000 bytes are cut."
         )
         .into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Path of the file, relative to the working directory." },
+                "path": { "type": "string", "description": "Path of the file." },
                 "offset": { "type": "integer", "minimum": 1, "description": "1-based line to start at; default 1." },
                 "limit": { "type": "integer", "minimum": 1, "description": "Maximum lines to print; default 2000." }
             },
@@ -290,6 +314,39 @@ mod tests {
         let path = tmp.path().join(name);
         tokio::fs::write(&path, contents).await.unwrap();
         path
+    }
+
+    #[tokio::test]
+    async fn read_byte_cap_stops_and_names_the_next_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let line = "x".repeat(99);
+        let text = format!("{line}\n").repeat(1000);
+        write(&tmp, "big.txt", &text).await;
+        let output = tool(&tmp)
+            .run(r#"{"path":"big.txt"}"#, &CancellationToken::new())
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        let content = output.content.as_ref();
+        assert!(content.len() <= BYTE_CAP + 200, "{} bytes", content.len());
+        let last = content.lines().last().unwrap_or_default();
+        assert!(last.contains("more bytes; use offset="), "{last}");
+        let next: usize = last
+            .rsplit("offset=")
+            .next()
+            .and_then(|rest| rest.trim_end_matches(']').parse().ok())
+            .expect("an offset");
+        let shown = content.lines().count() - 1;
+        assert_eq!(next, shown + 1);
+    }
+
+    #[tokio::test]
+    async fn read_byte_cap_leaves_a_small_file_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "a\nb\n").await;
+        let output = tool(&tmp)
+            .run(r#"{"path":"f.txt"}"#, &CancellationToken::new())
+            .await;
+        assert_eq!(output.content.as_ref(), "1\ta\n2\tb\n");
     }
 
     #[tokio::test]

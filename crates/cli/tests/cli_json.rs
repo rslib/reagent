@@ -313,6 +313,152 @@ async fn cli_json_completion_policy_is_quiet_without_changes() {
 }
 
 #[tokio::test]
+async fn usage_cost_and_context_tokens_in_the_summary() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let work = tempfile::tempdir().expect("work dir");
+    // A model table names the context window, so the summary can report it.
+    let config = tmp.path().join("xdg/reagent");
+    tokio::fs::create_dir_all(&config)
+        .await
+        .expect("config dir");
+    tokio::fs::write(
+        config.join("config.toml"),
+        "[providers.fi.models.\"m\"]\ncontext_window = 200000\n",
+    )
+    .await
+    .expect("write config");
+    let script = tmp.path().join("script.json");
+    // Two turns: the first calls a tool, so the second is the last turn, and
+    // its prompt is the one that sizes the context.
+    tokio::fs::write(
+        &script,
+        r#"{"replies": [
+            {"text": "first", "usage": {
+                "input": 40, "output": 5, "cache_read": 0, "cache_write": 0, "reasoning": 0
+            }, "calls": [
+                {"name": "read", "arguments": {"path": "notes.txt"}}
+            ]},
+            {"text": "second", "usage": {
+                "input": 12, "output": 3, "cache_read": 10, "cache_write": 2, "reasoning": 0
+            }}
+        ]}"#,
+    )
+    .await
+    .expect("write script");
+    tokio::fs::write(work.path().join("notes.txt"), "hello\n")
+        .await
+        .expect("write notes");
+
+    let work_arg = work.path().display().to_string();
+    let output = Command::new(BIN)
+        .args(["--json", "--model", "fi/m", "--cwd", &work_arg])
+        .arg("--provider")
+        .arg(format!("fake:{}", script.display()))
+        .args(["-p", "hi"])
+        .current_dir(tmp.path())
+        .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
+        .env("XDG_CACHE_HOME", tmp.path().join("cache"))
+        .env("ANTHROPIC_API_KEY", FAKE_KEY)
+        .output()
+        .await
+        .expect("the binary runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lines = json_lines(&output.stdout);
+    let summary = lines.last().expect("a summary line");
+    assert_eq!(summary["type"], "summary");
+    // The scripted usage reports no cost, so the summary has none.
+    assert!(
+        summary.get("cost").is_some(),
+        "the summary names the cost: {summary}"
+    );
+    assert_eq!(summary["cost"], Value::Null, "{summary}");
+    // The context is the last turn's prompt: input + cache_read + cache_write.
+    assert_eq!(summary["context_tokens"], 24, "{summary}");
+    assert_eq!(summary["context_window"], 200_000, "{summary}");
+
+    // Every usage line names the cost too, as null when the provider has none.
+    let usage_lines: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["type"] == "usage")
+        .collect();
+    assert_eq!(usage_lines.len(), 2, "{:?}", types(&lines));
+    for line in usage_lines {
+        assert_eq!(line["cost"], Value::Null, "{line}");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains(FAKE_KEY), "stdout leaks the API key");
+}
+
+#[tokio::test]
+async fn usage_cost_comes_from_the_cached_price() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let work = tempfile::tempdir().expect("work dir");
+    // A table makes `fi` a provider name, so `fi/m` finds its cache entry.
+    let config = tmp.path().join("xdg/reagent");
+    tokio::fs::create_dir_all(&config)
+        .await
+        .expect("config dir");
+    tokio::fs::write(config.join("config.toml"), "[providers.fi]\n")
+        .await
+        .expect("write config");
+    let models = tmp.path().join("cache/reagent/models");
+    tokio::fs::create_dir_all(&models).await.expect("cache dir");
+    tokio::fs::write(
+        models.join("fi.json"),
+        r#"{"fetched_at": 0, "models": [{"id": "m", "context_window": 8000, "max_output": null,
+            "price": {"input": 0.000001, "output": 0.000002, "cache_read": 0.0, "cache_write": 0.0}}]}"#,
+    )
+    .await
+    .expect("write cache");
+    let script = tmp.path().join("script.json");
+    tokio::fs::write(
+        &script,
+        r#"{"replies": [{"text": "done", "usage": {
+            "input": 1000, "output": 500, "cache_read": 0, "cache_write": 0, "reasoning": 0
+        }}]}"#,
+    )
+    .await
+    .expect("write script");
+
+    let work_arg = work.path().display().to_string();
+    let output = Command::new(BIN)
+        .args(["--json", "--model", "fi/m", "--cwd", &work_arg])
+        .arg("--provider")
+        .arg(format!("fake:{}", script.display()))
+        .args(["-p", "hi"])
+        .current_dir(tmp.path())
+        .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
+        .env("XDG_CACHE_HOME", tmp.path().join("cache"))
+        .env("ANTHROPIC_API_KEY", FAKE_KEY)
+        .output()
+        .await
+        .expect("the binary runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lines = json_lines(&output.stdout);
+    let usage = lines
+        .iter()
+        .find(|line| line["type"] == "usage")
+        .expect("a usage line");
+    let cost = usage["cost"].as_f64().expect("a computed cost");
+    assert!((cost - 0.002).abs() < 1e-12, "{usage}");
+    let summary = lines.last().expect("a summary line");
+    let total = summary["cost"].as_f64().expect("a summary cost");
+    assert!((total - 0.002).abs() < 1e-12, "{summary}");
+    assert_eq!(summary["context_window"], 8000, "{summary}");
+}
+
+#[tokio::test]
 async fn cli_json_without_json_flag_prints_plain_final_text() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let script = tmp.path().join("script.json");

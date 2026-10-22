@@ -26,7 +26,7 @@ use reagent_ai::openai::responses::request::{
 use reagent_ai::openai::responses::stream::StreamParser as ResponsesParser;
 use reagent_ai::sse::SseSplitter;
 use reagent_ai::{
-    AssistantMessage, Content, Message, ReasoningLevel, StopReason, ToolCall, ToolSpec,
+    AssistantMessage, Content, Message, ReasoningField, StopReason, ToolCall, ToolSpec,
 };
 
 fn main() {
@@ -42,6 +42,7 @@ const MESSAGES: usize = 200;
 const MODEL_ANTHROPIC: &str = "claude-sonnet-4-5";
 const MODEL_OPENAI: &str = "gpt-5";
 const SYSTEM: &str = "You are a careful coding agent.";
+const REASONING: &str = "medium";
 
 /// Splits `body` into one `Bytes` chunk per line, as a socket would.
 fn chunks(body: &str) -> Vec<Bytes> {
@@ -183,13 +184,8 @@ fn request_body_anthropic_cold(bencher: Bencher) {
         bodies
             .align(&messages, "anthropic")
             .expect("the history serializes");
-        let builder = AnthropicBuilder::new(
-            MODEL_ANTHROPIC,
-            1024,
-            Some(SYSTEM),
-            Some(ReasoningLevel::Medium),
-            &tools,
-        );
+        let builder =
+            AnthropicBuilder::new(MODEL_ANTHROPIC, 1024, Some(SYSTEM), Some(REASONING), &tools);
         black_box(builder.body(bodies.bodies()).len())
     });
 }
@@ -202,13 +198,8 @@ fn request_body_anthropic_warm(bencher: Bencher) {
     bodies
         .align(&messages, "anthropic")
         .expect("the history serializes");
-    let builder = AnthropicBuilder::new(
-        MODEL_ANTHROPIC,
-        1024,
-        Some(SYSTEM),
-        Some(ReasoningLevel::Medium),
-        &tools,
-    );
+    let builder =
+        AnthropicBuilder::new(MODEL_ANTHROPIC, 1024, Some(SYSTEM), Some(REASONING), &tools);
     bencher.bench_local(|| {
         bodies
             .align(&messages, "anthropic")
@@ -232,7 +223,7 @@ fn request_body_responses_cold(bencher: Bencher) {
             MODEL_OPENAI,
             1024,
             Some(SYSTEM),
-            Some(ReasoningLevel::Medium),
+            Some(REASONING),
             Some("sess-1"),
             &tools,
         );
@@ -254,7 +245,7 @@ fn request_body_responses_warm(bencher: Bencher) {
         MODEL_OPENAI,
         1024,
         Some(SYSTEM),
-        Some(ReasoningLevel::Medium),
+        Some(REASONING),
         Some("sess-1"),
         &tools,
     );
@@ -283,9 +274,10 @@ fn request_body_chat_cold(bencher: Bencher) {
             MODEL_OPENAI,
             1024,
             Some(SYSTEM),
-            Some(ReasoningLevel::Medium),
+            Some(REASONING),
             &tools,
-            false,
+            reagent_ai::MaxTokensField::MaxTokens,
+            ReasoningField::Effort,
         );
         black_box(builder.body(bodies.bodies()).len())
     });
@@ -305,9 +297,10 @@ fn request_body_chat_warm(bencher: Bencher) {
         MODEL_OPENAI,
         1024,
         Some(SYSTEM),
-        Some(ReasoningLevel::Medium),
+        Some(REASONING),
         &tools,
-        false,
+        reagent_ai::MaxTokensField::MaxTokens,
+        ReasoningField::Effort,
     );
     bencher.bench_local(|| {
         bodies

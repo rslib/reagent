@@ -15,6 +15,7 @@ reagent-agent = { path = "crates/agent" }
 reagent-tools = { path = "crates/tools" }
 reagent-config = { path = "crates/config" }
 reagent-util = { path = "crates/util" }
+reagent-sandbox = { path = "crates/sandbox" }
 reagent-script = { path = "crates/script" }
 reagent-mcp = { path = "crates/mcp" }
 reagent-tui = { path = "crates/tui" }

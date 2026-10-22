@@ -1,18 +1,12 @@
-//! The hidden `--sandbox-exec` helper: runs one program inside a birdcage
-//! sandbox and exits with its code.
+//! The hidden `--sandbox-exec` helper: sandboxes itself, replaces itself with
+//! the program and so exits with the program's code and signal. macOS uses a
+//! Seatbelt profile, Linux uses Landlock.
 
+use std::convert::Infallible;
 use std::ffi::OsString;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-
-#[expect(
-    clippy::disallowed_types,
-    reason = "birdcage has its own Command; the helper runs before any runtime starts"
-)]
-use birdcage::process::Command;
-use birdcage::process::Stdio;
-use birdcage::{Birdcage, Exception, Sandbox};
 
 /// The exit code that tells the bash tool the sandbox could not start.
 const UNAVAILABLE: u8 = 125;
@@ -73,54 +67,51 @@ fn on_path(program: &Path) -> bool {
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
 }
 
-/// Runs the helper: sandboxes itself as birdcage does, spawns the program,
-/// waits, and returns the program's exit code (128 + signal for a signal).
+/// Runs the helper: sandboxes itself and replaces itself with the program, so
+/// the program keeps the helper's pid, signals included. Only a failed exec
+/// comes back, as the reason the sandbox could not start.
 pub fn helper(args: impl IntoIterator<Item = OsString>) -> ExitCode {
-    match run(args) {
-        Ok(code) => ExitCode::from(code),
-        Err(error) => {
-            eprintln!("reagent: sandbox unavailable: {error}");
-            ExitCode::from(UNAVAILABLE)
-        }
-    }
+    // `exec` never returns on success, so the error is all that comes back.
+    let error = match run(args) {
+        Err(error) => error,
+        Ok(never) => match never {},
+    };
+    eprintln!("reagent: sandbox unavailable: {error}");
+    ExitCode::from(UNAVAILABLE)
 }
 
 #[expect(
     clippy::disallowed_types,
-    reason = "birdcage has its own Command; the helper runs before any runtime starts"
+    reason = "the helper runs before any runtime starts"
 )]
-fn run(args: impl IntoIterator<Item = OsString>) -> Result<u8, String> {
+fn run(args: impl IntoIterator<Item = OsString>) -> Result<Infallible, String> {
     let mut policy = parse_policy(args)?;
     if policy.program == "bash" && !on_path(Path::new("bash")) {
         policy.program = "sh".into();
     }
-    let mut sandbox = Birdcage::new();
-    let mut allow = |exception: Exception| {
-        sandbox
-            .add_exception(exception)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    };
-    allow(Exception::ExecuteAndRead("/".into()))?;
-    for dir in policy.write.iter().filter(|dir| dir.exists()) {
-        allow(Exception::WriteAndRead(dir.clone()))?;
-    }
-    allow(Exception::FullEnvironment)?;
-    if policy.network {
-        allow(Exception::Networking)?;
-    }
-    let mut command = Command::new(&policy.program);
-    command
+    reagent_sandbox::restrict(policy.network, &write_folders(&policy.write))?;
+    // `exec` keeps the pid and passes a signal on to the caller as a signal,
+    // so nothing waits for a child and no 128 + signal mapping is needed.
+    let error = std::process::Command::new(&policy.program)
         .args(&policy.args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let mut child = sandbox.spawn(command).map_err(|error| error.to_string())?;
-    let status = child.wait().map_err(|error| error.to_string())?;
-    Ok(status
-        .code()
-        .or_else(|| status.signal().map(|signal| 128 + signal))
-        .map_or(1, |code| u8::try_from(code & 0xff).unwrap_or(1)))
+        .exec();
+    Err(format!(
+        "cannot run {}: {error}",
+        policy.program.to_string_lossy()
+    ))
+}
+
+/// The write folders that exist, canonical, since both backends match the
+/// resolved path (`/tmp` is `/private/tmp` on macOS).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the helper runs before any runtime starts"
+)]
+fn write_folders(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    dirs.iter()
+        .filter_map(|dir| std::fs::canonicalize(dir).ok())
+        .filter(|dir| dir.is_dir())
+        .collect()
 }
 
 #[cfg(test)]

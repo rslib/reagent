@@ -5,9 +5,7 @@ use serde::Serialize;
 use serde_json::value::RawValue;
 
 use crate::Error;
-use crate::types::{
-    AssistantMessage, Content, Message, ReasoningLevel, Role, ToolResult, ToolSpec,
-};
+use crate::types::{AssistantMessage, Content, Message, Reasoning, Role, ToolResult, ToolSpec};
 
 /// One message serialized in Anthropic wire form, reusable across requests.
 #[derive(Debug, Clone)]
@@ -92,9 +90,9 @@ impl BodyCache {
 
 /// Builds an Anthropic Messages body from a stable head and reusable messages.
 ///
-/// The head holds the model, the system prompt, the reasoning budget and the
-/// tools, serialized once. Tools are sorted by name and the last one carries
-/// the tools cache breakpoint.
+/// The head holds the model, the system prompt, the reasoning and the tools,
+/// serialized once. Tools are sorted by name and the last one carries the
+/// tools cache breakpoint.
 #[derive(Debug)]
 pub struct RequestBuilder {
     head: Bytes,
@@ -106,14 +104,21 @@ impl RequestBuilder {
         model: &str,
         max_tokens: u32,
         system: Option<&str>,
-        reasoning: Option<ReasoningLevel>,
+        reasoning: Option<&str>,
         tools: &[ToolSpec],
     ) -> Self {
         let mut out = BytesMut::new();
         out.put_slice(b"{\"model\":");
         out.put_slice(json_string(model).as_bytes());
-        // The API counts thinking inside max_tokens and needs budget_tokens < max_tokens.
-        let budget = reasoning.map_or(0, budget_tokens);
+        // A level keeps max_tokens as given. A budget is extra, because the
+        // API counts thinking inside max_tokens and needs budget_tokens < max_tokens.
+        let reasoning = reasoning
+            .map(Reasoning::parse)
+            .filter(|reasoning| !reasoning.is_off());
+        let budget = match reasoning {
+            Some(Reasoning::Budget(budget)) => budget,
+            _ => 0,
+        };
         out.put_slice(b",\"max_tokens\":");
         out.put_slice(max_tokens.saturating_add(budget).to_string().as_bytes());
         if let Some(system) = system {
@@ -121,12 +126,20 @@ impl RequestBuilder {
             out.put_slice(json_string(system).as_bytes());
         }
         out.put_slice(b",\"stream\":true");
-        if reasoning.is_some() {
-            out.put_slice(b",\"thinking\":");
-            out.put_slice(&to_bytes(&Thinking {
-                kind: "enabled",
-                budget_tokens: budget,
-            }));
+        match reasoning {
+            Some(Reasoning::Level(level)) => {
+                out.put_slice(
+                    b",\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":",
+                );
+                out.put_slice(json_string(level).as_bytes());
+                out.put_slice(b"}");
+            }
+            Some(Reasoning::Budget(budget)) => {
+                out.put_slice(b",\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":");
+                out.put_slice(budget.to_string().as_bytes());
+                out.put_slice(b"}");
+            }
+            None => {}
         }
         out.put_slice(b",\"tools\":[");
 
@@ -217,13 +230,6 @@ struct CacheControl {
 }
 
 const EPHEMERAL: CacheControl = CacheControl { kind: "ephemeral" };
-
-#[derive(Serialize)]
-struct Thinking {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    budget_tokens: u32,
-}
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -321,14 +327,6 @@ fn serialize_tool(tool: &ToolSpec, cache_control: bool) -> Bytes {
     })
 }
 
-fn budget_tokens(level: ReasoningLevel) -> u32 {
-    match level {
-        ReasoningLevel::Low => 1_024,
-        ReasoningLevel::Medium => 4_096,
-        ReasoningLevel::High => 16_384,
-    }
-}
-
 fn json_string(value: &str) -> String {
     serde_json::to_string(value).expect("a str serializes to a JSON string")
 }
@@ -371,7 +369,7 @@ mod tests {
             "claude-sonnet-4-5",
             1024,
             Some("You are a careful coding agent."),
-            Some(ReasoningLevel::Medium),
+            Some("medium"),
             &tools,
         )
     }
@@ -420,11 +418,11 @@ mod tests {
     #[test]
     fn head_enables_streaming_and_maps_reasoning() {
         let tools: Vec<ToolSpec> = Vec::new();
-        let low = RequestBuilder::new("m", 1024, None, Some(ReasoningLevel::Low), &tools);
+        let low = RequestBuilder::new("m", 1024, None, Some("low"), &tools);
         let head = std::str::from_utf8(low.head()).unwrap();
         assert!(head.contains(r#""stream":true"#));
-        assert!(head.contains(r#""max_tokens":2048"#));
-        assert!(head.contains(r#""thinking":{"type":"enabled","budget_tokens":1024}"#));
+        assert!(head.contains(r#""max_tokens":1024"#));
+        assert!(head.contains(r#""thinking":{"type":"adaptive"}"#));
 
         let none = RequestBuilder::new("m", 1024, None, None, &tools);
         assert!(
@@ -432,6 +430,52 @@ mod tests {
                 .unwrap()
                 .contains("thinking")
         );
+    }
+
+    #[test]
+    fn a_level_reasoning_text_writes_adaptive_thinking_and_an_effort() {
+        let tools: Vec<ToolSpec> = Vec::new();
+        let builder = RequestBuilder::new("m", 1000, None, Some("max"), &tools);
+        let head = std::str::from_utf8(builder.head()).unwrap();
+        assert!(
+            head.contains(r#""thinking":{"type":"adaptive"},"output_config":{"effort":"max"}"#),
+            "{head}"
+        );
+        assert!(head.contains(r#""max_tokens":1000"#), "{head}");
+        assert!(!head.contains("budget_tokens"), "{head}");
+    }
+
+    #[test]
+    fn a_budget_reasoning_text_adds_to_max_tokens() {
+        let tools: Vec<ToolSpec> = Vec::new();
+        let builder = RequestBuilder::new("m", 1000, None, Some("4096"), &tools);
+        let head = std::str::from_utf8(builder.head()).unwrap();
+        assert!(
+            head.contains(r#""thinking":{"type":"enabled","budget_tokens":4096}"#),
+            "{head}"
+        );
+        assert!(head.contains(r#""max_tokens":5096"#), "{head}");
+        assert!(!head.contains("output_config"), "{head}");
+    }
+
+    #[test]
+    fn an_off_reasoning_text_writes_no_thinking() {
+        let tools: Vec<ToolSpec> = Vec::new();
+        for text in ["off", "none"] {
+            let builder = RequestBuilder::new("m", 1000, None, Some(text), &tools);
+            let head = std::str::from_utf8(builder.head()).unwrap();
+            assert!(!head.contains("thinking"), "{text}: {head}");
+            assert!(!head.contains("output_config"), "{text}: {head}");
+            assert!(head.contains(r#""max_tokens":1000"#), "{text}: {head}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_reasoning_text_is_escaped() {
+        let tools: Vec<ToolSpec> = Vec::new();
+        let builder = RequestBuilder::new("m", 1000, None, Some(r#"a"b"#), &tools);
+        let head = std::str::from_utf8(builder.head()).unwrap();
+        assert!(head.contains(r#""effort":"a\"b""#), "{head}");
     }
 
     #[test]

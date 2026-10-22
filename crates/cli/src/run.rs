@@ -1,11 +1,12 @@
 //! Runs one headless agent session and produces its output.
 
 use std::future::Future;
+use std::io::IsTerminal;
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -23,6 +24,7 @@ use reagent_agent::policy::completion::Completion;
 use reagent_agent::policy::stuck::Stuck;
 use reagent_agent::tool::Registry;
 use reagent_agent::workspace::Workspace;
+use reagent_ai::oauth::session::{Sleeper, Wait};
 use reagent_ai::{Provider, StopReason, Text, Usage};
 use reagent_config::Secret;
 use reagent_config::permissions::Rules;
@@ -156,14 +158,102 @@ fn compact_budget(context_window: Option<u64>) -> u64 {
     })
 }
 
-/// The context window the models cache of provider `name` lists for `model`.
-fn cached_context_window(dir: &std::path::Path, name: Option<&str>, model: &str) -> Option<u64> {
+/// The cache entry the models cache of provider `name` holds for `model`.
+fn cached_entry(
+    dir: &std::path::Path,
+    name: Option<&str>,
+    model: &str,
+) -> Option<reagent_ai::catalog::Entry> {
     let cache = reagent_ai::catalog::read(dir, name?)?;
-    cache
-        .models
-        .iter()
-        .find(|entry| entry.id == model)?
-        .context_window
+    cache.models.into_iter().find(|entry| entry.id == model)
+}
+
+/// What a run's usage costs, and whether a peak rule applies.
+#[derive(Clone, Copy, Debug)]
+struct Billing {
+    /// The price in USD per token.
+    price: reagent_ai::catalog::Price,
+    /// The peak windows of a price that came from the models.dev catalogue.
+    peak: Option<reagent_ai::providers::Peak>,
+}
+
+/// The price of a run: the model's config price, else the price of its model
+/// list, which may have come from the models.dev catalogue. Only a catalogue
+/// price brings the peak rule of its preset; a config price is final.
+fn billing(
+    config: Option<reagent_config::ModelPrice>,
+    preset: Option<&'static reagent_ai::providers::Preset>,
+    cached: Option<&reagent_ai::catalog::Entry>,
+) -> Option<Billing> {
+    if let Some(price) = config {
+        return Some(Billing {
+            price: per_token(price),
+            peak: None,
+        });
+    }
+    let entry = cached?;
+    let peak = match entry.price_source {
+        Some(reagent_ai::catalog::PriceSource::ModelsDev) => preset.and_then(|preset| preset.peak),
+        _ => None,
+    };
+    Some(Billing {
+        price: entry.price?,
+        peak,
+    })
+}
+
+/// A config price in USD per 1M tokens as USD per token.
+fn per_token(price: reagent_config::ModelPrice) -> reagent_ai::catalog::Price {
+    const MILLION: f64 = 1_000_000.0;
+    reagent_ai::catalog::Price {
+        input: price.input / MILLION,
+        output: price.output / MILLION,
+        cache_read: price.cached / MILLION,
+        cache_write: price.cache_write.unwrap_or(0.0) / MILLION,
+    }
+}
+
+/// The current Unix second.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// The one stderr line a text-mode run ends with: turns, context use, cost and
+/// cache hit rate. A part that is unknown is left out.
+fn end_line(
+    turns: u32,
+    context_tokens: u64,
+    context_window: Option<u64>,
+    cost: Option<f64>,
+    cache_hit_rate: f64,
+) -> String {
+    let noun = if turns == 1 { "turn" } else { "turns" };
+    let mut line = format!(
+        "{turns} {noun}, {}",
+        context_use(context_tokens, context_window)
+    );
+    if let Some(cost) = cost {
+        line.push_str(&format!(", ${cost:.4}"));
+    }
+    let percent = (cache_hit_rate * 100.0).round() as u32;
+    line.push_str(&format!(", {percent}% cached"));
+    line
+}
+
+/// The context part of [`end_line`]: `84k/200k context`, or `84k context` when
+/// the window is unknown.
+fn context_use(tokens: u64, window: Option<u64>) -> String {
+    match window {
+        Some(window) => format!("{}/{} context", kilo(tokens), kilo(window)),
+        None => format!("{} context", kilo(tokens)),
+    }
+}
+
+/// Whole thousands of tokens, with no decimals: `84k`.
+fn kilo(tokens: u64) -> String {
+    format!("{}k", tokens.saturating_add(500) / 1000)
 }
 
 /// Runs the agent for `args` and returns the process exit code.
@@ -172,11 +262,14 @@ pub async fn run(mut args: Args) -> ExitCode {
     // from standard input, and an empty or non-UTF-8 task input exits 2.
     // The task moves out of `args`; `args` is still borrowed below.
     let source = std::mem::replace(&mut args.task, crate::args::TaskSource::Stdin);
+    // The models cache names the context window and the price of the model, so
+    // it is read once for both.
+    let cached = crate::models::cache_dir()
+        .and_then(|dir| cached_entry(&dir, args.provider_name.as_deref(), &args.model));
     if args.context_window.is_none() {
-        args.context_window = crate::models::cache_dir().and_then(|dir| {
-            cached_context_window(&dir, args.provider_name.as_deref(), &args.model)
-        });
+        args.context_window = cached.as_ref().and_then(|entry| entry.context_window);
     }
+    let billing = billing(args.price, args.preset, cached.as_ref());
     let mut task = match source {
         crate::args::TaskSource::Text(text) => text,
         crate::args::TaskSource::Stdin => match read_stdin_task().await {
@@ -194,14 +287,24 @@ pub async fn run(mut args: Args) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let provider = build_provider(&args).await;
-    let provider = match provider {
-        Ok(provider) => provider,
+    let (provider, session, source) = match build_provider(&args).await {
+        Ok(built) => built,
         Err(message) => {
             eprintln!("reagent: {message}");
             return ExitCode::from(2);
         }
     };
+    // The one line before the first request, in both output modes: the
+    // profile, the model and where the credential came from, never the key.
+    eprintln!(
+        "{}",
+        start_line(
+            args.profile.as_deref(),
+            args.provider_name.as_deref(),
+            &args.model,
+            source.as_ref()
+        )
+    );
 
     // Masking and compaction keep removed outputs for the expand tool.
     let archive = args
@@ -234,7 +337,7 @@ pub async fn run(mut args: Args) -> ExitCode {
         model: args.model.clone(),
         max_tokens: args.max_tokens,
         system: Some(system),
-        reasoning: None,
+        reasoning: args.reasoning.clone(),
         cache_key: Some(Text::from("headless-v1")),
         max_turns: Some(MAX_TURNS),
     };
@@ -312,7 +415,7 @@ pub async fn run(mut args: Args) -> ExitCode {
     }
     let (tx, rx) = mpsc::channel::<Event>(256);
     let out = Out::new();
-    let writer = tokio::spawn(drain(rx, out, args.json));
+    let writer = tokio::spawn(drain(rx, out, args.json, billing, args.context_window));
 
     if snapshot_enabled {
         let snapshot = crate::snapshot::capture_environment(&cwd, &snapshot_cancel).await;
@@ -323,6 +426,11 @@ pub async fn run(mut args: Args) -> ExitCode {
     let mut history = vec![reagent_ai::Message::user(task)];
     agent.run(&mut history, None, &tx).await;
     drop(tx);
+    // A refresh that could not be saved costs the next run a refresh; the run
+    // that traded the tokens keeps going, so this is a warning, printed once.
+    if let Some(warning) = session.as_ref().and_then(|session| session.take_warning()) {
+        eprintln!("reagent: warning: could not save the refreshed chatgpt login: {warning}");
+    }
     for timer in timers {
         timer.abort();
     }
@@ -337,18 +445,29 @@ pub async fn run(mut args: Args) -> ExitCode {
 /// Consumes the agent's event channel, prints it and returns how the run ended.
 ///
 /// Owns stdout: in plain mode only the final answer is printed; in JSON mode
-/// every event is one line and a summary follows the run end.
-async fn drain(rx: mpsc::Receiver<Event>, mut out: Out, json: bool) -> TurnEndReason {
+/// every event is one line and a summary follows the run end. `billing` fills
+/// the cost of a usage the provider did not price, and `context_window` is the
+/// window the end line reports.
+async fn drain(
+    rx: mpsc::Receiver<Event>,
+    mut out: Out,
+    json: bool,
+    billing: Option<Billing>,
+    context_window: Option<u64>,
+) -> TurnEndReason {
     let mut answer = String::new();
     let mut total = Usage::default();
     let mut turns = 0u32;
     let mut reason = TurnEndReason::EndTurn;
     let mut stop = None;
     let mut ended = false;
+    // The prompt size of the last turn: how full the context is now.
+    let mut context_tokens = 0u64;
 
     let mut rx = rx;
     let mut buf = Vec::with_capacity(512);
     while let Some(event) = rx.recv().await {
+        let event = priced(event, billing);
         match &event {
             Event::TurnStart => {
                 turns += 1;
@@ -357,7 +476,10 @@ async fn drain(rx: mpsc::Receiver<Event>, mut out: Out, json: bool) -> TurnEndRe
             // A retried attempt starts the reply again, so its partial text goes.
             Event::Retry { .. } => answer.clear(),
             Event::TextDelta(text) => answer.push_str(text),
-            Event::Usage(usage) => sum(&mut total, usage),
+            Event::Usage(usage) => {
+                context_tokens = crate::json::context_tokens(usage);
+                sum(&mut total, usage);
+            }
             Event::Error(message) if !json => eprintln!("reagent: {message}"),
             Event::TurnEnd(r) => reason = *r,
             Event::RunEnd(r) => {
@@ -379,22 +501,75 @@ async fn drain(rx: mpsc::Receiver<Event>, mut out: Out, json: bool) -> TurnEndRe
 
     if json {
         buf.clear();
-        crate::json::write_summary(&mut buf, &total, turns, &reason, stop);
+        crate::json::write_summary(
+            &mut buf,
+            &total,
+            turns,
+            &reason,
+            stop,
+            context_tokens,
+            context_window,
+        );
         let _ = out.write(&buf).await;
     } else {
         let _ = out.line(&answer).await;
+        // A pipe or a file keeps its output clean; a terminal gets the line.
+        if std::io::stderr().is_terminal() {
+            let line = end_line(
+                turns,
+                context_tokens,
+                context_window,
+                total.cost,
+                crate::json::cache_hit_rate(&total),
+            );
+            eprintln!("reagent: {line}");
+        }
     }
 
     reason
 }
 
+/// Fills the cost of a usage event from the model price, at the peak rule of
+/// the price, when the provider reported none.
+fn priced(event: Event, billing: Option<Billing>) -> Event {
+    // The clock is read only for an unpriced usage under a peak rule, not for
+    // every text delta.
+    let timed = billing.is_some_and(|billing| billing.peak.is_some())
+        && matches!(&event, Event::Usage(usage) if usage.cost.is_none());
+    priced_at(event, billing, if timed { now_secs() } else { 0 })
+}
+
+/// [`priced`] at the UTC second `at`: a models.dev price multiplies inside its
+/// peak windows. Chinese public holidays are off-peak and not modeled, so a
+/// holiday run shows the peak price.
+fn priced_at(event: Event, billing: Option<Billing>, at: u64) -> Event {
+    let Event::Usage(usage) = &event else {
+        return event;
+    };
+    let Some(billing) = billing.filter(|_| usage.cost.is_none()) else {
+        return event;
+    };
+    let mut usage = *usage;
+    let factor = billing.peak.map_or(1.0, |peak| peak.factor_at(at));
+    usage.cost = Some(billing.price.cost(&usage) * factor);
+    Event::Usage(usage)
+}
+
 /// Adds `delta` into the running `total`.
+///
+/// A cost is known when at least one part of the run reported one, and the
+/// parts that did are added up.
 fn sum(total: &mut Usage, delta: &Usage) {
     total.input_tokens += delta.input_tokens;
     total.output_tokens += delta.output_tokens;
     total.cache_read_tokens += delta.cache_read_tokens;
     total.cache_write_tokens += delta.cache_write_tokens;
     total.reasoning_tokens += delta.reasoning_tokens;
+    total.cost = match (total.cost, delta.cost) {
+        (Some(sum), Some(cost)) => Some(sum + cost),
+        (Some(sum), None) => Some(sum),
+        (None, cost) => cost,
+    };
 }
 
 /// The provider stop reason as a string, when the run stopped for one.
@@ -430,70 +605,327 @@ fn exit_code(reason: &TurnEndReason, cause: Cause) -> ExitCode {
     ExitCode::from(code)
 }
 
-/// The API key: the chosen variable when set and not empty, else the key from
-/// the config, else the wire default variable.
-fn resolve_key(
-    chosen: Option<String>,
-    file: Option<&Secret>,
-    default: Option<String>,
-) -> Option<String> {
-    chosen
-        .filter(|key| !key.is_empty())
-        .or_else(|| file.map(|key| key.expose().to_string()))
-        .or_else(|| default.filter(|key| !key.is_empty()))
+/// Where the credential of a run came from, as the start line names it.
+///
+/// It never holds the key itself, so a line or an error that prints it is
+/// safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// The named variable held a key.
+    EnvVar(String),
+    /// The provider table held the key itself.
+    ConfigKey,
+    /// A saved login of that name held the key.
+    Login(String),
+    /// The wire's default variable held a key.
+    DefaultEnv(String),
 }
 
-/// The API key of a provider, or `missing <VAR>` naming the variable read.
+impl Source {
+    /// The source as the start line writes it: `env <VAR>`, `config key`,
+    /// `login <name>` or `env <VAR> (default)`.
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Source::EnvVar(name) => format!("env {name}"),
+            Source::ConfigKey => "config key".to_string(),
+            Source::Login(name) => format!("login {name}"),
+            Source::DefaultEnv(name) => format!("env {name} (default)"),
+        }
+    }
+}
+
+/// The API key and where it came from: the chosen variable when set and not
+/// empty, else the key from the config, else the saved login `login`, else the
+/// wire's default variable. `var` names the variable read, the chosen one or
+/// the wire default.
+fn resolve_key(
+    chosen: Option<String>,
+    var: &str,
+    file: Option<&Secret>,
+    saved: Option<&str>,
+    login: Option<&str>,
+    default: Option<String>,
+) -> Option<(String, Source)> {
+    if let Some(key) = chosen.filter(|key| !key.is_empty()) {
+        return Some((key, Source::EnvVar(var.to_string())));
+    }
+    if let Some(key) = file {
+        return Some((key.expose().to_string(), Source::ConfigKey));
+    }
+    if let Some(key) = saved.filter(|key| !key.is_empty()) {
+        return Some((
+            key.to_string(),
+            Source::Login(login.unwrap_or_default().to_string()),
+        ));
+    }
+    default
+        .filter(|key| !key.is_empty())
+        .map(|key| (key, Source::DefaultEnv(var.to_string())))
+}
+
+/// The key of a saved login `name` in the config folder `dir`.
+fn saved_login(
+    dir: Option<&std::path::Path>,
+    name: Option<&str>,
+) -> Result<Option<String>, String> {
+    let (Some(dir), Some(name)) = (dir, name) else {
+        return Ok(None);
+    };
+    let logins = reagent_config::auth::read(dir)?;
+    Ok(logins
+        .get(name)
+        .and_then(|login| login.key())
+        .map(|key| key.expose().to_string()))
+}
+
+/// Whether a key the user gave signs in before a saved browser login.
+///
+/// The named variable comes first, then the config key. The wire's default
+/// variable is not in this list: a saved ChatGPT login beats it, so a key the
+/// environment happens to hold does not hide a login made on purpose.
+fn key_beats_session(named: Option<&str>, file: Option<&Secret>) -> bool {
+    named.is_some_and(|key| !key.is_empty()) || file.is_some()
+}
+
+/// The session of a saved ChatGPT login, when nothing else signs in.
+///
+/// A named variable and a config key both come before it, and the wire's
+/// default variable comes after, which is the precedence of every other key.
+/// The auth file is read only here, so a broken file still costs a run only
+/// when nothing else signs in.
+pub(crate) fn saved_session(
+    named: Option<&str>,
+    file: Option<&Secret>,
+    dir: Option<&std::path::Path>,
+    name: Option<&str>,
+    token_url: &str,
+    sleep: Sleeper,
+) -> Result<Option<Arc<reagent_ai::oauth::session::Session>>, String> {
+    if key_beats_session(named, file) {
+        return Ok(None);
+    }
+    let (Some(dir), Some(name)) = (dir, name) else {
+        return Ok(None);
+    };
+    // A file this build cannot read is no login here: the key path reads it
+    // again and reports the problem only when no key is left either.
+    let Ok(logins) = reagent_config::auth::read(dir) else {
+        return Ok(None);
+    };
+    if !matches!(
+        logins.get(name),
+        Some(reagent_config::auth::Login::Oauth { .. })
+    ) {
+        return Ok(None);
+    }
+    let session = reagent_ai::oauth::session::Session::load(dir, name, token_url, sleep)?;
+    Ok(Some(Arc::new(session)))
+}
+
+/// The wait a saved login sleeps on: the timer of the runtime this process
+/// runs, handed to `reagent-ai`, which has no timer of its own.
+pub(crate) fn sleeper() -> Sleeper {
+    Arc::new(|duration: Duration| -> Wait { Box::pin(tokio::time::sleep(duration)) })
+}
+
+/// The API key of a provider and where it came from, or `missing <VAR>`
+/// naming the variable read.
+///
+/// `login` names the saved login of `--model name/id`, which is read only when
+/// the variable and the config key have nothing, so a refused or broken auth
+/// file costs a run only when the key would have come from it.
 pub(crate) fn api_key(
     api_key_env: Option<&str>,
     file: Option<&Secret>,
+    login: Option<&str>,
     wire: &crate::args::Wire,
-) -> Result<String, String> {
-    let default = wire.default_api_key_env();
+) -> Result<(String, Source), String> {
+    let var = api_key_env.unwrap_or(wire.default_api_key_env());
     let read = |name: &str| std::env::var(name).ok();
-    resolve_key(
-        api_key_env.and_then(read),
-        file,
-        api_key_env.is_none().then(|| read(default)).flatten(),
-    )
-    .ok_or_else(|| format!("missing {}", api_key_env.unwrap_or(default)))
+    let chosen = api_key_env.and_then(read);
+    let wired = api_key_env.is_none().then(|| read(var)).flatten();
+    let saved = match (chosen.as_deref(), file) {
+        (Some(key), _) if !key.is_empty() => Ok(None),
+        (_, Some(_)) => Ok(None),
+        _ => match login.map(|_| reagent_config::auth::dir()) {
+            Some(Ok(dir)) => saved_login(Some(&dir), login),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
+        },
+    };
+    key_from(chosen, var, file, saved, login, wired)
 }
 
-/// Builds the provider named on the command line, or reports why not.
-async fn build_provider(args: &Args) -> Result<Box<dyn Provider>, String> {
+/// The reason a provider with no key variable of its own gives instead of a
+/// missing variable: its only credential is a saved login. Any other error,
+/// such as a refused auth file, passes through.
+pub(crate) fn login_hint(
+    preset: Option<&reagent_ai::Preset>,
+    api_key_env: Option<&str>,
+    name: Option<&str>,
+    login: Option<&str>,
+    error: String,
+) -> String {
+    let (Some(preset), Some("")) = (preset, api_key_env) else {
+        return error;
+    };
+    if !error.starts_with("missing ") {
+        return error;
+    }
+    let name = name.unwrap_or(preset.name);
+    let login = login.unwrap_or(name);
+    format!(
+        "{name} needs a login; run {}",
+        login_command(preset.name, login)
+    )
+}
+
+/// The command that saves the login `login` of the preset `preset`.
+pub(crate) fn login_command(preset: &str, login: &str) -> String {
+    if login == preset {
+        format!("reagent login {preset}")
+    } else {
+        format!("reagent login {preset} --as {login}")
+    }
+}
+
+/// The key the sources give and where it came from, or the reason there is
+/// none.
+///
+/// A saved login this build cannot read costs the run only when no source
+/// gives a key: the wire default variable still answers, and the auth file
+/// error comes back only when it is the last source left.
+fn key_from(
+    chosen: Option<String>,
+    var: &str,
+    file: Option<&Secret>,
+    saved: Result<Option<String>, String>,
+    login: Option<&str>,
+    wired: Option<String>,
+) -> Result<(String, Source), String> {
+    match saved {
+        Ok(saved) => resolve_key(chosen, var, file, saved.as_deref(), login, wired)
+            .ok_or_else(|| format!("missing {var}")),
+        Err(error) => resolve_key(chosen, var, file, None, login, wired).ok_or(error),
+    }
+}
+
+/// The line a run prints before its first request: the profile, the model and
+/// where the credential came from, never the key.
+fn start_line(
+    profile: Option<&str>,
+    provider: Option<&str>,
+    model: &str,
+    source: Option<&Source>,
+) -> String {
+    let target = match provider {
+        Some(name) => format!("{name}/{model}"),
+        None => model.to_string(),
+    };
+    format!(
+        "reagent: profile {}, model {target}, credential {}",
+        profile.unwrap_or("none"),
+        source.map_or_else(|| "none".to_string(), Source::text)
+    )
+}
+
+/// Builds the provider named on the command line, or reports why not, with the
+/// saved login the run may have to warn about and where the credential came
+/// from. The scripted testing provider has no credential, so it gives none.
+async fn build_provider(
+    args: &Args,
+) -> Result<
+    (
+        Box<dyn Provider>,
+        Option<Arc<reagent_ai::oauth::session::Session>>,
+        Option<Source>,
+    ),
+    String,
+> {
     #[cfg(feature = "testing")]
     if let crate::args::Wire::Fake(spec) = &args.provider {
         return build_fake(spec)
             .await
-            .map(|provider| Box::new(provider) as Box<dyn Provider>);
+            .map(|provider| (Box::new(provider) as Box<dyn Provider>, None, None));
     }
 
     let base_url = args
         .base_url
         .clone()
         .unwrap_or_else(|| args.provider.base_url());
-    let api_key = api_key(
-        args.api_key_env.as_deref(),
+    // A saved ChatGPT login replaces the key string. A key from the named
+    // variable or the config keeps precedence over it.
+    let named = args
+        .api_key_env
+        .as_deref()
+        .and_then(|name| std::env::var(name).ok());
+    let session = saved_session(
+        named.as_deref(),
         args.api_key.as_ref(),
-        &args.provider,
+        reagent_config::auth::dir().ok().as_deref(),
+        args.login.as_deref(),
+        reagent_ai::oauth::chatgpt::TOKEN,
+        sleeper(),
     )?;
+    let credential = match &session {
+        Some(session) => (
+            reagent_ai::Credential::Session(Arc::clone(session)),
+            Source::Login(args.login.clone().unwrap_or_default()),
+        ),
+        None => {
+            let (api_key, source) = api_key(
+                args.api_key_env.as_deref(),
+                args.api_key.as_ref(),
+                args.login.as_deref(),
+                &args.provider,
+            )
+            .map_err(|error| {
+                login_hint(
+                    args.preset,
+                    args.api_key_env.as_deref(),
+                    args.provider_name.as_deref(),
+                    args.login.as_deref(),
+                    error,
+                )
+            })?;
+            let credential = match &args.provider {
+                crate::args::Wire::Anthropic => reagent_ai::Credential::x_api_key(&api_key)?,
+                _ => reagent_ai::Credential::bearer(&api_key)?,
+            };
+            (credential, source)
+        }
+    };
+    let (credential, source) = credential;
     let header = args.header.clone();
 
     let provider: Box<dyn Provider> = match &args.provider {
-        crate::args::Wire::Anthropic => {
-            Box::new(reagent_ai::anthropic::Anthropic::new(api_key, base_url).with_headers(header))
-        }
-        crate::args::Wire::OpenAiChat => Box::new(
-            reagent_ai::openai::chat::OpenAiChat::new(api_key, base_url).with_headers(header),
-        ),
-        crate::args::Wire::OpenAiResponses => Box::new(
-            reagent_ai::openai::responses::OpenAiResponses::new(api_key, base_url)
+        crate::args::Wire::Anthropic => Box::new(
+            reagent_ai::anthropic::Anthropic::new("", base_url)
+                .with_credential(credential)
                 .with_headers(header),
         ),
+        crate::args::Wire::OpenAiChat => {
+            let chat = reagent_ai::openai::chat::OpenAiChat::new("", base_url)
+                .with_credential(credential)
+                .with_headers(header);
+            Box::new(match args.compat {
+                Some(compat) => chat.with_compat(compat),
+                None => chat,
+            })
+        }
+        crate::args::Wire::OpenAiResponses => {
+            let responses = reagent_ai::openai::responses::OpenAiResponses::new("", base_url)
+                .with_credential(credential)
+                .with_headers(header);
+            Box::new(match args.compat {
+                Some(compat) => responses.with_compat(compat),
+                None => responses,
+            })
+        }
         #[cfg(feature = "testing")]
         crate::args::Wire::Fake(_) => unreachable!("the testing provider is handled above"),
     };
-    Ok(provider)
+    Ok((provider, session, Some(source)))
 }
 
 /// Reads a scripted FakeProvider from a JSON file, under the testing feature.
@@ -617,6 +1049,7 @@ mod fake {
                 cache_read_tokens: usage.cache_read,
                 cache_write_tokens: usage.cache_write,
                 reasoning_tokens: usage.reasoning,
+                cost: None,
             }));
         }
         events.push(StreamEvent::Stop(if used {
@@ -711,11 +1144,83 @@ fn tools(
 mod tests {
     use super::*;
 
+    /// The deepseek preset, whose price peaks in the working day.
+    fn deepseek() -> &'static reagent_ai::providers::Preset {
+        reagent_ai::providers::get("deepseek").expect("the deepseek preset")
+    }
+
+    /// A usage of 1000 input tokens and no output tokens.
+    fn usage_again() -> Usage {
+        Usage {
+            input_tokens: 1000,
+            ..Usage::default()
+        }
+    }
+
+    #[test]
+    fn named_account_login_hint_replaces_only_a_missing_key() {
+        let preset = reagent_ai::providers::get("chatgpt");
+        let hint = login_hint(
+            preset,
+            Some(""),
+            Some("codex-sub"),
+            Some("codex-sub"),
+            "missing ".into(),
+        );
+        assert_eq!(
+            hint,
+            "codex-sub needs a login; run reagent login chatgpt --as codex-sub"
+        );
+        let hint = login_hint(preset, Some(""), None, None, "missing ".into());
+        assert_eq!(hint, "chatgpt needs a login; run reagent login chatgpt");
+        let refused = "/s/auth.json: readable by others; run chmod 600 /s/auth.json".to_string();
+        assert_eq!(
+            login_hint(preset, Some(""), Some("chatgpt"), None, refused.clone()),
+            refused
+        );
+    }
+
+    #[test]
+    fn named_account_a_table_login_reads_that_login() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut logins = reagent_config::auth::Logins::default();
+        logins.set(
+            "codex-sub",
+            reagent_config::auth::Login::Key {
+                key: Secret::from("sk-sub"),
+            },
+        );
+        reagent_config::auth::write(dir.path(), &logins).expect("writes");
+        assert_eq!(
+            saved_login(Some(dir.path()), Some("codex-sub")),
+            Ok(Some("sk-sub".to_string()))
+        );
+        assert_eq!(saved_login(Some(dir.path()), Some("codex-api")), Ok(None));
+    }
+
+    /// The key alone, from a key and where it came from.
+    fn key(value: Option<(String, Source)>) -> Option<String> {
+        value.map(|(key, _)| key)
+    }
+
+    /// The key alone, from a result of a key and where it came from.
+    fn from_key(value: Result<(String, Source), String>) -> Result<String, String> {
+        value.map(|(key, _)| key)
+    }
+
     #[test]
     fn the_env_api_key_beats_the_file_api_key() {
         let file = Secret::from("from-file");
         assert_eq!(
-            resolve_key(Some("from-env".into()), Some(&file), None).as_deref(),
+            key(resolve_key(
+                Some("from-env".into()),
+                "FI_KEY",
+                Some(&file),
+                None,
+                None,
+                None
+            ))
+            .as_deref(),
             Some("from-env")
         );
     }
@@ -725,7 +1230,7 @@ mod tests {
         let file = Secret::from("from-file");
         for var in [None, Some(String::new())] {
             assert_eq!(
-                resolve_key(var, Some(&file), None).as_deref(),
+                key(resolve_key(var, "FI_KEY", Some(&file), None, None, None)).as_deref(),
                 Some("from-file")
             );
         }
@@ -733,8 +1238,276 @@ mod tests {
 
     #[test]
     fn no_api_key_anywhere_gives_none() {
-        assert_eq!(resolve_key(None, None, None), None);
-        assert_eq!(resolve_key(Some(String::new()), None, None), None);
+        assert_eq!(resolve_key(None, "FI_KEY", None, None, None, None), None);
+        assert_eq!(
+            resolve_key(Some(String::new()), "FI_KEY", None, None, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn login_precedence_is_env_then_config_then_saved_then_default() {
+        let file = Secret::from("from-file");
+        let default = || Some("from-default".to_string());
+        assert_eq!(
+            key(resolve_key(
+                Some("from-env".into()),
+                "FI_KEY",
+                Some(&file),
+                Some("from-saved"),
+                Some("work"),
+                default()
+            ))
+            .as_deref(),
+            Some("from-env")
+        );
+        assert_eq!(
+            key(resolve_key(
+                Some(String::new()),
+                "FI_KEY",
+                Some(&file),
+                Some("from-saved"),
+                Some("work"),
+                default()
+            ))
+            .as_deref(),
+            Some("from-file")
+        );
+        assert_eq!(
+            key(resolve_key(
+                None,
+                "FI_KEY",
+                None,
+                Some("from-saved"),
+                Some("work"),
+                default()
+            ))
+            .as_deref(),
+            Some("from-saved")
+        );
+        assert_eq!(
+            key(resolve_key(
+                None,
+                "FI_KEY",
+                None,
+                Some(""),
+                Some("work"),
+                default()
+            ))
+            .as_deref(),
+            Some("from-default")
+        );
+        assert_eq!(
+            key(resolve_key(None, "FI_KEY", None, None, None, default())).as_deref(),
+            Some("from-default")
+        );
+    }
+
+    #[test]
+    fn start_line_the_key_sources_are_named_without_the_key() {
+        let file = Secret::from("sk-secret-file");
+        let source = |value: Option<(String, Source)>| value.map(|(_, source)| source);
+        assert_eq!(
+            source(resolve_key(
+                Some("sk-secret-env".into()),
+                "FI_KEY",
+                None,
+                None,
+                None,
+                None
+            )),
+            Some(Source::EnvVar("FI_KEY".into()))
+        );
+        assert_eq!(
+            source(resolve_key(None, "FI_KEY", Some(&file), None, None, None)),
+            Some(Source::ConfigKey)
+        );
+        assert_eq!(
+            source(resolve_key(
+                None,
+                "FI_KEY",
+                None,
+                Some("sk-secret-login"),
+                Some("codex-sub"),
+                None
+            )),
+            Some(Source::Login("codex-sub".into()))
+        );
+        assert_eq!(
+            source(resolve_key(
+                None,
+                "FI_KEY",
+                None,
+                None,
+                None,
+                Some("sk-secret-default".into())
+            )),
+            Some(Source::DefaultEnv("FI_KEY".into()))
+        );
+        // The texts the start line writes never hold the key either.
+        for source in [
+            Source::EnvVar("FI_KEY".into()),
+            Source::ConfigKey,
+            Source::Login("codex-sub".into()),
+            Source::DefaultEnv("FI_KEY".into()),
+        ] {
+            let text = source.text();
+            assert!(!text.contains("sk-secret"), "{text}");
+        }
+        assert_eq!(Source::EnvVar("FI_KEY".into()).text(), "env FI_KEY");
+        assert_eq!(Source::ConfigKey.text(), "config key");
+        assert_eq!(Source::Login("work".into()).text(), "login work");
+        assert_eq!(
+            Source::DefaultEnv("FI_KEY".into()).text(),
+            "env FI_KEY (default)"
+        );
+    }
+
+    #[test]
+    fn login_chatgpt_oauth_login_beats_the_default_env_var() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut logins = reagent_config::auth::Logins::default();
+        logins.set(
+            "chatgpt",
+            reagent_config::auth::Login::Oauth {
+                client_id: "oaiapp_1".into(),
+                host_id: "urn:uuid:00000000-0000-4000-8000-000000000000".into(),
+                access: Secret::from("access-1"),
+                refresh: Secret::from("refresh-1"),
+                id_token: Secret::from("id-1"),
+                expires_at: 1_800_000_000,
+                subject: "user-1".into(),
+                email: None,
+            },
+        );
+        reagent_config::auth::write(dir.path(), &logins).expect("writes");
+        let session = |named: Option<&str>, file: Option<&Secret>| {
+            saved_session(
+                named,
+                file,
+                Some(dir.path()),
+                Some("chatgpt"),
+                "http://token",
+                sleeper(),
+            )
+            .expect("reads the login")
+        };
+        // Nothing else signs in, so the saved login does, even though the
+        // wire's default variable answers with a key of its own.
+        let saved = session(None, None).expect("the saved login");
+        assert!(format!("{saved:?}").contains("chatgpt"), "the session");
+        // An empty named variable is no key either.
+        assert!(session(Some(""), None).is_some());
+        // A named variable and the config key both come first.
+        assert!(session(Some("sk-named"), None).is_none());
+        let file = Secret::from("sk-file");
+        assert!(session(None, Some(&file)).is_none());
+        // With no saved login there is no session to fall back to.
+        let none = saved_session(
+            None,
+            None,
+            Some(dir.path()),
+            Some("openrouter"),
+            "http://token",
+            sleeper(),
+        )
+        .expect("reads the login");
+        assert!(none.is_none(), "a key login is no session");
+    }
+
+    #[test]
+    fn login_a_broken_auth_file_falls_back_to_the_default_variable() {
+        let refused = || Err("auth.json: readable by others; run chmod 600 auth.json".to_string());
+        assert_eq!(
+            from_key(key_from(
+                None,
+                "X",
+                None,
+                refused(),
+                None,
+                Some("from-default".into())
+            ))
+            .as_deref(),
+            Ok("from-default")
+        );
+        // An empty variable is no key either, so the auth file error comes back.
+        let message = key_from(None, "X", None, refused(), None, Some(String::new())).unwrap_err();
+        assert!(message.contains("chmod 600"), "{message}");
+        let message = key_from(None, "X", None, refused(), None, None).unwrap_err();
+        assert!(message.contains("auth.json"), "{message}");
+        // A file that did read gives its login before the default variable.
+        assert_eq!(
+            from_key(key_from(
+                None,
+                "X",
+                None,
+                Ok(Some("from-saved".into())),
+                Some("work"),
+                Some("from-default".into())
+            ))
+            .as_deref(),
+            Ok("from-saved")
+        );
+        assert_eq!(
+            from_key(key_from(
+                Some("from-env".into()),
+                "X",
+                None,
+                Ok(None),
+                None,
+                Some("from-default".into())
+            ))
+            .as_deref(),
+            Ok("from-env")
+        );
+    }
+
+    #[test]
+    fn login_the_saved_login_comes_from_the_auth_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut logins = reagent_config::auth::Logins::default();
+        logins.set(
+            "openrouter",
+            reagent_config::auth::Login::Key {
+                key: Secret::from("sk-or-1"),
+            },
+        );
+        reagent_config::auth::write(dir.path(), &logins).expect("writes");
+        assert_eq!(
+            saved_login(Some(dir.path()), Some("openrouter"))
+                .expect("reads")
+                .as_deref(),
+            Some("sk-or-1")
+        );
+        assert_eq!(
+            saved_login(Some(dir.path()), Some("nope")).expect("reads"),
+            None
+        );
+        assert_eq!(saved_login(Some(dir.path()), None).expect("reads"), None);
+        assert_eq!(saved_login(None, Some("openrouter")).expect("reads"), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn login_a_refused_auth_file_is_an_error_that_names_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut logins = reagent_config::auth::Logins::default();
+        logins.set(
+            "openrouter",
+            reagent_config::auth::Login::Key {
+                key: Secret::from("sk-or-1"),
+            },
+        );
+        reagent_config::auth::write(dir.path(), &logins).expect("writes");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            reagent_config::auth::path(dir.path()),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("chmods");
+        let error = saved_login(Some(dir.path()), Some("openrouter")).unwrap_err();
+        assert!(error.contains("auth.json"), "{error}");
+        assert!(!error.contains("sk-or-1"), "{error}");
     }
 
     #[test]
@@ -752,20 +1525,275 @@ mod tests {
             id: id.into(),
             context_window: window,
             max_output: None,
+            price: None,
+            price_source: None,
         };
         let cache = reagent_ai::catalog::Cache {
             fetched_at: 1,
             models: vec![entry("m", Some(128_000)), entry("n", None)],
         };
         reagent_ai::catalog::write(&dir, "fi", &cache).expect("writes the cache");
-        let window = cached_context_window(&dir, Some("fi"), "m");
-        assert_eq!(window, Some(128_000));
-        assert_eq!(compact_budget(window), 96_000);
-        assert_eq!(cached_context_window(&dir, Some("fi"), "n"), None);
-        assert_eq!(cached_context_window(&dir, Some("fi"), "x"), None);
-        assert_eq!(cached_context_window(&dir, Some("other"), "m"), None);
-        assert_eq!(cached_context_window(&dir, None, "m"), None);
+        let window =
+            |name, model| cached_entry(&dir, name, model).and_then(|entry| entry.context_window);
+        let window_of = window(Some("fi"), "m");
+        assert_eq!(window_of, Some(128_000));
+        assert_eq!(compact_budget(window_of), 96_000);
+        assert_eq!(window(Some("fi"), "n"), None);
+        assert_eq!(window(Some("fi"), "x"), None);
+        assert_eq!(window(Some("other"), "m"), None);
+        assert_eq!(window(None, "m"), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "the test removes its folder")]
+    fn usage_cost_from_cached_price() {
+        use reagent_ai::catalog::{Cache, Entry, Price};
+
+        let dir = std::env::temp_dir().join(format!("reagent-run-price-{}", std::process::id()));
+        let price = Price {
+            input: 0.000_001,
+            output: 0.000_002,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        };
+        let cache = Cache {
+            fetched_at: 1,
+            models: vec![Entry {
+                id: "m".into(),
+                context_window: Some(128_000),
+                max_output: None,
+                price: Some(price),
+                price_source: Some(reagent_ai::catalog::PriceSource::Provider),
+            }],
+        };
+        reagent_ai::catalog::write(&dir, "fi", &cache).expect("writes the cache");
+        let entry = cached_entry(&dir, Some("fi"), "m").expect("the entry");
+        assert_eq!(entry.context_window, Some(128_000));
+        let price = entry.price.expect("the cached price");
+
+        // 1000 input tokens at 0.000001 and 500 output tokens at 0.000002.
+        let usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            ..Usage::default()
+        };
+        let cost = price.cost(&usage);
+        assert!((cost - 0.002).abs() < 1e-12, "{cost}");
+
+        // A provider that prices its own reply wins over the cache.
+        let own = Usage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cost: Some(0.5),
+            ..Usage::default()
+        };
+        let filled = priced(Event::Usage(own), Some(Billing { price, peak: None }));
+        assert!(matches!(&filled, Event::Usage(usage) if usage.cost == Some(0.5)));
+
+        let unpriced = Usage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            ..Usage::default()
+        };
+        let filled = priced(Event::Usage(unpriced), Some(Billing { price, peak: None }));
+        let Event::Usage(usage) = filled else {
+            panic!("a usage event");
+        };
+        let cost = usage.cost.expect("a filled cost");
+        assert!((cost - 0.002).abs() < 1e-12, "{cost}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn price_rule_a_config_price_is_usd_per_million_in_the_run() {
+        let config = reagent_config::ModelPrice {
+            input: 1.0,
+            output: 2.0,
+            cached: 0.1,
+            cache_write: None,
+        };
+        let usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 1000,
+            ..Usage::default()
+        };
+        let billed = billing(Some(config), None, None).expect("a config price bills");
+        let filled = priced_at(Event::Usage(usage), Some(billed), 439_200);
+        let Event::Usage(usage) = filled else {
+            panic!("a usage event");
+        };
+        let cost = usage.cost.expect("a filled cost");
+        assert!((cost - 0.003).abs() < 1e-12, "{cost}");
+        assert!((billed.price.cache_read - 1e-7).abs() < 1e-15);
+        assert_eq!(billed.price.cache_write, 0.0);
+    }
+
+    #[test]
+    fn price_rule_a_config_price_wins_over_the_list_price() {
+        let cached = reagent_ai::catalog::Entry {
+            id: "m".into(),
+            context_window: None,
+            max_output: None,
+            price: Some(reagent_ai::catalog::Price {
+                input: 0.000_005,
+                output: 0.000_005,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            }),
+            price_source: Some(reagent_ai::catalog::PriceSource::ModelsDev),
+        };
+        let config = reagent_config::ModelPrice {
+            input: 1.0,
+            output: 2.0,
+            cached: 0.1,
+            cache_write: None,
+        };
+        let billed = billing(Some(config), Some(deepseek()), Some(&cached)).expect("a price");
+        assert!((billed.price.input - 1e-6).abs() < 1e-15, "{billed:?}");
+        assert!(billed.peak.is_none(), "a config price never peaks");
+        // Without a config price the list price bills, and its source decides
+        // whether the peak rule applies.
+        let billed = billing(None, Some(deepseek()), Some(&cached)).expect("a price");
+        assert!((billed.price.input - 5e-6).abs() < 1e-15);
+        assert_eq!(billed.peak, deepseek().peak);
+        assert!(billing(None, Some(deepseek()), None).is_none());
+    }
+
+    #[test]
+    fn price_rule_a_models_dev_price_doubles_at_peak_and_a_config_price_does_not() {
+        let cached = reagent_ai::catalog::Entry {
+            id: "m".into(),
+            context_window: None,
+            max_output: None,
+            price: Some(reagent_ai::catalog::Price {
+                input: 1e-6,
+                output: 2e-6,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            }),
+            price_source: Some(reagent_ai::catalog::PriceSource::ModelsDev),
+        };
+        let usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 0,
+            ..Usage::default()
+        };
+        // 02:00 UTC on a Tuesday is a peak hour of the deepseek preset.
+        let tuesday_two = 5 * 86_400 + 2 * 3_600;
+        let billed = billing(None, Some(deepseek()), Some(&cached)).expect("a price");
+        let doubled = priced_at(Event::Usage(usage), Some(billed), tuesday_two);
+        let Event::Usage(usage) = doubled else {
+            panic!("a usage event");
+        };
+        assert!(
+            (usage.cost.expect("a cost") - 0.002).abs() < 1e-12,
+            "{usage:?}"
+        );
+        // Outside the window the price stands as the catalogue listed it.
+        let off = priced_at(
+            Event::Usage(usage_again()),
+            Some(billed),
+            tuesday_two + 3 * 3_600,
+        );
+        let Event::Usage(usage) = off else {
+            panic!("a usage event");
+        };
+        assert!(
+            (usage.cost.expect("a cost") - 0.001).abs() < 1e-12,
+            "{usage:?}"
+        );
+        // A config price is a price the user wrote, so it never doubles.
+        let config = reagent_config::ModelPrice {
+            input: 1.0,
+            output: 2.0,
+            cached: 0.1,
+            cache_write: None,
+        };
+        let billed = billing(Some(config), Some(deepseek()), Some(&cached)).expect("a price");
+        let filled = priced_at(Event::Usage(usage_again()), Some(billed), tuesday_two);
+        let Event::Usage(usage) = filled else {
+            panic!("a usage event");
+        };
+        assert!(
+            (usage.cost.expect("a cost") - 0.001).abs() < 1e-12,
+            "{usage:?}"
+        );
+        // A price the provider listed carries no peak rule either.
+        let listed = reagent_ai::catalog::Entry {
+            price_source: Some(reagent_ai::catalog::PriceSource::Provider),
+            ..cached
+        };
+        let billed = billing(None, Some(deepseek()), Some(&listed)).expect("a price");
+        assert!(billed.peak.is_none());
+    }
+
+    #[test]
+    fn price_rule_the_deepseek_peak_covers_its_weekday_hours() {
+        let peak = deepseek().peak.expect("the deepseek peak");
+        assert_eq!(peak.factor_at(439_200), 2.0, "02:00 UTC Tuesday");
+        assert_eq!(peak.factor_at(439_200 + 3 * 3_600), 1.0, "05:00 Tuesday");
+        assert_eq!(peak.factor_at(439_200 + 4 * 86_400), 1.0, "02:00 Saturday");
+    }
+
+    #[test]
+    fn usage_cost_sums_known_parts() {
+        let mut total = Usage::default();
+        sum(&mut total, &Usage::default());
+        assert_eq!(total.cost, None);
+
+        sum(
+            &mut total,
+            &Usage {
+                output_tokens: 5,
+                cost: Some(0.25),
+                ..Usage::default()
+            },
+        );
+        assert_eq!(total.cost, Some(0.25));
+
+        sum(
+            &mut total,
+            &Usage {
+                output_tokens: 3,
+                ..Usage::default()
+            },
+        );
+        assert_eq!(total.cost, Some(0.25), "an unknown part adds nothing");
+        assert_eq!(total.output_tokens, 8);
+
+        sum(
+            &mut total,
+            &Usage {
+                cost: Some(0.125),
+                ..Usage::default()
+            },
+        );
+        assert_eq!(total.cost, Some(0.375));
+    }
+
+    #[test]
+    fn end_line_known_window_and_cost() {
+        assert_eq!(
+            end_line(12, 84_000, Some(200_000), Some(0.03), 0.96),
+            "12 turns, 84k/200k context, $0.0300, 96% cached"
+        );
+        assert_eq!(
+            end_line(1, 0, Some(8_000), Some(0.0), 0.0),
+            "1 turn, 0k/8k context, $0.0000, 0% cached"
+        );
+    }
+
+    #[test]
+    fn end_line_unknown_window_and_cost() {
+        assert_eq!(
+            end_line(3, 1_500, None, None, 0.5),
+            "3 turns, 2k context, 50% cached"
+        );
+        assert_eq!(
+            end_line(2, 128_000, Some(128_000), None, 1.0),
+            "2 turns, 128k/128k context, 100% cached"
+        );
     }
 
     #[test]

@@ -6,16 +6,20 @@ pub(crate) mod cross_provider;
 #[cfg(feature = "testing")]
 pub mod fake;
 mod http;
-mod key;
+pub mod key;
+pub mod oauth;
 pub mod openai;
+pub mod providers;
 pub mod sse;
 pub mod types;
 
 pub use http::check_header;
+pub use key::Credential;
+pub use providers::{Compat, CompatOverride, MaxTokensField, Preset, ReasoningField, Wire};
 
 pub use types::{
-    AssistantMessage, Content, Message, ReasoningLevel, Role, StopReason, Text, ToolCall,
-    ToolResult, ToolSpec, Usage,
+    AssistantMessage, Content, Message, Reasoning, Role, StopReason, Text, ToolCall, ToolResult,
+    ToolSpec, Usage,
 };
 
 use futures_util::stream::BoxStream;
@@ -183,8 +187,9 @@ pub struct Request<'a> {
     pub tools: &'a [ToolSpec],
     /// The conversation so far, oldest first.
     pub messages: &'a [Message],
-    /// How much reasoning the provider may spend.
-    pub reasoning: Option<ReasoningLevel>,
+    /// How much reasoning the provider may spend, in its own words: a level
+    /// text or a token budget. See [`Reasoning::parse`].
+    pub reasoning: Option<&'a str>,
     /// A stable key that identifies the cached prompt prefix of this session.
     pub cache_key: Option<&'a Text>,
 }

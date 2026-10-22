@@ -580,8 +580,8 @@ pub fn spec() -> ToolSpec {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Regular expression, or plain text with literal." },
-                "path": { "type": "string", "description": "Folder or file to search, relative to the working directory." },
-                "glob": { "type": "string", "description": "Only files whose path matches this glob, such as `*.rs`." },
+                "path": { "type": "string", "description": "Folder or file to search." },
+                "glob": { "type": "string", "description": "Only paths matching this glob, such as `*.rs`." },
                 "literal": { "type": "boolean", "description": "Match the pattern as plain text." },
                 "ignore_case": { "type": "boolean", "description": "Ignore ASCII letter case." }
             },

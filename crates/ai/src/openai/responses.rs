@@ -8,14 +8,16 @@ use std::sync::Mutex;
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use futures_util::stream::BoxStream;
+use serde::Deserialize;
 
 use self::request::{MessageBody, RequestBuilder};
 use self::stream::StreamParser;
 use crate::Error;
 use crate::http::ExtraHeaders;
-use crate::key::ApiKey;
+use crate::key::Credential;
 use crate::openai::BodyCache;
-use crate::types::{ReasoningLevel, Text, ToolSpec};
+use crate::providers::Compat;
+use crate::types::{Text, ToolSpec};
 use crate::{Provider, Request, StreamEvent};
 
 /// The provider name recorded on assistant messages.
@@ -40,12 +42,69 @@ pub(crate) fn split_reasoning(signature: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// The words for a ChatGPT plan error code, when the code is one these words
+/// cover. `param` names what a refused capability asked for.
+///
+/// The words stand alone: no other part of the reply body reaches the user.
+pub(crate) fn plan_error(code: &str, param: Option<&str>) -> Option<String> {
+    let message = match code {
+        "subscription_sharing_usage_limit_exceeded" => {
+            "ChatGPT plan usage limit reached; see https://chatgpt.com/settings/usage".to_string()
+        }
+        "subscription_sharing_user_not_eligible" => {
+            "this ChatGPT account cannot use its plan in other apps".to_string()
+        }
+        "subscription_sharing_invalid_user" => {
+            "chatgpt login is no longer valid; run reagent login chatgpt again (add --as <provider> for a named account)".to_string()
+        }
+        "subscription_sharing_unsupported_capability" => format!(
+            "the ChatGPT plan does not support {}",
+            param.unwrap_or("this request")
+        ),
+        "subscription_sharing_route_not_supported"
+        | "chatpass_v2_scope_not_authorized"
+        | "chatpass_v2_invalid_authorization_context" => {
+            format!("ChatGPT plan request refused: {code}")
+        }
+        _ => return None,
+    };
+    Some(message)
+}
+
+/// The error code a non-2xx reply body names: `error.code`, else `code`.
+///
+/// The rest of the body is read only to find the code and is not kept.
+fn plan_error_of_body(body: &str) -> Option<String> {
+    let parsed: ErrorBody<'_> = serde_json::from_str(body).ok()?;
+    let error = parsed.error.as_ref();
+    let code = error.and_then(|error| error.code).or(parsed.code)?;
+    plan_error(code, error.and_then(|error| error.param))
+}
+
+/// A non-2xx reply, flattened so no other field of it is buffered.
+#[derive(Deserialize)]
+struct ErrorBody<'a> {
+    #[serde(default, borrow)]
+    error: Option<ErrorField<'a>>,
+    #[serde(default, borrow)]
+    code: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct ErrorField<'a> {
+    #[serde(default, borrow)]
+    code: Option<&'a str>,
+    #[serde(default, borrow)]
+    param: Option<&'a str>,
+}
+
 /// Talks to the OpenAI Responses API over HTTP.
 #[derive(Debug)]
 pub struct OpenAiResponses {
     client: reqwest::Client,
-    api_key: ApiKey,
+    credential: Result<Credential, String>,
     base_url: String,
+    compat: Compat,
     headers: ExtraHeaders,
     head: Mutex<Option<Head>>,
     bodies: Mutex<BodyCache<MessageBody>>,
@@ -56,7 +115,7 @@ struct Head {
     model: String,
     max_tokens: u32,
     system: Option<Text>,
-    reasoning: Option<ReasoningLevel>,
+    reasoning: Option<String>,
     cache_key: Option<Text>,
     tools: Vec<ToolSpec>,
     builder: RequestBuilder,
@@ -67,8 +126,9 @@ impl OpenAiResponses {
     pub fn new(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             client: crate::http::client(),
-            api_key: ApiKey::new(api_key.into()),
+            credential: Credential::bearer(&api_key.into()),
             base_url: base_url.into(),
+            compat: Compat::DEFAULT,
             headers: ExtraHeaders::default(),
             head: Mutex::new(None),
             bodies: Mutex::new(BodyCache::default()),
@@ -85,15 +145,28 @@ impl OpenAiResponses {
         self
     }
 
+    /// Replaces how the request proves who sends it, for example with a saved
+    /// ChatGPT login that refreshes its token.
+    pub fn with_credential(mut self, credential: Credential) -> Self {
+        self.credential = Ok(credential);
+        self
+    }
+
+    /// Replaces how the endpoint differs from the plain wire.
+    pub fn with_compat(mut self, compat: Compat) -> Self {
+        self.compat = compat;
+        self.head = Mutex::new(None);
+        self
+    }
+
     /// Serializes the request body, reusing the bytes of unchanged messages.
     pub(crate) fn request_body(&self, request: &Request<'_>) -> Result<Bytes, Error> {
-        let reasoning = request.reasoning;
         let mut head = self.head.lock().expect("head cache lock");
         let reuse = head.as_ref().is_some_and(|cached| {
             cached.model == request.model
                 && cached.max_tokens == request.max_tokens
                 && cached.system.as_deref() == request.system.map(|system| &**system)
-                && cached.reasoning == reasoning
+                && cached.reasoning.as_deref() == request.reasoning
                 && cached.cache_key.as_deref() == request.cache_key.map(|key| &**key)
                 && cached.tools.as_slice() == request.tools
         });
@@ -102,16 +175,17 @@ impl OpenAiResponses {
                 model: request.model.to_string(),
                 max_tokens: request.max_tokens,
                 system: request.system.cloned(),
-                reasoning,
+                reasoning: request.reasoning.map(str::to_string),
                 cache_key: request.cache_key.cloned(),
                 tools: request.tools.to_vec(),
-                builder: RequestBuilder::new(
+                builder: RequestBuilder::with_compat(
                     request.model,
                     request.max_tokens,
                     request.system.map(|system| &**system),
-                    reasoning,
+                    request.reasoning,
                     request.cache_key.map(|key| &**key),
                     request.tools,
+                    self.compat,
                 ),
             });
         }
@@ -136,14 +210,18 @@ impl Provider for OpenAiResponses {
             Err(error) => return Box::pin(futures_util::stream::iter([Err(error)])),
         };
         let url = format!("{}/responses", self.base_url);
-        let api_key = self.api_key.reveal().to_owned();
         let client = self.client.clone();
         let headers = self.headers.clone();
+        let credential = self.credential.clone();
 
         let connect = futures_util::stream::once(async move {
+            let (key_name, key_value) = match credential {
+                Ok(credential) => credential.header().await.map_err(Error::Protocol)?,
+                Err(message) => return Err(Error::Protocol(message)),
+            };
             let request = client
                 .post(url)
-                .header("authorization", format!("Bearer {api_key}"))
+                .header(key_name, key_value)
                 .header("content-type", "application/json");
             let response = headers
                 .apply(request)
@@ -153,8 +231,18 @@ impl Provider for OpenAiResponses {
                 .map_err(|error| Error::Http(error.to_string()))?;
             let status = response.status();
             if !status.is_success() {
-                let retry = crate::Retry::from_headers(response.headers());
+                let mut retry = crate::Retry::from_headers(response.headers());
                 let text = response.text().await.unwrap_or_default();
+                // A plan error says what to do about it, and a retry spends the
+                // same limit again, so the provider's verdict is overridden.
+                if let Some(message) = plan_error_of_body(&text) {
+                    retry.should = Some(false);
+                    return Err(Error::Status {
+                        code: status.as_u16(),
+                        body: message,
+                        retry,
+                    });
+                }
                 return Err(Error::Status {
                     code: status.as_u16(),
                     body: text,
@@ -198,6 +286,83 @@ mod tests {
     }
 
     const EXTRA_REPLY: &str = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+
+    /// The error one request gets from a server that answers `status` with
+    /// `body`, and whether the loop would retry it.
+    async fn plan_error_reply(
+        status: u16,
+        body: &'static str,
+    ) -> (String, Option<Option<std::time::Duration>>) {
+        let (base, _recorded) = crate::oauth::test_server::serve(status, body).await;
+        let provider = OpenAiResponses::new("test-key", base);
+        let request = crate::Request {
+            model: "gpt-x",
+            max_tokens: 16,
+            system: None,
+            tools: &[],
+            messages: &[],
+            reasoning: None,
+            cache_key: None,
+        };
+        let mut events = provider.stream(&request);
+        let error = events
+            .next()
+            .await
+            .expect("one item")
+            .expect_err("the request fails");
+        (error.to_string(), error.retry_hint())
+    }
+
+    #[tokio::test]
+    async fn plan_error_usage_limit_is_not_retried_and_names_the_usage_page() {
+        let (message, retry) = plan_error_reply(
+            429,
+            r#"{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"detail"}}"#,
+        )
+        .await;
+        assert!(
+            message.contains("https://chatgpt.com/settings/usage"),
+            "{message}"
+        );
+        assert!(!message.contains("detail"), "{message}");
+        assert_eq!(retry, None);
+    }
+
+    #[tokio::test]
+    async fn plan_error_account_cannot_use_its_plan_in_other_apps() {
+        let (message, retry) = plan_error_reply(
+            403,
+            r#"{"error":{"code":"subscription_sharing_user_not_eligible"}}"#,
+        )
+        .await;
+        assert!(
+            message.contains("this ChatGPT account cannot use its plan in other apps"),
+            "{message}"
+        );
+        assert_eq!(retry, None);
+    }
+
+    #[tokio::test]
+    async fn plan_error_invalid_user_asks_for_a_new_login() {
+        let (message, retry) =
+            plan_error_reply(401, r#"{"code":"subscription_sharing_invalid_user"}"#).await;
+        assert!(
+            message.contains("chatgpt login is no longer valid; run reagent login chatgpt"),
+            "{message}"
+        );
+        assert_eq!(retry, None);
+    }
+
+    #[tokio::test]
+    async fn plan_error_unavailable_is_retried_like_any_server_error() {
+        let (message, retry) = plan_error_reply(
+            503,
+            r#"{"error":{"code":"subscription_sharing_usage_unavailable"}}"#,
+        )
+        .await;
+        assert!(!message.is_empty());
+        assert_eq!(retry, Some(None), "a 503 is retried: {message}");
+    }
 
     #[tokio::test]
     async fn extra_headers_reach_the_responses_request() {

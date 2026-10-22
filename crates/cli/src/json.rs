@@ -36,6 +36,7 @@ enum Line<'a> {
         cache_read: u64,
         cache_write: u64,
         cache_hit_rate: f64,
+        cost: Option<f64>,
     },
     TurnEnd {
         reason: &'static str,
@@ -67,6 +68,11 @@ enum Line<'a> {
         cache_read: u64,
         cache_write: u64,
         cache_hit_rate: f64,
+        cost: Option<f64>,
+        /// The prompt size of the last turn.
+        context_tokens: u64,
+        /// The model's context window, when it is known.
+        context_window: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         stop: Option<&'static str>,
     },
@@ -103,6 +109,7 @@ pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
             cache_read: usage.cache_read_tokens,
             cache_write: usage.cache_write_tokens,
             cache_hit_rate: cache_hit_rate(usage),
+            cost: usage.cost,
         },
         Event::TurnEnd(reason) => Line::TurnEnd {
             reason: turn_reason(reason),
@@ -134,13 +141,16 @@ pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
     push(buf, &line);
 }
 
-/// Appends the final summary line to `buf`: total usage, turns and stop reason.
+/// Appends the final summary line to `buf`: total usage, turns, the context
+/// the last turn used and the stop reason.
 pub fn write_summary(
     buf: &mut Vec<u8>,
     usage: &Usage,
     turns: u32,
     reason: &TurnEndReason,
     stop: Option<&'static str>,
+    context_tokens: u64,
+    context_window: Option<u64>,
 ) {
     let line = Line::Summary {
         turns,
@@ -150,6 +160,9 @@ pub fn write_summary(
         cache_read: usage.cache_read_tokens,
         cache_write: usage.cache_write_tokens,
         cache_hit_rate: cache_hit_rate(usage),
+        cost: usage.cost,
+        context_tokens,
+        context_window,
         stop,
     };
     push(buf, &line);
@@ -172,6 +185,11 @@ pub fn cache_hit_rate(usage: &Usage) -> f64 {
     } else {
         usage.cache_read_tokens as f64 / denominator as f64
     }
+}
+
+/// The prompt tokens of one turn: the size the context reached at that turn.
+pub fn context_tokens(usage: &Usage) -> u64 {
+    usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens
 }
 
 fn turn_reason(reason: &TurnEndReason) -> &'static str {
@@ -209,6 +227,7 @@ mod tests {
             cache_read_tokens: 30,
             cache_write_tokens: 0,
             reasoning_tokens: 2,
+            cost: Some(0.0123),
         }
     }
 
@@ -261,6 +280,7 @@ mod tests {
                     "cache_read": 30,
                     "cache_write": 0,
                     "cache_hit_rate": 0.75,
+                    "cost": 0.0123,
                 }),
             ),
             (
@@ -302,6 +322,8 @@ mod tests {
             7,
             &TurnEndReason::EndTurn,
             Some("max_tokens"),
+            40,
+            Some(200_000),
         );
         let expected = json!({
             "type": "summary",
@@ -312,13 +334,55 @@ mod tests {
             "cache_read": 30,
             "cache_write": 0,
             "cache_hit_rate": 0.75,
+            "cost": 0.0123,
+            "context_tokens": 40,
+            "context_window": 200_000,
             "stop": "max_tokens",
         });
         assert_eq!(parse_line(&buf), expected);
 
         buf.clear();
-        write_summary(&mut buf, &usage(), 7, &TurnEndReason::EndTurn, None);
-        assert!(parse_line(&buf).get("stop").is_none());
+        write_summary(
+            &mut buf,
+            &usage(),
+            7,
+            &TurnEndReason::EndTurn,
+            None,
+            40,
+            None,
+        );
+        let line = parse_line(&buf);
+        assert!(line.get("stop").is_none());
+        assert_eq!(line["context_window"], Value::Null);
+    }
+
+    #[test]
+    fn context_tokens_is_the_last_turn_prompt() {
+        let usage = Usage {
+            input_tokens: 12,
+            output_tokens: 3,
+            cache_read_tokens: 10,
+            cache_write_tokens: 2,
+            reasoning_tokens: 0,
+            cost: None,
+        };
+        assert_eq!(context_tokens(&usage), 24);
+        assert_eq!(context_tokens(&Usage::default()), 0);
+        // The other counts never count towards the prompt.
+        let output_only = Usage {
+            output_tokens: 500,
+            ..Usage::default()
+        };
+        assert_eq!(context_tokens(&output_only), 0);
+    }
+
+    #[test]
+    fn a_usage_without_a_cost_still_carries_the_key() {
+        let usage = Usage {
+            cost: None,
+            ..Usage::default()
+        };
+        assert_eq!(line(&Event::Usage(usage))["cost"], Value::Null);
     }
 
     #[test]

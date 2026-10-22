@@ -1,15 +1,15 @@
 //! Rules that apply when one history is rendered to more than one provider.
 
 use crate::Request;
-use crate::types::{Content, Message, ReasoningLevel};
+use crate::types::{Content, Message};
 
-/// The reasoning level Anthropic may enable for a request.
+/// The reasoning text Anthropic may enable for a request.
 ///
 /// Thinking is turned off when the last assistant message calls a tool and has
 /// no Anthropic thinking block. The Anthropic API rejects a tool use without a
 /// thinking block while thinking is enabled, and thinking from another
 /// provider is dropped on the wire.
-pub(crate) fn anthropic_reasoning(request: &Request) -> Option<ReasoningLevel> {
+pub(crate) fn anthropic_reasoning<'a>(request: &Request<'a>) -> Option<&'a str> {
     let reasoning = request.reasoning?;
     let tool_use_without_thinking = request
         .messages
@@ -43,7 +43,7 @@ mod tests {
     use crate::openai::responses::{OpenAiResponses, stream::StreamParser as ResponsesParser};
     use crate::types::{AssistantMessage, ToolCall, Usage};
 
-    fn request<'a>(reasoning: Option<ReasoningLevel>, messages: &'a [Message]) -> Request<'a> {
+    fn request<'a>(reasoning: Option<&'a str>, messages: &'a [Message]) -> Request<'a> {
         Request {
             model: "m",
             max_tokens: 128,
@@ -85,7 +85,7 @@ mod tests {
             Message::tool_result("call_01", "ok", false),
             Message::user("explain"),
         ];
-        let request = request(Some(ReasoningLevel::Medium), &history);
+        let request = request(Some("medium"), &history);
 
         let anthropic = Anthropic::new("key", "http://localhost");
         let body = anthropic.request_body(&request).unwrap();
@@ -114,7 +114,7 @@ mod tests {
             assistant("openai", vec![Content::text("hi"), tool_call()]),
             Message::tool_result("call_01", "ok", false),
         ];
-        let request = request(Some(ReasoningLevel::High), &history);
+        let request = request(Some("high"), &history);
         let body = Anthropic::new("key", "http://localhost")
             .request_body(&request)
             .unwrap();
@@ -139,12 +139,13 @@ mod tests {
             ),
             Message::tool_result("call_01", "ok", false),
         ];
-        let request = request(Some(ReasoningLevel::High), &history);
+        let request = request(Some("high"), &history);
         let body = Anthropic::new("key", "http://localhost")
             .request_body(&request)
             .unwrap();
         let body = std::str::from_utf8(&body).unwrap();
-        assert!(body.contains(r#""thinking":{"type":"enabled","budget_tokens":16384}"#));
+        assert!(body.contains(r#""thinking":{"type":"adaptive"}"#));
+        assert!(body.contains(r#""output_config":{"effort":"high"}"#));
     }
 
     #[test]
@@ -157,7 +158,7 @@ mod tests {
             ),
             Message::tool_result("call_01", "ok", false),
         ];
-        let request = request(Some(ReasoningLevel::High), &history);
+        let request = request(Some("high"), &history);
         let body = Anthropic::new("key", "http://localhost")
             .request_body(&request)
             .unwrap();
@@ -182,7 +183,7 @@ mod tests {
             ),
             Message::tool_result("call_01", "ok", false),
         ];
-        let request = request(Some(ReasoningLevel::High), &history);
+        let request = request(Some("high"), &history);
         let body = Anthropic::new("key", "http://localhost")
             .request_body(&request)
             .unwrap();
@@ -202,7 +203,7 @@ mod tests {
             "no reasoning was requested"
         );
         assert!(
-            anthropic_reasoning(&request(Some(ReasoningLevel::Low), &history)).is_none(),
+            anthropic_reasoning(&request(Some("low"), &history)).is_none(),
             "a tool use without thinking disables thinking"
         );
     }

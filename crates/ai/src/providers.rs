@@ -1,0 +1,456 @@
+//! Named provider presets: the wire, the endpoint and the key variable.
+
+pub mod anthropic;
+pub mod chatgpt;
+pub mod commandcode;
+pub mod deepseek;
+pub mod freeinference;
+pub mod openai;
+pub mod opencode_go;
+pub mod openrouter;
+
+use serde::{Deserialize, Serialize};
+
+/// The wire protocol a provider speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wire {
+    /// The Anthropic Messages API.
+    Anthropic,
+    /// OpenAI-compatible Chat Completions.
+    OpenAiChat,
+    /// The OpenAI Responses API.
+    OpenAiResponses,
+}
+
+impl Wire {
+    /// The canonical name, as written in a config file.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Wire::Anthropic => "anthropic",
+            Wire::OpenAiChat => "openai-chat",
+            Wire::OpenAiResponses => "openai-responses",
+        }
+    }
+
+    /// The wire with canonical name `name`.
+    pub fn parse(name: &str) -> Option<Self> {
+        [Wire::Anthropic, Wire::OpenAiChat, Wire::OpenAiResponses]
+            .into_iter()
+            .find(|wire| wire.name() == name)
+    }
+
+    /// The environment variable holding the key when none is named.
+    pub const fn default_api_key_env(self) -> &'static str {
+        match self {
+            Wire::Anthropic => "ANTHROPIC_API_KEY",
+            Wire::OpenAiChat | Wire::OpenAiResponses => "OPENAI_API_KEY",
+        }
+    }
+}
+
+/// The request field that caps reply tokens on a chat endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensField {
+    /// `max_tokens`.
+    MaxTokens,
+    /// `max_completion_tokens`.
+    MaxCompletionTokens,
+    /// No cap field at all, for an endpoint that refuses one.
+    Omit,
+}
+
+/// The request field that carries the reasoning level on a chat endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReasoningField {
+    /// `"reasoning_effort":"<text>"`.
+    #[serde(rename = "reasoning_effort")]
+    Effort,
+    /// `"reasoning":{"effort":"<text>"}` or `{"max_tokens":N}`.
+    #[serde(rename = "reasoning")]
+    EffortObject,
+}
+
+/// How an endpoint differs from the plain wire.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Compat {
+    /// The field that caps reply tokens.
+    pub max_tokens_field: MaxTokensField,
+    /// The field that carries the reasoning level.
+    pub reasoning_field: ReasoningField,
+    /// The word the endpoint takes for reasoning off, or `None` to leave the field out.
+    pub reasoning_off: Option<&'static str>,
+    /// The header that carries one id per conversation, for an endpoint that
+    /// rejects a request without it.
+    pub session_header: Option<&'static str>,
+}
+
+impl Compat {
+    /// The plain wire.
+    pub const DEFAULT: Compat = Compat {
+        max_tokens_field: MaxTokensField::MaxTokens,
+        reasoning_field: ReasoningField::Effort,
+        reasoning_off: None,
+        session_header: None,
+    };
+}
+
+impl Default for Compat {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// Compat fields a config file sets. A field left out keeps the base value.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompatOverride {
+    /// The field that caps reply tokens.
+    pub max_tokens_field: Option<MaxTokensField>,
+    /// The field that carries the reasoning level.
+    pub reasoning_field: Option<ReasoningField>,
+    /// The word the endpoint takes for reasoning off; an empty word leaves the
+    /// field out.
+    pub reasoning_off: Option<String>,
+}
+
+impl CompatOverride {
+    /// `base` with each given field replaced.
+    pub fn apply(self, base: Compat) -> Compat {
+        Compat {
+            max_tokens_field: self.max_tokens_field.unwrap_or(base.max_tokens_field),
+            reasoning_field: self.reasoning_field.unwrap_or(base.reasoning_field),
+            reasoning_off: match self.reasoning_off {
+                // Leaked so the word outlives the run and `Compat` stays `Copy`;
+                // a config is read once per run.
+                Some(word) if !word.is_empty() => Some(String::leak(word)),
+                Some(_) => None,
+                None => base.reasoning_off,
+            },
+            session_header: base.session_header,
+        }
+    }
+}
+
+/// How the models.dev catalogue fills a provider's model list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelsDev {
+    /// The catalogue provider id, when it is not the preset name.
+    pub id: Option<&'static str>,
+    /// Whether a missing per-token price is filled, or only the limits. A plan
+    /// with no per-token price fills the limits only.
+    pub prices: bool,
+}
+
+impl ModelsDev {
+    /// Prices come from the catalogue entry named as the provider.
+    pub const DEFAULT: ModelsDev = ModelsDev {
+        id: None,
+        prices: true,
+    };
+}
+
+/// The hours that multiply a price from the models.dev catalogue.
+///
+/// The catalogue's discount is a time of day, so a price it gave doubles inside
+/// the peak windows. Chinese public holidays are off-peak and not modeled, so a
+/// run on a holiday shows the peak price.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Peak {
+    /// The UTC hours `[start, end)` of the peak.
+    pub windows: &'static [(u8, u8)],
+    /// Whether the windows cover Monday to Friday only.
+    pub weekdays_only: bool,
+    /// The multiplier inside a window.
+    pub factor: f64,
+}
+
+impl Peak {
+    /// The weekday (0 is Sunday) and the hour of the UTC time `secs`. Day 0 of
+    /// the Unix clock, 1970-01-01, was a Thursday.
+    fn weekday_hour(secs: u64) -> (u64, u64) {
+        let days = secs / 86_400;
+        ((days + 4) % 7, (secs % 86_400) / 3_600)
+    }
+
+    /// The multiplier at the UTC time `secs`: `factor` inside a window, else
+    /// 1.0.
+    pub fn factor_at(self, secs: u64) -> f64 {
+        let (weekday, hour) = Self::weekday_hour(secs);
+        if self.weekdays_only && matches!(weekday, 0 | 6) {
+            return 1.0;
+        }
+        let hour = hour as u8;
+        if self
+            .windows
+            .iter()
+            .any(|(start, end)| (*start..*end).contains(&hour))
+        {
+            self.factor
+        } else {
+            1.0
+        }
+    }
+}
+
+/// A known provider.
+#[derive(Clone, Copy, Debug)]
+pub struct Preset {
+    /// The provider name.
+    pub name: &'static str,
+    /// The wire protocol.
+    pub wire: Wire,
+    /// The endpoint, with no trailing slash.
+    pub base_url: &'static str,
+    /// The environment variable that replaces `base_url` when set.
+    pub base_url_env: Option<&'static str>,
+    /// The environment variable holding the key.
+    pub api_key_env: &'static str,
+    /// The model list path under `base_url`.
+    pub models_path: &'static str,
+    /// How the endpoint differs from the plain wire.
+    pub compat: Compat,
+    /// How the models.dev catalogue fills its model list.
+    pub models_dev: ModelsDev,
+    /// The hours that multiply a models.dev price, if any.
+    pub peak: Option<Peak>,
+}
+
+impl Preset {
+    /// A chat endpoint with the plain wire. Presets override what differs.
+    pub const DEFAULT: Preset = Preset {
+        name: "",
+        wire: Wire::OpenAiChat,
+        base_url: "",
+        base_url_env: None,
+        api_key_env: "",
+        models_path: "/models",
+        compat: Compat::DEFAULT,
+        models_dev: ModelsDev::DEFAULT,
+        peak: None,
+    };
+
+    /// The endpoint: the `base_url_env` variable when set and not empty, else
+    /// `base_url`.
+    pub fn endpoint(&self) -> String {
+        self.base_url_env
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| self.base_url.to_string())
+    }
+}
+
+/// Every preset.
+pub const ALL: &[&Preset] = &[
+    &anthropic::PRESET,
+    &openai::PRESET,
+    &chatgpt::PRESET,
+    &openrouter::PRESET,
+    &opencode_go::PRESET,
+    &commandcode::PRESET,
+    &deepseek::PRESET,
+    &freeinference::PRESET,
+];
+
+/// The preset called `name`.
+pub fn get(name: &str) -> Option<&'static Preset> {
+    ALL.iter().copied().find(|preset| preset.name == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn price_rule_peak_covers_its_weekday_hours_only() {
+        let peak = get("deepseek").unwrap().peak.expect("deepseek peaks");
+        assert_eq!(peak.factor, 2.0);
+        assert_eq!(peak.factor_at(439_200), 2.0, "02:00 UTC Tuesday");
+        // 05:00 UTC is outside both windows; 02:00 on a Saturday is a weekend.
+        assert_eq!(peak.factor_at(439_200 + 3 * 3_600), 1.0, "05:00 Tuesday");
+        assert_eq!(peak.factor_at(439_200 + 4 * 86_400), 1.0, "02:00 Saturday");
+        assert_eq!(peak.factor_at(86_400), 1.0, "Friday 00:00");
+        let all_day = Peak {
+            windows: &[(0, 24)],
+            weekdays_only: false,
+            factor: 1.5,
+        };
+        assert_eq!(all_day.factor_at(439_200 + 4 * 86_400), 1.5);
+    }
+
+    #[test]
+    fn preset_names_are_unique_and_get_finds_each() {
+        for (index, preset) in ALL.iter().enumerate() {
+            assert!(!preset.name.is_empty());
+            assert!(ALL[..index].iter().all(|seen| seen.name != preset.name));
+            assert_eq!(get(preset.name).map(|found| found.name), Some(preset.name));
+        }
+        assert!(get("nope").is_none());
+    }
+
+    #[test]
+    fn each_preset_base_url_has_no_trailing_slash() {
+        for preset in ALL {
+            assert!(preset.base_url.starts_with("https://"), "{}", preset.name);
+            assert!(!preset.base_url.ends_with('/'), "{}", preset.name);
+            assert!(preset.models_path.starts_with('/'), "{}", preset.name);
+        }
+    }
+
+    #[test]
+    fn max_tokens_field_omit_is_named_omit() {
+        assert_eq!(
+            serde_json::from_str::<MaxTokensField>(r#""omit""#).unwrap(),
+            MaxTokensField::Omit
+        );
+        assert_eq!(
+            serde_json::to_string(&MaxTokensField::Omit).unwrap(),
+            r#""omit""#
+        );
+    }
+
+    #[test]
+    fn preset_wires_and_keys_match_the_design() {
+        let anthropic = get("anthropic").unwrap();
+        assert_eq!(anthropic.wire, Wire::Anthropic);
+        assert_eq!(anthropic.api_key_env, "ANTHROPIC_API_KEY");
+        let openai = get("openai").unwrap();
+        assert_eq!(openai.wire, Wire::OpenAiResponses);
+        assert_eq!(
+            openai.compat.max_tokens_field,
+            MaxTokensField::MaxCompletionTokens
+        );
+        assert_eq!(
+            get("openrouter").unwrap().compat,
+            Compat {
+                reasoning_field: ReasoningField::EffortObject,
+                reasoning_off: Some("none"),
+                ..Compat::DEFAULT
+            }
+        );
+    }
+
+    #[test]
+    fn deepseek_preset_sends_none_for_off_on_the_chat_wire() {
+        let deepseek = get("deepseek").expect("a deepseek preset");
+        assert_eq!(deepseek.wire, Wire::OpenAiChat);
+        assert_eq!(deepseek.base_url, "https://api.deepseek.com");
+        assert_eq!(deepseek.api_key_env, "DEEPSEEK_API_KEY");
+        let head = |level| {
+            let builder = crate::openai::chat::RequestBuilder::with_compat(
+                "deepseek-flash",
+                1024,
+                None,
+                Some(level),
+                &[],
+                deepseek.compat,
+            );
+            std::str::from_utf8(builder.head()).unwrap().to_string()
+        };
+        assert!(head("off").contains(r#""reasoning_effort":"none""#));
+        assert!(head("max").contains(r#""reasoning_effort":"max""#));
+        assert!(head("max").contains(r#""max_tokens":1024"#));
+    }
+
+    #[test]
+    fn reasoning_text_field_names_round_trip() {
+        assert_eq!(
+            serde_json::from_str::<ReasoningField>(r#""reasoning""#).unwrap(),
+            ReasoningField::EffortObject
+        );
+        assert_eq!(
+            serde_json::from_str::<ReasoningField>(r#""reasoning_effort""#).unwrap(),
+            ReasoningField::Effort
+        );
+        assert!(serde_json::from_str::<ReasoningField>(r#""nope""#).is_err());
+        assert_eq!(Compat::DEFAULT.reasoning_field, ReasoningField::Effort);
+    }
+
+    #[test]
+    fn preset_wire_names_round_trip() {
+        for wire in [Wire::Anthropic, Wire::OpenAiChat, Wire::OpenAiResponses] {
+            assert_eq!(Wire::parse(wire.name()), Some(wire));
+        }
+        assert_eq!(Wire::parse("fake"), None);
+        assert_eq!(Wire::OpenAiChat.default_api_key_env(), "OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn compat_override_sets_only_given_fields() {
+        let base = Compat {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+            session_header: Some("x-session"),
+            ..Compat::DEFAULT
+        };
+        let none: CompatOverride = serde_json::from_str("{}").unwrap();
+        assert_eq!(none.apply(base), base);
+        let set: CompatOverride =
+            serde_json::from_str(r#"{"max_tokens_field":"max_tokens"}"#).unwrap();
+        assert_eq!(
+            set.apply(base),
+            Compat {
+                max_tokens_field: MaxTokensField::MaxTokens,
+                ..base
+            }
+        );
+    }
+
+    #[test]
+    fn a_compat_override_sets_the_reasoning_text_field() {
+        let set: CompatOverride =
+            serde_json::from_str(r#"{"reasoning_field":"reasoning"}"#).unwrap();
+        assert_eq!(
+            set.apply(Compat::DEFAULT).reasoning_field,
+            ReasoningField::EffortObject
+        );
+    }
+
+    #[test]
+    fn gateway_opencode_go_preset_sets_the_session_header() {
+        let opencode = get("opencode-go").unwrap();
+        assert_eq!(opencode.compat.session_header, Some("x-opencode-session"));
+        assert_eq!(opencode.wire, Wire::OpenAiChat);
+        for preset in ALL.iter().filter(|preset| preset.name != "opencode-go") {
+            assert_eq!(preset.compat.session_header, None, "{}", preset.name);
+        }
+    }
+
+    #[test]
+    fn reasoning_off_presets_name_their_own_off_word() {
+        assert_eq!(
+            get("commandcode").unwrap().compat.reasoning_off,
+            Some("off")
+        );
+        assert_eq!(
+            get("openrouter").unwrap().compat.reasoning_off,
+            Some("none")
+        );
+        assert_eq!(get("openai").unwrap().compat.reasoning_off, Some("none"));
+        assert_eq!(Compat::DEFAULT.reasoning_off, None);
+    }
+
+    #[test]
+    fn reasoning_off_a_config_word_replaces_the_base_word() {
+        let base = Compat {
+            reasoning_off: Some("none"),
+            ..Compat::DEFAULT
+        };
+        let set = CompatOverride {
+            reasoning_off: Some("disabled".into()),
+            ..CompatOverride::default()
+        };
+        assert_eq!(set.apply(Compat::DEFAULT).reasoning_off, Some("disabled"));
+        let empty = CompatOverride {
+            reasoning_off: Some(String::new()),
+            ..CompatOverride::default()
+        };
+        assert_eq!(empty.apply(base).reasoning_off, None);
+    }
+
+    #[test]
+    fn compat_override_refuses_an_unknown_flag() {
+        assert!(serde_json::from_str::<CompatOverride>(r#"{"nope":true}"#).is_err());
+        assert!(serde_json::from_str::<CompatOverride>(r#"{"max_tokens_field":"nope"}"#).is_err());
+    }
+}

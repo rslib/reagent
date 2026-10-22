@@ -41,8 +41,9 @@ A feature that does not move 1 or 2 in a measured run does not ship as a default
 | Area | Crate | Contents |
 |---|---|---|
 | Small helpers with no domain types: text cuts, number writing, path normalizing, borrowed JSON reading | `crates/util` (`reagent-util`) | no other reagent crate |
+| OS sandbox for one process and its children: Seatbelt on macOS, Landlock on Linux | `crates/sandbox` (`reagent-sandbox`) | no other reagent crate |
 | Config files, providers and models, permission rules and their shell lexer and glob | `crates/config` (`reagent-config`) | depends on util |
-| Message types, providers, SSE, `FakeProvider` | `crates/ai` (`reagent-ai`) | no other reagent crate |
+| Message types, providers, SSE, `FakeProvider`, OAuth logins | `crates/ai` (`reagent-ai`) | `reagent-config` (the auth file) |
 | Loop, events, session, context policy, `Tool` trait, the permission guard | `crates/agent` (`reagent-agent`) | depends on ai, config and util |
 | Native tools | `crates/tools` (`reagent-tools`) | depends on agent, config and util |
 | QuickJS plugins and `execute(code)` | `crates/script` (`reagent-script`) | depends on agent |

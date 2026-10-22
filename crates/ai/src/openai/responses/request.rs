@@ -4,7 +4,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::Serialize;
 
 use crate::Error;
-use crate::types::{AssistantMessage, Content, Message, ReasoningLevel, ToolSpec};
+use crate::providers::{Compat, MaxTokensField};
+use crate::types::{AssistantMessage, Content, Message, Reasoning, ToolSpec};
 
 /// One message serialized in Responses wire form, reusable across requests.
 #[derive(Debug, Clone)]
@@ -33,7 +34,7 @@ impl MessageBody {
 
 /// Builds a Responses body from a stable head and reusable message bodies.
 ///
-/// The head holds the model, the instructions, the reasoning budget, the
+/// The head holds the model, the instructions, the reasoning text, the
 /// prompt cache key and the tools, serialized once. Tools are sorted by name.
 #[derive(Debug)]
 pub struct RequestBuilder {
@@ -41,15 +42,37 @@ pub struct RequestBuilder {
 }
 
 impl RequestBuilder {
-    /// Serializes the request head once.
+    /// Serializes the request head once, for the plain wire.
     pub fn new(
         model: &str,
         max_tokens: u32,
         system: Option<&str>,
-        reasoning: Option<ReasoningLevel>,
+        reasoning: Option<&str>,
         cache_key: Option<&str>,
         tools: &[ToolSpec],
     ) -> Self {
+        Self::with_compat(
+            model,
+            max_tokens,
+            system,
+            reasoning,
+            cache_key,
+            tools,
+            Compat::DEFAULT,
+        )
+    }
+
+    /// Serializes the request head once, for an endpoint described by `compat`.
+    pub fn with_compat(
+        model: &str,
+        max_tokens: u32,
+        system: Option<&str>,
+        reasoning: Option<&str>,
+        cache_key: Option<&str>,
+        tools: &[ToolSpec],
+        compat: Compat,
+    ) -> Self {
+        let reasoning_off = compat.reasoning_off;
         let mut out = BytesMut::new();
         out.put_slice(b"{\"model\":");
         out.put_slice(json_string(model).as_bytes());
@@ -57,17 +80,28 @@ impl RequestBuilder {
             out.put_slice(b",\"instructions\":");
             out.put_slice(json_string(system).as_bytes());
         }
-        // The API counts reasoning inside max_output_tokens.
-        let budget = reasoning.map_or(0, reasoning_budget);
-        out.put_slice(b",\"max_output_tokens\":");
-        out.put_slice(max_tokens.saturating_add(budget).to_string().as_bytes());
+        // The cap covers reasoning too, so it is sent as given. An endpoint
+        // that refuses a cap field gets none.
+        if compat.max_tokens_field != MaxTokensField::Omit {
+            out.put_slice(b",\"max_output_tokens\":");
+            out.put_slice(max_tokens.to_string().as_bytes());
+        }
         out.put_slice(b",\"stream\":true,\"store\":false");
-        if let Some(level) = reasoning {
-            out.put_slice(
-                b",\"include\":[\"reasoning.encrypted_content\"],\"reasoning\":{\"effort\":",
-            );
-            out.put_slice(json_string(reasoning_effort(level)).as_bytes());
-            out.put_slice(b",\"summary\":\"auto\"}");
+        if let Some(reasoning) = reasoning.map(Reasoning::parse) {
+            if reasoning.is_off() {
+                if let Some(word) = reasoning_off {
+                    out.put_slice(b",\"reasoning\":{\"effort\":");
+                    out.put_slice(json_string(word).as_bytes());
+                    out.put_slice(b"}");
+                }
+            } else {
+                let effort = reasoning.text();
+                out.put_slice(
+                    b",\"include\":[\"reasoning.encrypted_content\"],\"reasoning\":{\"effort\":",
+                );
+                out.put_slice(json_string(&effort).as_bytes());
+                out.put_slice(b",\"summary\":\"auto\"}");
+            }
         }
         if let Some(cache_key) = cache_key {
             out.put_slice(b",\"prompt_cache_key\":");
@@ -244,22 +278,6 @@ fn commit_reasoning(items: &mut Vec<Bytes>, pending_reasoning: &mut Vec<Bytes>) 
     items.append(pending_reasoning);
 }
 
-fn reasoning_budget(level: ReasoningLevel) -> u32 {
-    match level {
-        ReasoningLevel::Low => 1_024,
-        ReasoningLevel::Medium => 4_096,
-        ReasoningLevel::High => 16_384,
-    }
-}
-
-fn reasoning_effort(level: ReasoningLevel) -> &'static str {
-    match level {
-        ReasoningLevel::Low => "low",
-        ReasoningLevel::Medium => "medium",
-        ReasoningLevel::High => "high",
-    }
-}
-
 fn json_string(value: &str) -> String {
     serde_json::to_string(value).expect("a str serializes to a JSON string")
 }
@@ -293,7 +311,7 @@ mod tests {
             "gpt-5",
             1024,
             Some("You are a careful coding agent."),
-            Some(ReasoningLevel::Medium),
+            Some("medium"),
             Some("sess-1"),
             &tools,
         )
@@ -346,7 +364,7 @@ mod tests {
     fn head_carries_reasoning_and_the_prompt_cache_key() {
         let builder = golden_builder();
         let head = std::str::from_utf8(builder.head()).unwrap();
-        assert!(head.contains(r#""max_output_tokens":5120"#));
+        assert!(head.contains(r#""max_output_tokens":1024"#));
         assert!(head.contains(r#""store":false"#));
         assert!(head.contains(r#""include":["reasoning.encrypted_content"]"#));
         assert!(head.contains(r#""reasoning":{"effort":"medium","summary":"auto"}"#));
@@ -516,12 +534,105 @@ mod tests {
     }
 
     #[test]
+    fn a_level_reasoning_text_is_written_as_an_effort_with_a_summary() {
+        let builder = RequestBuilder::new("m", 1024, None, Some("medium"), None, &[]);
+        let head = std::str::from_utf8(builder.head()).unwrap();
+        assert!(
+            head.contains(r#""include":["reasoning.encrypted_content"]"#),
+            "{head}"
+        );
+        assert!(
+            head.contains(r#""reasoning":{"effort":"medium","summary":"auto"}"#),
+            "{head}"
+        );
+        assert!(
+            head.contains(r#""max_output_tokens":1024"#),
+            "the cap does not grow: {head}"
+        );
+    }
+
+    #[test]
+    fn a_budget_reasoning_text_is_written_as_the_effort_text() {
+        let builder = RequestBuilder::new("m", 1024, None, Some("4096"), None, &[]);
+        let head = std::str::from_utf8(builder.head()).unwrap();
+        assert!(
+            head.contains(r#""reasoning":{"effort":"4096","summary":"auto"}"#),
+            "{head}"
+        );
+        assert!(
+            head.contains(r#""max_output_tokens":1024"#),
+            "the cap does not grow: {head}"
+        );
+    }
+
+    #[test]
+    fn an_off_reasoning_text_writes_no_reasoning() {
+        for text in ["off", "none"] {
+            let builder = RequestBuilder::new("m", 128, None, Some(text), None, &[]);
+            let head = std::str::from_utf8(builder.head()).unwrap();
+            assert!(!head.contains("reasoning"), "{text}: {head}");
+            assert!(
+                head.contains(r#""max_output_tokens":128"#),
+                "{text}: {head}"
+            );
+        }
+    }
+
+    #[test]
     fn a_request_without_reasoning_has_no_reasoning_fields() {
         let builder = RequestBuilder::new("m", 128, None, None, None, &[]);
         let head = std::str::from_utf8(builder.head()).unwrap();
         assert!(head.contains(r#""max_output_tokens":128"#));
         assert!(!head.contains("reasoning"));
         assert!(!head.contains("prompt_cache_key"));
+    }
+
+    #[test]
+    fn reasoning_off_writes_the_off_word_without_encrypted_content() {
+        let builder = RequestBuilder::with_compat(
+            "m",
+            128,
+            None,
+            Some("off"),
+            None,
+            &[],
+            Compat {
+                reasoning_off: Some("none"),
+                ..Compat::DEFAULT
+            },
+        );
+        let head = std::str::from_utf8(builder.head()).unwrap();
+        assert!(head.contains(r#""reasoning":{"effort":"none"}"#), "{head}");
+        assert!(!head.contains("reasoning.encrypted_content"), "{head}");
+        assert!(!head.contains("summary"), "{head}");
+    }
+
+    #[test]
+    fn reasoning_off_without_a_word_writes_no_reasoning() {
+        for text in ["off", "none", "0"] {
+            let builder = RequestBuilder::new("m", 128, None, Some(text), None, &[]);
+            let head = std::str::from_utf8(builder.head()).unwrap();
+            assert!(!head.contains("reasoning"), "{text}: {head}");
+        }
+    }
+
+    #[test]
+    fn chatgpt_preset_head_has_no_cap_and_keeps_store_and_stream() {
+        let builder = RequestBuilder::with_compat(
+            "gpt-5",
+            128,
+            None,
+            Some("off"),
+            None,
+            &[],
+            crate::providers::get("chatgpt").expect("the preset").compat,
+        );
+        let head = std::str::from_utf8(builder.head()).unwrap();
+        assert!(!head.contains("max_output_tokens"), "{head}");
+        assert!(!head.contains("max_tokens"), "{head}");
+        assert!(head.contains(r#""store":false"#), "{head}");
+        assert!(head.contains(r#""stream":true"#), "{head}");
+        assert!(head.contains(r#""reasoning":{"effort":"none"}"#), "{head}");
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 mod args;
 mod json;
+mod login;
 mod models;
 mod prompt;
 mod run;
@@ -13,9 +14,20 @@ mod snapshot;
 const PROMPT_BUDGET: usize = 1000;
 
 fn main() -> std::process::ExitCode {
-    let mut argv = std::env::args_os().skip(1);
-    if argv.next().is_some_and(|arg| arg == "--sandbox-exec") {
-        return sandbox::helper(argv);
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if argv.first().is_some_and(|arg| *arg == "--sandbox-exec") {
+        return sandbox::helper(argv.into_iter().skip(1));
+    }
+    if let Some(command) = argv.first().and_then(|arg| arg.to_str())
+        && matches!(command, "login" | "logout")
+    {
+        let runtime = runtime();
+        let code = runtime.block_on(login::run(command, argv[1..].to_vec()));
+        // The pasted-URL reader holds a blocking stdin thread, and dropping a
+        // runtime waits for it, so `login` would hang until Enter after a
+        // browser login. Shut the runtime down without waiting instead.
+        runtime.shutdown_background();
+        return code;
     }
     let outcome = match args::parse() {
         Ok(outcome) => outcome,

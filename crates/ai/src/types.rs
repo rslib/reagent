@@ -35,16 +35,47 @@ pub enum StopReason {
     Error,
 }
 
-/// How much reasoning a provider may spend on a request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReasoningLevel {
-    /// A small reasoning budget.
-    Low,
-    /// A moderate reasoning budget.
-    Medium,
-    /// A large reasoning budget.
-    High,
+/// How much reasoning a provider may spend on a request, in the provider's
+/// own words: a token budget when the config text is a whole number, else the
+/// level text the provider reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reasoning<'a> {
+    /// A token budget for the reply's reasoning.
+    Budget(u32),
+    /// The provider's own level text, such as `xhigh`.
+    Level(&'a str),
+}
+
+impl<'a> Reasoning<'a> {
+    /// Reads the config text, trimmed. A whole number is a
+    /// [`Reasoning::Budget`], anything else a [`Reasoning::Level`].
+    pub fn parse(text: &'a str) -> Reasoning<'a> {
+        let text = text.trim();
+        match text.parse::<u32>() {
+            Ok(budget) => Reasoning::Budget(budget),
+            Err(_) => Reasoning::Level(text),
+        }
+    }
+
+    /// The text the provider reads: the level itself, or a budget as a bare
+    /// number.
+    pub fn text(self) -> std::borrow::Cow<'a, str> {
+        match self {
+            Reasoning::Level(text) => std::borrow::Cow::Borrowed(text),
+            Reasoning::Budget(budget) => std::borrow::Cow::Owned(budget.to_string()),
+        }
+    }
+
+    /// Whether the text turns reasoning off. A provider's `off` and `none`
+    /// mean the same thing.
+    pub fn is_off(self) -> bool {
+        match self {
+            Reasoning::Level(text) => {
+                text.eq_ignore_ascii_case("off") || text.eq_ignore_ascii_case("none")
+            }
+            Reasoning::Budget(budget) => budget == 0,
+        }
+    }
 }
 
 /// A model request to run one tool.
@@ -205,7 +236,7 @@ pub struct ToolSpec {
 }
 
 /// Token counts reported by a provider.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     /// Input tokens, excluding tokens read from or written to the cache.
     pub input_tokens: u64,
@@ -217,7 +248,15 @@ pub struct Usage {
     pub cache_write_tokens: u64,
     /// Tokens the provider spent on private reasoning.
     pub reasoning_tokens: u64,
+    /// The cost of this reply in USD, when the provider reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
 }
+
+// `f64` has no `Eq`, so the marker is written out by hand. A provider never
+// reports a `NaN` cost, and a usage is compared only in tests and in a history
+// round trip.
+impl Eq for Usage {}
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -249,6 +288,28 @@ mod tests {
         assistant.stop_reason = Some(StopReason::ToolUse);
         assistant.usage.input_tokens = 10;
         assistant
+    }
+
+    #[test]
+    fn reasoning_text_parses_a_level_and_a_budget() {
+        assert_eq!(Reasoning::parse("high"), Reasoning::Level("high"));
+        assert_eq!(Reasoning::parse("4096"), Reasoning::Budget(4096));
+        assert_eq!(Reasoning::parse(" 12 "), Reasoning::Budget(12));
+        assert_eq!(Reasoning::parse(" xhigh "), Reasoning::Level("xhigh"));
+        assert_eq!(Reasoning::parse("median").text(), "median");
+        assert_eq!(Reasoning::parse("4096").text(), "4096");
+    }
+
+    #[test]
+    fn reasoning_text_off_and_none_are_off_but_a_budget_is_not() {
+        assert!(Reasoning::parse("off").is_off());
+        assert!(Reasoning::parse(" none ").is_off());
+        assert!(!Reasoning::parse("high").is_off());
+        assert!(!Reasoning::parse("4096").is_off());
+        assert!(
+            Reasoning::parse("0").is_off(),
+            "a zero budget thinks not at all"
+        );
     }
 
     #[test]
@@ -318,11 +379,27 @@ mod tests {
             cache_read_tokens: 100,
             cache_write_tokens: 50,
             reasoning_tokens: 7,
+            cost: None,
         };
         let json = serde_json::to_string(&usage).unwrap();
         let back: Usage = serde_json::from_str(&json).unwrap();
         assert_eq!(back, usage);
+        assert!(!json.contains("cost"), "{json}");
         assert_eq!(Usage::default().reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn usage_cost_round_trips_when_known() {
+        let usage = Usage {
+            input_tokens: 12,
+            cost: Some(0.0123),
+            ..Usage::default()
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains(r#""cost":0.0123"#), "{json}");
+        let back: Usage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.cost, Some(0.0123));
+        assert_eq!(back, usage);
     }
 
     #[test]

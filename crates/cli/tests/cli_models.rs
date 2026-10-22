@@ -101,6 +101,9 @@ async fn serve_with(
 /// A temp home with a config for provider `fi` and room for the cache.
 struct Home {
     dir: TempDir,
+    /// A catalogue URL on a port nothing listens on, so a fill fails at once
+    /// and no test reaches the real models.dev.
+    catalogue: String,
 }
 
 impl Home {
@@ -124,7 +127,13 @@ impl Home {
         tokio::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
             .await
             .expect("restrict the config");
-        Self { dir }
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a port");
+        let dead = listener.local_addr().expect("the bound address");
+        drop(listener);
+        Self {
+            dir,
+            catalogue: format!("http://{dead}/api.json"),
+        }
     }
 
     fn cache_file(&self) -> std::path::PathBuf {
@@ -162,6 +171,10 @@ impl Home {
         command.env("XDG_CACHE_HOME", root.join("cache"));
         command.env("HOME", root);
         command.env("FI_MODELS_KEY", KEY);
+        // Tests never reach the real catalogue; a test that serves its own
+        // reply overrides this.
+        command.env("REAGENT_MODELS_DEV_URL", &self.catalogue);
+        command.env_remove("REAGENT_PROFILE");
         command.env_remove("ANTHROPIC_API_KEY");
         command.env_remove("OPENAI_API_KEY");
         for (name, value) in env {
@@ -184,6 +197,35 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// A temp home whose config names `codex-sub` on `base`, with a saved ChatGPT
+/// login for it.
+async fn home_with_a_saved_login(base: &str) -> Home {
+    let home = Home::with_config(&format!(
+        "[providers.codex-sub]\npreset = \"chatgpt\"\nbase_url = \"{base}\"\n"
+    ))
+    .await;
+    let state = home.dir.path().join("state/reagent");
+    tokio::fs::create_dir_all(&state).await.expect("state dir");
+    let auth = state.join("auth.json");
+    let far = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("a clock")
+        .as_secs()
+        + 3600;
+    tokio::fs::write(
+        &auth,
+        format!(
+            r#"{{"codex-sub":{{"type":"oauth","client_id":"oaiapp_test","host_id":"urn:uuid:00000000-0000-4000-8000-000000000000","access":"at-models-test","refresh":"rt-models-test","id_token":"id-test","expires_at":{far},"subject":"sub","email":null}}}}"#
+        ),
+    )
+    .await
+    .expect("write the login");
+    tokio::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600))
+        .await
+        .expect("restrict the login");
+    home
 }
 
 #[tokio::test]
@@ -248,7 +290,11 @@ async fn models_a_failing_server_without_a_cache_exits_1() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(stdout(&output), "");
     let error = stderr(&output);
-    assert!(error.starts_with("reagent: fi: "), "{error}");
+    // The start line comes first, so the error is one of the later lines.
+    assert!(
+        error.lines().any(|line| line.starts_with("reagent: fi: ")),
+        "{error}"
+    );
     assert!(error.contains("401"), "{error}");
     assert!(!error.contains(KEY), "{error}");
 }
@@ -262,7 +308,11 @@ async fn models_a_failed_refresh_falls_back_to_the_stale_cache() {
     assert!(output.status.success(), "stderr {}", stderr(&output));
     assert_eq!(stdout(&output), "fi/z\n");
     let error = stderr(&output);
-    assert!(error.starts_with("reagent: fi: "), "{error}");
+    // The start line comes first, so the error is one of the later lines.
+    assert!(
+        error.lines().any(|line| line.starts_with("reagent: fi: ")),
+        "{error}"
+    );
     assert!(error.contains("using the cached list from"), "{error}");
     assert!(!error.contains(KEY), "{error}");
 }
@@ -278,6 +328,7 @@ async fn models_a_missing_key_names_the_variable() {
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("HOME", root)
+        .env_remove("REAGENT_PROFILE")
         .env_remove("FI_MODELS_KEY")
         .output()
         .await
@@ -314,7 +365,10 @@ async fn models_one_failing_provider_does_not_stop_the_others() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(stdout(&output), "fi/a\nfi/b\n");
     let error = stderr(&output);
-    assert!(error.starts_with("reagent: zz: "), "{error}");
+    assert!(
+        error.lines().any(|line| line.starts_with("reagent: zz: ")),
+        "{error}"
+    );
     assert!(error.contains("500"), "{error}");
 }
 
@@ -403,10 +457,205 @@ async fn models_a_redirect_is_an_error_and_is_not_followed() {
     let output = home.run(&["models"]).await;
     assert_eq!(output.status.code(), Some(1));
     let error = stderr(&output);
-    assert!(error.starts_with("reagent: fi: "), "{error}");
+    // The start line comes first, so the error is one of the later lines.
+    assert!(
+        error.lines().any(|line| line.starts_with("reagent: fi: ")),
+        "{error}"
+    );
     assert!(error.contains("302"), "{error}");
     assert!(
         target_requests.try_recv().is_err(),
         "the redirect was followed"
+    );
+}
+
+const PLAN_LIST: &str = r#"{"models":[{"slug":"gpt-x","display_name":"GPT X","visibility":"list"},{"slug":"gpt-hidden","visibility":"hide"}]}"#;
+
+/// A trimmed catalogue reply for the deepseek provider.
+const CATALOGUE: &str = r#"{"deepseek":{"id":"deepseek","name":"DeepSeek","models":{
+    "deepseek-flash":{"id":"deepseek-flash","name":"DeepSeek V4.1 Flash",
+        "limit":{"context":1048576,"output":393216},
+        "cost":{"input":0.15,"output":0.6,"cache_read":0.003}},
+    "deepseek-v4-pro":{"id":"deepseek-v4-pro",
+        "limit":{"context":1048576,"output":393216},
+        "cost":{"input":0.66,"output":1.98}}
+}}}"#;
+
+/// A trimmed catalogue reply for the openai provider, used by the plan test.
+const OPENAI_CATALOGUE: &str = r#"{"openai":{"id":"openai","models":{
+    "gpt-x":{"id":"gpt-x","limit":{"context":1050000,"output":128000},
+        "cost":{"input":2,"output":10}}
+}}}"#;
+
+/// A provider table that resolves the deepseek preset, with a fake endpoint.
+fn deepseek_config(base: &str) -> String {
+    format!("[providers.deepseek]\nbase_url = \"{base}\"\napi_key_env = \"FI_MODELS_KEY\"\n")
+}
+
+#[tokio::test]
+async fn models_dev_a_fetch_error_does_not_fail_the_command() {
+    let (base, _requests) = serve("200 OK", LIST).await;
+    let home = Home::with_config(&deepseek_config(&base)).await;
+    // A port nothing listens on: the catalogue fetch cannot connect.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a port");
+    let address = listener.local_addr().expect("the bound address");
+    drop(listener);
+    let url = format!("http://{address}/api.json");
+    let output = home
+        .run_env(
+            &["models", "deepseek"],
+            &[("REAGENT_MODELS_DEV_URL", url.as_str())],
+        )
+        .await;
+    assert!(output.status.success(), "stderr {}", stderr(&output));
+    assert_eq!(stdout(&output), "deepseek/a\ndeepseek/b\n");
+    let error = stderr(&output);
+    assert!(
+        error
+            .lines()
+            .any(|line| line.starts_with("reagent: models.dev: ")),
+        "{error}"
+    );
+    // The list is still cached, without a price.
+    let cache =
+        tokio::fs::read_to_string(home.dir.path().join("cache/reagent/models/deepseek.json"))
+            .await
+            .expect("the cache exists");
+    assert!(!cache.contains("price"), "{cache}");
+    assert!(!error.contains(KEY), "{error}");
+}
+
+#[tokio::test]
+async fn models_dev_a_catalogue_price_fills_the_provider_cache() {
+    let (base, _requests) = serve("200 OK", r#"{"data":[{"id":"deepseek-flash"}]}"#).await;
+    let (catalogue, _catalogue_requests) = serve("200 OK", CATALOGUE).await;
+    let home = Home::with_config(&deepseek_config(&base)).await;
+    let output = home
+        .run_env(
+            &["models", "deepseek"],
+            &[("REAGENT_MODELS_DEV_URL", catalogue.as_str())],
+        )
+        .await;
+    assert!(output.status.success(), "stderr {}", stderr(&output));
+    assert_eq!(stdout(&output), "deepseek/deepseek-flash\n");
+    let text =
+        tokio::fs::read_to_string(home.dir.path().join("cache/reagent/models/deepseek.json"))
+            .await
+            .expect("the cache exists");
+    let cache: serde_json::Value = serde_json::from_str(&text).expect("the cache is JSON");
+    let entry = &cache["models"][0];
+    assert_eq!(entry["id"], "deepseek-flash");
+    assert_eq!(entry["context_window"], 1_048_576);
+    assert_eq!(entry["max_output"], 393_216);
+    assert_eq!(entry["price_source"], "models_dev");
+    let price = |part: &str| entry["price"][part].as_f64().expect("a price part");
+    assert!((price("input") - 0.15e-6).abs() < 1e-15, "{text}");
+    assert!((price("output") - 0.6e-6).abs() < 1e-15, "{text}");
+    assert!((price("cache_read") - 0.003e-6).abs() < 1e-15, "{text}");
+    // The catalogue cache holds only the provider asked for.
+    let text =
+        tokio::fs::read_to_string(home.dir.path().join("cache/reagent/models/models.dev.json"))
+            .await
+            .expect("the catalogue cache exists");
+    assert!(text.contains("\"deepseek\""), "{text}");
+    assert!(!text.contains("\"openai\""), "{text}");
+}
+
+#[tokio::test]
+async fn models_dev_a_plan_fills_the_limits_but_no_price() {
+    let (base, _requests) = serve("200 OK", PLAN_LIST).await;
+    let (catalogue, _catalogue_requests) = serve("200 OK", OPENAI_CATALOGUE).await;
+    let home = home_with_a_saved_login(&base).await;
+    let state_home = home.dir.path().join("state");
+    let output = home
+        .run_env(
+            &["models", "codex-sub", "--refresh"],
+            &[
+                ("XDG_STATE_HOME", state_home.to_str().expect("utf-8 path")),
+                ("REAGENT_MODELS_DEV_URL", catalogue.as_str()),
+            ],
+        )
+        .await;
+    assert!(output.status.success(), "stderr {}", stderr(&output));
+    let text =
+        tokio::fs::read_to_string(home.dir.path().join("cache/reagent/models/codex-sub.json"))
+            .await
+            .expect("the cache exists");
+    let cache: serde_json::Value = serde_json::from_str(&text).expect("the cache is JSON");
+    let entry = &cache["models"][0];
+    assert_eq!(entry["id"], "gpt-x");
+    assert_eq!(entry["context_window"], 1_050_000);
+    assert_eq!(entry["max_output"], 128_000);
+    assert_eq!(entry["price"], serde_json::Value::Null, "{text}");
+    assert_eq!(entry["price_source"], serde_json::Value::Null, "{text}");
+}
+
+#[tokio::test]
+async fn named_account_models_sends_the_saved_login_bearer() {
+    let (base, mut requests) = serve("200 OK", PLAN_LIST).await;
+    let home = home_with_a_saved_login(&base).await;
+    let state_home = home.dir.path().join("state");
+    let output = home
+        .run_env(
+            &["models", "codex-sub", "--refresh"],
+            &[("XDG_STATE_HOME", state_home.to_str().expect("utf-8 path"))],
+        )
+        .await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("gpt-x"), "{stdout}");
+    assert!(!stdout.contains("gpt-hidden"), "{stdout}");
+    let request = requests.recv().await.expect("one request");
+    assert_eq!(
+        request.header("authorization"),
+        Some("Bearer at-models-test")
+    );
+    assert!(!stdout.contains("at-models-test"));
+}
+
+#[tokio::test]
+async fn start_line_the_models_line_names_the_saved_login() {
+    let (base, mut requests) = serve("200 OK", PLAN_LIST).await;
+    let home = home_with_a_saved_login(&base).await;
+    let state_home = home.dir.path().join("state");
+    let output = home
+        .run_env(
+            &["models", "codex-sub", "--refresh"],
+            &[("XDG_STATE_HOME", state_home.to_str().expect("utf-8 path"))],
+        )
+        .await;
+    let error = stderr(&output);
+    assert!(output.status.success(), "{error}");
+    assert!(
+        error
+            .lines()
+            .any(|line| line
+                == "reagent: profile none, provider codex-sub, credential login codex-sub"),
+        "{error}"
+    );
+    // The login signed the list request in, and its token never shows.
+    assert!(requests.recv().await.is_some());
+    assert!(!error.contains("at-models-test"));
+}
+
+#[tokio::test]
+async fn named_account_models_without_a_login_names_the_login_command() {
+    let home = Home::with_config("[providers.codex-sub]\npreset = \"chatgpt\"\n").await;
+    let state_home = home.dir.path().join("state");
+    let output = home
+        .run_env(
+            &["models", "codex-sub"],
+            &[("XDG_STATE_HOME", state_home.to_str().expect("utf-8 path"))],
+        )
+        .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("codex-sub needs a login; run reagent login chatgpt --as codex-sub"),
+        "{stderr}"
     );
 }

@@ -133,6 +133,22 @@ pub fn estimate_tokens(bytes: usize) -> usize {
 mod tests {
     use super::*;
 
+    #[test]
+    fn prompt_turn_hints_are_in_the_system_prompt() {
+        assert!(TEMPLATE.contains("in one turn"), "{TEMPLATE}");
+        assert!(TEMPLATE.contains("one bash command"), "{TEMPLATE}");
+        assert!(TEMPLATE.contains("one edit call"), "{TEMPLATE}");
+    }
+
+    #[test]
+    fn prompt_file_tool_hint_is_in_the_system_prompt() {
+        assert!(TEMPLATE.contains("Use read, grep and find"), "{TEMPLATE}");
+        assert!(
+            TEMPLATE.contains("not cat, sed or grep in bash"),
+            "{TEMPLATE}"
+        );
+    }
+
     struct Dir(PathBuf);
 
     impl Dir {

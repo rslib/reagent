@@ -5,8 +5,10 @@
 //! only when the `testing` feature is on.
 #![cfg(feature = "testing")]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_reagent");
@@ -21,6 +23,7 @@ async fn run(tmp: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin())
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
+        .env_remove("REAGENT_PROFILE")
         .args(args)
         .current_dir(tmp)
         .output()
@@ -268,6 +271,153 @@ async fn the_final_text_is_the_last_turn_only() {
         .expect("write a");
     let output = run(tmp.path(), &["--provider", &fake, "-p", "hi"]).await;
     assert_eq!(String::from_utf8_lossy(&output.stdout), "the answer\n");
+}
+
+#[tokio::test]
+async fn start_line_a_fake_run_names_the_profile_and_no_credential() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let fake = script(tmp.path(), r#"{"replies": [{"text": "ok"}]}"#).await;
+    let output = run(tmp.path(), &["--provider", &fake, "-p", "hi"]).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr {stderr}");
+    let line = stderr
+        .lines()
+        .find(|line| line.starts_with("reagent: profile "))
+        .unwrap_or_else(|| panic!("no start line in {stderr}"));
+    assert!(line.starts_with("reagent: profile none, model "), "{line}");
+    assert!(line.ends_with(", credential none"), "{line}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ok\n");
+}
+
+#[tokio::test]
+async fn start_line_names_the_profile_a_run_reads() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let config = tmp.path().join("config/reagent");
+    tokio::fs::create_dir_all(config.join("profiles"))
+        .await
+        .expect("config dir");
+    let file = config.join("config.toml");
+    tokio::fs::write(&file, "model = \"fake-model\"\n")
+        .await
+        .expect("write the config");
+    tokio::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+        .await
+        .expect("restrict the config");
+    let profile = config.join("profiles/work.toml");
+    tokio::fs::write(&profile, "max_tokens = 1000\n")
+        .await
+        .expect("write the profile");
+    tokio::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o600))
+        .await
+        .expect("restrict the profile");
+    let fake = script(tmp.path(), r#"{"replies": [{"text": "ok"}]}"#).await;
+    let output = Command::new(bin())
+        .env("XDG_CONFIG_HOME", tmp.path().join("config"))
+        .env("HOME", tmp.path())
+        .env_remove("REAGENT_PROFILE")
+        .args(["--provider", &fake, "--profile", "work", "-p", "hi"])
+        .current_dir(tmp.path())
+        .output()
+        .await
+        .expect("the binary runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr {stderr}");
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == "reagent: profile work, model fake-model, credential none"),
+        "stderr {stderr}"
+    );
+}
+
+const CHAT_REPLY: &str = concat!(
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+    "data: [DONE]\n\n"
+);
+
+/// Serves one chat request with [`CHAT_REPLY`], and returns the base URL and
+/// the authorization header the request carried.
+async fn serve_chat() -> (String, tokio::sync::oneshot::Receiver<Option<String>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a port");
+    let address = listener.local_addr().expect("the bound address");
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept a connection");
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap_or(0);
+            buffer.extend_from_slice(&chunk[..read]);
+            if read == 0 || buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&buffer).into_owned();
+        let authorization = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(": ")?;
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.to_owned())
+        });
+        let _ = sender.send(authorization);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{CHAT_REPLY}",
+            CHAT_REPLY.len()
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+        let _ = socket.shutdown().await;
+    });
+    (format!("http://{address}/v1"), receiver)
+}
+
+#[tokio::test]
+async fn start_line_names_the_env_var_and_never_the_key() {
+    const KEY: &str = "sk-print-start-line-secret";
+    let (base, request) = serve_chat().await;
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let output = Command::new(bin())
+        // The user's real config must not change the test.
+        .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
+        .env("XDG_CACHE_HOME", tmp.path().join("cache"))
+        .env("HOME", tmp.path())
+        .env("PRINT_START_KEY", KEY)
+        .env_remove("REAGENT_PROFILE")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .args([
+            "--provider",
+            "openai-chat",
+            "--model",
+            "print-model",
+            "--api-key-env",
+            "PRINT_START_KEY",
+            "--base-url",
+            &base,
+            "-p",
+            "hi",
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .await
+        .expect("the binary runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr {stderr}");
+    assert!(
+        stderr.lines().any(|line| line
+            == "reagent: profile none, model print-model, credential env PRINT_START_KEY"),
+        "stderr {stderr}"
+    );
+    assert_eq!(stdout, "ok\n");
+    assert!(!stdout.contains(KEY), "stdout leaks the key: {stdout}");
+    assert!(!stderr.contains(KEY), "stderr leaks the key: {stderr}");
+    // The key reached the request, so the line named its source rather than a
+    // login that held nothing.
+    assert_eq!(
+        request.await.expect("the request was recorded"),
+        Some(format!("Bearer {KEY}"))
+    );
 }
 
 #[tokio::test]

@@ -176,7 +176,7 @@ pub fn spec() -> ToolSpec {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Glob, or text the path must contain." },
-                "path": { "type": "string", "description": "Folder to search, relative to the working directory." }
+                "path": { "type": "string", "description": "Folder to search." }
             },
             "required": ["pattern"]
         }),
