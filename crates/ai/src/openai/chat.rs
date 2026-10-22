@@ -12,7 +12,7 @@ use serde_json::{Map, Value, value::RawValue};
 use crate::Error;
 use crate::http::ExtraHeaders;
 use crate::key::Credential;
-use crate::openai::{BodyCache, JsonStr};
+use crate::openai::{BodyCache, BodyParts, JsonStr};
 use crate::providers::{Compat, MaxTokensField, ReasoningField};
 use crate::types::{AssistantMessage, Content, Message, Reasoning, StopReason, Text, ToolSpec};
 use crate::{Provider, Request, StreamEvent, Usage};
@@ -105,7 +105,7 @@ impl OpenAiChat {
     }
 
     /// Serializes the request body, reusing the bytes of unchanged messages.
-    pub(crate) fn request_body(&self, request: &Request<'_>) -> Result<Bytes, Error> {
+    pub(crate) fn request_parts(&self, request: &Request<'_>) -> Result<BodyParts, Error> {
         let mut head = self.head.lock().expect("head cache lock");
         let reuse = head.as_ref().is_some_and(|cached| {
             cached.model == request.model
@@ -137,7 +137,14 @@ impl OpenAiChat {
         bodies.align(request.messages, |message| {
             MessageBody::new(message, PROVIDER)
         })?;
-        Ok(builder.body(bodies.bodies()))
+        Ok(builder.body_parts(bodies.bodies()))
+    }
+
+    /// The request body as one buffer, for the tests and the cross-provider
+    /// comparisons that need the bytes in one place.
+    #[cfg(test)]
+    pub(crate) fn request_body(&self, request: &Request<'_>) -> Result<Bytes, Error> {
+        self.request_parts(request).map(|parts| parts.join())
     }
 }
 
@@ -147,10 +154,11 @@ impl Provider for OpenAiChat {
     }
 
     fn stream(&self, request: &Request<'_>) -> BoxStream<'static, Result<StreamEvent, Error>> {
-        let body = match self.request_body(request) {
+        let body = match self.request_parts(request) {
             Ok(body) => body,
             Err(error) => return Box::pin(futures_util::stream::iter([Err(error)])),
         };
+        let length = body.len();
         let url = self.url();
         let client = self.client.clone();
         let headers = self.headers.clone();
@@ -172,7 +180,10 @@ impl Provider for OpenAiChat {
             };
             let response = headers
                 .apply(request)
-                .body(body)
+                // The body is streamed in pieces, so its length is stated here
+                // and the request is not chunked.
+                .header(reqwest::header::CONTENT_LENGTH, length)
+                .body(body.into_body())
                 .send()
                 .await
                 .map_err(|error| Error::Http(error.to_string()))?;
@@ -384,27 +395,67 @@ impl RequestBuilder {
 
     /// Serializes a body from the head and the message bodies.
     pub fn body(&self, messages: &[MessageBody]) -> Bytes {
-        let mut out = BytesMut::with_capacity(self.head.len() + 128 * messages.len());
-        out.put_slice(&self.head);
-        let mut first = true;
-        if let Some(system) = &self.system {
-            out.put_slice(system);
-            first = false;
-        }
+        self.body_parts(messages).join()
+    }
+
+    /// The body as its pieces: the head, the system prompt, each cached message
+    /// and the separators between them, with no message copied.
+    pub fn body_parts(&self, messages: &[MessageBody]) -> BodyParts {
+        let visible = messages
+            .iter()
+            .filter(|message| message.bytes.is_some())
+            .count();
+        let mut parts = BodyParts::with_capacity(
+            2 + usize::from(self.system.is_some()) + crate::openai::item_pieces(visible),
+        );
+        parts.push(self.head.clone());
+        let mut first = match &self.system {
+            Some(system) => {
+                parts.push(system.clone());
+                false
+            }
+            None => true,
+        };
         for message in messages {
             let Some(bytes) = &message.bytes else {
                 continue;
             };
             if !first {
-                out.put_u8(b',');
+                parts.push_static(COMMA);
             }
             first = false;
-            out.put_slice(bytes);
+            parts.push(bytes.clone());
         }
-        out.put_slice(b"]}");
-        out.freeze()
+        parts.push_static(END);
+        debug_assert_eq!(
+            parts.len(),
+            self.body_len(messages),
+            "the pieces hold the body the buffer held"
+        );
+        parts
+    }
+
+    /// The length of the body [`RequestBuilder::body_parts`] appends, so the
+    /// pieces hold the bytes the buffer held, which a debug build checks.
+    fn body_len(&self, messages: &[MessageBody]) -> usize {
+        let mut len = self.head.len() + END.len();
+        let mut first = true;
+        if let Some(system) = &self.system {
+            len += system.len();
+            first = false;
+        }
+        for message in messages {
+            if let Some(bytes) = &message.bytes {
+                len += bytes.len() + usize::from(!first);
+                first = false;
+            }
+        }
+        len
     }
 }
+
+const COMMA: &[u8] = b",";
+const END: &[u8] = b"]}";
 
 #[derive(Serialize)]
 struct ChatTool<'a> {
@@ -603,12 +654,8 @@ impl StreamParser {
 
         for choice in chunk.choices.into_choices() {
             let delta = choice.delta;
-            if let Some(reasoning) = delta
-                .reasoning_content
-                .as_ref()
-                .or(delta.reasoning.as_ref())
-            {
-                out.push(StreamEvent::ThinkingDelta(Text::from(reasoning.as_str())));
+            if let Some(reasoning) = delta.reasoning_content.or(delta.reasoning) {
+                out.push(StreamEvent::ThinkingDelta(reasoning.into_text()));
             }
             if let Some(details) = delta.reasoning_details {
                 for detail in details {
@@ -618,7 +665,7 @@ impl StreamParser {
             if let Some(content) = delta.content
                 && !content.as_str().is_empty()
             {
-                out.push(StreamEvent::TextDelta(Text::from(content.as_str())));
+                out.push(StreamEvent::TextDelta(content.into_text()));
             }
             for call in delta.tool_calls {
                 self.accept_tool_call(call, out);
@@ -651,7 +698,8 @@ impl StreamParser {
         if self.done || self.failed {
             Ok(())
         } else {
-            Err(Error::Protocol("stream ended before [DONE]".into()))
+            // A cut stream, not a bad one: the same request may finish on a retry.
+            Err(Error::Transient("stream ended before [DONE]".into()))
         }
     }
 
@@ -675,7 +723,7 @@ impl StreamParser {
         if let Some(name) = function.name {
             out.push(StreamEvent::ToolCallStart {
                 id: id.clone(),
-                name: Text::from(name.as_str()),
+                name: name.into_text(),
             });
         }
         if let Some(arguments) = function.arguments
@@ -683,7 +731,7 @@ impl StreamParser {
         {
             out.push(StreamEvent::ToolCallDelta {
                 id,
-                partial_json: Text::from(arguments.as_str()),
+                partial_json: arguments.into_text(),
             });
         }
     }
@@ -694,6 +742,9 @@ impl StreamParser {
     /// Only a text or summary item is parsed, and only so the next piece of the
     /// same kind can fold into it. Every other item keeps its bytes.
     fn accept_detail(&mut self, raw: Box<RawValue>) {
+        if self.fold_detail(&raw) {
+            return;
+        }
         let Some(kind) = detail_kind(&raw) else {
             self.reasoning_details.push(ReasoningDetail::Raw(raw));
             return;
@@ -718,6 +769,39 @@ impl StreamParser {
                 raw,
                 merged: false,
             }));
+    }
+
+    /// Folds `raw` into the item it continues when the piece carries nothing
+    /// the item does not already hold.
+    ///
+    /// A reasoning stream sends one small text piece per chunk, all of them for
+    /// the same item, so this path parses such a piece once and copies only its
+    /// text. It answers false for a piece that needs the fields themselves.
+    fn fold_detail(&mut self, raw: &RawValue) -> bool {
+        let Some(ReasoningDetail::Piece(target)) = self.reasoning_details.last() else {
+            return false;
+        };
+        let Some(peek) = peek_detail(raw.get(), &target.map) else {
+            return false;
+        };
+        let Some(kind) = peek.kind.and_then(DetailKind::of) else {
+            return false;
+        };
+        if peek.extra || target.kind != kind {
+            return false;
+        }
+        let content = match kind {
+            DetailKind::Text => peek.text,
+            DetailKind::Summary => peek.summary,
+        };
+        let Some(ReasoningDetail::Piece(piece)) = self.reasoning_details.last_mut() else {
+            return false;
+        };
+        if let Some(content) = content {
+            piece.append(content.as_str());
+        }
+        piece.merged = true;
+        true
     }
 
     /// The reasoning details as one JSON array, taken off the parser.
@@ -812,6 +896,18 @@ struct DetailPiece {
 }
 
 impl DetailPiece {
+    /// Appends the content a later piece carried to this item's own content.
+    fn append(&mut self, more: &str) {
+        let field = self.kind.field();
+        match self.map.get_mut(field) {
+            Some(Value::String(last)) => last.push_str(more),
+            _ => {
+                self.map
+                    .insert(field.to_string(), Value::String(more.to_owned()));
+            }
+        }
+    }
+
     /// Folds `next` into this item, the way pi folds streamed pieces.
     ///
     /// The content field grows. A field this item already holds wins, and a
@@ -820,12 +916,7 @@ impl DetailPiece {
     fn merge(&mut self, mut next: Map<String, Value>) {
         let field = self.kind.field();
         if let Some(Value::String(more)) = next.remove(field) {
-            match self.map.get_mut(field) {
-                Some(Value::String(last)) => last.push_str(&more),
-                _ => {
-                    self.map.insert(field.to_string(), Value::String(more));
-                }
-            }
+            self.append(&more);
         }
         for (key, value) in next {
             if self.map.get(&key).is_none_or(Value::is_null) {
@@ -871,6 +962,67 @@ struct DetailType<'a> {
 fn detail_kind(raw: &RawValue) -> Option<DetailKind> {
     let detail: DetailType<'_> = serde_json::from_str(raw.get()).ok()?;
     DetailKind::of(detail.kind?)
+}
+
+/// The fields of one reasoning detail that folding it into an item needs.
+#[derive(Default)]
+struct DetailPeek<'a> {
+    /// The `type` the detail named.
+    kind: Option<&'a str>,
+    /// The text the detail carried, when that field held a string.
+    text: Option<JsonStr<'a>>,
+    /// The summary the detail carried, when that field held a string.
+    summary: Option<JsonStr<'a>>,
+    /// Whether the detail holds a field the item it folds into lacks.
+    extra: bool,
+}
+
+/// Reads one reasoning detail in one pass: its type, its text and its summary.
+///
+/// `known` is the item the detail may fold into. A field that item already
+/// holds cannot reach it, so the value of such a field is not read at all, and
+/// `extra` says whether the detail held one the item needs.
+fn peek_detail<'a>(raw: &'a str, known: &Map<String, Value>) -> Option<DetailPeek<'a>> {
+    struct Peek<'k>(&'k Map<String, Value>);
+
+    impl<'de> serde::de::Visitor<'de> for Peek<'_> {
+        type Value = DetailPeek<'de>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a reasoning detail")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut peek = DetailPeek::default();
+            while let Some(key) = map.next_key::<&'de str>()? {
+                match key {
+                    "type" => peek.kind = map.next_value::<Option<&'de str>>()?,
+                    "text" => peek.text = map.next_value::<Option<JsonStr<'de>>>()?,
+                    "summary" => peek.summary = map.next_value::<Option<JsonStr<'de>>>()?,
+                    _ => {
+                        if self.0.get(key).is_none_or(Value::is_null) {
+                            peek.extra = true;
+                        }
+                        map.next_value::<&'de RawValue>()?;
+                    }
+                }
+            }
+            // Only the field of the item's own kind is its content, so a detail
+            // that carries both needs the values.
+            if peek.text.is_some() && peek.summary.is_some() {
+                peek.extra = true;
+            }
+            Ok(peek)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    let peek = serde::de::Deserializer::deserialize_map(&mut deserializer, Peek(known)).ok()?;
+    deserializer.end().ok()?;
+    Some(peek)
 }
 
 impl crate::openai::EventParser for StreamParser {
@@ -1242,6 +1394,111 @@ mod tests {
             "/tests/fixtures/openai_chat_request.json"
         ));
         assert_eq!(std::str::from_utf8(&body).unwrap(), golden.trim_end());
+    }
+
+    /// A history with every shape a session holds: text, a reply with thinking
+    /// and a tool call, that tool's result, and a text-only reply.
+    fn mixed_messages() -> Vec<MessageBody> {
+        let mut assistant = AssistantMessage::new(
+            PROVIDER,
+            "glm-4.6",
+            vec![
+                Content::Thinking {
+                    thinking: "consider the file".into(),
+                    signature: Some("sig_1".into()),
+                },
+                Content::text("reading"),
+                Content::ToolCall(crate::types::ToolCall {
+                    id: "call_02".into(),
+                    name: "read".into(),
+                    arguments: "{\"path\":\"b.rs\"}".into(),
+                }),
+            ],
+        );
+        assistant.stop_reason = Some(StopReason::ToolUse);
+        [
+            Message::user("hello"),
+            Message::assistant(assistant),
+            Message::tool_result("call_02", "fn b() {}", false),
+            Message::assistant(AssistantMessage::new(
+                PROVIDER,
+                "glm-4.6",
+                vec![Content::text("here it is")],
+            )),
+        ]
+        .iter()
+        .map(|message| MessageBody::new(message, PROVIDER).unwrap())
+        .collect()
+    }
+
+    /// The pieces joined are the bytes the old single buffer wrote, and their
+    /// length is the length of that body.
+    #[test]
+    fn body_pieces_join_to_the_single_buffer_body() {
+        let builder = golden_builder();
+        let bodies = mixed_messages();
+        let parts = builder.body_parts(&bodies);
+        let joined = parts.join();
+        assert_eq!(
+            parts.len(),
+            joined.len(),
+            "the length of the body is the sum of its pieces"
+        );
+        assert_eq!(
+            joined,
+            builder.body(&bodies),
+            "the joined pieces are the body"
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&joined).is_ok(),
+            "the body of a mixed history is one JSON object"
+        );
+
+        let golden = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/openai_chat_request.json"
+        ));
+        let pieces = builder.body_parts(&golden_messages()).join();
+        assert_eq!(
+            std::str::from_utf8(&pieces).unwrap(),
+            golden.trim_end(),
+            "the pieces write the bytes the old buffer wrote"
+        );
+    }
+
+    /// Whether `piece` points into `block`, so the two hold one copy of the
+    /// bytes and no copy was made.
+    fn shares(piece: &Bytes, block: &Bytes) -> bool {
+        let start = block.as_ptr() as usize;
+        let at = piece.as_ptr() as usize;
+        at >= start && at + piece.len() <= start + block.len()
+    }
+
+    /// Every cached message reaches the body as the piece that points into its
+    /// bytes, so the body holds no second copy of any message.
+    #[test]
+    fn body_pieces_share_the_cached_message_bytes() {
+        let builder = golden_builder();
+        let bodies = mixed_messages();
+        let parts = builder.body_parts(&bodies);
+        for block in bodies.iter().filter_map(|body| body.bytes.as_ref()) {
+            let pieces: Vec<&Bytes> = parts
+                .parts()
+                .iter()
+                .filter(|piece| shares(piece, block))
+                .collect();
+            assert_eq!(pieces.len(), 1, "one piece holds the message, no copy");
+            assert_eq!(
+                pieces[0].as_ptr(),
+                block.as_ptr(),
+                "the piece starts the message"
+            );
+            assert_eq!(
+                pieces[0].len(),
+                block.len(),
+                "the piece is the whole message"
+            );
+        }
     }
 
     #[test]
@@ -2002,7 +2259,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_done_is_an_error() {
+    fn cut_stream_without_done_is_transient() {
         let mut parser = StreamParser::new();
         let mut out = Vec::new();
         parser
@@ -2012,7 +2269,7 @@ mod tests {
             )
             .unwrap();
         let error = parser.finish().unwrap_err();
-        assert!(matches!(error, Error::Protocol(message) if message.contains("[DONE]")));
+        assert!(matches!(error, Error::Transient(message) if message.contains("[DONE]")));
     }
 
     #[test]
@@ -2031,6 +2288,35 @@ mod tests {
         let first = provider.request_body(&request).unwrap();
         let second = provider.request_body(&request).unwrap();
         assert_eq!(first, second);
+    }
+
+    /// The body leaves in pieces, so its length is the `content-length` header
+    /// and the request is not chunked.
+    #[tokio::test]
+    async fn body_pieces_send_the_same_bytes_with_their_length() {
+        let (base, recorded) = crate::http::test_server::serve(EXTRA_REPLY).await;
+        let provider = OpenAiChat::new("test-key", base);
+        let history = vec![
+            Message::user("hello"),
+            Message::tool_result("call_01", "fn main() {}", false),
+        ];
+        let request = request_for(&history);
+        let body = provider.request_body(&request).expect("the body builds");
+        let events: Vec<_> = provider.stream(&request).collect().await;
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let recorded = recorded.await.expect("the server recorded the request");
+        let length: usize = recorded
+            .header("content-length")
+            .expect("a content length")
+            .parse()
+            .expect("a number");
+        assert_eq!(length, body.len(), "the length of the body that is sent");
+        assert_eq!(recorded.body, body.as_ref(), "the bytes the server read");
+        assert_eq!(
+            recorded.header("transfer-encoding"),
+            None,
+            "a body with a known length is not chunked"
+        );
     }
 
     #[test]

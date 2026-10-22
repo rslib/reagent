@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
 use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
@@ -16,6 +16,9 @@ use crate::resolve;
 
 /// Bytes read from the start of a file to decide whether it is binary.
 const BINARY_PROBE: usize = 8 * 1024;
+/// Bytes buffered around the file: skipping `offset` lines costs one read per
+/// buffer, not one per 8 KB.
+const READ_BUF: usize = 64 * 1024;
 /// Each line is cut at this many bytes, with a trailing mark.
 const LINE_CAP: usize = 2000;
 const DEFAULT_LIMIT: usize = 2000;
@@ -71,7 +74,7 @@ impl Read {
         }
         // The probe bytes are the start of the file, so the reader takes them
         // from the slice already in hand instead of seeking back for them.
-        let mut feed = LineFeed::new(BufReader::new((&probe[..probe_len]).chain(file)));
+        let mut feed = LineFeed::new(reader(&probe[..probe_len], file));
 
         let mut number: u64 = 1;
         while number < offset {
@@ -152,6 +155,12 @@ impl Tool for Read {
             }
         })
     }
+}
+
+/// The reader around the file, buffered so that skipping lines reads the file
+/// in `READ_BUF` pieces.
+fn reader<R: AsyncRead + Unpin>(probe: &[u8], file: R) -> BufReader<tokio::io::Chain<&[u8], R>> {
+    BufReader::with_capacity(READ_BUF, probe.chain(file))
 }
 
 /// Streams a file line by line from the reader's own buffer, keeping at most
@@ -304,6 +313,11 @@ pub fn spec() -> ToolSpec {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Context, Poll};
+
     use super::*;
 
     fn tool(tmp: &tempfile::TempDir) -> Read {
@@ -586,6 +600,57 @@ mod tests {
             output.content.as_ref(),
             "2002\tlast line\n",
             "expected the last line near the end of the sparse file"
+        );
+    }
+
+    /// A file that counts the reads which reach it.
+    struct Counted {
+        bytes: Vec<u8>,
+        at: usize,
+        reads: Rc<Cell<usize>>,
+    }
+
+    impl AsyncRead for Counted {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            self.reads.set(self.reads.get() + 1);
+            let take = (self.bytes.len() - self.at).min(buf.remaining());
+            let end = self.at + take;
+            buf.put_slice(&self.bytes[self.at..end]);
+            self.at = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Skipping lines must read the file in `READ_BUF` pieces: the 8 KB
+    /// default would cost eight times as many read hops on a network file
+    /// system. The reads that reach the file are counted, not the lines.
+    #[tokio::test]
+    async fn skipping_lines_reads_the_file_in_large_buffers() {
+        let line = format!("{}\n", "x".repeat(99));
+        let text = line.repeat(1000);
+        let size = text.len();
+        let reads = Rc::new(Cell::new(0));
+        let file = Counted {
+            bytes: text.into_bytes(),
+            at: 0,
+            reads: Rc::clone(&reads),
+        };
+        let mut feed = LineFeed::new(reader(b"", file));
+        let mut lines = 0;
+        while feed.skip().await.unwrap() {
+            lines += 1;
+        }
+        assert_eq!(lines, 1000);
+        let most = size / READ_BUF + 2;
+        eprintln!("reads: {} for {size} bytes, at most {most}", reads.get());
+        assert!(
+            reads.get() <= most,
+            "{} reads for {size} bytes, over {most}",
+            reads.get()
         );
     }
 

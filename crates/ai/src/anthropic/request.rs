@@ -5,6 +5,7 @@ use serde::Serialize;
 use serde_json::value::RawValue;
 
 use crate::Error;
+use crate::openai::BodyParts;
 use crate::types::{AssistantMessage, Content, Message, Reasoning, Role, ToolResult, ToolSpec};
 
 /// One message serialized in Anthropic wire form, reusable across requests.
@@ -40,17 +41,6 @@ impl MessageBody {
     /// The role this message was built from.
     pub fn role(&self) -> Role {
         self.role
-    }
-
-    fn write_assistant(&self, out: &mut BytesMut) {
-        out.put_slice(b"{\"role\":\"assistant\",\"content\":[");
-        for (index, block) in self.blocks.iter().enumerate() {
-            if index > 0 {
-                out.put_u8(b',');
-            }
-            out.put_slice(block);
-        }
-        out.put_slice(b"]}");
     }
 }
 
@@ -168,25 +158,45 @@ impl RequestBuilder {
     /// user-side messages around it merge into one, because Anthropic requires
     /// alternating roles. The last user-side block carries the cache breakpoint.
     pub fn body(&self, messages: &[MessageBody]) -> Bytes {
-        let visible: Vec<&MessageBody> = messages
-            .iter()
-            .filter(|message| !(message.role == Role::Assistant && message.blocks.is_empty()))
-            .collect();
+        self.body_parts(messages).join()
+    }
+
+    /// The body as its pieces: the head, the separators and every cached
+    /// message's bytes, none of them copied.
+    ///
+    /// The block that carries the cache breakpoint is three pieces: the bytes
+    /// before its closing brace, the marker, and that brace, which is the last
+    /// byte of the cached block. [`Bytes::slice`] shares them with the cache,
+    /// so the block reaches the wire without a copy.
+    pub fn body_parts(&self, messages: &[MessageBody]) -> BodyParts {
+        let mut visible: Vec<&MessageBody> = Vec::with_capacity(messages.len());
+        visible.extend(
+            messages
+                .iter()
+                .filter(|message| !(message.role == Role::Assistant && message.blocks.is_empty())),
+        );
         let last_user = visible
             .iter()
             .rposition(|message| matches!(message.role, Role::User | Role::ToolResult));
 
-        let mut out = BytesMut::with_capacity(self.head.len() + 128 * visible.len());
-        out.put_slice(&self.head);
+        let mut parts = BodyParts::with_capacity(self.pieces(&visible, last_user));
+        parts.push(self.head.clone());
         let mut first = true;
         let mut index = 0;
         while index < visible.len() {
             if !first {
-                out.put_u8(b',');
+                parts.push_static(COMMA);
             }
             first = false;
             if visible[index].role == Role::Assistant {
-                visible[index].write_assistant(&mut out);
+                parts.push_static(ASSISTANT_PREFIX);
+                for (block_index, block) in visible[index].blocks.iter().enumerate() {
+                    if block_index > 0 {
+                        parts.push_static(COMMA);
+                    }
+                    parts.push(block.clone());
+                }
+                parts.push_static(END);
                 index += 1;
             } else {
                 let start = index;
@@ -194,33 +204,131 @@ impl RequestBuilder {
                     index += 1;
                 }
                 let cached = last_user.filter(|last| *last >= start && *last < index);
-                write_user(&visible[start..index], start, cached, &mut out);
+                push_user(&visible[start..index], start, cached, &mut parts);
             }
         }
-        out.put_slice(b"]}");
-        out.freeze()
+        parts.push_static(END);
+        debug_assert_eq!(
+            parts.len(),
+            self.body_len(&visible, last_user),
+            "the pieces hold the body the buffer held"
+        );
+        parts
+    }
+
+    /// How many pieces [`RequestBuilder::body_parts`] appends, so the list of
+    /// them is one allocation whatever the history holds.
+    fn pieces(&self, visible: &[&MessageBody], last_user: Option<usize>) -> usize {
+        // The head and the bracket that closes the message list.
+        let mut count = 2;
+        let mut first = true;
+        let mut index = 0;
+        while index < visible.len() {
+            // The prefix, and the comma before it on every group but the first.
+            count += 1 + usize::from(!first);
+            first = false;
+            if visible[index].role == Role::Assistant {
+                count += group_pieces(visible[index].blocks.len());
+                index += 1;
+            } else {
+                let start = index;
+                while index < visible.len() && visible[index].role != Role::Assistant {
+                    index += 1;
+                }
+                let blocks: usize = visible[start..index]
+                    .iter()
+                    .map(|entry| entry.blocks.len())
+                    .sum();
+                count += group_pieces(blocks);
+                if last_user.is_some_and(|last| last >= start && last < index) {
+                    // The marker, between the two halves of the cached block.
+                    count += 2;
+                }
+            }
+        }
+        count
+    }
+
+    /// The length of the body [`RequestBuilder::body_parts`] appends, so the
+    /// pieces hold the bytes the buffer held, which a debug build checks.
+    fn body_len(&self, visible: &[&MessageBody], last_user: Option<usize>) -> usize {
+        let mut len = self.head.len() + END.len();
+        let mut first = true;
+        let mut index = 0;
+        while index < visible.len() {
+            if !first {
+                len += 1;
+            }
+            first = false;
+            if visible[index].role == Role::Assistant {
+                len += block_len(&visible[index].blocks) + ASSISTANT_PREFIX.len();
+                index += 1;
+            } else {
+                let start = index;
+                while index < visible.len() && visible[index].role != Role::Assistant {
+                    index += 1;
+                }
+                len += block_len(visible[start..index].iter().flat_map(|group| &group.blocks))
+                    + USER_PREFIX.len();
+                if last_user.is_some_and(|last| last >= start && last < index) {
+                    // The block keeps its closing brace, and the marker comes
+                    // before it, where the brace used to close the block.
+                    len += CACHE_CONTROL.len();
+                }
+            }
+        }
+        len
     }
 }
 
-fn write_user(entries: &[&MessageBody], start: usize, cached: Option<usize>, out: &mut BytesMut) {
-    out.put_slice(b"{\"role\":\"user\",\"content\":[");
+const COMMA: &[u8] = b",";
+const ASSISTANT_PREFIX: &[u8] = b"{\"role\":\"assistant\",\"content\":[";
+const USER_PREFIX: &[u8] = b"{\"role\":\"user\",\"content\":[";
+const END: &[u8] = b"]}";
+/// The cache breakpoint marker, without the brace that closes the block it
+/// sits in: the block's own last byte closes it, so the block crosses the wire
+/// as the bytes before its brace, this marker, and the brace.
+const CACHE_CONTROL: &[u8] = b",\"cache_control\":{\"type\":\"ephemeral\"}";
+
+/// The length of `blocks`, written one after another with a comma between
+/// them, plus the bracket that closes them.
+fn block_len<'a>(blocks: impl IntoIterator<Item = &'a Bytes>) -> usize {
+    let mut len = END.len();
+    let mut count: usize = 0;
+    for block in blocks {
+        len += block.len();
+        count += 1;
+    }
+    len + count.saturating_sub(1)
+}
+
+/// The pieces one message group writes: one per block, the comma between them
+/// and the bracket that closes them.
+fn group_pieces(blocks: usize) -> usize {
+    if blocks == 0 { 1 } else { 2 * blocks }
+}
+
+fn push_user(entries: &[&MessageBody], start: usize, cached: Option<usize>, parts: &mut BodyParts) {
+    parts.push_static(USER_PREFIX);
     let mut first = true;
     for (offset, entry) in entries.iter().enumerate() {
         let cache_here = cached == Some(start + offset);
         for (block_index, block) in entry.blocks.iter().enumerate() {
             if !first {
-                out.put_u8(b',');
+                parts.push_static(COMMA);
             }
             first = false;
             if cache_here && block_index + 1 == entry.blocks.len() {
-                out.put_slice(&block[..block.len() - 1]);
-                out.put_slice(b",\"cache_control\":{\"type\":\"ephemeral\"}}");
+                let at = block.len() - 1;
+                parts.push(block.slice(..at));
+                parts.push_static(CACHE_CONTROL);
+                parts.push(block.slice(at..));
             } else {
-                out.put_slice(block);
+                parts.push(block.clone());
             }
         }
     }
-    out.put_slice(b"]}");
+    parts.push_static(END);
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -494,6 +602,122 @@ mod tests {
             "/tests/fixtures/anthropic_request.json"
         ));
         assert_eq!(std::str::from_utf8(&body).unwrap(), golden.trim_end());
+    }
+
+    /// A history with every shape a session holds: text, a reply with thinking
+    /// and a tool call, that tool's result, and a text-only reply.
+    fn mixed_messages() -> Vec<MessageBody> {
+        let mut assistant = AssistantMessage::new(
+            PROVIDER,
+            "claude-sonnet-4-5",
+            vec![
+                Content::Thinking {
+                    thinking: "consider the file".into(),
+                    signature: Some("sig_1".into()),
+                },
+                Content::text("reading"),
+                Content::ToolCall(ToolCall {
+                    id: "toolu_02".into(),
+                    name: "read".into(),
+                    arguments: "{\"path\":\"b.rs\"}".into(),
+                }),
+            ],
+        );
+        assistant.stop_reason = Some(StopReason::ToolUse);
+        [
+            Message::user("hello"),
+            Message::assistant(assistant),
+            Message::tool_result("toolu_02", "fn b() {}", false),
+            Message::assistant(AssistantMessage::new(
+                PROVIDER,
+                "claude-sonnet-4-5",
+                vec![Content::text("here it is")],
+            )),
+        ]
+        .iter()
+        .map(|message| MessageBody::new(message, PROVIDER).unwrap())
+        .collect()
+    }
+
+    /// The pieces joined are the bytes the old single buffer wrote, and their
+    /// length is the length of that body.
+    #[test]
+    fn body_pieces_join_to_the_single_buffer_body() {
+        let builder = golden_builder();
+        let bodies = mixed_messages();
+        let parts = builder.body_parts(&bodies);
+        let joined = parts.join();
+        assert_eq!(
+            parts.len(),
+            joined.len(),
+            "the length of the body is the sum of its pieces"
+        );
+        assert_eq!(
+            joined,
+            builder.body(&bodies),
+            "the joined pieces are the body"
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&joined).is_ok(),
+            "the body of a mixed history is one JSON object"
+        );
+
+        let golden = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/anthropic_request.json"
+        ));
+        let pieces = builder.body_parts(&golden_messages()).join();
+        assert_eq!(
+            std::str::from_utf8(&pieces).unwrap(),
+            golden.trim_end(),
+            "the pieces write the bytes the old buffer wrote"
+        );
+    }
+
+    /// Whether `piece` points into `block`, so the two hold one copy of the
+    /// bytes and no copy was made.
+    fn shares(piece: &Bytes, block: &Bytes) -> bool {
+        let start = block.as_ptr() as usize;
+        let at = piece.as_ptr() as usize;
+        at >= start && at + piece.len() <= start + block.len()
+    }
+
+    /// Every cached block reaches the body as pieces that point into it, so the
+    /// body holds no second copy of any message.
+    #[test]
+    fn body_pieces_share_the_cached_message_bytes() {
+        let builder = golden_builder();
+        let bodies = mixed_messages();
+        let parts = builder.body_parts(&bodies);
+        let mut split = 0;
+        for block in bodies.iter().flat_map(|body| &body.blocks) {
+            let pieces: Vec<&Bytes> = parts
+                .parts()
+                .iter()
+                .filter(|piece| shares(piece, block))
+                .collect();
+            assert!(!pieces.is_empty(), "every cached block is in the body");
+            let held: usize = pieces.iter().map(|piece| piece.len()).sum();
+            assert_eq!(held, block.len(), "the pieces hold the block once");
+            assert_eq!(
+                pieces[0].as_ptr(),
+                block.as_ptr(),
+                "the first piece starts the block"
+            );
+            let last = pieces[pieces.len() - 1];
+            assert_eq!(
+                last.as_ptr() as usize + last.len(),
+                block.as_ptr() as usize + block.len(),
+                "the last piece ends the block"
+            );
+            if pieces.len() > 1 {
+                split += 1;
+            }
+        }
+        assert_eq!(
+            split, 1,
+            "the block that carries the breakpoint is two pieces around the marker"
+        );
     }
 
     #[test]

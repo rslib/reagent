@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use memchr::memmem::Finder;
@@ -99,9 +99,11 @@ impl Grep {
             }
         };
         let mut truncated = false;
-        let files = if meta.is_file() {
+        // `File.rel` is relative to this folder: the walk root, or the working
+        // folder for the one file the caller named.
+        let (files, base) = if meta.is_file() {
             let rel = args.path.as_deref().unwrap_or_default().to_string();
-            vec![File { rel, path: root }]
+            (vec![File { rel, raw: None }], self.working_dir.clone())
         } else {
             let Ok(listing) = walk(&root, &self.skip, cancel).await else {
                 return ToolOutput::error("cancelled");
@@ -111,14 +113,14 @@ impl Grep {
             if let Some(glob) = args.glob.as_deref() {
                 files.retain(|file| glob_matches(glob, &file.rel));
             }
-            files
+            (files, root)
         };
         // The prefix goes on printed lines only, not on every listed file.
         let prefix: Option<Arc<str>> = match args.path.as_deref() {
             Some(path) if !meta.is_file() => Some(Arc::from(path.trim_end_matches('/'))),
             _ => None,
         };
-        let Some(hits) = search(files, matcher, prefix, cancel).await else {
+        let Some(hits) = search(files, Arc::from(base), matcher, prefix, cancel).await else {
             return ToolOutput::error("cancelled");
         };
         ToolOutput::ok(render(&hits, truncated))
@@ -189,9 +191,11 @@ struct Hits {
 }
 
 /// Reads the files in batches and returns their hits in listing order, or
-/// `None` when cancelled.
+/// `None` when cancelled. Each file is opened at [`File::path`], which adds
+/// the name the file system gave when `rel` is not that name.
 async fn search(
     files: Vec<File>,
+    base: Arc<Path>,
     matcher: Arc<Matcher>,
     prefix: Option<Arc<str>>,
     cancel: &CancellationToken,
@@ -213,8 +217,13 @@ async fn search(
         {
             let matcher = Arc::clone(&matcher);
             let prefix = prefix.clone();
-            tasks
-                .spawn_blocking(move || (index, search_batch(&batch, &matcher, prefix.as_deref())));
+            let base = Arc::clone(&base);
+            tasks.spawn_blocking(move || {
+                (
+                    index,
+                    search_batch(&batch, &base, &matcher, prefix.as_deref()),
+                )
+            });
         }
         let next = tokio::select! {
             biased;
@@ -244,7 +253,7 @@ async fn search(
     Some(results.into_iter().flatten().collect())
 }
 
-fn search_batch(batch: &[File], matcher: &Matcher, prefix: Option<&str>) -> Hits {
+fn search_batch(batch: &[File], base: &Path, matcher: &Matcher, prefix: Option<&str>) -> Hits {
     let mut hits = Hits::default();
     // One read buffer for the whole batch.
     let mut bytes = Vec::new();
@@ -252,7 +261,7 @@ fn search_batch(batch: &[File], matcher: &Matcher, prefix: Option<&str>) -> Hits
         if hits.count >= MAX_MATCHES {
             break;
         }
-        if !read_text(file, &mut bytes) {
+        if !read_text(base, file, &mut bytes) {
             continue;
         }
         search_text(prefix, &file.rel, &bytes, matcher, &mut hits);
@@ -260,12 +269,12 @@ fn search_batch(batch: &[File], matcher: &Matcher, prefix: Option<&str>) -> Hits
     hits
 }
 
-/// Reads the file into `bytes`, replacing what it held. False for a file
-/// that cannot be read, is too big or looks binary.
+/// Reads `file` under `base` into `bytes`, replacing what it held. False for
+/// a file that cannot be read, is too big or looks binary.
 #[expect(clippy::disallowed_types, reason = "runs inside spawn_blocking")]
-fn read_text(file: &File, bytes: &mut Vec<u8>) -> bool {
+fn read_text(base: &Path, file: &File, bytes: &mut Vec<u8>) -> bool {
     bytes.clear();
-    let Ok(mut handle) = std::fs::File::open(&file.path) else {
+    let Ok(mut handle) = std::fs::File::open(file.path(base)) else {
         return false;
     };
     if (&mut handle)
@@ -275,6 +284,11 @@ fn read_text(file: &File, bytes: &mut Vec<u8>) -> bool {
         || bytes.contains(&0)
     {
         return false;
+    }
+    // A probe that short of its limit reached the end of the file: reading
+    // again would only ask for a byte that is not there.
+    if bytes.len() < BINARY_PROBE {
+        return true;
     }
     let room = MAX_FILE + 1 - bytes.len() as u64;
     handle.take(room).read_to_end(bytes).is_ok() && bytes.len() as u64 <= MAX_FILE
@@ -356,8 +370,9 @@ enum Matcher {
     Plain(Vec<Finder<'static>>),
     Regex {
         regex: regex_lite::Regex,
-        /// Text every match contains, to skip files without it.
-        required: Option<Finder<'static>>,
+        /// Text every match contains, to skip files without it. Boxed: a
+        /// finder is large on x86_64, and the matcher is built once per call.
+        required: Option<Box<Finder<'static>>>,
     },
 }
 
@@ -402,7 +417,7 @@ impl Matcher {
         let regex = regex_lite::Regex::new(&source).map_err(|error| error.to_string())?;
         Ok(Self::Regex {
             regex,
-            required: required.map(|text| Finder::new(&text).into_owned()),
+            required: required.map(|text| Box::new(Finder::new(&text).into_owned())),
         })
     }
 
@@ -667,6 +682,24 @@ mod tests {
         write(tmp.path(), ".gitignore", "*.log\n");
         let got = lines(tmp.path(), serde_json::json!({"pattern": "needle"})).await;
         assert_eq!(got, ["a.txt:1:needle"]);
+    }
+
+    /// A name that is not UTF-8 loses a byte in `rel`, so the search opens the
+    /// name the file system gave instead. The printed path is the lossy text.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_name_that_is_not_utf8_is_still_searched() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let name = OsStr::from_bytes(b"caf\xe9.txt");
+        // APFS rejects the name; there is nothing to search then.
+        if std::fs::write(tmp.path().join(name), "needle\n").is_err() {
+            return;
+        }
+        let got = lines(tmp.path(), serde_json::json!({"pattern": "needle"})).await;
+        assert_eq!(got, ["caf\u{fffd}.txt:1:needle"]);
     }
 
     #[tokio::test]

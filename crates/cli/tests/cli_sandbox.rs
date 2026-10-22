@@ -246,6 +246,150 @@ async fn sandbox_backend_refuses_a_write_outside_the_write_folders() {
     );
 }
 
+/// The `bash` on `PATH`, for a test that names it directly.
+fn bash_on_path() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("bash"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// A helper start with `PATH` pointing at a folder with nothing the shell
+/// needs, so only a resolved shell path can run the command.
+#[tokio::test]
+async fn perf_helper_runs_a_resolved_shell_without_a_path_search() {
+    let Some(bash) = bash_on_path() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let empty = tmp.path().join("empty-path");
+    tokio::fs::create_dir_all(&empty).await.expect("empty dir");
+    let output = Command::new(BIN)
+        .args(["--sandbox-exec", "--shell"])
+        .arg(&bash)
+        .args(["--write"])
+        .arg(tmp.path())
+        .args(["--", "bash", "-c", "echo hi"])
+        .env("PATH", &empty)
+        .current_dir(tmp.path())
+        .output()
+        .await
+        .expect("the binary runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(125) {
+        // The sandbox cannot start here, but a missing shell must not be why.
+        assert!(
+            !stderr.contains("cannot run") && !stderr.contains("unknown sandbox argument"),
+            "the helper did not use the resolved shell: {stderr}"
+        );
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "exit {} stderr {stderr}",
+        output.status
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi");
+}
+
+#[tokio::test]
+async fn perf_helper_a_removed_shell_falls_back_to_the_search() {
+    let Some(bash) = bash_on_path() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("temp dir");
+    tokio::fs::symlink(&bash, tmp.path().join("bash"))
+        .await
+        .expect("symlink");
+    let gone = tmp.path().join("gone-bash");
+    let output = Command::new(BIN)
+        .args(["--sandbox-exec", "--shell"])
+        .arg(&gone)
+        .args(["--write"])
+        .arg(tmp.path())
+        .args(["--", "bash", "-c", "echo hi"])
+        .env("PATH", tmp.path())
+        .current_dir(tmp.path())
+        .output()
+        .await
+        .expect("the binary runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(125) {
+        assert!(!stderr.contains("cannot run"), "{stderr}");
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "exit {} stderr {stderr}",
+        output.status
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi");
+}
+
+#[tokio::test]
+async fn perf_helper_falls_back_to_sh_without_a_resolved_shell() {
+    let Some(bash) = bash_on_path() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("temp dir");
+    tokio::fs::symlink(&bash, tmp.path().join("sh"))
+        .await
+        .expect("symlink");
+    let output = Command::new(BIN)
+        .args(["--sandbox-exec", "--write"])
+        .arg(tmp.path())
+        .args(["--", "bash", "-c", "echo hi"])
+        .env("PATH", tmp.path())
+        .current_dir(tmp.path())
+        .output()
+        .await
+        .expect("the binary runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(125) {
+        assert!(!stderr.contains("cannot run"), "{stderr}");
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "exit {} stderr {stderr}",
+        output.status
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hi");
+}
+
+#[tokio::test]
+async fn perf_helper_writes_inside_a_resolved_folder() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let dir = tokio::fs::canonicalize(tmp.path())
+        .await
+        .expect("a canonical path");
+    let output = Command::new(BIN)
+        .args(["--sandbox-exec", "--write-resolved"])
+        .arg(&dir)
+        .args(["--", "sh", "-c", "echo ok > made.txt"])
+        .current_dir(&dir)
+        .output()
+        .await
+        .expect("the binary runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(125) {
+        assert!(
+            !stderr.contains("unknown sandbox argument"),
+            "the helper ignores a resolved folder: {stderr}"
+        );
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "exit {} stderr {stderr}",
+        output.status
+    );
+    let made = tokio::fs::read_to_string(dir.join("made.txt"))
+        .await
+        .expect("the write inside went through");
+    assert_eq!(made.trim(), "ok");
+}
+
 #[tokio::test]
 async fn sandbox_backend_links_no_gpl_crate() {
     let output = Command::new(env!("CARGO"))

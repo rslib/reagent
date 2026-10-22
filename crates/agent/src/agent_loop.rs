@@ -1,6 +1,6 @@
 //! The agent loop: stream a reply, run its tool calls, repeat.
 
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -54,6 +54,9 @@ const MAX_TOKENS_NOTE: &str = include_str!(concat!(
 
 /// How many max_tokens stops in a row the loop recovers from before it stops.
 const MAX_TOKENS_RECOVERIES: u32 = 3;
+
+/// The most stream events one reservation of channel room covers.
+const EVENT_BATCH: usize = 64;
 
 /// The parts of a [`Request`] a session controls, besides the conversation.
 #[derive(Clone, Debug)]
@@ -545,21 +548,24 @@ impl<'a> Agent<'a> {
                 .await;
                 // Every result reaches history before any event is sent, so a
                 // cancel or a closed receiver cannot leave a call unanswered.
+                // The results move into history, so only their event fields
+                // are kept here; nothing is cloned.
+                let mut facts: Vec<(bool, usize)> = Vec::with_capacity(results.len());
                 let mut failure = None;
-                for result in &results {
-                    if let Err(error) = record(result.clone(), history, session).await {
-                        history.push(result.clone());
+                for result in results {
+                    facts.push((tool_error(&result), tool_bytes(&result)));
+                    if let Some(error) = record_result(result, history, session).await {
                         failure.get_or_insert(error);
                     }
                 }
                 if let Some(error) = failure {
                     return TurnOutcome::Error(error);
                 }
-                for (call, result) in calls.iter().zip(&results) {
+                for (call, (is_error, bytes)) in calls.iter().zip(facts) {
                     let event = Event::ToolResult {
                         id: call.id.clone(),
-                        is_error: tool_error(result),
-                        bytes: tool_bytes(result),
+                        is_error,
+                        bytes,
                     };
                     if emit(events, &self.token, event).await {
                         return TurnOutcome::Cancelled;
@@ -612,6 +618,12 @@ impl<'a> Agent<'a> {
     ) -> ConsumeOutcome {
         let request = self.request(history);
         let mut stream = self.provider.stream(&request);
+        // Room is reserved for a whole batch of events at once, so a streamed
+        // answer waits on the channel once per batch instead of once per
+        // delta. A channel smaller than a batch keeps its one-event behaviour.
+        let batch_cap = events.max_capacity().min(EVENT_BATCH);
+        // Grown on use: a tool turn has a few events, a long answer fills it.
+        let mut raw: Vec<(StreamEvent, Option<Event>)> = Vec::new();
         loop {
             let item = tokio::select! {
                 item = stream.next() => item,
@@ -620,28 +632,41 @@ impl<'a> Agent<'a> {
             let Some(item) = item else {
                 return ConsumeOutcome::Finished;
             };
-            match item {
-                Ok(event) => {
-                    if let Some(event) = stream_event(&event)
-                        && emit(events, &self.token, event).await
-                    {
-                        return ConsumeOutcome::Cancelled;
-                    }
-                    assembler.push(event);
-                    // A finished tool call gains its name and arguments only
-                    // once the assembler has them.
-                    for ready in assembler.drain_ready() {
-                        let event = Event::ToolCallReady {
-                            id: ready.id,
-                            name: ready.name,
-                            arguments: ready.arguments,
-                        };
-                        if emit(events, &self.token, event).await {
-                            return ConsumeOutcome::Cancelled;
-                        }
-                    }
+            let batch = take_ready(&mut stream, item, &mut raw, batch_cap);
+            // One reservation covers the batch. A cancel while waiting for it
+            // stops the run before any event of the batch lands, so the
+            // assembler never runs ahead of what the receiver saw. A batch with
+            // nothing to send leaves the channel alone, as the per-event send
+            // did, so a closed receiver does not end it.
+            let permits = if batch.sent == 0 {
+                None
+            } else {
+                match reserve(events, &self.token, batch.sent).await {
+                    Some(permits) => Some(permits),
+                    None => return ConsumeOutcome::Cancelled,
                 }
-                Err(error) => return ConsumeOutcome::StreamError(error),
+            };
+            deliver(&mut raw, permits, assembler);
+            // A finished tool call gains its name and arguments only once the
+            // assembler has them. Only a tool call end makes one, and it closes
+            // the batch, so it follows every event of its batch as before.
+            for ready in assembler.drain_ready() {
+                let event = Event::ToolCallReady {
+                    id: ready.id,
+                    name: ready.name,
+                    arguments: ready.arguments,
+                };
+                if emit(events, &self.token, event).await {
+                    return ConsumeOutcome::Cancelled;
+                }
+            }
+            // A stream error keeps the events taken before it, as a send per
+            // event did, and then ends the turn.
+            if let Some(error) = batch.error {
+                return ConsumeOutcome::StreamError(error);
+            }
+            if batch.ended {
+                return ConsumeOutcome::Finished;
             }
         }
     }
@@ -674,6 +699,27 @@ async fn record(
     }
     history.push(message);
     Ok(())
+}
+
+/// Records one tool result, which reaches history even when the session write
+/// fails: a failed write must not drop the answer to a call.
+///
+/// Returns the session error, if any.
+async fn record_result(
+    message: Message,
+    history: &mut Vec<Message>,
+    session: &mut Option<&mut Session>,
+) -> Option<Text> {
+    let error = match session.as_mut() {
+        Some(session) => session
+            .append(&message)
+            .await
+            .err()
+            .map(|error| session_error(&error)),
+        None => None,
+    };
+    history.push(message);
+    error
 }
 
 /// Borrows the assistant message of the last turn and pairs its tool calls
@@ -772,6 +818,104 @@ async fn emit(events: &mpsc::Sender<Event>, token: &CancellationToken, event: Ev
     }
 }
 
+/// What [`take_ready`] took from the stream besides the events.
+struct Batch {
+    /// The events of the batch that go to the channel, one slot each.
+    sent: usize,
+    /// The stream error that ended the batch, after the events before it.
+    error: Option<Error>,
+    /// The stream returned its end, so it must not be polled again.
+    ended: bool,
+}
+
+/// Fills `raw` with `first` and every event `stream` has ready now, up to
+/// `cap`, each beside its channel event.
+///
+/// A tool call end closes the batch: its `tool_call_ready` is sent outside the
+/// reservation, and the slots reserved for later events would otherwise block
+/// it on a small channel. Kept out of the async loop so its state machine stays
+/// small.
+#[inline(never)]
+fn take_ready(
+    stream: &mut futures_util::stream::BoxStream<'static, Result<StreamEvent, Error>>,
+    first: Result<StreamEvent, Error>,
+    raw: &mut Vec<(StreamEvent, Option<Event>)>,
+    cap: usize,
+) -> Batch {
+    raw.clear();
+    let mut batch = Batch {
+        sent: 0,
+        error: None,
+        ended: false,
+    };
+    let mut item = Some(first);
+    while let Some(next) = item.take() {
+        match next {
+            Ok(event) => {
+                let closes = matches!(event, StreamEvent::ToolCallEnd { .. });
+                let mapped = stream_event(&event);
+                batch.sent += usize::from(mapped.is_some());
+                raw.push((event, mapped));
+                if closes {
+                    break;
+                }
+            }
+            Err(failure) => {
+                batch.error = Some(failure);
+                break;
+            }
+        }
+        if raw.len() < cap {
+            match stream.next().now_or_never() {
+                Some(Some(next)) => item = Some(next),
+                Some(None) => batch.ended = true,
+                // Nothing is ready now: the batch is what the loop has.
+                None => {}
+            }
+        }
+    }
+    batch
+}
+
+/// Sends each event of `raw` through its reserved slot and gives it to the
+/// assembler, in stream order.
+#[inline(never)]
+fn deliver(
+    raw: &mut Vec<(StreamEvent, Option<Event>)>,
+    mut permits: Option<mpsc::PermitIterator<'_, Event>>,
+    assembler: &mut Assembler,
+) {
+    for (event, mapped) in raw.drain(..) {
+        if let Some(mapped) = mapped {
+            let permit = permits
+                .as_mut()
+                .and_then(Iterator::next)
+                .expect("room is reserved for the batch");
+            permit.send(mapped);
+        }
+        assembler.push(event);
+    }
+}
+
+/// Reserves room in `events` for `n` events at once, waiting on the
+/// cancellation token. `None` stops the run: a closed receiver, or a cancel
+/// while waiting for room.
+///
+/// The reserve is polled before the token, so a batch the channel has room for
+/// is delivered even after a cancel, as a single send is; only waiting for
+/// room gives way to the token.
+async fn reserve<'a>(
+    events: &'a mpsc::Sender<Event>,
+    token: &CancellationToken,
+    n: usize,
+) -> Option<mpsc::PermitIterator<'a, Event>> {
+    tokio::select! {
+        biased;
+        result = events.reserve_many(n) => result.ok(),
+        () = token.cancelled() => None,
+    }
+}
+
 /// Maps one streamed event to its channel event, if any.
 ///
 /// The completed tool call is reported by the [`Assembler`] (which knows the
@@ -866,7 +1010,9 @@ impl Assembler {
     fn push(&mut self, event: StreamEvent) {
         match event {
             StreamEvent::TextDelta(delta) => {
-                self.close_aux();
+                // Only a thinking block ends here: the text so far stays open,
+                // or every delta would become a block sent again each turn.
+                self.close_thinking();
                 self.text.push_str(&delta);
             }
             StreamEvent::ThinkingDelta(delta) => {
@@ -947,14 +1093,21 @@ impl Assembler {
 
     /// Closes any open thinking block or text block into the content.
     fn close_aux(&mut self) {
-        if let Some(thinking) = self.thinking.take() {
-            self.content.push(Content::Thinking {
-                thinking: Text::from(thinking.text),
-                signature: thinking.signature,
-            });
-            return;
+        if !self.close_thinking() {
+            self.close_text();
         }
-        self.close_text();
+    }
+
+    /// Closes an open thinking block into the content; whether one was open.
+    fn close_thinking(&mut self) -> bool {
+        let Some(thinking) = self.thinking.take() else {
+            return false;
+        };
+        self.content.push(Content::Thinking {
+            thinking: Text::from(thinking.text),
+            signature: thinking.signature,
+        });
+        true
     }
 
     /// Closes an open text block into the content, if it has text.
@@ -988,6 +1141,27 @@ impl Assembler {
 mod tests {
     use super::*;
     use std::borrow::Cow;
+
+    #[test]
+    fn one_text_block_holds_every_delta_of_a_reply() {
+        let mut assembler = Assembler::new();
+        assembler.push(StreamEvent::TextDelta("a".into()));
+        assembler.push(StreamEvent::TextDelta("b".into()));
+        assembler.push(StreamEvent::ThinkingDelta("t".into()));
+        assembler.push(StreamEvent::TextDelta("c".into()));
+        assembler.push(StreamEvent::TextDelta("d".into()));
+        let message = assembler.finish("p".into(), "m".into());
+        let texts: Vec<&str> = message
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                Content::Text { text } => Some(&**text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["ab", "cd"]);
+        assert!(matches!(message.content[1], Content::Thinking { .. }));
+    }
     use std::time::Duration;
 
     use futures_util::future::BoxFuture;
@@ -2323,5 +2497,216 @@ mod tests {
         let seen = changed_files_per_turn(None).await;
 
         assert_eq!(seen, vec![None, None, None]);
+    }
+
+    /// Runs a reply of `deltas` deltas through the loop and returns every
+    /// event the receiver got, in order, drained in the same runtime.
+    async fn batch_events(
+        provider: &dyn Provider,
+        token: CancellationToken,
+        capacity: usize,
+        events: usize,
+    ) -> (Vec<Event>, Vec<Message>) {
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(capacity);
+        let mut history = vec![Message::user("hello")];
+        let mut agent = Agent::new(provider, &registry, config(), token);
+        let run = async {
+            agent.run(&mut history, None, &tx).await;
+            drop(tx);
+        };
+        let drain = async {
+            let mut seen = Vec::with_capacity(events);
+            while let Some(event) = rx.recv().await {
+                seen.push(event);
+            }
+            seen
+        };
+        let ((), seen) = tokio::join!(run, drain);
+        (seen, history)
+    }
+
+    /// A reply of `deltas` one-character text deltas and a normal end.
+    fn many_deltas(deltas: usize) -> Vec<StreamEvent> {
+        let mut reply: Vec<StreamEvent> = (0..deltas)
+            .map(|_| StreamEvent::TextDelta(Text::from("x")))
+            .collect();
+        reply.push(StreamEvent::Stop(StopReason::EndTurn));
+        reply
+    }
+
+    #[tokio::test]
+    async fn batched_events_arrive_in_order_and_the_reply_is_whole() {
+        let provider = FakeProvider::new(vec![many_deltas(1000)]);
+        let (seen, history) = batch_events(&provider, CancellationToken::new(), 256, 1004).await;
+
+        assert_eq!(seen.first(), Some(&Event::TurnStart));
+        let deltas: Vec<&Arc<str>> = seen
+            .iter()
+            .filter_map(|event| match event {
+                Event::TextDelta(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.len(), 1000);
+        assert!(deltas.iter().all(|text| &***text == "x"));
+        assert_eq!(seen.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
+        // The batch order is the stream order, so the reply reads as it came.
+        let reply = history
+            .iter()
+            .find_map(|message| match message {
+                Message::Assistant(message) => Some(message),
+                _ => None,
+            })
+            .expect("the assistant message is recorded");
+        let text: String = reply
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                Content::Text { text } => Some(&**text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "x".repeat(1000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batched_events_a_cancel_while_waiting_for_room_keeps_what_was_sent() {
+        // Room for 128 events and a reply of 300: the first batch of 64 fits
+        // next to the turn start, the second does not, and only the token
+        // frees the loop. Nobody drains, so the channel stays as it was.
+        let provider = FakeProvider::new(vec![many_deltas(300)]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(128);
+        let token = CancellationToken::new();
+        let cancellation = token.clone();
+        let mut history = vec![Message::user("hello")];
+
+        let handle = tokio::spawn(async move {
+            let mut agent = Agent::new(&provider, &registry, config(), token);
+            agent.run(&mut history, None, &tx).await;
+            (history, tx)
+        });
+        // The loop runs until the reservation it waits for cannot fit.
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        let (history, tx) = tokio::time::timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("cancel unblocks the reservation")
+            .expect("runner finishes");
+
+        let seen = drain(tx, &mut rx);
+        // The turn start and the first batch, in order, then the ends the loop
+        // can still fit after the cancel: a send with room is delivered.
+        assert_eq!(seen.first(), Some(&Event::TurnStart));
+        let deltas: Vec<&Arc<str>> = seen
+            .iter()
+            .filter_map(|event| match event {
+                Event::TextDelta(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.len(), EVENT_BATCH);
+        assert!(deltas.iter().all(|text| &***text == "x"));
+        // The run ends once, and only the delivered batch reached the
+        // assembler, so the recorded reply is the batch and nothing past it.
+        let ends = seen
+            .iter()
+            .filter(|event| matches!(event, Event::TurnEnd(_) | Event::RunEnd(_)))
+            .count();
+        assert_eq!(ends, 2);
+        assert_eq!(seen.last(), Some(&Event::RunEnd(TurnEndReason::Cancelled)));
+        assert_eq!(history.len(), 2);
+        let recorded = history
+            .iter()
+            .find_map(|message| match message {
+                Message::Assistant(message) => Some(message),
+                _ => None,
+            })
+            .expect("the partial reply is recorded");
+        let text: String = recorded
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                Content::Text { text } => Some(&**text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text.len(), EVENT_BATCH);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batched_events_a_tool_call_end_on_a_small_channel_does_not_hang() {
+        // Room for 4 events and a call whose arguments come in 10 pieces, all
+        // ready at once: the third batch is 3 pieces and the end, and sends
+        // nothing, so slots held for it would leave no room for the
+        // `tool_call_ready` the end brings.
+        let mut call = vec![StreamEvent::ToolCallStart {
+            id: Text::from("call_1"),
+            name: Text::from("echo"),
+        }];
+        for piece in ["{", "\"mes", "sage", "\"", ":", "\"", "h", "i", "\"", "}"] {
+            call.push(StreamEvent::ToolCallDelta {
+                id: Text::from("call_1"),
+                partial_json: Text::from(piece),
+            });
+        }
+        call.push(StreamEvent::ToolCallEnd {
+            id: Text::from("call_1"),
+        });
+        call.push(StreamEvent::Stop(StopReason::ToolUse));
+        let provider = FakeProvider::new(vec![call, text_reply("done")]);
+
+        let (seen, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            batch_events(&provider, CancellationToken::new(), 4, 16),
+        )
+        .await
+        .expect("the run does not hang on a full channel");
+
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            Event::ToolCallReady { arguments, .. } if &**arguments == r#"{"message":"hi"}"#
+        )));
+        assert_eq!(seen.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
+    }
+
+    /// A provider that hands out one event per poll, never two at once.
+    struct Trickle {
+        events: Vec<StreamEvent>,
+    }
+
+    impl Provider for Trickle {
+        fn name(&self) -> &'static str {
+            "trickle"
+        }
+
+        fn stream(
+            &self,
+            _request: &Request<'_>,
+        ) -> futures_util::stream::BoxStream<'static, Result<StreamEvent, Error>> {
+            let events = self.events.clone();
+            Box::pin(futures_util::stream::iter(events).then(|event| async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                Ok(event)
+            }))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batched_events_a_trickling_stream_still_works() {
+        // A batch of one every time: nothing is ready together, so every event
+        // is reserved and sent on its own.
+        let provider = Trickle {
+            events: many_deltas(100),
+        };
+        let (seen, _) = batch_events(&provider, CancellationToken::new(), 256, 104).await;
+
+        let deltas = seen
+            .iter()
+            .filter(|event| matches!(event, Event::TextDelta(_)))
+            .count();
+        assert_eq!(deltas, 100);
+        assert_eq!(seen.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
     }
 }

@@ -24,4 +24,9 @@ workspace = true
 
 [dev-dependencies]
 dhat = { version = "0.3.3", default-features = false }
+gungraun = "0.20.0"
 tempfile = { version = "3.27.0", default-features = false }
+
+[[bench]]
+name = "instructions"
+harness = false

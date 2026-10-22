@@ -82,15 +82,15 @@ impl StreamParser {
                 };
                 match content_block.kind {
                     "tool_use" => {
-                        let id: Text = content_block.id.unwrap_or_default().as_str().into();
-                        let name: Text = content_block.name.unwrap_or_default().as_str().into();
+                        let id: Text = content_block.id.unwrap_or_default().into_text();
+                        let name: Text = content_block.name.unwrap_or_default().into_text();
                         self.tool_id = Some(id.clone());
                         out.push(StreamEvent::ToolCallStart { id, name });
                     }
                     "redacted_thinking" => {
-                        out.push(StreamEvent::RedactedThinking(Text::from(
-                            content_block.data.unwrap_or_default().as_str(),
-                        )));
+                        out.push(StreamEvent::RedactedThinking(
+                            content_block.data.unwrap_or_default().into_text(),
+                        ));
                     }
                     _ => {}
                 }
@@ -105,24 +105,24 @@ impl StreamParser {
                         kind: Some("text_delta"),
                         text: Some(text),
                         ..
-                    } => StreamEvent::TextDelta(Text::from(text.as_str())),
+                    } => StreamEvent::TextDelta(text.into_text()),
                     Delta {
                         kind: Some("thinking_delta"),
                         thinking: Some(thinking),
                         ..
-                    } => StreamEvent::ThinkingDelta(Text::from(thinking.as_str())),
+                    } => StreamEvent::ThinkingDelta(thinking.into_text()),
                     Delta {
                         kind: Some("signature_delta"),
                         signature: Some(signature),
                         ..
-                    } => StreamEvent::ThinkingSignature(Text::from(signature.as_str())),
+                    } => StreamEvent::ThinkingSignature(signature.into_text()),
                     Delta {
                         kind: Some("input_json_delta"),
                         partial_json: Some(partial_json),
                         ..
                     } => StreamEvent::ToolCallDelta {
                         id: self.tool_id.clone().unwrap_or_default(),
-                        partial_json: Text::from(partial_json.as_str()),
+                        partial_json: partial_json.into_text(),
                     },
                     _ => return Ok(()),
                 };
@@ -170,7 +170,8 @@ impl StreamParser {
         if self.done {
             Ok(())
         } else {
-            Err(Error::Protocol("stream ended before message_stop".into()))
+            // A cut stream, not a bad one: the same request may finish on a retry.
+            Err(Error::Transient("stream ended before message_stop".into()))
         }
     }
 }
@@ -503,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_message_stop_is_an_error() {
+    fn cut_stream_without_message_stop_is_transient() {
         let mut parser = StreamParser::new();
         let mut out = Vec::new();
         parser
@@ -513,7 +514,7 @@ mod tests {
             )
             .unwrap();
         let error = parser.finish().unwrap_err();
-        assert!(matches!(error, Error::Protocol(message) if message.contains("message_stop")));
+        assert!(matches!(error, Error::Transient(message) if message.contains("message_stop")));
     }
     #[test]
     fn a_known_event_without_its_payload_is_an_error() {

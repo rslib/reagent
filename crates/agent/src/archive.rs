@@ -29,6 +29,10 @@ pub struct Archive {
     /// The temp file, opened once and kept open for appends. Holding it also
     /// keeps flushes in order.
     writer: tokio::sync::Mutex<Option<tokio::fs::File>>,
+    /// The write calls [`Archive::flush`] made, so a test can check that one
+    /// flush is one write whatever the number of pending outputs.
+    #[cfg(test)]
+    writes: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -142,27 +146,37 @@ impl Archive {
         if let Ok(meta) = file.metadata().await {
             end = meta.len();
         }
-        let mut written = Vec::with_capacity(pending.len());
-        let mut failed = Vec::new();
-        for (id, text) in pending {
-            if !failed.is_empty() || file.write_all(text.as_bytes()).await.is_err() {
-                failed.push(id);
-                continue;
-            }
-            written.push((id, end, text.len()));
-            end += text.len() as u64;
+        // One write for every pending output: a flush after a mask step keeps
+        // about 20 outputs out of 20 blocking calls.
+        let total: usize = pending.iter().map(|(_, text)| text.len()).sum();
+        let mut batch = Vec::with_capacity(total);
+        let mut offsets = Vec::with_capacity(pending.len());
+        let mut at = end;
+        for (id, text) in &pending {
+            batch.extend_from_slice(text.as_bytes());
+            offsets.push((*id, at, text.len()));
+            at += text.len() as u64;
         }
+        #[cfg(test)]
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let wrote = file.write_all(&batch).await.is_ok();
         let flushed = file.flush().await.is_ok();
         let mut inner = self.lock();
-        inner.pending.extend(failed);
-        if !flushed {
-            inner.pending.extend(written.iter().map(|(id, _, _)| *id));
+        if !wrote || !flushed {
+            inner.pending.extend(pending.iter().map(|(id, _)| *id));
             return;
         }
-        inner.end = end;
-        for (id, offset, len) in written {
+        inner.end = at;
+        for (id, offset, len) in offsets {
             inner.kept.insert(id, Stored::File { offset, len });
         }
+    }
+
+    /// The write calls [`Archive::flush`] has made so far.
+    #[cfg(test)]
+    fn write_count(&self) -> usize {
+        self.writes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The kept output of call `id`.
@@ -379,6 +393,24 @@ mod tests {
         archive.flush().await;
         assert_eq!(archive.get(1).await.as_deref(), Some("one"));
         assert_eq!(archive.get(2).await.as_deref(), Some("two"));
+    }
+
+    #[tokio::test]
+    async fn perf_archive_keeps_twenty_pending_outputs_in_one_write() {
+        let archive = Archive::new();
+        let outputs: Vec<String> = (1..=20).map(|n| format!("output {n}")).collect();
+        for (index, output) in outputs.iter().enumerate() {
+            let id = archive.assign(&Text::from(format!("call_{index}")));
+            archive.keep(id, Text::from(output.as_str()));
+        }
+        archive.flush().await;
+
+        assert_eq!(archive.write_count(), 1, "one write for the whole batch");
+        for (index, output) in outputs.iter().enumerate() {
+            let id = index as u32 + 1;
+            assert_eq!(archive.get(id).await.as_deref(), Some(output.as_str()));
+            assert_eq!(archive.kept_len(id), Some(output.len()));
+        }
     }
 
     #[tokio::test]

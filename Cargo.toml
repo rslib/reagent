@@ -44,6 +44,12 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+# Callgrind finds a bench function by its symbol, so benches keep symbols
+# that the release profile strips; without them every count reads 0.
+[profile.bench]
+strip = false
+debug = "line-tables-only"
+
 # Size-first build for footprint measurements and the eval container.
 [profile.min]
 inherits = "release"

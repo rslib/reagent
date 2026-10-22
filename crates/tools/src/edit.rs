@@ -6,6 +6,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use tokio_util::sync::CancellationToken;
 
 use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
@@ -41,6 +42,41 @@ pub struct Args<'a> {
     /// Several replacements; each one matches the file text as it was read.
     #[serde(default, borrow)]
     edits: Option<Vec<Replacement<'a>>>,
+}
+
+/// The arguments an effect check reads: the path, and the shape of the edits.
+/// The texts have to be strings, but they are skipped, not decoded again.
+#[derive(Debug, Deserialize)]
+struct EffectArgs<'a> {
+    #[serde(borrow)]
+    path: Cow<'a, str>,
+    #[serde(default, borrow)]
+    old_string: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    new_string: Option<&'a RawValue>,
+    #[serde(default, borrow)]
+    edits: Option<Vec<EffectEdit<'a>>>,
+}
+
+/// One replacement of an `edits` list, both of its texts checked as strings.
+#[derive(Debug, Deserialize)]
+struct EffectEdit<'a> {
+    #[serde(borrow)]
+    old_string: &'a RawValue,
+    #[serde(borrow)]
+    new_string: &'a RawValue,
+}
+
+/// Whether the arguments are a JSON object, the only form `run` reads: serde's
+/// derived visitor would also take a bare array, in its struct-from-seq shape.
+fn is_object(args: &str) -> bool {
+    args.trim_start().starts_with('{')
+}
+
+/// Whether `raw` holds a JSON string, read from the value's own text so the
+/// string is never unescaped or copied.
+fn is_string(raw: &RawValue) -> bool {
+    raw.get().starts_with('"')
 }
 
 /// One replacement in an `edits` list.
@@ -797,9 +833,27 @@ impl Tool for Edit {
     }
 
     fn effects(&self, args: &str) -> Effects {
-        let Ok(arguments) = parse_args::<Args<'_>>(args) else {
+        // A JSON object is the only form `run` accepts: serde's derived visitor
+        // would also read a bare array, in its struct-from-seq shape.
+        if !is_object(args) {
+            return Effects::default();
+        }
+        let Ok(arguments) = parse_args::<EffectArgs<'_>>(args) else {
             return Effects::default();
         };
+        // Every text has to be a string for `run` to take the call, but each
+        // one is skipped, never built.
+        let single = [arguments.old_string, arguments.new_string]
+            .into_iter()
+            .flatten();
+        let many = arguments
+            .edits
+            .iter()
+            .flatten()
+            .flat_map(|edit| [edit.old_string, edit.new_string]);
+        if !single.chain(many).all(is_string) {
+            return Effects::default();
+        }
         let Ok(path) = resolve(&self.working_dir, &arguments.path) else {
             return Effects::default();
         };
@@ -1317,7 +1371,19 @@ mod tests {
 
     #[test]
     fn edit_bad_args_have_no_effects() {
-        assert_eq!(Edit::new("/work").effects("{}"), Effects::default());
+        let edit = Edit::new("/work");
+        assert_eq!(edit.effects("{}"), Effects::default());
+        // Every text has to be a string and the call an object: `run` takes
+        // none of these, so the effects report nothing.
+        assert_eq!(
+            edit.effects(r#"{"path":"a.txt","old_string":1,"new_string":"b"}"#),
+            Effects::default()
+        );
+        assert_eq!(
+            edit.effects(r#"{"path":"a.txt","edits":[{"old_string":[],"new_string":"b"}]}"#),
+            Effects::default()
+        );
+        assert_eq!(edit.effects(r#"["a.txt","a","b"]"#), Effects::default());
     }
 
     #[tokio::test]

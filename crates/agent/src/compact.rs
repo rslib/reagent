@@ -8,6 +8,8 @@
 
 use std::path::PathBuf;
 
+use tokio::io::AsyncReadExt;
+
 use reagent_ai::{Content, Message, Text};
 use reagent_util::text;
 
@@ -25,6 +27,11 @@ const MAX_FILES: usize = 5;
 
 /// The most bytes shown of each changed file.
 const FILE_CAP: usize = 20 * 1024;
+
+/// The most bytes read of a changed file: four times [`FILE_CAP`], which is
+/// enough for the cut and the rest of a multi-byte character, so a huge file
+/// never lands in RAM whole.
+const READ_CAP: usize = 4 * FILE_CAP + 4;
 
 /// The checkpoint header, the same file [`crate::checkpoint`] writes first.
 const HEADER: &str = include_str!(concat!(
@@ -128,19 +135,37 @@ impl Compact {
     }
 
     /// The message with the current text of up to [`MAX_FILES`] files.
+    ///
+    /// Each file is read up to [`READ_CAP`] bytes, and the note that it was cut
+    /// comes from the file's length, so a large file costs a bounded read.
     async fn files_message(&self, changed: &[String]) -> Option<Message> {
         let mut text = String::new();
         for path in changed.iter().take(MAX_FILES) {
-            let Ok(bytes) = tokio::fs::read(self.working_dir.join(path)).await else {
+            let Ok(file) = tokio::fs::File::open(self.working_dir.join(path)).await else {
                 continue;
             };
+            let Ok(meta) = file.metadata().await else {
+                continue;
+            };
+            let len = meta.len();
+            let mut bytes = Vec::with_capacity(len.min(READ_CAP as u64) as usize);
+            if file
+                .take(READ_CAP as u64)
+                .read_to_end(&mut bytes)
+                .await
+                .is_err()
+            {
+                continue;
+            }
             let body = String::from_utf8_lossy(&bytes);
             let cut = text::head(&body, FILE_CAP);
             text.push_str("\n\n== ");
             text.push_str(path);
             text.push_str(" ==\n");
             text.push_str(cut);
-            if cut.len() < body.len() {
+            // Cut when the read stopped early or the decoded text is longer
+            // than what was kept: lossy decoding can grow an invalid file.
+            if cut.len() < body.len() || (bytes.len() as u64) < len {
                 text.push_str("\n[cut at 20 KB; read the file for the rest]");
             }
         }

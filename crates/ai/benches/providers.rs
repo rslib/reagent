@@ -186,7 +186,7 @@ fn request_body_anthropic_cold(bencher: Bencher) {
             .expect("the history serializes");
         let builder =
             AnthropicBuilder::new(MODEL_ANTHROPIC, 1024, Some(SYSTEM), Some(REASONING), &tools);
-        black_box(builder.body(bodies.bodies()).len())
+        black_box(builder.body_parts(bodies.bodies()).len())
     });
 }
 
@@ -204,7 +204,7 @@ fn request_body_anthropic_warm(bencher: Bencher) {
         bodies
             .align(&messages, "anthropic")
             .expect("the history serializes");
-        black_box(builder.body(bodies.bodies()).len())
+        black_box(builder.body_parts(bodies.bodies()).len())
     });
 }
 
@@ -227,7 +227,7 @@ fn request_body_responses_cold(bencher: Bencher) {
             Some("sess-1"),
             &tools,
         );
-        black_box(builder.body(bodies.bodies()).len())
+        black_box(builder.body_parts(bodies.bodies()).len())
     });
 }
 
@@ -255,7 +255,7 @@ fn request_body_responses_warm(bencher: Bencher) {
                 ResponsesMessage::new(message, "openai")
             })
             .expect("the history serializes");
-        black_box(builder.body(bodies.bodies()).len())
+        black_box(builder.body_parts(bodies.bodies()).len())
     });
 }
 
@@ -279,7 +279,7 @@ fn request_body_chat_cold(bencher: Bencher) {
             reagent_ai::MaxTokensField::MaxTokens,
             ReasoningField::Effort,
         );
-        black_box(builder.body(bodies.bodies()).len())
+        black_box(builder.body_parts(bodies.bodies()).len())
     });
 }
 
@@ -308,6 +308,6 @@ fn request_body_chat_warm(bencher: Bencher) {
                 ChatMessage::new(message, "openai-chat")
             })
             .expect("the history serializes");
-        black_box(builder.body(bodies.bodies()).len())
+        black_box(builder.body_parts(bodies.bodies()).len())
     });
 }

@@ -51,26 +51,30 @@ impl Lines<'_> {
         let chunk: &[u8] = self.chunk;
 
         if !self.splitter.carry.is_empty() {
-            let mut line = mem::take(&mut self.splitter.carry);
+            // The carried part and the line it completes trade buffers, so a
+            // line split across reads keeps both capacities instead of taking
+            // a new buffer for each line.
+            mem::swap(&mut self.splitter.carry, &mut self.splitter.completed);
+            self.splitter.carry.clear();
             let rest = &chunk[self.pos..];
-            match rest.iter().position(|&b| b == b'\n') {
+            match memchr::memchr(b'\n', rest) {
                 Some(nl) => {
-                    line.extend_from_slice(&rest[..nl]);
+                    self.splitter.completed.extend_from_slice(&rest[..nl]);
                     self.pos += nl + 1;
                 }
                 None => {
-                    line.extend_from_slice(rest);
+                    self.splitter.completed.extend_from_slice(rest);
                     self.pos = chunk.len();
-                    self.splitter.carry = line;
+                    mem::swap(&mut self.splitter.carry, &mut self.splitter.completed);
+                    self.splitter.completed.clear();
                     return None;
                 }
             }
-            self.splitter.completed = line;
             return Some(trim_cr(&self.splitter.completed));
         }
 
         let rest = &chunk[self.pos..];
-        match rest.iter().position(|&b| b == b'\n') {
+        match memchr::memchr(b'\n', rest) {
             Some(nl) => {
                 let line = &rest[..nl];
                 self.pos += nl + 1;

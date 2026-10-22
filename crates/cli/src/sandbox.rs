@@ -16,8 +16,15 @@ const UNAVAILABLE: u8 = 125;
 pub struct Policy {
     /// Whether the program may open network connections.
     pub network: bool,
-    /// Folders the program may write, besides what it can read.
+    /// Folders the program may write, besides what it can read, as the caller
+    /// named them: they are resolved per run below.
     pub write: Vec<PathBuf>,
+    /// Write folders the caller already resolved: canonical and existing, so
+    /// the helper uses them as they are.
+    pub resolved_write: Vec<PathBuf>,
+    /// The `bash` the caller resolved, when it did: the helper runs it as it
+    /// is instead of searching `PATH` for it on every start.
+    pub shell: Option<PathBuf>,
     /// The program to run.
     pub program: OsString,
     /// The arguments of the program.
@@ -25,11 +32,14 @@ pub struct Policy {
 }
 
 /// Parses the helper arguments after `--sandbox-exec`:
-/// `[--network] [--write DIR]... -- PROGRAM ARGS...`.
+/// `[--network] [--shell PATH] [--write DIR]... [--write-resolved DIR]...
+/// -- PROGRAM ARGS...`.
 pub fn parse_policy(args: impl IntoIterator<Item = OsString>) -> Result<Policy, String> {
     let mut args = args.into_iter();
     let mut network = false;
     let mut write = Vec::new();
+    let mut resolved_write = Vec::new();
+    let mut shell = None;
     while let Some(arg) = args.next() {
         if arg == "--" {
             let program = args
@@ -38,11 +48,23 @@ pub fn parse_policy(args: impl IntoIterator<Item = OsString>) -> Result<Policy, 
             return Ok(Policy {
                 network,
                 write,
+                resolved_write,
+                shell,
                 program,
                 args: args.collect(),
             });
         } else if arg == "--network" {
             network = true;
+        } else if arg == "--shell" {
+            let path = args
+                .next()
+                .ok_or_else(|| "missing value for --shell".to_string())?;
+            shell = Some(PathBuf::from(path));
+        } else if arg == "--write-resolved" {
+            let dir = args
+                .next()
+                .ok_or_else(|| "missing value for --write-resolved".to_string())?;
+            resolved_write.push(PathBuf::from(dir));
         } else if arg == "--write" {
             let dir = args
                 .next()
@@ -86,10 +108,19 @@ pub fn helper(args: impl IntoIterator<Item = OsString>) -> ExitCode {
 )]
 fn run(args: impl IntoIterator<Item = OsString>) -> Result<Infallible, String> {
     let mut policy = parse_policy(args)?;
-    if policy.program == "bash" && !on_path(Path::new("bash")) {
-        policy.program = "sh".into();
+    if policy.program == "bash" {
+        // A resolved shell needs no search; without one, a missing bash still
+        // falls back to sh.
+        // A shell removed since the run started falls back to the search.
+        match policy.shell.take().filter(|shell| shell.is_file()) {
+            Some(shell) => policy.program = shell.into_os_string(),
+            None if !on_path(Path::new("bash")) => policy.program = "sh".into(),
+            None => {}
+        }
     }
-    reagent_sandbox::restrict(policy.network, &write_folders(&policy.write))?;
+    let mut write = policy.resolved_write;
+    write.extend(write_folders(&policy.write));
+    reagent_sandbox::restrict(policy.network, &write)?;
     // `exec` keeps the pid and passes a signal on to the caller as a signal,
     // so nothing waits for a child and no 128 + signal mapping is needed.
     let error = std::process::Command::new(&policy.program)
@@ -141,9 +172,37 @@ mod tests {
             Policy {
                 network: true,
                 write: vec!["/a".into(), "/b".into()],
+                resolved_write: Vec::new(),
+                shell: None,
                 program: "bash".into(),
                 args: vec!["-c".into(), "x".into()],
             }
+        );
+    }
+
+    #[test]
+    fn perf_helper_parses_a_resolved_shell_and_write_folders() {
+        let policy = parse(&[
+            "--shell",
+            "/bin/bash",
+            "--write-resolved",
+            "/resolved",
+            "--write",
+            "/later",
+            "--",
+            "bash",
+            "-c",
+            "x",
+        ])
+        .expect("parses");
+        assert_eq!(policy.shell, Some(PathBuf::from("/bin/bash")));
+        assert_eq!(policy.resolved_write, [PathBuf::from("/resolved")]);
+        assert_eq!(policy.write, [PathBuf::from("/later")]);
+        assert!(parse(&["--shell"]).unwrap_err().contains("--shell"));
+        assert!(
+            parse(&["--write-resolved", "/r", "--"])
+                .unwrap_err()
+                .contains("program")
         );
     }
 

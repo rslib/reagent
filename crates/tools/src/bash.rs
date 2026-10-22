@@ -2,7 +2,6 @@
 //! sees while spilling the full output to a file when it is large.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::io;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -20,6 +19,7 @@ use reagent_agent::tool::{Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
 use crate::process_group::{self, GroupGuard};
+use crate::spill;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -29,6 +29,11 @@ const CAP: usize = 8 * 1024;
 const CUT_AT: u64 = 2 * CAP as u64;
 /// The spill file stops growing here, so `yes` cannot fill the disk.
 const SPILL_CAP: u64 = 64 * 1024 * 1024;
+/// Bytes read from a pipe at once, and the spill buffer's size, so a large
+/// output costs one read and one write per buffer, not per 4 KB. A full
+/// buffer is written, never a partial one, so the file sees one write per
+/// `BUF` bytes whatever sizes the pipes hand over.
+const BUF: usize = 64 * 1024;
 /// How long to keep reading after the shell ends. A background child that
 /// holds the pipe open would otherwise block the call until it exits.
 const GRACE: Duration = Duration::from_millis(250);
@@ -107,6 +112,10 @@ pub struct Bash {
     working_dir: PathBuf,
     launcher: Option<Launcher>,
     disabled: AtomicBool,
+    /// The writes that reached the spill file of the last call. A test shows
+    /// that the buffering costs one write per `BUF` bytes.
+    #[cfg(test)]
+    spill_writes: AtomicU64,
 }
 
 impl Bash {
@@ -117,6 +126,8 @@ impl Bash {
             working_dir: working_dir.into(),
             launcher: None,
             disabled: AtomicBool::new(false),
+            #[cfg(test)]
+            spill_writes: AtomicU64::new(0),
         }
     }
 
@@ -182,6 +193,10 @@ impl Bash {
         let mut group = GroupGuard::new(pid as i32);
         let (outcome, mut collect, pipe_held) =
             run_and_collect(&mut child, &mut group, timeout_ms, cancel).await;
+
+        // The writes of this call, so a test never reads another call's count.
+        #[cfg(test)]
+        self.spill_writes.store(collect.writes, Ordering::Relaxed);
 
         let mut text = collect.view();
         let unavailable = match &outcome {
@@ -272,8 +287,9 @@ async fn run_and_collect(
 ) -> (Outcome, Collect, bool) {
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
-    let mut out_buf = [0_u8; 4096];
-    let mut err_buf = [0_u8; 4096];
+    // On the heap: two 64 KB arrays would make this future too large to move.
+    let mut out_buf = vec![0_u8; BUF];
+    let mut err_buf = vec![0_u8; BUF];
     let mut collect = Collect::default();
     let mut ended: Option<Outcome> = None;
     let mut reaped = false;
@@ -343,9 +359,13 @@ where
 #[derive(Default)]
 struct Collect {
     head: Vec<u8>,
-    tail: VecDeque<u8>,
+    tail: Vec<u8>,
     total: u64,
     spill: Spill,
+    /// The writes that reached the spill file, so a test can show that the
+    /// buffering costs one write per `BUF` bytes.
+    #[cfg(test)]
+    writes: u64,
 }
 
 #[derive(Default)]
@@ -356,6 +376,8 @@ enum Spill {
         file: tokio::fs::File,
         path: PathBuf,
         written: u64,
+        /// Output not yet written to `file`, at most `BUF` bytes.
+        buffer: Vec<u8>,
     },
     Failed(String),
 }
@@ -368,11 +390,26 @@ impl Collect {
             let prefix = self.whole(before);
             self.spill = open_spill(&prefix).await;
         }
-        if let Spill::Open { file, written, .. } = &mut self.spill {
+        if let Spill::Open {
+            file,
+            written,
+            buffer,
+            ..
+        } = &mut self.spill
+        {
             let room = SPILL_CAP.saturating_sub(*written);
             let part = &chunk[..chunk.len().min(room as usize)];
-            match file.write_all(part).await {
-                Ok(()) => *written += part.len() as u64,
+            #[cfg(test)]
+            let held = buffer.len();
+            match buffer_spill(file, buffer, part).await {
+                Ok(()) => {
+                    *written += part.len() as u64;
+                    // Only a full buffer is written: that is one write.
+                    #[cfg(test)]
+                    {
+                        self.writes += ((held + part.len()) / BUF) as u64;
+                    }
+                }
                 Err(error) => self.spill = Spill::Failed(error.to_string()),
             }
         }
@@ -381,22 +418,51 @@ impl Collect {
             let take = chunk.len().min(CAP - self.head.len());
             self.head.extend_from_slice(&chunk[..take]);
         }
-        self.tail.extend(chunk);
-        let overflow = self.tail.len().saturating_sub(CAP);
-        self.tail.drain(..overflow);
+        // The last `CAP` bytes are the tail. A chunk at least `CAP` long is
+        // kept whole, its front dropped once, rather than byte by byte.
+        if chunk.len() >= CAP {
+            self.tail.clear();
+            self.tail.extend_from_slice(&chunk[chunk.len() - CAP..]);
+        } else {
+            self.tail.extend_from_slice(chunk);
+            // Old bytes are dropped only once there are `CAP` of them, so the
+            // copies of the front amortise.
+            let overflow = self.tail.len().saturating_sub(2 * CAP);
+            if overflow > 0 {
+                self.tail.drain(..overflow);
+            }
+        }
     }
 
-    /// The first `total` bytes of the stream. Valid only while
-    /// `total <= CUT_AT`, when the head and the tail cover every byte.
+    /// The first `total` bytes of the stream, in one buffer of the size it
+    /// needs. Valid only while `total <= CUT_AT`, when the head and the tail
+    /// cover every byte.
     fn whole(&self, total: u64) -> Vec<u8> {
-        let overlap = (self.head.len() + self.tail.len()).saturating_sub(total as usize);
-        let mut bytes = self.head.clone();
-        bytes.extend(self.tail.iter().skip(overlap));
+        let rest = &self.tail[self.overlap(total)..];
+        let mut bytes = Vec::with_capacity(self.head.len() + rest.len());
+        bytes.extend_from_slice(&self.head);
+        bytes.extend_from_slice(rest);
         bytes
     }
 
+    /// How many of its last bytes the tail repeats from the end of the head,
+    /// given `total` bytes seen.
+    fn overlap(&self, total: u64) -> usize {
+        (self.head.len() + self.tail.len())
+            .saturating_sub(total as usize)
+            .min(self.tail.len())
+    }
+
     async fn flush(&mut self) {
-        if let Spill::Open { file, .. } = &mut self.spill {
+        if let Spill::Open { file, buffer, .. } = &mut self.spill {
+            if !buffer.is_empty() {
+                let _ = file.write_all(buffer).await;
+                buffer.clear();
+                #[cfg(test)]
+                {
+                    self.writes += 1;
+                }
+            }
             let _ = file.flush().await;
         }
     }
@@ -405,7 +471,20 @@ impl Collect {
     /// the tail under a line that says where the full output is.
     fn view(&mut self) -> String {
         if self.total <= CUT_AT {
-            return String::from_utf8_lossy(&self.whole(self.total)).into_owned();
+            // Nothing reads the collector once it has its text, so the head's
+            // buffer is taken when it holds every byte: an output under `CAP`
+            // costs no copy at all, a larger one one buffer and one cast.
+            let bytes = if self.overlap(self.total) == self.tail.len() {
+                std::mem::take(&mut self.head)
+            } else {
+                self.whole(self.total)
+            };
+            // Valid UTF-8 is the common case and takes its bytes as they are;
+            // only a broken output pays the lossy decode.
+            return match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+            };
         }
         let total = self.total;
         let note = match &self.spill {
@@ -424,42 +503,102 @@ impl Collect {
             }
             Spill::None => format!("[output cut: {total} bytes]"),
         };
-        format!(
-            "{note}\n{}\n...\n{}",
-            head_text(&self.head),
-            tail_text(self.tail.make_contiguous())
-        )
+        let head = head_text(&self.head);
+        // The tail may hold up to 2 * CAP bytes between drains; show CAP.
+        let tail = tail_text(&self.tail[self.tail.len().saturating_sub(CAP)..]);
+        let mut text = String::with_capacity(note.len() + head.len() + tail.len() + 6);
+        text.push_str(&note);
+        text.push('\n');
+        text.push_str(&head);
+        text.push_str("\n...\n");
+        text.push_str(&tail);
+        text
     }
 }
 
-/// Opens a new spill file and writes `prefix`, the output before the cut.
+/// Opens a new spill file in this run's folder and buffers `prefix`, the output
+/// before the cut.
 async fn open_spill(prefix: &[u8]) -> Spill {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let folder = std::env::temp_dir().join("reagent-spill");
-    let path = folder.join(format!(
-        "bash-{}-{}.log",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    match spill::folder().await {
+        Ok(folder) => open_spill_in(folder, &NEXT, prefix).await,
+        Err(error) => Spill::Failed(error),
+    }
+}
+
+/// How many taken names a spill skips before it gives up.
+const SPILL_NAME_TRIES: u32 = 64;
+
+/// Opens a new spill file in `folder`, named by the process id and the next
+/// value of `next`. A taken name is skipped, so an old spill in the folder is
+/// never truncated.
+async fn open_spill_in(folder: &Path, next: &AtomicU64, prefix: &[u8]) -> Spill {
     let result = async {
-        tokio::fs::create_dir_all(&folder).await?;
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await?;
-        file.write_all(prefix).await?;
-        io::Result::Ok(file)
+        tokio::fs::create_dir_all(folder).await?;
+        let mut tries = 0;
+        let (file, path) = loop {
+            let path = folder.join(format!(
+                "bash-{}-{}.log",
+                std::process::id(),
+                next.fetch_add(1, Ordering::Relaxed)
+            ));
+            match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await
+            {
+                Ok(file) => break (file, path),
+                Err(error)
+                    if error.kind() == io::ErrorKind::AlreadyExists
+                        && tries + 1 < SPILL_NAME_TRIES =>
+                {
+                    tries += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let mut buffer = Vec::with_capacity(BUF);
+        buffer.extend_from_slice(prefix);
+        io::Result::Ok((file, path, buffer))
     }
     .await;
     match result {
-        Ok(file) => Spill::Open {
+        Ok((file, path, buffer)) => Spill::Open {
             file,
             path,
             written: prefix.len() as u64,
+            buffer,
         },
         Err(error) => Spill::Failed(error.to_string()),
     }
+}
+
+/// Adds `bytes` to the spill buffer and writes it to the file in `BUF` blocks,
+/// so the file costs one write per `BUF` bytes whatever sizes the pipes hand
+/// over.
+async fn buffer_spill(
+    file: &mut tokio::fs::File,
+    buffer: &mut Vec<u8>,
+    mut bytes: &[u8],
+) -> io::Result<()> {
+    // An empty buffer writes whole blocks straight from `bytes`: no copy
+    // through the buffer for a chunk as large as it.
+    if buffer.is_empty() && bytes.len() >= BUF {
+        let whole = bytes.len() / BUF * BUF;
+        file.write_all(&bytes[..whole]).await?;
+        bytes = &bytes[whole..];
+    }
+    while !bytes.is_empty() {
+        let take = (BUF - buffer.len()).min(bytes.len());
+        buffer.extend_from_slice(&bytes[..take]);
+        bytes = &bytes[take..];
+        if buffer.len() == BUF {
+            file.write_all(buffer).await?;
+            buffer.clear();
+        }
+    }
+    Ok(())
 }
 
 /// Decodes the head, dropping a character that the cut split at the end.
@@ -752,6 +891,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spill_name_takes_the_next_free_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        for n in 0..4 {
+            tokio::fs::write(tmp.path().join(format!("bash-{pid}-{n}.log")), b"old")
+                .await
+                .unwrap();
+        }
+        let next = AtomicU64::new(0);
+        let spill = open_spill_in(tmp.path(), &next, b"new").await;
+        let Spill::Open { path, .. } = &spill else {
+            panic!("the spill did not open");
+        };
+        assert_eq!(path, &tmp.path().join(format!("bash-{pid}-4.log")));
+        assert_eq!(next.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
     async fn large_output_is_cut_and_the_spill_is_exact() {
         let tmp = tempfile::tempdir().unwrap();
         let output = run(&tmp, r#"{"command":"seq 1 50000","timeout_ms":8000}"#).await;
@@ -778,6 +935,37 @@ mod tests {
             "spill differs: {} vs {} bytes",
             spilled.len(),
             expected.len()
+        );
+    }
+
+    /// A spill of 8 MB stays byte for byte the output, and costs one write per
+    /// `BUF` bytes rather than one per read chunk: the spill buffer holds
+    /// `BUF` bytes and only a full one is written, so 8 MB / 64 KB + 2 writes
+    /// is the most the file may see (128 measured, against 2045 with a 4 KB
+    /// read buffer and a direct write per chunk). The count is the call's own,
+    /// kept by the run, so a test that spills at the same time cannot touch it.
+    #[tokio::test]
+    async fn perf_spill_writes_one_buffer_per_write() {
+        const BYTES: u64 = 8 * 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let bash = tool(&tmp);
+        let args = format!(
+            r#"{{"command":"head -c {BYTES} /dev/zero | tr '\\000' 'x'","timeout_ms":60000}}"#
+        );
+        let output = bash.run(&args, &CancellationToken::new()).await;
+        assert!(!output.is_error, "{}", output.content);
+        let spilled = tokio::fs::read(spill_path(output.content.as_ref()))
+            .await
+            .unwrap();
+        assert_eq!(spilled.len() as u64, BYTES);
+        assert!(spilled.iter().all(|&byte| byte == b'x'), "spill differs");
+
+        let writes = bash.spill_writes.load(Ordering::Relaxed);
+        let most = BYTES / BUF as u64 + 2;
+        eprintln!("spill writes: {writes} for {BYTES} bytes, at most {most}");
+        assert!(
+            writes <= most,
+            "{writes} writes for {BYTES} bytes to the spill, over {most}"
         );
     }
 
@@ -812,12 +1000,73 @@ mod tests {
         assert_eq!(tail_text("\u{e9}x".as_bytes()), "\u{e9}x");
     }
 
+    /// The tail holds the last `CAP` bytes of the stream: a chunk at least
+    /// `CAP` long is taken in one copy, and a run of small chunks drops its
+    /// front only once `CAP` stale bytes are there, so the copies amortise.
+    /// Either way what stays is the end of the stream, never a gap.
+    #[tokio::test]
+    async fn perf_capture_tail_keeps_the_end_of_the_stream() {
+        let stream: Vec<u8> = (0..3 * CAP).map(|n| b'a' + (n % 26) as u8).collect();
+        let end = std::str::from_utf8(&stream[stream.len() - CAP..]).unwrap_or_default();
+        let mut collect = Collect::default();
+        let expected = tail_text(&stream[stream.len() - CAP..]);
+        for chunk in stream.chunks(1000) {
+            collect.push(chunk).await;
+        }
+        let view = collect.view();
+        let shown = view.rsplit_once("\n...\n").map(|(_, tail)| tail);
+        assert_eq!(shown, Some(&*expected), "small chunks change the tail");
+        assert!(view.ends_with(end), "the view lost the last bytes");
+
+        let mut collect = Collect::default();
+        collect.push(&stream).await;
+        let view = collect.view();
+        let shown = view.rsplit_once("\n...\n").map(|(_, tail)| tail);
+        assert_eq!(shown, Some(&*expected), "one large chunk changes the tail");
+    }
+
+    /// An output under the cut keeps its bytes: the text is the stream's own,
+    /// not a lossy decode of it.
+    #[tokio::test]
+    async fn the_whole_view_is_the_output_text() {
+        let text = "\u{e9}".repeat(CUT_AT as usize / 2);
+        assert_eq!(text.len() as u64, CUT_AT);
+        let mut collect = Collect::default();
+        for chunk in text.as_bytes().chunks(1000) {
+            collect.push(chunk).await;
+        }
+        assert_eq!(collect.view(), text);
+    }
+
+    /// An output cut inside a multi-byte character drops that one character at
+    /// each end and keeps every other byte as it was.
+    #[tokio::test]
+    async fn the_cut_view_drops_only_the_split_characters() {
+        // "a\u{e9}" is three bytes, so an 8 KiB cut lands inside an
+        // "\u{e9}" at the end of the head and at the start of the tail.
+        let mut stream = "a\u{e9}".repeat(CAP).into_bytes();
+        stream.push(b'a');
+        let mut collect = Collect::default();
+        collect.push(&stream).await;
+        let view = collect.view();
+        let (note, shown) = view.split_once('\n').expect("no note line");
+        assert!(
+            note.starts_with(&format!("[output cut: {} bytes", stream.len())),
+            "{note}"
+        );
+        let (head, tail) = shown.rsplit_once("\n...\n").expect("no cut marker");
+        assert_eq!(head.len(), CAP - 1, "the head lost more than one byte");
+        assert_eq!(tail.len(), CAP - 1, "the tail lost more than one byte");
+        assert!(head.chars().all(|c| c == 'a' || c == '\u{e9}'), "{head:?}");
+        assert!(tail.chars().all(|c| c == 'a' || c == '\u{e9}'), "{tail:?}");
+    }
+
     #[test]
     fn whole_joins_the_head_and_the_tail_without_overlap() {
         let mut collect = Collect::default();
         let bytes: Vec<u8> = (0..CUT_AT).map(|n| n as u8).collect();
         collect.head.extend_from_slice(&bytes[..CAP]);
-        collect.tail.extend(&bytes[bytes.len() - CAP..]);
+        collect.tail.extend_from_slice(&bytes[bytes.len() - CAP..]);
         collect.total = CUT_AT;
         assert_eq!(collect.whole(CUT_AT), bytes);
     }

@@ -80,6 +80,14 @@ enum Line<'a> {
 
 /// Appends one agent event to `buf` as a JSON object and a newline.
 pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
+    // The deltas of a streamed answer are the hot path of `--json`: their whole
+    // line is written straight into the buffer, with the bytes the serializer
+    // writes, instead of going through the serializer once per delta.
+    match event {
+        Event::TextDelta(text) => return string_line(buf, "text_delta", "text", text),
+        Event::ThinkingDelta(text) => return string_line(buf, "thinking_delta", "text", text),
+        _ => {}
+    }
     let line = match event {
         Event::TurnStart => Line::TurnStart,
         Event::TextDelta(text) => Line::TextDelta { text },
@@ -172,6 +180,57 @@ fn push(buf: &mut Vec<u8>, line: &Line<'_>) {
     // A Vec writer cannot fail, and every field serializes.
     serde_json::to_writer(&mut *buf, line).expect("a json line serializes");
     buf.push(b'\n');
+}
+
+/// Appends the line of an event with one string field: `{"type":"<kind>",
+/// "<name>":"<value>"}` and a newline, the same bytes the serializer writes.
+fn string_line(buf: &mut Vec<u8>, kind: &str, name: &str, value: &str) {
+    buf.extend_from_slice(b"{\"type\":\"");
+    buf.extend_from_slice(kind.as_bytes());
+    buf.extend_from_slice(b"\",\"");
+    buf.extend_from_slice(name.as_bytes());
+    buf.extend_from_slice(b"\":");
+    write_string(buf, value);
+    buf.extend_from_slice(b"}\n");
+}
+
+/// The lowercase hex digits of the `\u00XX` form.
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// Appends `value` as a JSON string: quoted, with the escapes `serde_json`
+/// writes (`\" \\ \n \r \t \b \f` and `\u00XX` for the other control
+/// bytes) and nothing else, so the bytes match the serializer's. A string with
+/// nothing to escape is one copy, with no second pass.
+fn write_string(buf: &mut Vec<u8>, value: &str) {
+    buf.push(b'"');
+    let bytes = value.as_bytes();
+    // Where the run of plain bytes still to copy starts.
+    let mut plain = 0;
+    for (at, &byte) in bytes.iter().enumerate() {
+        let short: &[u8] = match byte {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            b'\n' => b"\\n",
+            b'\r' => b"\\r",
+            b'\t' => b"\\t",
+            0x08 => b"\\b",
+            0x0c => b"\\f",
+            0x00..=0x1f => {
+                buf.extend_from_slice(&bytes[plain..at]);
+                buf.extend_from_slice(b"\\u00");
+                buf.push(HEX[(byte >> 4) as usize]);
+                buf.push(HEX[(byte & 0xf) as usize]);
+                plain = at + 1;
+                continue;
+            }
+            _ => continue,
+        };
+        buf.extend_from_slice(&bytes[plain..at]);
+        buf.extend_from_slice(short);
+        plain = at + 1;
+    }
+    buf.extend_from_slice(&bytes[plain..]);
+    buf.push(b'"');
 }
 
 /// The prompt cache hit rate: cached tokens over every non-output token.
@@ -393,5 +452,70 @@ mod tests {
         let text = std::str::from_utf8(&buf).unwrap();
         assert_eq!(text.lines().count(), 2);
         assert!(text.ends_with('\n'));
+    }
+
+    /// The line the serialize derive wrote before the fast path, so the fast
+    /// path's bytes are checked against the bytes it replaced.
+    #[derive(Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum Old<'a> {
+        TextDelta { text: &'a str },
+        ThinkingDelta { text: &'a str },
+    }
+
+    fn old_line(line: &Old<'_>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        serde_json::to_writer(&mut buf, line).expect("a json line serializes");
+        buf.push(b'\n');
+        buf
+    }
+
+    fn fast_string(value: &str) -> String {
+        let mut buf = Vec::new();
+        write_string(&mut buf, value);
+        String::from_utf8(buf).expect("a json string is utf8")
+    }
+
+    #[test]
+    fn json_string_writer_matches_serde_json() {
+        let mut cases: Vec<String> = vec![
+            String::new(),
+            "plain ascii, with a space".into(),
+            "a \"quoted\" word".into(),
+            "back\\slash\\\\".into(),
+            "tab\tnewline\ncarriage\r".into(),
+            "/solidus/ and 0x7f are not escaped: \u{7f}".into(),
+            "héllo—ünïcode".into(),
+            "汉字テスト".into(),
+            "x".repeat(10 * 1024),
+        ];
+        // Every control byte on its own, then all of them in one string.
+        let controls: String = (0u8..=0x1f).map(char::from).collect();
+        cases.extend(controls.chars().map(String::from));
+        cases.push(controls);
+        for value in &cases {
+            let expected = serde_json::to_string(value).expect("a string serializes");
+            assert_eq!(fast_string(value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn json_string_text_delta_line_is_unchanged() {
+        for text in ["x", "a \"q\"\n", "", "汉字", "tab\there", "back\\"] {
+            let mut buf = Vec::new();
+            write_event(&mut buf, &Event::TextDelta(text.into()));
+            assert_eq!(buf, old_line(&Old::TextDelta { text }), "{text:?}");
+
+            let mut buf = Vec::new();
+            write_event(&mut buf, &Event::ThinkingDelta(text.into()));
+            assert_eq!(buf, old_line(&Old::ThinkingDelta { text }), "{text:?}");
+        }
+        // The exact bytes of the common line.
+        let mut buf = Vec::new();
+        write_event(&mut buf, &Event::TextDelta("x".into()));
+        assert_eq!(
+            std::str::from_utf8(&buf).expect("utf8"),
+            "{\"type\":\"text_delta\",\"text\":\"x\"}\n"
+        );
     }
 }

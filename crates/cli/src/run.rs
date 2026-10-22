@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -53,15 +53,22 @@ impl Workspace for Folder {
 /// An async line writer over the process stdout. A write that fails (for
 /// example a closed pipe) stops further writes instead of panicking, so a
 /// piped consumer can close early.
-struct Out {
-    stdout: tokio::io::Stdout,
+struct Out<W = tokio::io::Stdout> {
+    writer: W,
     online: bool,
 }
 
-impl Out {
+impl Out<tokio::io::Stdout> {
     fn new() -> Self {
+        Self::with_writer(tokio::io::stdout())
+    }
+}
+
+impl<W: AsyncWrite + Unpin> Out<W> {
+    /// An `Out` over any writer, so a test can count its writes and flushes.
+    fn with_writer(writer: W) -> Self {
         Self {
-            stdout: tokio::io::stdout(),
+            writer,
             online: true,
         }
     }
@@ -85,8 +92,8 @@ impl Out {
     /// Writes `bytes` and flushes. On any error, takes the writer offline.
     async fn write(&mut self, bytes: &[u8]) -> bool {
         let result = async {
-            self.stdout.write_all(bytes).await?;
-            self.stdout.flush().await
+            self.writer.write_all(bytes).await?;
+            self.writer.flush().await
         }
         .await;
         let online = result.is_ok();
@@ -442,15 +449,22 @@ pub async fn run(mut args: Args) -> ExitCode {
     exit_code(&reason, Cause::from_u8(cause.load(Ordering::SeqCst)))
 }
 
+/// The bytes of JSON lines the drain loop takes from the channel before one
+/// write and one flush.
+const JSON_BATCH: usize = 8 * 1024;
+
+/// The most events one receive takes from the channel.
+const EVENT_BATCH: usize = 64;
+
 /// Consumes the agent's event channel, prints it and returns how the run ended.
 ///
 /// Owns stdout: in plain mode only the final answer is printed; in JSON mode
 /// every event is one line and a summary follows the run end. `billing` fills
 /// the cost of a usage the provider did not price, and `context_window` is the
 /// window the end line reports.
-async fn drain(
+async fn drain<W: AsyncWrite + Unpin>(
     rx: mpsc::Receiver<Event>,
-    mut out: Out,
+    mut out: Out<W>,
     json: bool,
     billing: Option<Billing>,
     context_window: Option<u64>,
@@ -466,36 +480,62 @@ async fn drain(
 
     let mut rx = rx;
     let mut buf = Vec::with_capacity(512);
-    while let Some(event) = rx.recv().await {
-        let event = priced(event, billing);
-        match &event {
-            Event::TurnStart => {
-                turns += 1;
-                answer.clear();
-            }
-            // A retried attempt starts the reply again, so its partial text goes.
-            Event::Retry { .. } => answer.clear(),
-            Event::TextDelta(text) => answer.push_str(text),
-            Event::Usage(usage) => {
-                context_tokens = crate::json::context_tokens(usage);
-                sum(&mut total, usage);
-            }
-            Event::Error(message) if !json => eprintln!("reagent: {message}"),
-            Event::TurnEnd(r) => reason = *r,
-            Event::RunEnd(r) => {
-                reason = *r;
-                stop = stop_string(r);
-                ended = true;
-            }
-            _ => {}
-        }
+    // The events one receive takes. A reply sends one event right after
+    // another, so in JSON mode they share one write and one flush instead of
+    // taking one per event; the ready events after a batch join it, so a write
+    // covers the whole 8 KiB. `recv_many` returns as soon as one event is
+    // there, so an idle channel still writes at once and turn end and run end
+    // keep their latency.
+    let mut batch: Vec<Event> = Vec::with_capacity(EVENT_BATCH);
+    'run: while rx.recv_many(&mut batch, EVENT_BATCH).await > 0 {
         if json {
             buf.clear();
-            crate::json::write_event(&mut buf, &event);
-            let _ = out.write(&buf).await;
         }
-        if ended {
-            break;
+        loop {
+            for event in batch.drain(..) {
+                let event = priced(event, billing);
+                match &event {
+                    Event::TurnStart => {
+                        turns += 1;
+                        answer.clear();
+                    }
+                    // A retried attempt starts the reply again, so its partial text goes.
+                    Event::Retry { .. } => answer.clear(),
+                    // A plain run prints the answer at the end; JSON mode writes the
+                    // text on its own line, so it copies nothing.
+                    Event::TextDelta(text) if !json => keep_answer(&mut answer, text),
+                    Event::Usage(usage) => {
+                        context_tokens = crate::json::context_tokens(usage);
+                        sum(&mut total, usage);
+                    }
+                    Event::Error(message) if !json => eprintln!("reagent: {message}"),
+                    Event::TurnEnd(r) => reason = *r,
+                    Event::RunEnd(r) => {
+                        reason = *r;
+                        stop = stop_string(r);
+                        ended = true;
+                    }
+                    _ => {}
+                }
+                if json {
+                    crate::json::write_event(&mut buf, &event);
+                    if ended || buf.len() >= JSON_BATCH {
+                        let _ = out.write(&buf).await;
+                        buf.clear();
+                    }
+                }
+                if ended {
+                    break 'run;
+                }
+            }
+            match rx.try_recv() {
+                Ok(event) => batch.push(event),
+                Err(_) => break,
+            }
+        }
+        if json && !buf.is_empty() {
+            let _ = out.write(&buf).await;
+            buf.clear();
         }
     }
 
@@ -527,6 +567,20 @@ async fn drain(
     }
 
     reason
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bytes copied into the answer of a run on this thread, so a test can
+    /// prove that JSON mode copies none.
+    static ANSWER_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Appends one text delta to the answer a plain run prints at the end.
+fn keep_answer(answer: &mut String, text: &str) {
+    #[cfg(test)]
+    ANSWER_BYTES.with(|bytes| bytes.set(bytes.get() + text.len()));
+    answer.push_str(text);
 }
 
 /// Fills the cost of a usage event from the model price, at the peak rule of
@@ -952,6 +1006,9 @@ mod fake {
     struct ScriptedReply {
         #[serde(default)]
         text: String,
+        /// More text, each item streamed as its own delta after `text`.
+        #[serde(default)]
+        deltas: Vec<String>,
         #[serde(default)]
         calls: Vec<ScriptedCall>,
         #[serde(default)]
@@ -1019,10 +1076,16 @@ mod fake {
                 StreamEvent::Stop(StopReason::MaxTokens),
             ];
         }
-        let mut events = Vec::new();
+        let mut events = Vec::with_capacity(reply.deltas.len() + reply.calls.len() * 3 + 3);
         if !reply.text.is_empty() {
             events.push(StreamEvent::TextDelta(Text::from(reply.text)));
         }
+        events.extend(
+            reply
+                .deltas
+                .into_iter()
+                .map(|delta| StreamEvent::TextDelta(Text::from(delta))),
+        );
         let mut used = false;
         for (index, call) in reply.calls.into_iter().enumerate() {
             let id = if call.id.is_empty() {
@@ -1102,10 +1165,25 @@ fn launcher(args: &Args, cwd: &std::path::Path) -> Result<Option<Launcher>, Stri
         Err(error) => return Err(format!("the sandbox could not start ({error})")),
     };
     let mut helper = vec!["--sandbox-exec".to_string()];
+    // Resolved once here instead of on every bash call: the shell the helper
+    // runs, and the write folders that exist, canonical. A folder that is not
+    // there yet keeps the old `--write` form.
+    if let Some(shell) = bash_path() {
+        helper.push("--shell".into());
+        helper.push(shell.to_string_lossy().into_owned());
+    }
     let folders = [cwd.to_path_buf(), std::env::temp_dir()];
     for dir in folders.iter().chain(&args.write) {
-        helper.push("--write".into());
-        helper.push(dir.to_string_lossy().into_owned());
+        match canonical(dir).filter(|dir| dir.is_dir()) {
+            Some(dir) => {
+                helper.push("--write-resolved".into());
+                helper.push(dir.to_string_lossy().into_owned());
+            }
+            None => {
+                helper.push("--write".into());
+                helper.push(dir.to_string_lossy().into_owned());
+            }
+        }
     }
     if args.network {
         helper.push("--network".into());
@@ -1115,6 +1193,36 @@ fn launcher(args: &Args, cwd: &std::path::Path) -> Result<Option<Launcher>, Stri
         args: helper,
         fallback,
     }))
+}
+
+/// The `bash` on `PATH`, resolved once per run so the helper runs it without
+/// a search of its own.
+fn bash_path() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("bash"))
+        .find(|candidate| executable(candidate))
+        .and_then(|candidate| canonical(&candidate))
+}
+
+/// Whether `path` is a file someone may run, as a PATH search requires.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "once per run, before the tools start"
+)]
+fn executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// `path` as the file system resolves it, or none when it is not there.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "once per run, before the tools start"
+)]
+fn canonical(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    std::fs::canonicalize(path).ok()
 }
 
 /// The tools a headless run offers, all rooted at `cwd`.
@@ -1838,5 +1946,120 @@ mod tests {
         let archive = Archive::new();
         let registry = tools(std::path::Path::new("."), &[], Some(&archive), None);
         assert!(registry.names().any(|name| name == "expand"));
+    }
+
+    /// A writer that keeps the bytes it is given and counts the writes and the
+    /// flushes, so a test can see how many blocking hops a batch costs.
+    #[derive(Clone, Default)]
+    struct Sink {
+        bytes: std::rc::Rc<std::cell::RefCell<Vec<u8>>>,
+        writes: std::rc::Rc<std::cell::Cell<usize>>,
+        flushes: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl tokio::io::AsyncWrite for Sink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.bytes.borrow_mut().extend_from_slice(buf);
+            self.writes.set(self.writes.get() + 1);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.flushes.set(self.flushes.get() + 1);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Queues `count` text deltas of `text`, closes the channel and drains it.
+    async fn drain_text(count: usize, text: &str, json: bool, sink: &Sink) {
+        let (tx, rx) = mpsc::channel(count + 8);
+        for _ in 0..count {
+            tx.send(Event::TextDelta(Text::from(text)))
+                .await
+                .expect("the channel takes the event");
+        }
+        drop(tx);
+        drain(rx, Out::with_writer(sink.clone()), json, None, None).await;
+    }
+
+    #[tokio::test]
+    async fn perf_json_batch_keeps_every_line_and_cuts_the_flushes() {
+        let text = "x".repeat(40);
+        let sink = Sink::default();
+        let (tx, rx) = mpsc::channel(1024);
+        let mut expected = Vec::new();
+        for _ in 0..1000 {
+            let event = Event::TextDelta(Text::from(text.as_str()));
+            crate::json::write_event(&mut expected, &event);
+            tx.send(event).await.expect("the channel takes the event");
+        }
+        let end = Event::RunEnd(TurnEndReason::EndTurn);
+        crate::json::write_event(&mut expected, &end);
+        tx.send(end).await.expect("the channel takes the event");
+        drop(tx);
+        crate::json::write_summary(
+            &mut expected,
+            &Usage::default(),
+            0,
+            &TurnEndReason::EndTurn,
+            None,
+            0,
+            None,
+        );
+
+        let reason = drain(rx, Out::with_writer(sink.clone()), true, None, None).await;
+        assert_eq!(reason, TurnEndReason::EndTurn);
+        assert_eq!(
+            sink.bytes.borrow().as_slice(),
+            expected.as_slice(),
+            "the lines changed"
+        );
+        let lines = sink
+            .bytes
+            .borrow()
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        assert_eq!(lines, 1002, "1000 events plus the run end and the summary");
+        let flushes = sink.flushes.get();
+        assert_eq!(flushes, sink.writes.get(), "one flush per write");
+        // One write and one flush per 8 KiB batch: ten for these 1002 lines,
+        // against one each (1002) before the batch.
+        assert!(flushes <= 16, "1000 events cost {flushes} flushes");
+    }
+
+    #[tokio::test]
+    async fn perf_json_batch_answer_is_copied_only_in_plain_mode() {
+        let text = "y".repeat(64);
+        let sink = Sink::default();
+        ANSWER_BYTES.with(|bytes| bytes.set(0));
+        drain_text(1000, &text, true, &sink).await;
+        assert_eq!(
+            ANSWER_BYTES.with(|bytes| bytes.get()),
+            0,
+            "JSON mode copied the reply text"
+        );
+
+        // A plain run still prints the whole answer.
+        let sink = Sink::default();
+        drain_text(1000, &text, false, &sink).await;
+        assert_eq!(ANSWER_BYTES.with(|bytes| bytes.get()), 1000 * text.len());
+        let mut printed = text.repeat(1000);
+        printed.push('\n');
+        assert_eq!(sink.bytes.borrow().as_slice(), printed.as_bytes());
     }
 }

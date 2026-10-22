@@ -208,19 +208,20 @@ impl Chain {
     }
 
     /// Whether `rel` is ignored by this chain and its parents, by the rules
-    /// of [`Ignores::is_ignored`].
-    pub(crate) fn is_ignored(&self, rel: &[u8], is_dir: bool) -> bool {
+    /// of [`Ignores::is_ignored`]. `scratch` holds the joined path of a chain
+    /// above the walk root: the caller reuses it across the entries of one
+    /// directory, so matching costs no allocation per entry.
+    pub(crate) fn is_ignored(&self, rel: &[u8], is_dir: bool, scratch: &mut Vec<u8>) -> bool {
         let mut cur = Some(self);
-        let mut joined = Vec::new();
         while let Some(chain) = cur {
             let rel = if chain.above.is_empty() {
                 rel
             } else {
-                joined.clear();
-                joined.extend_from_slice(&chain.above);
-                joined.push(b'/');
-                joined.extend_from_slice(rel);
-                &joined
+                scratch.clear();
+                scratch.extend_from_slice(&chain.above);
+                scratch.push(b'/');
+                scratch.extend_from_slice(rel);
+                &scratch[..]
             };
             if let Some(ignored) = verdict(&chain.base, &chain.patterns, rel, is_dir) {
                 return ignored;

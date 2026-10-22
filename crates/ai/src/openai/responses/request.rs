@@ -4,6 +4,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::Serialize;
 
 use crate::Error;
+use crate::openai::{BodyParts, item_pieces};
 use crate::providers::{Compat, MaxTokensField};
 use crate::types::{AssistantMessage, Content, Message, Reasoning, ToolSpec};
 
@@ -136,22 +137,51 @@ impl RequestBuilder {
     ///
     /// A message whose blocks were all dropped disappears.
     pub fn body(&self, messages: &[MessageBody]) -> Bytes {
-        let mut out = BytesMut::with_capacity(self.head.len() + 128 * messages.len());
-        out.put_slice(&self.head);
+        self.body_parts(messages).join()
+    }
+
+    /// The body as its pieces: the head, the separators and every cached
+    /// message's items, none of them copied.
+    pub fn body_parts(&self, messages: &[MessageBody]) -> BodyParts {
+        let items: usize = messages.iter().map(|message| message.items.len()).sum();
+        let mut parts = BodyParts::with_capacity(2 + item_pieces(items));
+        parts.push(self.head.clone());
         let mut first = true;
         for message in messages {
             for item in &message.items {
                 if !first {
-                    out.put_u8(b',');
+                    parts.push_static(COMMA);
                 }
                 first = false;
-                out.put_slice(item);
+                parts.push(item.clone());
             }
         }
-        out.put_slice(b"]}");
-        out.freeze()
+        parts.push_static(END);
+        debug_assert_eq!(
+            parts.len(),
+            self.body_len(messages),
+            "the pieces hold the body the buffer held"
+        );
+        parts
+    }
+
+    /// The length of the body [`RequestBuilder::body_parts`] appends, so the
+    /// pieces hold the bytes the buffer held, which a debug build checks.
+    fn body_len(&self, messages: &[MessageBody]) -> usize {
+        let mut len = self.head.len() + END.len();
+        let mut first = true;
+        for message in messages {
+            for item in &message.items {
+                len += item.len() + usize::from(!first);
+                first = false;
+            }
+        }
+        len
     }
 }
+
+const COMMA: &[u8] = b",";
+const END: &[u8] = b"]}";
 
 #[derive(Serialize)]
 struct FunctionTool<'a> {
@@ -358,6 +388,107 @@ mod tests {
             "/tests/fixtures/openai_responses_request.json"
         ));
         assert_eq!(std::str::from_utf8(&body).unwrap(), golden.trim_end());
+    }
+
+    /// A history with every shape a session holds: text, a reply with thinking
+    /// and a tool call, that tool's result, and a text-only reply.
+    fn mixed_messages() -> Vec<MessageBody> {
+        let mut assistant = AssistantMessage::new(
+            PROVIDER,
+            "gpt-5",
+            vec![
+                Content::Thinking {
+                    thinking: "consider the file".into(),
+                    signature: Some("enc_1".into()),
+                },
+                Content::text("reading"),
+                Content::ToolCall(ToolCall {
+                    id: "call_02".into(),
+                    name: "read".into(),
+                    arguments: "{\"path\":\"b.rs\"}".into(),
+                }),
+            ],
+        );
+        assistant.stop_reason = Some(StopReason::ToolUse);
+        [
+            Message::user("hello"),
+            Message::assistant(assistant),
+            Message::tool_result("call_02", "fn b() {}", false),
+            Message::assistant(AssistantMessage::new(
+                PROVIDER,
+                "gpt-5",
+                vec![Content::text("here it is")],
+            )),
+        ]
+        .iter()
+        .map(|message| MessageBody::new(message, PROVIDER).unwrap())
+        .collect()
+    }
+
+    /// The pieces joined are the bytes the old single buffer wrote, and their
+    /// length is the length of that body.
+    #[test]
+    fn body_pieces_join_to_the_single_buffer_body() {
+        let builder = golden_builder();
+        let bodies = mixed_messages();
+        let parts = builder.body_parts(&bodies);
+        let joined = parts.join();
+        assert_eq!(
+            parts.len(),
+            joined.len(),
+            "the length of the body is the sum of its pieces"
+        );
+        assert_eq!(
+            joined,
+            builder.body(&bodies),
+            "the joined pieces are the body"
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&joined).is_ok(),
+            "the body of a mixed history is one JSON object"
+        );
+
+        let golden = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/openai_responses_request.json"
+        ));
+        let pieces = builder.body_parts(&golden_messages()).join();
+        assert_eq!(
+            std::str::from_utf8(&pieces).unwrap(),
+            golden.trim_end(),
+            "the pieces write the bytes the old buffer wrote"
+        );
+    }
+
+    /// Whether `piece` points into `item`, so the two hold one copy of the
+    /// bytes and no copy was made.
+    fn shares(piece: &Bytes, item: &Bytes) -> bool {
+        let start = item.as_ptr() as usize;
+        let at = piece.as_ptr() as usize;
+        at >= start && at + piece.len() <= start + item.len()
+    }
+
+    /// Every item of every cached message reaches the body as the piece that
+    /// points into it, so the body holds no second copy of any message.
+    #[test]
+    fn body_pieces_share_the_cached_message_bytes() {
+        let builder = golden_builder();
+        let bodies = mixed_messages();
+        let parts = builder.body_parts(&bodies);
+        for item in bodies.iter().flat_map(|body| &body.items) {
+            let pieces: Vec<&Bytes> = parts
+                .parts()
+                .iter()
+                .filter(|piece| shares(piece, item))
+                .collect();
+            assert_eq!(pieces.len(), 1, "one piece holds the item, no copy");
+            assert_eq!(
+                pieces[0].as_ptr(),
+                item.as_ptr(),
+                "the piece starts the item"
+            );
+            assert_eq!(pieces[0].len(), item.len(), "the piece is the whole item");
+        }
     }
 
     #[test]

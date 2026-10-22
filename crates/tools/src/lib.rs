@@ -12,6 +12,7 @@ pub mod edit;
 pub mod find;
 pub mod grep;
 pub mod read;
+pub mod spill;
 pub mod workspace;
 pub mod write;
 

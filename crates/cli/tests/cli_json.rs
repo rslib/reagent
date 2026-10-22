@@ -617,3 +617,30 @@ async fn cli_json_a_denied_call_names_the_rule() {
     );
     assert!(lines.iter().any(|line| line["type"] == "run_end"));
 }
+
+#[tokio::test]
+async fn scripted_deltas_stream_one_event_each() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let script = tmp.path().join("script.json");
+    tokio::fs::write(&script, r#"{"replies": [{"deltas": ["a", "b", "c"]}]}"#)
+        .await
+        .expect("write script");
+    let script_arg = format!("fake:{}", script.display());
+    let output = run(
+        tmp.path(),
+        &["--json", "--provider", &script_arg, "-p", "go"],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = json_lines(&output.stdout);
+    let deltas: Vec<&str> = lines
+        .iter()
+        .filter(|line| line["type"] == "text_delta")
+        .map(|line| line["text"].as_str().expect("a delta has text"))
+        .collect();
+    assert_eq!(deltas, ["a", "b", "c"]);
+}

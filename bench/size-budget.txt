@@ -1,0 +1,10 @@
+# The footprint budget of the `min` profile binary, one line per platform:
+# `<os>-<arch> <bytes>`, with os from `uname -s` lowercased (darwin, linux) and
+# arch from `uname -m` (arm64, x86_64). `bench/size.sh` fails a build over its
+# line and exits 2 on a platform with no line.
+#
+# Each budget is the measured size plus 5%, rounded up to a multiple of 4096.
+# darwin-arm64: measured 2977360 bytes on 2026-10-22, budget 3129344.
+darwin-arm64 3129344
+# linux-x86_64 measured 3712216 bytes on 2026-10-22 (dftu-gate, Debian 13), budget +5%
+linux-x86_64 3899392

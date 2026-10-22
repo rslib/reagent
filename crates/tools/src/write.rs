@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use tokio_util::sync::CancellationToken;
 
 use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
@@ -20,6 +21,28 @@ pub struct Args<'a> {
     /// The content to write.
     #[serde(borrow)]
     content: Cow<'a, str>,
+}
+
+/// The arguments an effect check reads: the path, and the content, which must
+/// be a string. The text itself is skipped, not decoded a second time.
+#[derive(Debug, Deserialize)]
+struct EffectArgs<'a> {
+    #[serde(borrow)]
+    path: Cow<'a, str>,
+    #[serde(borrow)]
+    content: &'a RawValue,
+}
+
+/// Whether the arguments are a JSON object, the only form `run` reads: serde's
+/// derived visitor would also take a bare array, in its struct-from-seq shape.
+fn is_object(args: &str) -> bool {
+    args.trim_start().starts_with('{')
+}
+
+/// Whether `raw` holds a JSON string, read from the value's own text so the
+/// string is never unescaped or copied.
+fn is_string(raw: &RawValue) -> bool {
+    raw.get().starts_with('"')
 }
 
 /// Writes a file, creating parent folders and replacing an existing file.
@@ -67,9 +90,19 @@ impl Tool for Write {
     }
 
     fn effects(&self, args: &str) -> Effects {
-        let Ok(arguments) = parse_args::<Args<'_>>(args) else {
+        // A JSON object is the only form `run` accepts: serde's derived visitor
+        // would also read a bare array, in its struct-from-seq shape.
+        if !is_object(args) {
+            return Effects::default();
+        }
+        let Ok(arguments) = parse_args::<EffectArgs<'_>>(args) else {
             return Effects::default();
         };
+        // The content has to be a string for `run` to take the call, but its
+        // text is skipped, never built.
+        if !is_string(arguments.content) {
+            return Effects::default();
+        }
         let Ok(path) = resolve(&self.working_dir, &arguments.path) else {
             return Effects::default();
         };
@@ -207,6 +240,18 @@ mod tests {
 
     #[test]
     fn write_bad_args_have_no_effects() {
-        assert_eq!(Write::new("/work").effects("{}"), Effects::default());
+        let write = Write::new("/work");
+        assert_eq!(write.effects("{}"), Effects::default());
+        // The content has to be a string and the call an object: `run` takes
+        // neither of these, so the effects report nothing.
+        assert_eq!(
+            write.effects(r#"{"path":"a.txt","content":[1]}"#),
+            Effects::default()
+        );
+        assert_eq!(
+            write.effects(r#"{"path":"a.txt","content":null}"#),
+            Effects::default()
+        );
+        assert_eq!(write.effects(r#"["a.txt","x"]"#), Effects::default());
     }
 }

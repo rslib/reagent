@@ -49,7 +49,11 @@ fn main() -> std::process::ExitCode {
         args::Outcome::Run(args) => *args,
     };
 
-    runtime().block_on(run::run(args))
+    let code = runtime().block_on(run::run(args));
+    // Every way out of a run comes back here, Ctrl-C and the deadline too, so
+    // the spill folder of this run goes at its end, once the runtime is gone.
+    reagent_tools::spill::cleanup();
+    code
 }
 
 fn runtime() -> tokio::runtime::Runtime {

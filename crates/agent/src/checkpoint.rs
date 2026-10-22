@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 
 use reagent_ai::{Content, Message, Text, ToolCall};
+use reagent_util::json;
 use reagent_util::text;
 
 use crate::archive::Archive;
@@ -216,9 +217,12 @@ fn note_file(files: &mut Vec<FileEntry>, changed: &mut Vec<String>, call: &ToolC
     changed.push(path);
 }
 
+/// The `path` argument of `call`, borrowed from the arguments when they hold
+/// no escapes. Every other argument is skipped without being built, so the body
+/// of a `write` is never copied. A repeated `path` key keeps the first value,
+/// where a `serde_json::Value` kept the last; tool arguments carry one.
 fn path_of(call: &ToolCall) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
-    value.get("path")?.as_str().map(str::to_string)
+    json::string_arg(&call.arguments, "path").map(std::borrow::Cow::into_owned)
 }
 
 /// The output's last lines, within the byte limit.

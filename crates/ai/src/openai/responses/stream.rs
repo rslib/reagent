@@ -55,8 +55,8 @@ impl StreamParser {
                 if let Some(item) = event.item
                     && item.kind == "function_call"
                 {
-                    let call_id: Text = item.call_id.unwrap_or_default().as_str().into();
-                    let name: Text = item.name.unwrap_or_default().as_str().into();
+                    let call_id: Text = item.call_id.unwrap_or_default().into_text();
+                    let name: Text = item.name.unwrap_or_default().into_text();
                     if let Some(id) = item.id.as_ref() {
                         self.remember(id.as_str(), &call_id);
                     }
@@ -70,9 +70,7 @@ impl StreamParser {
                     if item.kind == "function_call" {
                         let call_id = self
                             .call_id_for(item.id.as_ref().map(JsonStr::as_str))
-                            .unwrap_or_else(|| {
-                                Text::from(item.call_id.unwrap_or_default().as_str())
-                            });
+                            .unwrap_or_else(|| item.call_id.unwrap_or_default().into_text());
                         self.saw_tool_call = true;
                         out.push(StreamEvent::ToolCallEnd { id: call_id });
                     } else if item.kind == "reasoning"
@@ -90,14 +88,14 @@ impl StreamParser {
                 let Some(delta) = event.delta else {
                     return Err(self.missing("response.output_text.delta", "delta"));
                 };
-                out.push(StreamEvent::TextDelta(Text::from(delta.as_str())));
+                out.push(StreamEvent::TextDelta(delta.into_text()));
                 Ok(())
             }
             "response.reasoning_summary_text.delta" => {
                 let Some(delta) = event.delta else {
                     return Err(self.missing("response.reasoning_summary_text.delta", "delta"));
                 };
-                out.push(StreamEvent::ThinkingDelta(Text::from(delta.as_str())));
+                out.push(StreamEvent::ThinkingDelta(delta.into_text()));
                 Ok(())
             }
             "response.function_call_arguments.delta" => {
@@ -111,7 +109,7 @@ impl StreamParser {
                 let id = self.call_id_for(event.item_id).unwrap_or_default();
                 out.push(StreamEvent::ToolCallDelta {
                     id,
-                    partial_json: Text::from(delta.as_str()),
+                    partial_json: delta.into_text(),
                 });
                 Ok(())
             }
@@ -201,7 +199,8 @@ impl StreamParser {
             return Ok(None);
         }
         if !self.done {
-            return Err(Error::Protocol(
+            // A cut stream, not a bad one: the same request may finish on a retry.
+            return Err(Error::Transient(
                 "stream ended before response.completed".into(),
             ));
         }
@@ -522,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_response_completed_is_an_error() {
+    fn cut_stream_without_response_completed_is_transient() {
         let mut parser = StreamParser::new();
         let mut out = Vec::new();
         parser
@@ -533,7 +532,7 @@ mod tests {
             .unwrap();
         let error = parser.finish().unwrap_err();
         assert!(
-            matches!(error, Error::Protocol(message) if message.contains("response.completed"))
+            matches!(error, Error::Transient(message) if message.contains("response.completed"))
         );
     }
 

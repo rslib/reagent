@@ -9,10 +9,15 @@
 //! `edit`/`write` on the same path 5 times. Keys are short hashes, so the map
 //! stays small and each call is O(1).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
 
 use reagent_ai::Text;
+use serde::Deserialize;
+use serde::de::{Deserializer, Visitor};
 
 use super::{Decision, TurnPolicy, TurnView};
 
@@ -38,15 +43,15 @@ const EDIT_LIMIT: u32 = 5;
 /// already fired for it.
 #[derive(Debug, Default)]
 pub struct Stuck {
-    counters: HashMap<String, (u32, bool)>,
-    last_call: Option<String>,
+    counters: HashMap<u64, (u32, bool)>,
+    last_call: Option<u64>,
     streak: u32,
 }
 
 impl Stuck {
     /// Counts `key` and, when it crossed its `limit` for the first time,
     /// returns the count that crossed it.
-    fn count(&mut self, key: String, limit: u32) -> Option<u32> {
+    fn count(&mut self, key: u64, limit: u32) -> Option<u32> {
         let entry = self.counters.entry(key).or_insert((0, false));
         if entry.1 {
             return None;
@@ -62,8 +67,8 @@ impl Stuck {
 
     /// Counts `key` as the next call and returns the streak length when it
     /// reaches the limit. A different call starts a new streak.
-    fn count_call(&mut self, key: String) -> Option<u32> {
-        if self.last_call.as_ref() == Some(&key) {
+    fn count_call(&mut self, key: u64) -> Option<u32> {
+        if self.last_call == Some(key) {
             self.streak += 1;
         } else {
             self.last_call = Some(key);
@@ -138,18 +143,73 @@ fn join_notes(notes: Vec<Text>) -> String {
 }
 
 /// A short, stable-in-run key for one repeated thing and its trigger kind.
-fn key(kind: &str, parts: &[&str]) -> String {
+///
+/// The kind is hashed with the parts, so a call, an error and a file rewrite
+/// with the same text keep separate counters.
+fn key(kind: &str, parts: &[&str]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut hasher);
     for part in parts {
         part.hash(&mut hasher);
     }
-    format!("{kind}:{:x}", hasher.finish())
+    hasher.finish()
 }
 
 /// The `path` argument of an `edit`/`write` call, if it parses.
-fn path_of(args: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(args).ok()?;
-    value.get("path")?.as_str().map(ToOwned::to_owned)
+///
+/// Only the path is read, and serde skips every other field, so the body of a
+/// `write` is scanned but never copied. The path borrows out of `args` unless
+/// the JSON string holds escapes, which must be unescaped into a new string.
+fn path_of(args: &str) -> Option<Cow<'_, str>> {
+    // Arguments that are not an object have no `path` field. The derived
+    // struct visit would otherwise also accept a JSON array.
+    if !args.trim_start().starts_with('{') {
+        return None;
+    }
+
+    #[derive(Deserialize)]
+    struct Call<'a> {
+        #[serde(borrow)]
+        path: Option<PathArg<'a>>,
+    }
+
+    serde_json::from_str::<Call<'_>>(args)
+        .ok()?
+        .path
+        .map(|path| path.0)
+}
+
+/// A JSON string that borrows from the input when it holds no escapes.
+///
+/// serde's own `Cow` impl always owns its string, so a `#[serde(borrow)]`
+/// `Option<Cow<str>>` field would still copy the path.
+struct PathArg<'a>(Cow<'a, str>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for PathArg<'a> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BorrowOrOwn<'a>(PhantomData<&'a ()>);
+
+        impl<'de: 'a, 'a> Visitor<'de> for BorrowOrOwn<'a> {
+            type Value = PathArg<'a>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+                Ok(PathArg(Cow::Borrowed(value)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(PathArg(Cow::Owned(value.to_owned())))
+            }
+        }
+
+        deserializer.deserialize_str(BorrowOrOwn(PhantomData))
+    }
 }
 
 #[cfg(test)]
@@ -427,5 +487,33 @@ mod tests {
         // Neither fires a second time.
         assert_eq!(turn_with(&mut policy, &a), Decision::Continue);
         assert_eq!(turn_with(&mut policy, &b), Decision::Continue);
+    }
+
+    #[test]
+    fn perf_stuck_path_of_borrows_the_path_out_of_the_arguments() {
+        let body = "x".repeat(1_000_000);
+        let args = format!(r#"{{"path":"src/a.rs","content":"{body}"}}"#);
+        let path = path_of(&args).expect("path");
+        assert!(
+            matches!(path, Cow::Borrowed(_)),
+            "the path points into the arguments, so the body was not copied"
+        );
+        assert_eq!(&*path, "src/a.rs");
+        // An escaped path is unescaped into a string of its own, as before.
+        let escaped = path_of(r#"{"path":"a\u0041b\\c"}"#).expect("escaped path");
+        assert_eq!(&*escaped, "aAb\\c");
+        assert!(matches!(escaped, Cow::Owned(_)));
+        // A missing or unusable path is no path, as before.
+        assert_eq!(path_of(r#"{"content":"x"}"#), None);
+        assert_eq!(path_of(r#"{"path":7}"#), None);
+        assert_eq!(path_of(r#"["a"]"#), None);
+        assert_eq!(path_of(r#"{"path":"a.rs"} {:not json"#), None);
+        assert_eq!(path_of("not json"), None);
+        // Leading whitespace is fine, as it was for a whole-value parse.
+        assert_eq!(
+            path_of(" {\"path\":\"a.rs\"}").as_deref(),
+            Some("a.rs"),
+            "leading whitespace"
+        );
     }
 }

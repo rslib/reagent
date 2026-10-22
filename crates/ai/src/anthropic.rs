@@ -13,6 +13,7 @@ use self::request::{BodyCache, RequestBuilder};
 use self::stream::StreamParser;
 use crate::http::ExtraHeaders;
 use crate::key::Credential;
+use crate::openai::BodyParts;
 use crate::{Error, Provider, Request, StreamEvent, Text, ToolSpec};
 
 /// The provider name recorded on assistant messages and used to keep thinking.
@@ -69,7 +70,7 @@ impl Anthropic {
         self
     }
 
-    pub(crate) fn request_body(&self, request: &Request<'_>) -> Result<Bytes, Error> {
+    pub(crate) fn request_parts(&self, request: &Request<'_>) -> Result<BodyParts, Error> {
         let reasoning = crate::cross_provider::anthropic_reasoning(request);
         let mut head = self.head.lock().expect("head cache lock");
         let reuse = head.as_ref().is_some_and(|cached| {
@@ -99,7 +100,14 @@ impl Anthropic {
 
         let mut bodies = self.bodies.lock().expect("body cache lock");
         bodies.align(request.messages, self.name())?;
-        Ok(builder.body(bodies.bodies()))
+        Ok(builder.body_parts(bodies.bodies()))
+    }
+
+    /// The request body as one buffer, for the tests and the cross-provider
+    /// comparisons that need the bytes in one place.
+    #[cfg(test)]
+    pub(crate) fn request_body(&self, request: &Request<'_>) -> Result<Bytes, Error> {
+        self.request_parts(request).map(|parts| parts.join())
     }
 }
 
@@ -109,10 +117,11 @@ impl Provider for Anthropic {
     }
 
     fn stream(&self, request: &Request<'_>) -> BoxStream<'static, Result<StreamEvent, Error>> {
-        let body = match self.request_body(request) {
+        let body = match self.request_parts(request) {
             Ok(body) => body,
             Err(error) => return Box::pin(futures_util::stream::iter([Err(error)])),
         };
+        let length = body.len();
         let url = format!("{}/v1/messages", self.base_url);
         let client = self.client.clone();
         let headers = self.headers.clone();
@@ -130,7 +139,10 @@ impl Provider for Anthropic {
                 .header("content-type", "application/json");
             let response = headers
                 .apply(request)
-                .body(body)
+                // The body is streamed in pieces, so its length is stated here
+                // and the request is not chunked.
+                .header(reqwest::header::CONTENT_LENGTH, length)
+                .body(body.into_body())
                 .send()
                 .await
                 .map_err(|error| Error::Http(error.to_string()))?;
@@ -168,6 +180,7 @@ mod tests {
     use futures_util::{FutureExt, StreamExt};
 
     use super::*;
+    use crate::types::Message;
 
     #[test]
     fn a_transport_error_is_the_only_error() {
@@ -225,5 +238,42 @@ mod tests {
         assert_eq!(recorded.header("x-extra"), Some("yes"));
         assert_eq!(recorded.header("x-api-key"), Some("test-key"));
         assert_eq!(recorded.header("content-type"), Some("application/json"));
+    }
+
+    /// The body leaves in pieces, so its length is the `content-length` header
+    /// and the request is not chunked.
+    #[tokio::test]
+    async fn body_pieces_send_the_same_bytes_with_their_length() {
+        let (base, recorded) = crate::http::test_server::serve(EXTRA_REPLY).await;
+        let provider = Anthropic::new("test-key", base);
+        let history = vec![
+            Message::user("hello"),
+            Message::tool_result("toolu_01", "fn main() {}", false),
+        ];
+        let request = crate::Request {
+            model: "test-model",
+            max_tokens: 16,
+            system: None,
+            tools: &[],
+            messages: &history,
+            reasoning: None,
+            cache_key: None,
+        };
+        let body = provider.request_body(&request).expect("the body builds");
+        let events: Vec<_> = provider.stream(&request).collect().await;
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let recorded = recorded.await.expect("the server recorded the request");
+        let length: usize = recorded
+            .header("content-length")
+            .expect("a content length")
+            .parse()
+            .expect("a number");
+        assert_eq!(length, body.len(), "the length of the body that is sent");
+        assert_eq!(recorded.body, body.as_ref(), "the bytes the server read");
+        assert_eq!(
+            recorded.header("transfer-encoding"),
+            None,
+            "a body with a known length is not chunked"
+        );
     }
 }

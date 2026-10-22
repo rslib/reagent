@@ -14,17 +14,24 @@ use reagent_ai::Message;
 /// The session assigns every [`Entry`] an id and links it to the previous one
 /// through `parent_id`. The root entry has no parent. Every append goes to the
 /// end of the file, so the lines are a write-ahead log of the conversation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+///
+/// The id text and the message are borrowed, so writing an entry copies
+/// neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Entry {
+pub struct Entry<'a> {
     /// This entry's id in the session tree.
-    pub id: String,
+    pub id: &'a str,
     /// The id of the entry that precedes this one, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_id: Option<String>,
+    pub parent_id: Option<&'a str>,
     /// The message this entry records.
-    pub message: Message,
+    pub message: &'a Message,
 }
+
+/// The largest line buffer a session keeps for reuse. A message with a huge
+/// tool result would otherwise leave its JSON encoding resident for the run.
+const LINE_KEEP_BYTES: usize = 64 * 1024;
 
 /// Appends one [`Entry`] per message to a JSONL file.
 ///
@@ -36,7 +43,12 @@ pub struct Session {
     writer: BufWriter<File>,
     prefix: String,
     counter: u64,
+    /// The id of the entry written last: the parent of the next one.
     last_id: Option<String>,
+    /// The id text of the entry being written, reused across appends.
+    id: String,
+    /// The serialized line of the entry being written, reused across appends.
+    line: Vec<u8>,
 }
 
 impl Session {
@@ -52,6 +64,8 @@ impl Session {
             prefix: nanos_hex(),
             counter: 0,
             last_id: None,
+            id: String::new(),
+            line: Vec::new(),
         })
     }
 
@@ -59,18 +73,36 @@ impl Session {
     ///
     /// The id comes from a per-file prefix plus a counter; the entry's parent
     /// is the previous entry. The message text itself is not copied.
+    ///
+    /// The entry is serialized from borrowed fields into a buffer the session
+    /// owns, so an append costs one allocation: the id handed back to the
+    /// caller.
     pub async fn append(&mut self, message: &Message) -> io::Result<String> {
-        let id = self.next_id();
+        let mut id = std::mem::take(&mut self.id);
+        id.clear();
+        id.push_str(&self.prefix);
+        push_hex(&mut id, self.counter);
+        self.counter += 1;
+
         let entry = Entry {
-            id: id.clone(),
-            parent_id: self.last_id.clone(),
-            message: message.clone(),
+            id: &id,
+            parent_id: self.last_id.as_deref(),
+            message,
         };
-        self.last_id = Some(id.clone());
-        let mut line = serde_json::to_string(&entry).map_err(io::Error::other)?;
-        line.push('\n');
-        self.writer.write_all(line.as_bytes()).await?;
-        Ok(id)
+        self.line.clear();
+        serde_json::to_writer(&mut self.line, &entry).map_err(io::Error::other)?;
+        self.line.push(b'\n');
+
+        let appended = id.clone();
+        // The id becomes the parent before the write, as it always did, so a
+        // failed write leaves the same chain. The previous id text becomes the
+        // buffer the next id is built in.
+        self.id = self.last_id.replace(id).unwrap_or_default();
+        self.writer.write_all(&self.line).await?;
+        if self.line.capacity() > LINE_KEEP_BYTES {
+            self.line = Vec::new();
+        }
+        Ok(appended)
     }
 
     /// Writes the buffered entries to the file. Call after each turn.
@@ -82,11 +114,21 @@ impl Session {
     pub async fn close(mut self) -> io::Result<()> {
         self.flush().await
     }
+}
 
-    fn next_id(&mut self) -> String {
-        let id = format!("{}{:04x}", self.prefix, self.counter);
-        self.counter += 1;
-        id
+/// Writes `value` as lowercase hex with at least four digits, the same text as
+/// `format!("{value:04x}")`, without building a `String` of its own.
+fn push_hex(out: &mut String, value: u64) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut width = 1;
+    while width < 16 && value >> (width * 4) != 0 {
+        width += 1;
+    }
+    for _ in width..4 {
+        out.push('0');
+    }
+    for place in (0..width).rev() {
+        out.push(DIGITS[(value >> (place * 4)) as usize & 0xf] as char);
     }
 }
 
@@ -178,5 +220,47 @@ mod tests {
         assert_eq!(text.lines().count(), 2);
         assert!(text.contains(r#""text":"message 1""#));
         assert!(text.contains(r#""text":"message 2""#));
+    }
+
+    #[test]
+    fn perf_session_a_large_message_does_not_keep_its_line_buffer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        let big = Message::user(Arc::from("x".repeat(200_000)));
+        runtime.block_on(async {
+            let mut session = Session::open(&path).await.expect("open");
+            session.append(&big).await.expect("append big");
+            assert!(
+                session.line.capacity() <= LINE_KEEP_BYTES,
+                "{} bytes of line buffer kept",
+                session.line.capacity()
+            );
+            session.close().await.expect("close");
+        });
+    }
+
+    #[test]
+    fn perf_session_the_id_counter_formats_like_format_04x() {
+        for value in [
+            0,
+            1,
+            0xa,
+            0xf,
+            0x10,
+            0xfff,
+            0x1000,
+            0xffff,
+            0x10000,
+            0xfffff,
+            0x1234_5678_9abc_def0,
+            u64::MAX,
+        ] {
+            let mut text = String::from("ab");
+            push_hex(&mut text, value);
+            assert_eq!(text, format!("ab{value:04x}"), "value {value}");
+        }
     }
 }

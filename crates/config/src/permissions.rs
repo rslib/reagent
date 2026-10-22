@@ -198,10 +198,21 @@ impl Rules {
                 reason: Reason::Default,
             };
         }
+        // No rule names this tool and no Read or Edit rule could see the call:
+        // the default decides, and parsing the command would only cost time.
+        if !self.touches(call.tool) {
+            return Decision {
+                kind: self.default,
+                reason: Reason::Default,
+            };
+        }
         let command = (call.main_arg == Some("command"))
             .then_some(call.value)
             .flatten()
             .map(shell::parse);
+        // The words of each command part joined and the raw text tokenised are
+        // the same for every rule, so they are built once here.
+        let globs = self.has_glob();
         let mut view = View {
             call,
             command: command.as_ref(),
@@ -209,15 +220,18 @@ impl Rules {
             reads: call
                 .reads
                 .iter()
-                .map(|p| self.absolute(&self.cwd, p))
+                .map(|p| ViewPath::new(self.absolute(&self.cwd, p)))
                 .collect(),
             writes: call
                 .writes
                 .iter()
-                .map(|p| self.absolute(&self.cwd, p))
+                .map(|p| ViewPath::new(self.absolute(&self.cwd, p)))
                 .collect(),
             words: Vec::new(),
             unknown_target: false,
+            parts: Vec::new(),
+            raw: None,
+            main_path: None,
         };
         if let Some(command) = &command {
             // Scripts handed to another program (`sudo sh -c '...'`,
@@ -228,8 +242,24 @@ impl Rules {
                 self.resolve(&inner, &mut view);
                 view.nested.push(inner);
             }
+            if globs {
+                let mut parts = Vec::with_capacity(command.parts.len());
+                parts.extend(command.parts.iter().map(PartText::new));
+                for inner in &view.nested {
+                    parts.extend(inner.parts.iter().map(PartText::new));
+                }
+                view.parts = parts;
+            }
+            if command.complex {
+                view.raw = call.value.map(RawText::new);
+            }
         }
-
+        if globs
+            && call.main_arg == Some("path")
+            && let Some(value) = call.value
+        {
+            view.main_path = Some(ViewPath::new(self.absolute(&self.cwd, Path::new(value))));
+        }
         for kind in [Kind::Deny, Kind::Ask] {
             if let Some(rule) = self
                 .rules
@@ -247,6 +277,22 @@ impl Rules {
             kind: self.default,
             reason: Reason::Default,
         }
+    }
+
+    /// Whether a rule could decide a call of this tool: it names the tool, or
+    /// it sees the paths a call reads or writes.
+    fn touches(&self, tool: &str) -> bool {
+        self.rules.iter().any(|rule| {
+            matches!(rule.tool, Tool::ReadEffect | Tool::EditEffect) || rule.tool.covers(tool)
+        })
+    }
+
+    /// Whether a rule has a glob pattern, the only pattern that reads the
+    /// joined words of a command part and the `path` value as a path.
+    fn has_glob(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| matches!(rule.pattern, Some(Pattern::Glob(_))))
     }
 
     /// Whether any rule needs the paths a call reads or writes.
@@ -289,8 +335,8 @@ impl Rules {
             for (list, is_write) in [(&part.reads, false), (&part.writes, true)] {
                 for target in list {
                     match dir.as_ref().and_then(|at| self.target(at, target)) {
-                        Some(path) if is_write => view.writes.push(path),
-                        Some(path) => view.reads.push(path),
+                        Some(path) if is_write => view.writes.push(ViewPath::new(path)),
+                        Some(path) => view.reads.push(ViewPath::new(path)),
                         None => view.unknown_target = true,
                     }
                 }
@@ -298,7 +344,7 @@ impl Rules {
             if want_words && let Some(at) = &dir {
                 for word in part.words.iter().skip(1).filter(|w| !w.starts_with('-')) {
                     if let Some(path) = self.target(at, word) {
-                        view.words.push(path);
+                        view.words.push(ViewPath::new(path));
                     }
                 }
             }
@@ -348,19 +394,22 @@ impl Rules {
                     return true;
                 };
                 match (view.command, view.call.value) {
-                    (Some(command), raw) => {
+                    (Some(command), _) => {
                         command.unknown_program
                             || (command.parts.is_empty() && pattern.is_star())
                             || std::iter::once(command)
                                 .chain(&view.nested)
                                 .flat_map(|c| &c.parts)
-                                .any(|part| pattern.matches_part_loosely(part))
-                            || (command.complex
-                                && raw.is_some_and(|raw| pattern.found_in_text(raw)))
+                                .enumerate()
+                                .any(|(at, part)| {
+                                    pattern.matches_part_loosely(part, view.parts.get(at))
+                                })
+                            || view
+                                .raw
+                                .as_ref()
+                                .is_some_and(|raw| pattern.found_in_text(raw))
                     }
-                    (None, Some(value)) => {
-                        self.matches_value(pattern, rule.path.as_ref(), view.call.main_arg, value)
-                    }
+                    (None, Some(_)) => self.matches_value(pattern, rule.path.as_ref(), view),
                     (None, None) => false,
                 }
             }
@@ -395,11 +444,11 @@ impl Rules {
                 return None;
             }
             let mut first = None;
-            for part in &command.parts {
+            for (at, part) in command.parts.iter().enumerate() {
                 let rule = by_arg().find(|rule| {
-                    rule.pattern
-                        .as_ref()
-                        .is_some_and(|pattern| pattern.matches_part_strictly(part))
+                    rule.pattern.as_ref().is_some_and(|pattern| {
+                        pattern.matches_part_strictly(part, view.parts.get(at))
+                    })
                 })?;
                 first.get_or_insert(rule);
             }
@@ -409,11 +458,11 @@ impl Rules {
             }
             return first;
         }
-        if let Some(value) = view.call.value
+        if view.call.value.is_some()
             && let Some(rule) = by_arg().find(|rule| {
-                rule.pattern.as_ref().is_some_and(|pattern| {
-                    self.matches_value(pattern, rule.path.as_ref(), view.call.main_arg, value)
-                })
+                rule.pattern
+                    .as_ref()
+                    .is_some_and(|pattern| self.matches_value(pattern, rule.path.as_ref(), view))
             })
         {
             return Some(rule);
@@ -437,7 +486,7 @@ impl Rules {
         None
     }
 
-    fn all_paths_allowed(&self, paths: &[PathBuf], effect: Tool) -> bool {
+    fn all_paths_allowed(&self, paths: &[ViewPath], effect: Tool) -> bool {
         paths.iter().all(|path| {
             self.rules.iter().any(|rule| {
                 rule.kind == Kind::Allow && rule.tool == effect && self.path_matches(rule, path)
@@ -445,26 +494,26 @@ impl Rules {
         })
     }
 
-    fn any_path(&self, rule: &Rule, paths: &[PathBuf]) -> bool {
+    fn any_path(&self, rule: &Rule, paths: &[ViewPath]) -> bool {
         paths.iter().any(|path| self.path_matches(rule, path))
     }
 
     /// A bare effect rule covers every path; a pattern is a gitignore-style
     /// glob that also covers everything below a match.
-    fn path_matches(&self, rule: &Rule, path: &Path) -> bool {
+    fn path_matches(&self, rule: &Rule, path: &ViewPath) -> bool {
         match (&rule.pattern, &rule.path) {
             (None, _) => true,
-            (Some(Pattern::Glob(_)), Some(glob)) => glob.matches(path),
+            (Some(Pattern::Glob(_)), Some(glob)) => glob.matches(path.bytes()),
             _ => false,
         }
     }
 
     /// Whether the rule's pattern names a place below `folder`, so a search
     /// of the folder would read it.
-    fn rule_below(&self, rule: &Rule, folder: &Path) -> bool {
+    fn rule_below(&self, rule: &Rule, folder: &ViewPath) -> bool {
         match (&rule.pattern, &rule.path) {
             (None, _) => true,
-            (Some(Pattern::Glob(_)), Some(glob)) => glob.below(folder),
+            (Some(Pattern::Glob(_)), Some(glob)) => glob.below(folder.bytes()),
             _ => false,
         }
     }
@@ -473,14 +522,16 @@ impl Rules {
         &self,
         pattern: &Pattern,
         rule_path: Option<&PathGlob>,
-        main_arg: Option<&str>,
-        value: &str,
+        view: &View<'_>,
     ) -> bool {
+        let Some(value) = view.call.value else {
+            return false;
+        };
         match pattern {
-            Pattern::Glob(_) if main_arg == Some("path") => {
-                let path = self.absolute(&self.cwd, Path::new(value));
-                rule_path.is_some_and(|glob| glob.matches(&path))
-            }
+            Pattern::Glob(_) if view.call.main_arg == Some("path") => view
+                .main_path
+                .as_ref()
+                .is_some_and(|path| rule_path.is_some_and(|glob| glob.matches(path.bytes()))),
             Pattern::Glob(glob) => glob_any(glob.as_bytes(), value.as_bytes()),
             Pattern::Prefix(words) => {
                 let mut given = value.split_whitespace();
@@ -494,12 +545,103 @@ struct View<'a> {
     call: &'a Call<'a>,
     command: Option<&'a shell::Command<'a>>,
     nested: Vec<shell::Command<'static>>,
-    reads: Vec<PathBuf>,
-    writes: Vec<PathBuf>,
+    reads: Vec<ViewPath>,
+    writes: Vec<ViewPath>,
     /// Path-like words of command parts, for loose Read and Edit rules.
-    words: Vec<PathBuf>,
+    words: Vec<ViewPath>,
     /// A redirect target or a `cd` that could not be resolved.
     unknown_target: bool,
+    /// The joined words of every command part, the command's first and then
+    /// those of the nested commands, in the order the parts are walked. Empty
+    /// when no rule has a glob pattern, the only pattern that reads them.
+    parts: Vec<PartText>,
+    /// The raw command with quotes and backslashes dropped and its tokens,
+    /// for a command that did not parse cleanly.
+    raw: Option<RawText>,
+    /// The `path` value as a path from the working folder.
+    main_path: Option<ViewPath>,
+}
+
+/// One command part's words joined by one space, and the byte offset where
+/// each of them starts, so no rule has to join them again.
+struct PartText {
+    joined: String,
+    starts: Vec<usize>,
+}
+
+impl PartText {
+    fn new(part: &shell::Part<'_>) -> Self {
+        let joined = join(&part.words);
+        let mut starts = vec![0];
+        starts.extend(joined.match_indices(' ').map(|(at, _)| at + 1));
+        Self { joined, starts }
+    }
+}
+
+/// A command line that did not parse cleanly, as the loose matcher reads it:
+/// its text without quotes and backslashes, and the byte range of each token,
+/// built once for every rule.
+struct RawText {
+    plain: String,
+    tokens: Vec<(usize, usize)>,
+}
+
+impl RawText {
+    fn new(raw: &str) -> Self {
+        let plain: String = raw
+            .chars()
+            .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+            .collect();
+        let mut tokens = Vec::new();
+        let mut start = None;
+        for (at, c) in plain.char_indices() {
+            if c.is_whitespace() || "`$();&|<>{}".contains(c) {
+                if let Some(from) = start.take() {
+                    tokens.push((from, at));
+                }
+            } else if start.is_none() {
+                start = Some(at);
+            }
+        }
+        if let Some(from) = start {
+            tokens.push((from, plain.len()));
+        }
+        Self { plain, tokens }
+    }
+
+    /// The token at `at`.
+    fn token(&self, at: usize) -> &str {
+        let (from, to) = self.tokens[at];
+        &self.plain[from..to]
+    }
+}
+
+/// A path as the rules see it: absolute, and folded to lower case on macOS,
+/// where the file system ignores case and the globs are lowered too.
+struct ViewPath {
+    path: PathBuf,
+    /// The path bytes in lower case, empty where case matters.
+    folded: Vec<u8>,
+}
+
+impl ViewPath {
+    fn new(path: PathBuf) -> Self {
+        let folded = if cfg!(target_os = "macos") {
+            path.as_os_str().as_encoded_bytes().to_ascii_lowercase()
+        } else {
+            Vec::new()
+        };
+        Self { path, folded }
+    }
+
+    /// The bytes a path glob matches against.
+    fn bytes(&self) -> &[u8] {
+        if cfg!(target_os = "macos") {
+            &self.folded
+        } else {
+            self.path.as_os_str().as_encoded_bytes()
+        }
+    }
 }
 
 /// The commands inside words that hold a command line, `depth` levels deep.
@@ -584,7 +726,7 @@ impl Pattern {
 
     /// The allow match: the part's words start with the rule's words, the
     /// program exactly as written in the rule.
-    fn matches_part_strictly(&self, part: &shell::Part<'_>) -> bool {
+    fn matches_part_strictly(&self, part: &shell::Part<'_>, text: Option<&PartText>) -> bool {
         match self {
             Pattern::Prefix(want) => {
                 part.words.len() >= want.len()
@@ -594,15 +736,22 @@ impl Pattern {
                         .all(|(want, have)| have.as_ref() == want)
             }
             Pattern::Glob(glob) => {
-                let joined = join(&part.words);
-                glob_words(glob, &joined)
+                let built;
+                let text = match text {
+                    Some(text) => text,
+                    None => {
+                        built = PartText::new(part);
+                        &built
+                    }
+                };
+                glob_words(glob, &text.joined)
             }
         }
     }
 
     /// The deny and ask match: from any word on, the program by its name in
     /// any path, options skipped between the rule's words.
-    fn matches_part_loosely(&self, part: &shell::Part<'_>) -> bool {
+    fn matches_part_loosely(&self, part: &shell::Part<'_>, text: Option<&PartText>) -> bool {
         match self {
             Pattern::Prefix(want) => (0..part.words.len()).any(|start| {
                 let mut have = part.words[start..].iter();
@@ -634,54 +783,83 @@ impl Pattern {
                 })
             }),
             Pattern::Glob(glob) => {
-                let joined = join(&part.words);
-                let mut starts = vec![0];
-                starts.extend(joined.match_indices(' ').map(|(at, _)| at + 1));
-                starts.iter().any(|&at| {
-                    let text = &joined[at..];
-                    let program_end = text.find(' ').unwrap_or(text.len());
-                    let program = &text[..program_end];
+                let built;
+                let text = match text {
+                    Some(text) => text,
+                    None => {
+                        built = PartText::new(part);
+                        &built
+                    }
+                };
+                let joined = &text.joined;
+                text.starts.iter().any(|&at| {
+                    let rest = &joined[at..];
+                    let program_end = rest.find(' ').unwrap_or(rest.len());
+                    let program = &rest[..program_end];
                     let short = shell::program_name(program);
-                    glob_words(glob, text)
+                    glob_words(glob, rest)
                         || (short.len() != program.len()
-                            && glob_words(glob, &format!("{short}{}", &text[program_end..])))
+                            && glob_words(glob, &format!("{short}{}", &rest[program_end..])))
                 })
             }
         }
     }
 
-    /// Whether the rule's words occur in a row in raw text, for a command
-    /// that did not parse cleanly. Quotes and backslashes are removed first,
-    /// so `g'i't push` is `git push`.
-    fn found_in_text(&self, raw: &str) -> bool {
-        let words: Vec<&str> = match self {
-            Pattern::Prefix(words) => words.iter().map(String::as_str).collect(),
-            Pattern::Glob(glob) => glob
-                .split_whitespace()
-                .take_while(|word| !word.contains(['*', '?', '[']))
-                .collect(),
+    /// Whether the rule's words occur in a row in a raw command line, for a
+    /// command that did not parse cleanly. Quotes and backslashes are removed
+    /// first, so `g'i't push` is `git push`.
+    fn found_in_text(&self, raw: &RawText) -> bool {
+        let words = match self {
+            Pattern::Prefix(words) => Words::Prefix(words),
+            Pattern::Glob(glob) => Words::Glob(glob),
         };
-        if words.is_empty() {
+        let count = words.count();
+        if count == 0 || raw.tokens.len() < count {
             return false;
         }
-        let plain: String = raw
-            .chars()
-            .filter(|c| !matches!(c, '\'' | '"' | '\\'))
-            .collect();
-        let tokens: Vec<&str> = plain
-            .split(|c: char| c.is_whitespace() || "`$();&|<>{}".contains(c))
-            .filter(|token| !token.is_empty())
-            .collect();
-        tokens.windows(words.len()).any(|window| {
-            window
-                .iter()
-                .zip(&words)
-                .enumerate()
-                .all(|(at, (have, want))| {
+        (0..=raw.tokens.len() - count).any(|start| {
+            (0..count).all(|at| match words.get(at) {
+                Some(want) => {
+                    let have = raw.token(start + at);
                     same_program(have, want)
                         || (at == 0 && same_program(shell::program_name(have), want))
-                })
+                }
+                None => false,
+            })
         })
+    }
+}
+
+/// The words a rule looks for in a raw command line, read without building a
+/// list of them for every rule.
+enum Words<'a> {
+    /// A `words:*` rule: its words.
+    Prefix(&'a [String]),
+    /// A glob rule: its words up to the first wildcard.
+    Glob(&'a str),
+}
+
+impl Words<'_> {
+    /// The `at`th word, if the rule has that many.
+    fn get(&self, at: usize) -> Option<&str> {
+        match self {
+            Words::Prefix(words) => words.get(at).map(String::as_str),
+            Words::Glob(glob) => glob
+                .split_whitespace()
+                .take_while(|word| !word.contains(['*', '?', '[']))
+                .nth(at),
+        }
+    }
+
+    /// How many words the rule looks for.
+    fn count(&self) -> usize {
+        match self {
+            Words::Prefix(words) => words.len(),
+            Words::Glob(glob) => glob
+                .split_whitespace()
+                .take_while(|word| !word.contains(['*', '?', '[']))
+                .count(),
+        }
     }
 }
 
@@ -740,15 +918,10 @@ impl PathGlob {
         }
     }
 
-    /// Whether `path` or any folder above it matches; a name pattern
-    /// matches any part of the path.
-    fn matches(&self, path: &Path) -> bool {
-        let lowered;
-        let mut bytes = path.as_os_str().as_encoded_bytes();
-        if cfg!(target_os = "macos") {
-            lowered = bytes.to_ascii_lowercase();
-            bytes = &lowered;
-        }
+    /// Whether `bytes` or any folder above it matches; a name pattern matches
+    /// any part of the path. The bytes are folded to lower case on macOS,
+    /// where the glob is lowered too.
+    fn matches(&self, bytes: &[u8]) -> bool {
         if self.name_only {
             return bytes
                 .split(|b| *b == b'/')
@@ -769,15 +942,9 @@ impl PathGlob {
     /// Whether a match could lie below `folder`: the pattern's literal head
     /// starts inside it. A name pattern could match anywhere, but blocking
     /// every search for it would make search useless, so it does not count.
-    fn below(&self, folder: &Path) -> bool {
+    fn below(&self, folder: &[u8]) -> bool {
         if self.name_only {
             return false;
-        }
-        let lowered;
-        let mut folder = folder.as_os_str().as_encoded_bytes();
-        if cfg!(target_os = "macos") {
-            lowered = folder.to_ascii_lowercase();
-            folder = &lowered;
         }
         let head_len = self
             .glob

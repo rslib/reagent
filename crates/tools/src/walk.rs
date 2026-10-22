@@ -4,8 +4,9 @@
 //! system the round trips of many directories overlap. Listing needs no
 //! `stat`: the file type comes with the directory entry.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -58,10 +59,23 @@ pub(crate) const MAX_FILES: usize = 200_000;
 /// One file the walk found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct File {
-    /// The path relative to the walk root, with `/` between parts.
+    /// The path relative to the walk root, with `/` between parts. The reader
+    /// joins it to the root only where it opens the file.
     pub rel: String,
-    /// The path to open.
-    pub path: PathBuf,
+    /// The same path with the bytes the file system gave, kept only for a name
+    /// that is not UTF-8: `rel` loses those bytes, so it cannot name the file.
+    pub raw: Option<OsString>,
+}
+
+impl File {
+    /// The path to open: `base` joined to the real name when `rel` lost bytes
+    /// to the lossy decode, else to `rel`.
+    pub(crate) fn path(&self, base: &Path) -> PathBuf {
+        match &self.raw {
+            Some(raw) => base.join(raw),
+            None => base.join(&self.rel),
+        }
+    }
 }
 
 /// The files of a walk, sorted by relative path.
@@ -197,6 +211,9 @@ fn read_dir(dir: Dir) -> DirOutput {
         return output;
     };
     let mut rel = Vec::new();
+    // The path of an ignore file above the walk root, joined to each entry.
+    // Allocated on first use and reused for the whole directory.
+    let mut above = Vec::new();
     for entry in entries.flatten() {
         // The type comes from the directory entry; std calls lstat only
         // when the file system does not report it.
@@ -213,13 +230,13 @@ fn read_dir(dir: Dir) -> DirOutput {
             rel.push(b'/');
         }
         rel.extend_from_slice(name.as_encoded_bytes());
-        let ignored = |is_dir| {
+        let ignored = |is_dir, above: &mut Vec<u8>| {
             ignores
                 .as_deref()
-                .is_some_and(|chain| chain.is_ignored(&rel, is_dir))
+                .is_some_and(|chain| chain.is_ignored(&rel, is_dir, above))
         };
         if kind.is_dir() {
-            if !dir.skip.is_skipped(&name) && !ignored(true) {
+            if !dir.skip.is_skipped(&name) && !ignored(true, &mut above) {
                 output.dirs.push(Dir {
                     skip: dir.skip.clone(),
                     path: entry.path(),
@@ -227,14 +244,34 @@ fn read_dir(dir: Dir) -> DirOutput {
                     ignores: ignores.clone(),
                 });
             }
-        } else if kind.is_file() && !ignored(false) {
-            output.files.push(File {
-                rel: String::from_utf8_lossy(&rel).into_owned(),
-                path: entry.path(),
+        } else if kind.is_file() && !ignored(false, &mut above) {
+            output.files.push(match String::from_utf8_lossy(&rel) {
+                Cow::Borrowed(text) => File {
+                    rel: text.to_owned(),
+                    raw: None,
+                },
+                // A name that is not UTF-8: keep the bytes to open it.
+                Cow::Owned(text) => File {
+                    rel: text,
+                    raw: raw_name(&rel),
+                },
             });
         }
     }
     output
+}
+
+/// The relative path of an entry from the name the file system gave it, for a
+/// name that is not UTF-8. None where paths are not bytes.
+#[cfg(unix)]
+fn raw_name(rel: &[u8]) -> Option<OsString> {
+    use std::os::unix::ffi::OsStringExt as _;
+    Some(OsString::from_vec(rel.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn raw_name(_rel: &[u8]) -> Option<OsString> {
+    None
 }
 
 #[cfg(test)]

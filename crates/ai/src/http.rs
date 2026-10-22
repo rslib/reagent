@@ -198,6 +198,8 @@ pub(crate) mod test_server {
         pub(crate) request_line: String,
         /// The header names, lowercased, and their values.
         pub(crate) headers: Vec<(String, String)>,
+        /// The body, read by its `content-length`; empty without one.
+        pub(crate) body: Vec<u8>,
     }
 
     impl Recorded {
@@ -265,17 +267,34 @@ pub(crate) mod test_server {
                 Err(_) => break,
             }
         }
-        let text = String::from_utf8_lossy(&buffer);
+        let end = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map_or(buffer.len(), |at| at + 4);
+        let text = String::from_utf8_lossy(&buffer[..end]);
         let mut lines = text.split("\r\n");
         let request_line = lines.next().unwrap_or_default().to_owned();
-        let headers = lines
+        let headers: Vec<(String, String)> = lines
             .take_while(|line| !line.is_empty())
             .filter_map(|line| line.split_once(": "))
             .map(|(name, value)| (name.to_ascii_lowercase(), value.to_owned()))
             .collect();
+        let length = headers
+            .iter()
+            .find(|(name, _)| name == "content-length")
+            .and_then(|(_, value)| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = buffer[end..].to_vec();
+        while body.len() < length {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => body.extend_from_slice(&chunk[..read]),
+            }
+        }
         Recorded {
             request_line,
             headers,
+            body,
         }
     }
 

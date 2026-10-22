@@ -14,6 +14,11 @@ cargo fmt --all
 cargo build --profile min -p reagent             # size build for footprint checks
 cargo nextest run --release -p reagent-agent --test budget                    # loop heap and CPU budgets
 cargo nextest run --release -p reagent --features testing --test footprint    # process RSS and CPU budgets
+cargo nextest run -p reagent-ai --features testing --test allocs   # heap blocks per stream event and body build
+cargo nextest run -p reagent-tools --test allocs                   # heap blocks for edit, read, walk and effects
+cargo nextest run -p reagent-agent --test session_allocs           # heap blocks per session line and stuck turn
+bash bench/instructions.sh                                         # Linux: Callgrind instruction counts against the merge base
+bash bench/size.sh   # size build against bench/size-budget.txt
 cargo run -q -p reagent -- --version
 ```
 
@@ -67,6 +72,10 @@ Design decisions and their reasons: `docs/plans/architecture.md` (local only, ig
 - All I/O is async: `tokio::fs`, `tokio::process`, `tokio::net`, `tokio::time`. `clippy.toml` bans the `std` versions, in tests too. Heavy CPU work goes in `tokio::task::spawn_blocking`. The runtime is `current_thread`.
 - A new dependency needs `default-features = false` and only the features it uses. Add it with `cargo add -p <package> <dep> --no-default-features -F <features>`.
 - Claim a speed or size gain only with a measured number and the command that produced it.
+- A hot path runs per stream event, per request, per tool call or per line or file a tool touches. A change to one keeps its `allocs` test and `bench/instructions.sh` passing (2% on instructions and estimated cycles, 12% for `find`, `grep` and `capture`, which touch the file system or a child process). A new hot path adds a dhat case that fails on the old code, with the bound set near the measured value. Raise a bound only with the old and new number in the commit body.
+- Every test in a dhat file takes the file's shared lock as its first line. dhat counts every thread, and `cargo test` runs tests in parallel threads, so another test's setup lands in the count.
+- No per-event syscall: batch output writes, and read the clock only when the value is used.
+- No stack array over 16 KB in an async function; put the buffer on the heap. Clippy's `large_futures`, `large_stack_arrays` and `large_enum_variant` fire on x86_64 Linux with sizes macOS does not show, so a change to an async function, a buffer or an enum runs clippy on Linux too.
 
 ## Unsafe
 
@@ -78,6 +87,7 @@ Design decisions and their reasons: `docs/plans/architecture.md` (local only, ig
 - A bug fix lands with a test that fails before the fix.
 - Task checks use `cargo nextest run`, not `cargo test <filter>`. `cargo test` passes when the filter matches no test.
 - Tools are tested on temp folders (`tempfile`), never on the repo.
+- A test that runs `reagent models` sets `REAGENT_MODELS_DEV_URL` to a closed port, or it fetches the real models.dev.
 - CPU budgets are tight only in release builds, so a change to the loop, a provider or the output path runs the two budget commands with `--release`. Raise a budget only with the new measured number in the commit body.
 
 ## Boundaries
