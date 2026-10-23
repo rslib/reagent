@@ -1,0 +1,20 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -12,6 +12,7 @@
+     (10, "X"),
+     (9, "IX"),
+     (5, "V"),
++    (4, "IV"),
+     (1, "I"),
+ ];
+ 
+@@ -54,7 +55,7 @@
+     }
+     let mut total: i64 = 0;
+     for i in 0..vals.len() {
+-        if i + 1 < vals.len() && vals[i] > vals[i + 1] {
++        if i + 1 < vals.len() && vals[i] < vals[i + 1] {
+             total -= vals[i];
+         } else {
+             total += vals[i];

@@ -1,0 +1,1 @@
+Slugs for titles come out wrong: long titles are cut much too short, punctuation between words gives repeated dashes, and the cut is off by one character. Please fix the slug code. Do not edit the tests.

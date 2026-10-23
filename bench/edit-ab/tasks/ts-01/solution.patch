@@ -1,0 +1,21 @@
+diff -ruN a/heap.ts b/heap.ts
+--- a/heap.ts
++++ b/heap.ts
+@@ -77,7 +77,7 @@
+   private siftUp(start: number): void {
+     let i = start;
+     while (i > 0) {
+-      const parent = i >> 1;
++      const parent = (i - 1) >> 1;
+       if (this.compare(this.heap[i], this.heap[parent]) >= 0) {
+         break;
+       }
+@@ -96,7 +96,7 @@
+       if (left < n && this.compare(this.heap[left], this.heap[best]) < 0) {
+         best = left;
+       }
+-      if (right < n && this.compare(this.heap[right], this.heap[i]) < 0) {
++      if (right < n && this.compare(this.heap[right], this.heap[best]) < 0) {
+         best = right;
+       }
+       if (best === i) {

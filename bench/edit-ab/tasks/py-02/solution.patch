@@ -1,0 +1,17 @@
+diff -ruN a/ranges.py b/ranges.py
+--- a/ranges.py
++++ b/ranges.py
+@@ -39,10 +39,12 @@
+ def merge(intervals):
+     """Merge overlapping or touching intervals into a sorted list."""
+     ordered = sorted(normalize(i) for i in intervals)
++    if not ordered:
++        return []
+     merged = [ordered[0]]
+     for lo, hi in ordered[1:]:
+         last_lo, last_hi = merged[-1]
+-        if lo < last_hi:
++        if lo <= last_hi:
+             merged[-1] = (last_lo, max(last_hi, hi))
+         else:
+             merged.append((lo, hi))

@@ -1,5 +1,5 @@
 //! OS sandboxes for one process and its children: a Seatbelt profile on macOS
-//! and Landlock on Linux.
+//! and Landlock on Linux, with a seccomp filter when the network is off.
 
 use std::path::PathBuf;
 
@@ -88,7 +88,8 @@ mod seatbelt {
 }
 
 /// Sandboxes this thread and every child it starts with Landlock: read and
-/// run anywhere, write only in `write`, and no TCP unless `network` is true.
+/// run anywhere, write only in `write`. Unless `network` is true, Landlock
+/// refuses TCP and a seccomp filter refuses every socket but a local one.
 #[cfg(target_os = "linux")]
 pub fn restrict(network: bool, write: &[PathBuf]) -> Result<(), String> {
     use landlock::{
@@ -121,7 +122,158 @@ pub fn restrict(network: bool, write: &[PathBuf]) -> Result<(), String> {
     if status.ruleset == RulesetStatus::NotEnforced {
         return Err("this kernel has no Landlock".into());
     }
+    if !network {
+        seccomp::deny_ip_sockets()?;
+    }
     Ok(())
+}
+
+/// The seccomp filter of a sandbox with no network.
+///
+/// Landlock refuses TCP only: UDP rights come in Linux 7.2, and no Landlock
+/// version controls raw, ICMP or packet sockets. So `socket()` takes only
+/// AF_UNIX, which tools need, and AF_NETLINK, which an unprivileged process
+/// can only read; io_uring, which makes sockets without `socket()`, and the
+/// syscalls of another architecture (i386 `socketcall`, x32) are refused.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[allow(unsafe_code)]
+mod seccomp {
+    #[cfg(target_arch = "x86_64")]
+    use libc::BPF_JGE;
+    use libc::{
+        BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W, SECCOMP_RET_ALLOW,
+        SECCOMP_RET_DATA, SECCOMP_RET_ERRNO, sock_filter, sock_fprog,
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    const ARCH: u32 = 0xC000_003E; // AUDIT_ARCH_X86_64
+    #[cfg(target_arch = "aarch64")]
+    const ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
+
+    // Offsets into `struct seccomp_data`: the syscall number, the audit
+    // architecture and the low half of the first argument (little-endian).
+    const NR: u32 = 0;
+    const AUDIT_ARCH: u32 = 4;
+    const ARG0_LOW: u32 = 16;
+
+    /// The x32 syscalls on x86_64 carry this bit in their number.
+    #[cfg(target_arch = "x86_64")]
+    const X32_BIT: u32 = 0x4000_0000;
+
+    fn load(offset: u32) -> sock_filter {
+        sock_filter {
+            code: (BPF_LD | BPF_W | BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: offset,
+        }
+    }
+
+    /// A jump that skips `jt` instructions when the test holds, else `jf`.
+    fn jump(test: u32, value: u32, jt: u8, jf: u8) -> sock_filter {
+        sock_filter {
+            code: (BPF_JMP | test | BPF_K) as u16,
+            jt,
+            jf,
+            k: value,
+        }
+    }
+
+    fn ret(action: u32) -> sock_filter {
+        sock_filter {
+            code: (BPF_RET | BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: action,
+        }
+    }
+
+    fn errno(code: i32) -> u32 {
+        SECCOMP_RET_ERRNO | (code as u32 & SECCOMP_RET_DATA)
+    }
+
+    /// The instructions before the three returns, whose places the jumps
+    /// count from.
+    #[cfg(target_arch = "x86_64")]
+    const HEAD: usize = 9;
+    #[cfg(target_arch = "aarch64")]
+    const HEAD: usize = 8;
+
+    /// The program: the head of tests, then deny (EACCES), no io_uring
+    /// (ENOSYS) and allow, in that order.
+    pub(crate) fn program() -> Vec<sock_filter> {
+        let (deny, no_ring, allow) = (HEAD, HEAD + 1, HEAD + 2);
+        // A jump at `from` to `target` skips the instructions between them.
+        let to = |from: usize, target: usize| (target - from - 1) as u8;
+        let mut program = Vec::with_capacity(HEAD + 3);
+        program.push(load(AUDIT_ARCH));
+        program.push(jump(BPF_JEQ, ARCH, 0, to(1, deny)));
+        program.push(load(NR));
+        #[cfg(target_arch = "x86_64")]
+        program.push(jump(BPF_JGE, X32_BIT, to(program.len(), deny), 0));
+        let at = program.len();
+        program.push(jump(
+            BPF_JEQ,
+            libc::SYS_io_uring_setup as u32,
+            to(at, no_ring),
+            0,
+        ));
+        let at = program.len();
+        program.push(jump(BPF_JEQ, libc::SYS_socket as u32, 0, to(at, allow)));
+        program.push(load(ARG0_LOW));
+        let at = program.len();
+        program.push(jump(BPF_JEQ, libc::AF_UNIX as u32, to(at, allow), 0));
+        let at = program.len();
+        program.push(jump(BPF_JEQ, libc::AF_NETLINK as u32, to(at, allow), 0));
+        debug_assert_eq!(program.len(), HEAD);
+        program.push(ret(errno(libc::EACCES)));
+        program.push(ret(errno(libc::ENOSYS)));
+        program.push(ret(SECCOMP_RET_ALLOW));
+        program
+    }
+
+    /// Installs the filter on this thread; every child it starts keeps it.
+    pub(crate) fn deny_ip_sockets() -> Result<(), String> {
+        let mut program = program();
+        let filter = sock_fprog {
+            len: program.len() as u16,
+            filter: program.as_mut_ptr(),
+        };
+        // SAFETY: plain prctl calls; `filter` points at `program`, which
+        // outlives the call, and the kernel copies the program.
+        unsafe {
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(format!("no_new_privs: {}", std::io::Error::last_os_error()));
+            }
+            if libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &filter as *const sock_fprog,
+            ) != 0
+            {
+                return Err(format!(
+                    "the network filter: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// No network filter exists for this architecture. Landlock still fences the
+/// files and TCP: failing here would make `auto` drop the whole sandbox.
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
+mod seccomp {
+    pub(crate) fn deny_ip_sockets() -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// No sandbox exists on this system.
@@ -152,5 +304,133 @@ mod tests {
                 .expect("a profile")
                 .contains("(allow network*)")
         );
+    }
+
+    /// Opens a socket and closes it, or returns the errno.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[allow(unsafe_code)]
+    fn open(domain: i32, kind: i32, protocol: i32) -> Result<(), i32> {
+        // SAFETY: plain syscalls; the fd is closed at once.
+        let fd = unsafe { libc::socket(domain, kind | libc::SOCK_CLOEXEC, protocol) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+        }
+        unsafe { libc::close(fd) };
+        Ok(())
+    }
+
+    /// Runs `body` on a thread of its own with the network filter, so the rest
+    /// of the test process keeps its sockets.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn filtered<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::spawn(move || {
+            seccomp::deny_ip_sockets().expect("the filter installs");
+            body()
+        })
+        .join()
+        .expect("the filtered thread")
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn seccomp_refuses_every_ip_socket() {
+        use libc::{AF_INET, AF_INET6, AF_PACKET, IPPROTO_ICMP, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM};
+        // Without the filter UDP opens, so a refusal below is the filter's.
+        assert_eq!(open(AF_INET, SOCK_DGRAM, 0), Ok(()));
+        let refused = filtered(|| {
+            [
+                open(AF_INET, SOCK_DGRAM, 0),
+                open(AF_INET6, SOCK_DGRAM, 0),
+                open(AF_INET, SOCK_STREAM, 0),
+                open(AF_INET6, SOCK_STREAM, 0),
+                open(AF_INET, SOCK_DGRAM, IPPROTO_ICMP),
+                open(AF_INET, SOCK_RAW, IPPROTO_ICMP),
+                open(AF_PACKET, SOCK_RAW, 0),
+            ]
+        });
+        for (index, result) in refused.iter().enumerate() {
+            assert_eq!(*result, Err(libc::EACCES), "socket {index}");
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn seccomp_keeps_local_sockets() {
+        let kept = filtered(|| {
+            [
+                open(libc::AF_UNIX, libc::SOCK_STREAM, 0),
+                open(libc::AF_UNIX, libc::SOCK_DGRAM, 0),
+                open(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE),
+            ]
+        });
+        assert_eq!(kept, [Ok(()), Ok(()), Ok(())]);
+    }
+
+    /// Calls io_uring_setup for a one-entry ring: the errno, or `None` when a
+    /// ring was made (and closed).
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[allow(unsafe_code)]
+    fn ring_setup() -> Option<i32> {
+        let mut params = [0u8; 120];
+        // SAFETY: io_uring_setup reads and writes `params`, which is large
+        // enough for `struct io_uring_params`; a ring fd made here is closed.
+        let fd = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1, params.as_mut_ptr()) };
+        if fd < 0 {
+            return std::io::Error::last_os_error().raw_os_error();
+        }
+        unsafe { libc::close(fd as i32) };
+        None
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn seccomp_refuses_io_uring_with_enosys() {
+        // A kernel without io_uring already says ENOSYS, which proves nothing.
+        if ring_setup() == Some(libc::ENOSYS) {
+            return;
+        }
+        assert_eq!(filtered(ring_setup), Some(libc::ENOSYS));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn seccomp_refuses_an_x32_syscall() {
+        let errno = filtered(|| {
+            // SAFETY: socket(2) through the x32 number; any fd made is closed.
+            let fd = unsafe {
+                libc::syscall(
+                    libc::SYS_socket | 0x4000_0000,
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM,
+                    0,
+                )
+            };
+            if fd >= 0 {
+                unsafe { libc::close(fd as i32) };
+                return None;
+            }
+            std::io::Error::last_os_error().raw_os_error()
+        });
+        // Without the filter, a kernel without x32 says ENOSYS instead.
+        assert_eq!(errno, Some(libc::EACCES));
     }
 }

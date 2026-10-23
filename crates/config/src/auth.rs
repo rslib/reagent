@@ -44,6 +44,22 @@ pub enum Login {
         /// The account address, when the account shared one.
         email: Option<String>,
     },
+    /// A device-code login whose access token expires and is refreshed at
+    /// the token endpoint it names.
+    Device {
+        /// The provider the login is for, as `reagent login` names it.
+        provider: String,
+        /// The client id the login signed in with.
+        client_id: String,
+        /// The endpoint a refresh posts to.
+        token_url: String,
+        /// The access token, which its `Debug` hides.
+        access: Secret,
+        /// The refresh token, which its `Debug` hides.
+        refresh: Secret,
+        /// The time the access token stops being usable, since the epoch.
+        expires_at: u64,
+    },
 }
 
 impl Login {
@@ -51,7 +67,7 @@ impl Login {
     pub fn key(&self) -> Option<&Secret> {
         match self {
             Login::Key { key } => Some(key),
-            Login::Oauth { .. } => None,
+            Login::Oauth { .. } | Login::Device { .. } => None,
         }
     }
 }
@@ -88,6 +104,21 @@ enum Saved<'a> {
         /// The account address.
         email: Option<&'a str>,
     },
+    /// A device-code login.
+    Device {
+        /// The provider name.
+        provider: &'a str,
+        /// The client id.
+        client_id: &'a str,
+        /// The refresh endpoint.
+        token_url: &'a str,
+        /// The access token, as plain text, for this write only.
+        access: &'a str,
+        /// The refresh token, as plain text, for this write only.
+        refresh: &'a str,
+        /// The time the access token stops being usable.
+        expires_at: u64,
+    },
 }
 
 impl<'a> Saved<'a> {
@@ -114,6 +145,21 @@ impl<'a> Saved<'a> {
                 expires_at: *expires_at,
                 subject,
                 email: email.as_deref(),
+            },
+            Login::Device {
+                provider,
+                client_id,
+                token_url,
+                access,
+                refresh,
+                expires_at,
+            } => Saved::Device {
+                provider,
+                client_id,
+                token_url,
+                access: access.expose(),
+                refresh: refresh.expose(),
+                expires_at: *expires_at,
             },
         }
     }
@@ -513,6 +559,30 @@ mod tests {
             subject: "user-1".into(),
             email: Some("a@b.c".into()),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "a test reads its own file")]
+    fn device_login_round_trips_and_hides_its_tokens() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut logins = Logins::default();
+        let login = Login::Device {
+            provider: "radius".into(),
+            client_id: "pi-gateway".into(),
+            token_url: "https://radius.pi.dev/v1/oauth/token".into(),
+            access: Secret::from("access-1"),
+            refresh: Secret::from("refresh-1"),
+            expires_at: 1_800_000_000,
+        };
+        assert!(!format!("{login:?}").contains("access-1"));
+        assert_eq!(login.key(), None);
+        logins.set("radius", login);
+        write(dir.path(), &logins).expect("writes");
+        assert_eq!(mode(&path(dir.path())), 0o600);
+        let text = std::fs::read_to_string(path(dir.path())).expect("reads the file");
+        assert!(text.contains("\"type\": \"device\""), "{text}");
+        assert_eq!(read(dir.path()).expect("reads"), logins);
     }
 
     #[cfg(unix)]

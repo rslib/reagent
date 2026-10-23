@@ -1,0 +1,1 @@
+The signup validators accept ages like 200 or -5, treat an empty email as a bad format instead of a missing one, and allow passwords shorter than our documented minimum. Please fix the validators. Do not edit the tests.

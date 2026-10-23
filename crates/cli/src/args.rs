@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use reagent_ai::{Compat, CompatOverride, MaxTokensField, Preset};
+use reagent_ai::{Auth, Compat, CompatOverride, MaxTokensField, Preset, Route};
 use reagent_config::permissions::Rules;
 use reagent_config::{Layer, Layers, Model, Provider, Secret, Settings};
 use serde::Deserialize;
@@ -26,12 +26,14 @@ pub const POLICY_NAMES: [&str; 6] = [
 const ALL_POLICIES: [&str; 3] = ["completion", "budget", "snapshot"];
 
 /// The policies with no `--policy` flag. The budget note does nothing without
-/// a deadline or a turn cap, and with one it cut timeouts on a slow model.
-const DEFAULT_POLICIES: [&str; 1] = ["budget"];
+/// a deadline or a turn cap, and with one it cut timeouts on a slow model. The
+/// snapshot hands the model its environment in the first message, so it does
+/// not spend a turn finding out.
+const DEFAULT_POLICIES: [&str; 2] = ["budget", "snapshot"];
 
 /// The policies with no `--policy` flag on the chat wire. Masking cut prompt
 /// tokens by 42% on a glm-5.3-flash dev run with no drop in pass rate.
-const DEFAULT_CHAT_POLICIES: [&str; 2] = ["budget", "mask"];
+const DEFAULT_CHAT_POLICIES: [&str; 3] = ["budget", "mask", "snapshot"];
 
 /// The reply token cap when `--max-tokens` is absent. A `write` call carries
 /// the whole file, and thinking counts toward the cap, so a low cap cuts the
@@ -47,18 +49,33 @@ pub enum Wire {
     OpenAiChat,
     /// The OpenAI Responses API.
     OpenAiResponses,
+    /// The pi-messages API.
+    PiMessages,
     /// A scripted provider read from `fake:<file>`, testing builds only.
     #[cfg(feature = "testing")]
     Fake(String),
 }
 
 impl Wire {
+    /// The preset wire this is, if it is one.
+    fn to_ai(&self) -> Option<reagent_ai::Wire> {
+        match self {
+            Wire::Anthropic => Some(reagent_ai::Wire::Anthropic),
+            Wire::OpenAiChat => Some(reagent_ai::Wire::OpenAiChat),
+            Wire::OpenAiResponses => Some(reagent_ai::Wire::OpenAiResponses),
+            Wire::PiMessages => Some(reagent_ai::Wire::PiMessages),
+            #[cfg(feature = "testing")]
+            Wire::Fake(_) => None,
+        }
+    }
+
     /// The wire of a preset.
     fn from_ai(wire: reagent_ai::Wire) -> Self {
         match wire {
             reagent_ai::Wire::Anthropic => Wire::Anthropic,
             reagent_ai::Wire::OpenAiChat => Wire::OpenAiChat,
             reagent_ai::Wire::OpenAiResponses => Wire::OpenAiResponses,
+            reagent_ai::Wire::PiMessages => Wire::PiMessages,
         }
     }
 
@@ -69,6 +86,7 @@ impl Wire {
             Wire::Anthropic => reagent_ai::Wire::Anthropic.default_api_key_env(),
             Wire::OpenAiChat => reagent_ai::Wire::OpenAiChat.default_api_key_env(),
             Wire::OpenAiResponses => reagent_ai::Wire::OpenAiResponses.default_api_key_env(),
+            Wire::PiMessages => reagent_ai::Wire::PiMessages.default_api_key_env(),
             #[cfg(feature = "testing")]
             Wire::Fake(_) => reagent_ai::Wire::Anthropic.default_api_key_env(),
         }
@@ -82,6 +100,7 @@ impl Wire {
             Wire::OpenAiChat | Wire::OpenAiResponses => {
                 ("OPENAI_BASE_URL", "https://api.openai.com/v1")
             }
+            Wire::PiMessages => ("RADIUS_BASE_URL", "https://radius.pi.dev/v1"),
             #[cfg(feature = "testing")]
             Wire::Fake(_) => ("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
         };
@@ -117,6 +136,8 @@ pub struct Args {
     pub provider_name: Option<String>,
     /// The preset the provider takes its defaults from, if any.
     pub preset: Option<&'static Preset>,
+    /// The header the key goes in.
+    pub auth: Auth,
     /// The saved login this provider signs in with, if it has a name.
     pub login: Option<String>,
     /// Extra request headers from `--header`, in order.
@@ -261,9 +282,11 @@ fn usage() -> &'static str {
         "  -p, --print <task>   the task for the agent to complete; `-` reads it from stdin\n",
         "      --json           print one JSON object per event on stdout\n",
         "      --model <id>     the provider model id\n",
-        "      --provider <wire>  anthropic, openai-chat or openai-responses (default: anthropic)\n",
+        "      --provider <wire>  anthropic, openai-chat, openai-responses or pi-messages\n",
+        "                       (default: anthropic)\n",
         "                       --model <name>/<id> picks a preset: anthropic, openai, chatgpt,\n",
-        "                       openrouter, opencode-go, commandcode, deepseek or freeinference\n",
+        "                       openrouter, opencode-go, commandcode, deepseek, freeinference,\n",
+        "                       radius or synthetic\n",
         "      --base-url <url>   the endpoint; default from the provider env, else built in\n",
         "      --api-key-env <name>  the env var holding the API key; never the key itself\n",
         "      --header <name:value>  an extra request header; repeatable; reserved names\n",
@@ -276,7 +299,7 @@ fn usage() -> &'static str {
         "                       REAGENT_PROFILE names one too\n",
         "      --policy <list>  loop policies: completion, stuck, budget, snapshot, mask, compact;\n",
         "                       all = completion, budget, snapshot; none = off\n",
-        "                       (default: budget, plus mask on openai-chat)\n",
+        "                       (default: budget and snapshot, plus mask on openai-chat)\n",
         "      --version        print the version and exit\n",
         "\n",
         "Commands:\n",
@@ -488,13 +511,14 @@ fn check_provider_names(settings: &Settings) -> Result<(), String> {
     Ok(())
 }
 
-/// The compat flags of a run: the config flags over the preset's, or over the
-/// host rule of the endpoint when there is no preset. `None` when neither
-/// sets any.
+/// The compat flags of a run: the config flags over the route's, or over the
+/// host rule of the endpoint when there is no route. `None` when there is no
+/// preset and no config flag.
 fn resolve_compat(
     name: Option<&str>,
     table: Option<&reagent_config::Table>,
     preset: Option<&Preset>,
+    route: Option<&Route>,
     base_url: &str,
 ) -> Result<Option<Compat>, String> {
     let over = match table {
@@ -508,10 +532,11 @@ fn resolve_compat(
         }
         None => CompatOverride::default(),
     };
-    // A preset's flags describe its own endpoint; another URL gets the host rule.
-    let base = match (preset, table) {
-        (Some(preset), _) if base_url.trim_end_matches('/') == preset.base_url => preset.compat,
-        (Some(_), _) | (None, Some(_)) => {
+    // A route's flags describe its own endpoint; another URL gets the host rule.
+    let base = match (route, table) {
+        (Some(route), _) if base_url.trim_end_matches('/') == route.base_url => route.compat,
+        (None, None) if preset.is_none() => return Ok(None),
+        _ => {
             let field = if base_url.contains("api.openai.com") {
                 MaxTokensField::MaxCompletionTokens
             } else {
@@ -524,7 +549,6 @@ fn resolve_compat(
             }
             .apply(Compat::DEFAULT)
         }
-        (None, None) => return Ok(None),
     };
     Ok(Some(over.apply(base)))
 }
@@ -559,12 +583,19 @@ fn model_targets(settings: &Settings, name: Option<&str>) -> Result<Vec<Target>,
             let table = settings.providers.get(name).cloned().unwrap_or_default();
             let built_in = preset_for(name, settings.providers.get(name))?;
             let login = table.login.clone().unwrap_or_else(|| name.to_string());
-            let wire = match (&table.wire, &built_in) {
-                (Some(wire), _) => {
-                    parse_provider(wire).map_err(|error| format!("config: {error}"))?
-                }
-                (None, Some(preset)) => Wire::from_ai(preset.wire),
-                (None, None) => Wire::Anthropic,
+            // A preset's list lives on its default route whatever wire a run
+            // names; a table with its own endpoint lists from there.
+            let route = built_in.map(Preset::default_route);
+            let named = table
+                .wire
+                .as_deref()
+                .map(parse_provider)
+                .transpose()
+                .map_err(|error| format!("config: {error}"))?;
+            let wire = match (&table.base_url, named, route) {
+                (None, _, Some(route)) | (Some(_), None, Some(route)) => Wire::from_ai(route.wire),
+                (Some(_), Some(wire), _) | (None, Some(wire), None) => wire,
+                (_, None, None) => Wire::Anthropic,
             };
             let mut header = Vec::new();
             for (key, value) in &table.headers {
@@ -576,9 +607,7 @@ fn model_targets(settings: &Settings, name: Option<&str>) -> Result<Vec<Target>,
                 login,
                 preset: built_in,
                 wire,
-                base_url: table
-                    .base_url
-                    .or_else(|| built_in.map(|preset| preset.endpoint())),
+                base_url: table.base_url.or_else(|| route.map(Route::endpoint)),
                 api_key_env: table
                     .api_key_env
                     .or_else(|| built_in.map(|preset| preset.api_key_env.to_string())),
@@ -799,10 +828,34 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
         .get(&model_id)
         .cloned()
         .unwrap_or_else(Model::default);
-    let provider = match (provider, &table.wire) {
+    let named = match (provider, &table.wire) {
+        (Some(wire), _) => Some(wire),
+        (None, Some(name)) => {
+            Some(parse_provider(name).map_err(|error| format!("config: {error}"))?)
+        }
+        (None, None) => None,
+    };
+    let base_url = base_url.or(table.base_url);
+    let route = match built_in {
+        Some(preset) => {
+            let wire = named.as_ref().and_then(Wire::to_ai);
+            let route = preset.route(&model_id, wire);
+            if let (None, Some(wire), None) = (route, wire, &base_url) {
+                return Err(format!(
+                    "{}: no {} route for model {model_id}; routes: {}; or set base_url",
+                    preset.name,
+                    wire.name(),
+                    preset.route_names(&model_id)
+                ));
+            }
+            route
+        }
+        None => None,
+    };
+    let provider = match (named, route) {
         (Some(wire), _) => wire,
-        (None, Some(name)) => parse_provider(name).map_err(|error| format!("config: {error}"))?,
-        (None, None) => built_in.map_or(Wire::Anthropic, |preset| Wire::from_ai(preset.wire)),
+        (None, Some(route)) => Wire::from_ai(route.wire),
+        (None, None) => Wire::Anthropic,
     };
     let mut config_header = Vec::new();
     for (name, value) in &table.headers {
@@ -831,13 +884,12 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
         return Err("--policy compact needs --provider openai-chat".into());
     }
 
-    let base_url = base_url
-        .or(table.base_url)
-        .or_else(|| built_in.map(|preset| preset.endpoint()));
+    let base_url = base_url.or_else(|| route.map(Route::endpoint));
     let compat = resolve_compat(
         provider_name,
         table.compat.as_ref(),
         built_in,
+        route,
         base_url
             .clone()
             .unwrap_or_else(|| provider.base_url())
@@ -855,6 +907,7 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
         api_key: table.api_key,
         provider_name: provider_name.map(str::to_string),
         preset: built_in,
+        auth: route.map_or(Auth::Wire, |route| route.auth),
         login: provider_name.map(|name| table.login.clone().unwrap_or_else(|| name.to_string())),
         api_key_env: api_key_env
             .or(table.api_key_env)
@@ -967,6 +1020,15 @@ mod tests {
         assert_eq!(args.write, [PathBuf::from("/data")]);
     }
 
+    #[test]
+    fn edit_flag_is_unknown() {
+        let error = parse_with(&["-p", "x", "--edit", "lines"], Settings::default()).unwrap_err();
+        assert!(
+            error.starts_with("unknown argument") && error.contains("edit"),
+            "{error}"
+        );
+    }
+
     fn providers(provider: Provider) -> std::collections::BTreeMap<String, Provider> {
         [("fi".to_string(), provider)].into()
     }
@@ -1065,8 +1127,8 @@ mod tests {
     }
 
     #[test]
-    fn policy_default_is_budget_only() {
-        assert_eq!(run(&["-p", "task"]).policy, vec!["budget"]);
+    fn policy_default_is_budget_and_snapshot() {
+        assert_eq!(run(&["-p", "task"]).policy, vec!["budget", "snapshot"]);
     }
 
     #[test]
@@ -1078,9 +1140,9 @@ mod tests {
     }
 
     #[test]
-    fn policy_default_on_the_chat_wire_is_budget_and_mask() {
+    fn policy_default_on_the_chat_wire_is_budget_mask_and_snapshot() {
         let args = run(&["-p", "task", "--provider", "openai-chat"]);
-        assert_eq!(args.policy, vec!["budget", "mask"]);
+        assert_eq!(args.policy, vec!["budget", "mask", "snapshot"]);
     }
 
     #[test]
@@ -1108,6 +1170,29 @@ mod tests {
     #[test]
     fn policy_default_is_turned_off_by_none() {
         assert!(run(&["-p", "task", "--policy", "none"]).policy.is_empty());
+    }
+
+    #[test]
+    fn snapshot_policy_is_on_by_default_on_both_wires() {
+        let args = run(&["-p", "task"]);
+        assert!(
+            args.policy.iter().any(|name| name == "snapshot"),
+            "{args:?}"
+        );
+        let args = run(&["-p", "task", "--provider", "openai-chat"]);
+        assert!(
+            args.policy.iter().any(|name| name == "snapshot"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_policy_is_left_out_by_a_flag() {
+        let args = run(&["-p", "task", "--policy", "budget"]);
+        assert!(
+            !args.policy.iter().any(|name| name == "snapshot"),
+            "{args:?}"
+        );
     }
 
     #[test]
@@ -1589,7 +1674,9 @@ mod tests {
                 "opencode-go",
                 "commandcode",
                 "deepseek",
-                "freeinference"
+                "freeinference",
+                "radius",
+                "synthetic"
             ]
         );
         assert!(parse_with(&["models", "nope"], settings.clone()).is_err());
@@ -1657,7 +1744,7 @@ mod tests {
                 ("x-team".to_string(), "b".to_string())
             ]
         );
-        assert_eq!(args.policy, vec!["budget", "mask"]);
+        assert_eq!(args.policy, vec!["budget", "mask", "snapshot"]);
     }
 
     #[test]
@@ -1837,7 +1924,198 @@ mod tests {
             Some("https://opencode.ai/zen/go/v1")
         );
         assert_eq!(args.api_key_env.as_deref(), Some("OPENCODE_API_KEY"));
-        assert_eq!(args.policy, vec!["budget", "mask"]);
+        assert_eq!(args.policy, vec!["budget", "mask", "snapshot"]);
+    }
+
+    fn table(name: &str, provider: Provider) -> Settings {
+        Settings {
+            providers: [(name.to_string(), provider)].into(),
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn route_a_commandcode_claude_model_takes_the_messages_endpoint() {
+        let args = run(&["-p", "task", "--model", "commandcode/claude-haiku-5-5"]);
+        assert_eq!(args.model, "claude-haiku-5-5");
+        assert_eq!(args.provider, Wire::Anthropic);
+        assert_eq!(
+            args.base_url.as_deref(),
+            Some("https://api.commandcode.ai/provider")
+        );
+        assert_eq!(args.auth, Auth::Wire);
+        assert_eq!(args.api_key_env.as_deref(), Some("COMMANDCODE_API_KEY"));
+        // The chat wire's default mask does not apply on Messages.
+        assert_eq!(args.policy, vec!["budget", "snapshot"]);
+
+        let other = run(&[
+            "-p",
+            "task",
+            "--model",
+            "commandcode/deepseek/deepseek-v4.1-flash",
+        ]);
+        assert_eq!(other.provider, Wire::OpenAiChat);
+        assert_eq!(
+            other.base_url.as_deref(),
+            Some("https://api.commandcode.ai/provider/v1")
+        );
+        assert_eq!(other.compat.expect("a compat").reasoning_off, Some("off"));
+    }
+
+    #[test]
+    fn route_a_config_endpoint_wins_over_the_route_endpoint() {
+        let settings = table(
+            "commandcode",
+            Provider {
+                base_url: Some("http://localhost:1".into()),
+                ..Provider::default()
+            },
+        );
+        let args = run_with(
+            &["-p", "task", "--model", "commandcode/claude-haiku-5-5"],
+            settings,
+        );
+        assert_eq!(args.provider, Wire::Anthropic);
+        assert_eq!(args.base_url.as_deref(), Some("http://localhost:1"));
+    }
+
+    #[test]
+    fn route_a_named_wire_picks_its_route() {
+        let deepseek = run_with(
+            &["-p", "task", "--model", "deepseek/deepseek-flash"],
+            table(
+                "deepseek",
+                Provider {
+                    wire: Some("anthropic".into()),
+                    ..Provider::default()
+                },
+            ),
+        );
+        assert_eq!(deepseek.provider, Wire::Anthropic);
+        assert_eq!(
+            deepseek.base_url.as_deref(),
+            Some("https://api.deepseek.com/anthropic")
+        );
+
+        let chat = run(&[
+            "-p",
+            "task",
+            "--provider",
+            "openai-chat",
+            "--model",
+            "commandcode/claude-haiku-5-5",
+        ]);
+        assert_eq!(chat.provider, Wire::OpenAiChat);
+        assert_eq!(
+            chat.base_url.as_deref(),
+            Some("https://api.commandcode.ai/provider/v1")
+        );
+
+        let openrouter = run_with(
+            &[
+                "-p",
+                "task",
+                "--model",
+                "openrouter/anthropic/claude-sonnet-5",
+            ],
+            table(
+                "openrouter",
+                Provider {
+                    wire: Some("anthropic".into()),
+                    ..Provider::default()
+                },
+            ),
+        );
+        assert_eq!(
+            openrouter.base_url.as_deref(),
+            Some("https://openrouter.ai/api")
+        );
+        assert_eq!(openrouter.auth, Auth::Bearer);
+    }
+
+    #[test]
+    fn route_a_named_wire_with_no_route_is_an_error() {
+        let error = parse(&[
+            "-p",
+            "task",
+            "--provider",
+            "openai-responses",
+            "--model",
+            "deepseek/deepseek-flash",
+        ])
+        .unwrap_err();
+        assert!(error.contains("no openai-responses route"), "{error}");
+        assert!(
+            error.contains("chat (openai-chat), messages (anthropic)"),
+            "{error}"
+        );
+        // An endpoint of its own needs no route.
+        let args = run(&[
+            "-p",
+            "task",
+            "--provider",
+            "openai-responses",
+            "--base-url",
+            "http://localhost:1/v1",
+            "--model",
+            "deepseek/deepseek-flash",
+        ]);
+        assert_eq!(args.provider, Wire::OpenAiResponses);
+        assert_eq!(args.auth, Auth::Wire);
+    }
+
+    #[test]
+    fn route_an_own_endpoint_with_no_route_keeps_the_host_rule() {
+        let args = run(&[
+            "-p",
+            "task",
+            "--provider",
+            "openai-responses",
+            "--base-url",
+            "https://api.openai.com/v1",
+            "--model",
+            "deepseek/deepseek-flash",
+        ]);
+        assert_eq!(
+            args.compat.expect("a compat").max_tokens_field,
+            MaxTokensField::MaxCompletionTokens
+        );
+    }
+
+    #[test]
+    fn route_the_model_list_checks_a_wire_it_does_not_use() {
+        let error = model_targets(
+            &table(
+                "deepseek",
+                Provider {
+                    wire: Some("nope".into()),
+                    ..Provider::default()
+                },
+            ),
+            Some("deepseek"),
+        )
+        .expect_err("a bad wire is an error");
+        assert!(error.contains("nope"), "{error}");
+    }
+
+    #[test]
+    fn route_the_model_list_reads_the_default_route() {
+        let targets = model_targets(
+            &table(
+                "deepseek",
+                Provider {
+                    wire: Some("anthropic".into()),
+                    ..Provider::default()
+                },
+            ),
+            Some("deepseek"),
+        )
+        .expect("the targets");
+        assert_eq!(targets[0].wire, Wire::OpenAiChat);
+        assert_eq!(
+            targets[0].base_url.as_deref(),
+            Some("https://api.deepseek.com")
+        );
     }
 
     #[test]

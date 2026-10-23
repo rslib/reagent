@@ -1,0 +1,28 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -7,9 +7,12 @@
+ /// Writes seconds as `1d 2h 3m 4s`, leaving out the parts that are zero.
+ /// Zero seconds is written as `0s`.
+ pub fn format_duration(secs: u64) -> String {
++    if secs == 0 {
++        return "0s".to_string();
++    }
+     let days = secs / DAY;
+     let hours = secs % DAY / HOUR;
+-    let minutes = secs / MINUTE;
++    let minutes = secs % HOUR / MINUTE;
+     let seconds = secs % MINUTE;
+     let mut parts = Vec::new();
+     for (value, unit) in [(days, "d"), (hours, "h"), (minutes, "m"), (seconds, "s")] {
+@@ -24,8 +27,8 @@
+ fn unit_seconds(unit: char) -> Option<u64> {
+     match unit {
+         'd' => Some(DAY),
+-        'h' => Some(MINUTE),
+-        'm' => Some(HOUR),
++        'h' => Some(HOUR),
++        'm' => Some(MINUTE),
+         's' => Some(1),
+         _ => None,
+     }

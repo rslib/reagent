@@ -1,0 +1,1 @@
+The warehouse tool lets me ship zero units without an error, and the low-stock list misses items that sit exactly at the threshold. The default restock plan also orders too little. Please fix the inventory code. Do not edit the tests.

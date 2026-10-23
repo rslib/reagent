@@ -1,0 +1,1 @@
+The median of a list with an even number of items is wrong or crashes, and the default variance and standard deviation come out too small. Asking for the 100th percentile crashes too. Please fix the stats module. Do not edit the tests.

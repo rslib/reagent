@@ -1,0 +1,21 @@
+diff -ruN a/cache.py b/cache.py
+--- a/cache.py
++++ b/cache.py
+@@ -26,7 +26,7 @@
+     def _expired(self, stamp, now):
+         if self.ttl is None:
+             return False
+-        return now - stamp > self.ttl
++        return now - stamp >= self.ttl
+ 
+     def get(self, key, now=0, default=None):
+         entry = self._data.get(key)
+@@ -53,7 +53,7 @@
+             self._data[key] = (value, now)
+             self._data.move_to_end(key)
+             if len(self._data) > self.capacity:
+-                self._data.popitem(last=True)
++                self._data.popitem(last=False)
+ 
+     def pop_newest(self):
+         """Remove and return the most recently used (key, value)."""

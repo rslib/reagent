@@ -1,0 +1,22 @@
+diff -ruN a/money.ts b/money.ts
+--- a/money.ts
++++ b/money.ts
+@@ -26,7 +26,7 @@
+ 
+ export function subtract(a: Money, b: Money): Money {
+   assertSameCurrency(a, b);
+-  return { cents: a.cents + b.cents, currency: a.currency };
++  return { cents: a.cents - b.cents, currency: a.currency };
+ }
+ 
+ export function negate(a: Money): Money {
+@@ -57,7 +57,8 @@
+   const whole = Math.floor(abs / 100);
+   const frac = String(abs % 100).padStart(2, "0");
+   const grouped = String(whole).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+-  return `${symbol}${grouped}.${frac}`;
++  const sign = a.cents < 0 ? "-" : "";
++  return `${sign}${symbol}${grouped}.${frac}`;
+ }
+ 
+ // Split an amount into n parts that add up exactly, giving the extra cents

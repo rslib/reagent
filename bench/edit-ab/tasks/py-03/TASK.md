@@ -1,0 +1,1 @@
+Word wrapping breaks lines one character too early: a line that exactly fits the width gets split. The banner helper also gives me garbled output. Please fix the text layout helpers. Do not edit the tests.

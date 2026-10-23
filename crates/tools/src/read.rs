@@ -9,8 +9,8 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
-use reagent_ai::ToolSpec;
+use reagent_agent::tool::{Effects, Identity, Seen, Tool, ToolOutput, parse_args};
+use reagent_ai::{Text, ToolSpec};
 
 use crate::resolve;
 
@@ -51,7 +51,7 @@ impl Read {
         }
     }
 
-    async fn run_inner(&self, args: &Args<'_>) -> Result<String, String> {
+    async fn run_inner(&self, args: &Args<'_>) -> Result<(String, Option<Seen>), String> {
         let offset = args.offset.unwrap_or(1).max(1) as u64;
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
         if limit == 0 {
@@ -63,7 +63,14 @@ impl Read {
         let mut file = tokio::fs::File::open(&path)
             .await
             .map_err(|error| open_error(&path, &error))?;
-        let size = file.metadata().await.map_err(failed)?.len();
+        // The identity, the size and the modified time come from the open
+        // handle's own metadata, so they name the file this read actually saw.
+        // On unix the identity is the device and inode already in the
+        // metadata, so it costs no syscall and no allocation.
+        let metadata = file.metadata().await.map_err(failed)?;
+        let key = Identity::new(&metadata, &path).await;
+        let size = metadata.len();
+        let modified = metadata.modified().ok();
         let mut probe = [0_u8; BINARY_PROBE];
         let probe_len = file.read(&mut probe).await.map_err(failed)?;
         if probe[..probe_len].contains(&0) {
@@ -94,19 +101,30 @@ impl Read {
             printed += 1;
         }
         if printed == 0 {
-            return Ok(match number - 1 {
-                0 => format!("{} is empty", path.display()),
-                lines => format!(
-                    "{} has {lines} line(s); offset={offset} is past the end",
-                    path.display()
-                ),
-            });
+            return Ok((
+                match number - 1 {
+                    0 => format!("{} is empty", path.display()),
+                    lines => format!(
+                        "{} has {lines} line(s); offset={offset} is past the end",
+                        path.display()
+                    ),
+                },
+                None,
+            ));
         }
         if feed.has_more().await.map_err(failed)? {
             let rest = size.saturating_sub(feed.consumed);
             out.push_str(&format!("[{rest} more bytes; use offset={number}]\n"));
         }
-        Ok(out)
+        let seen = Seen {
+            path: Text::from(args.path.as_ref()),
+            key,
+            start: offset,
+            end: number - 1,
+            size,
+            modified,
+        };
+        Ok((out, Some(seen)))
     }
 }
 
@@ -146,12 +164,18 @@ impl Tool for Read {
                 Ok(arguments) => arguments,
                 Err(output) => return output,
             };
+            // Cancel first: an unbiased select let a fast read win over a
+            // token that was already cancelled.
             tokio::select! {
+                biased;
+                () = cancel.cancelled() => ToolOutput::error("cancelled"),
                 result = self.run_inner(&arguments) => match result {
-                    Ok(text) => ToolOutput::ok(text),
+                    Ok((text, seen)) => match seen {
+                        Some(seen) => ToolOutput::ok(text).with_seen(seen),
+                        None => ToolOutput::ok(text),
+                    },
                     Err(message) => ToolOutput::error(message),
                 },
-                () = cancel.cancelled() => ToolOutput::error("cancelled"),
             }
         })
     }
@@ -652,6 +676,83 @@ mod tests {
             "{} reads for {size} bytes, over {most}",
             reads.get()
         );
+    }
+
+    #[tokio::test]
+    async fn reread_a_plain_read_records_the_range_shown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write(&tmp, "f.txt", "a\nb\nc\n").await;
+        let metadata = tokio::fs::metadata(&path).await.unwrap();
+        let output = tool(&tmp)
+            .run(r#"{"path":"f.txt"}"#, &CancellationToken::new())
+            .await;
+        let seen = output.seen.expect("a read reports the lines it showed");
+        assert_eq!(seen.path.as_ref(), "f.txt");
+        assert_eq!(seen.key, Identity::new(&metadata, &path).await);
+        assert_eq!((seen.start, seen.end), (1, 3));
+    }
+
+    #[tokio::test]
+    async fn reread_a_limit_records_the_last_line_shown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut contents = String::new();
+        for i in 1..=10 {
+            contents.push_str(&format!("line {i}\n"));
+        }
+        write(&tmp, "f.txt", &contents).await;
+        let output = tool(&tmp)
+            .run(r#"{"path":"f.txt","limit":3}"#, &CancellationToken::new())
+            .await;
+        let seen = output.seen.expect("a read reports the lines it showed");
+        assert_eq!((seen.start, seen.end), (1, 3));
+    }
+
+    #[tokio::test]
+    async fn reread_the_byte_cap_records_the_last_line_shown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let line = "x".repeat(99);
+        let text = format!("{line}\n").repeat(1000);
+        write(&tmp, "big.txt", &text).await;
+        let output = tool(&tmp)
+            .run(r#"{"path":"big.txt"}"#, &CancellationToken::new())
+            .await;
+        assert!(
+            output.content.contains("more bytes; use offset="),
+            "{}",
+            output.content
+        );
+        let seen = output.seen.expect("a read reports the lines it showed");
+        // Every line but the trailing `[N more bytes]` marker was shown.
+        let shown = output.content.lines().count() - 1;
+        assert_eq!((seen.start, seen.end), (1, shown as u64));
+    }
+
+    #[tokio::test]
+    async fn reread_the_range_matches_the_file_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write(&tmp, "f.txt", "a\nb\n").await;
+        let metadata = tokio::fs::metadata(&path).await.unwrap();
+        let output = tool(&tmp)
+            .run(r#"{"path":"f.txt"}"#, &CancellationToken::new())
+            .await;
+        let seen = output.seen.expect("a read reports the lines it showed");
+        assert_eq!(seen.size, metadata.len());
+        assert_eq!(seen.modified, metadata.modified().ok());
+    }
+
+    #[tokio::test]
+    async fn reread_an_empty_range_records_no_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "a\nb\nc\n").await;
+        write(&tmp, "empty.txt", "").await;
+        let past = tool(&tmp)
+            .run(r#"{"path":"f.txt","offset":10}"#, &CancellationToken::new())
+            .await;
+        assert_eq!(past.seen, None, "a range past the end shows no lines");
+        let empty = tool(&tmp)
+            .run(r#"{"path":"empty.txt"}"#, &CancellationToken::new())
+            .await;
+        assert_eq!(empty.seen, None, "an empty file shows no lines");
     }
 
     #[test]

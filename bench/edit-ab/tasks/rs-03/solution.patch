@@ -1,0 +1,21 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -73,7 +73,7 @@
+     }
+ 
+     pub fn flip_horizontal(&self) -> Grid {
+-        let mut out = Grid::new(self.height, self.width);
++        let mut out = Grid::new(self.width, self.height);
+         for y in 0..self.height {
+             for x in 0..self.width {
+                 out.set(self.width - 1 - x, y, self.cells[y * self.width + x]);
+@@ -102,7 +102,7 @@
+         if x > 0 {
+             out.push((x - 1, y));
+         }
+-        if x + 1 <= self.width {
++        if x + 1 < self.width {
+             out.push((x + 1, y));
+         }
+         if y + 1 < self.height {

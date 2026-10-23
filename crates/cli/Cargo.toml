@@ -21,7 +21,7 @@ reagent-script.workspace = true
 reagent-mcp.workspace = true
 reagent-tui.workspace = true
 lexopt = { version = "0.3.2", default-features = false }
-tokio = { version = "1.53.3", default-features = false, features = ["signal", "io-util", "io-std", "time", "rt", "macros", "sync", "net"] }
+tokio = { version = "1.53.3", default-features = false, features = ["signal", "io-util", "io-std", "time", "rt", "macros", "sync", "net", "process"] }
 tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }

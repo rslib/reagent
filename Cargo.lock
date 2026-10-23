@@ -1034,6 +1034,7 @@ name = "reagent-sandbox"
 version = "0.0.0"
 dependencies = [
  "landlock",
+ "libc",
 ]
 
 [[package]]

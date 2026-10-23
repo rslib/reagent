@@ -1,0 +1,21 @@
+diff -ruN a/matrix.ts b/matrix.ts
+--- a/matrix.ts
++++ b/matrix.ts
+@@ -20,7 +20,7 @@
+ 
+ export function identity(n: number): Matrix {
+   const out = create(n, n);
+-  for (let i = 1; i < n; i++) {
++  for (let i = 0; i < n; i++) {
+     out[i][i] = 1;
+   }
+   return out;
+@@ -71,7 +71,7 @@
+     for (let j = 0; j < cols(b); j++) {
+       let total = 0;
+       for (let k = 0; k < cols(a); k++) {
+-        total += a[i][k] * b[j][k];
++        total += a[i][k] * b[k][j];
+       }
+       out[i][j] = total;
+     }

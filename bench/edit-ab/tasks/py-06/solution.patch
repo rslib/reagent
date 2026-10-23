@@ -1,0 +1,30 @@
+diff -ruN a/stats.py b/stats.py
+--- a/stats.py
++++ b/stats.py
+@@ -18,7 +18,7 @@
+     mid = n // 2
+     if n % 2:
+         return s[mid]
+-    return (s[mid] + s[mid + 1]) / 2
++    return (s[mid - 1] + s[mid]) / 2
+ 
+ 
+ def mode(values):
+@@ -42,7 +42,7 @@
+         raise ValueError("variance of an empty list")
+     m = mean(values)
+     total = sum((v - m) ** 2 for v in values)
+-    return total / n
++    return total / (n - 1 if sample else n)
+ 
+ 
+ def stdev(values, sample=True):
+@@ -59,7 +59,7 @@
+     n = len(s)
+     rank = p / 100 * (n - 1)
+     lo = int(math.floor(rank))
+-    hi = lo + 1
++    hi = min(lo + 1, n - 1)
+     frac = rank - lo
+     return s[lo] + (s[hi] - s[lo]) * frac
+ 

@@ -34,6 +34,7 @@ pub(crate) trait EventParser: Send {
 /// The text borrows from the line when the line carried it verbatim and is
 /// unescaped into its own text when it did not. serde's `Cow` cannot do this:
 /// its `Cow` impl always copies, so a text delta would allocate twice.
+#[derive(Debug)]
 pub(crate) enum JsonStr<'a> {
     /// The JSON string had no escape, so it borrows from the line.
     Borrowed(&'a str),
@@ -306,6 +307,21 @@ impl<T> BodyCache<T> {
         messages: &[Message],
         mut build: impl FnMut(&Message) -> Result<T, Error>,
     ) -> Result<(), Error> {
+        self.align_at(messages, |_, message| build(message))
+    }
+
+    /// Rebuilds the bodies whose message changed and reuses the rest, handing
+    /// `build` the index of the message it serializes.
+    ///
+    /// A wire whose bytes carry the position of a message, such as the fixed
+    /// timestamp counter of the pi-messages wire, reads it here: a body is
+    /// rebuilt exactly when the message at its index changed, so it always
+    /// holds the bytes of the message that index carried last.
+    pub fn align_at(
+        &mut self,
+        messages: &[Message],
+        mut build: impl FnMut(usize, &Message) -> Result<T, Error>,
+    ) -> Result<(), Error> {
         self.messages.truncate(messages.len());
         self.bodies.truncate(messages.len());
         for (index, message) in messages.iter().enumerate() {
@@ -314,7 +330,7 @@ impl<T> BodyCache<T> {
             }
             self.messages.truncate(index);
             self.bodies.truncate(index);
-            self.bodies.push(build(message)?);
+            self.bodies.push(build(index, message)?);
             self.messages.push(message.clone());
         }
         Ok(())

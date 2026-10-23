@@ -1,0 +1,21 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,7 +10,7 @@
+     /// A set that can hold the numbers 0 up to but not including `bits`.
+     pub fn new(bits: usize) -> BitSet {
+         BitSet {
+-            words: vec![0; bits / 64],
++            words: vec![0; (bits + 63) / 64],
+             bits,
+         }
+     }
+@@ -37,7 +37,7 @@
+         }
+         let w = n / 64;
+         let mask = 1u64 << (n % 64);
+-        self.words[w] |= mask;
++        self.words[w] &= !mask;
+         true
+     }
+ 

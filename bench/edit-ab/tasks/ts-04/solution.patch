@@ -1,0 +1,15 @@
+diff -ruN a/emitter.ts b/emitter.ts
+--- a/emitter.ts
++++ b/emitter.ts
+@@ -57,9 +57,9 @@
+     }
+     for (const entry of [...list]) {
+       if (entry.once) {
+-        this.off(entry.listener, event);
++        this.off(event, entry.listener);
+       }
+-      entry.listener(args[0]);
++      entry.listener(...args);
+     }
+     return true;
+   }

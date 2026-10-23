@@ -1,0 +1,1 @@
+Command line options that take a value, like --jobs 4, crash or set the wrong thing, a bare -- doesn't stop option parsing, and the retry count is wrong when I don't pass one. Please fix the argument parser. Do not edit the tests.

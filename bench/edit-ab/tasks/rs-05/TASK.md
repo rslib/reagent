@@ -1,0 +1,1 @@
+Transfers take the money from the receiving account and give it to the sender, I can't withdraw my whole balance, and the default interest is ten times too small. Please fix the bank code. Do not edit the tests.

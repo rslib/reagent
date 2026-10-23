@@ -79,6 +79,8 @@ impl Fill<'_> {
             entry.price = source.price;
             entry.price_source = source.price_source;
         }
+        // The provider's own list wins over the catalogue, as with the price.
+        entry.fill_reasoning(source);
     }
 }
 
@@ -160,6 +162,23 @@ async fn credential(target: &Target) -> Result<(reagent_ai::Credential, Source),
     Ok((credential, source))
 }
 
+/// Whether `target` lists its models without a key. The radius preset reads
+/// the endpoint's own `/config`, which is public.
+fn lists_to_anyone(target: &Target) -> bool {
+    target.preset.is_some_and(|preset| preset.public_list)
+}
+
+/// Whether the reason `target` had no credential is that no source held one:
+/// a missing key variable, or the hint of a provider whose only credential is
+/// a saved login.
+///
+/// Any other reason, a refused auth file, an expired login or a key the server
+/// would not take as a header, is a real error and not a reason to list the
+/// models without a credential.
+fn no_credential(error: &str) -> bool {
+    error.starts_with("missing ") || error.contains(" needs a login; run ")
+}
+
 /// The line the command prints before it fetches `target`: the profile, the
 /// provider and where its credential came from, never the key.
 fn start_line(profile: Option<&str>, target: &Target, source: &Source) -> String {
@@ -181,22 +200,44 @@ async fn fetch(
 ) -> Result<Cache, String> {
     let auth = match &target.wire {
         Wire::Anthropic => Auth::XApiKey,
-        Wire::OpenAiChat | Wire::OpenAiResponses => Auth::Bearer,
+        Wire::OpenAiChat | Wire::OpenAiResponses | Wire::PiMessages => Auth::Bearer,
         #[cfg(feature = "testing")]
         Wire::Fake(_) => return Err("the scripted provider has no model list".into()),
     };
-    let (credential, source) = credential(target).await?;
-    eprintln!("{}", start_line(profile, target, &source));
+    let credential = match credential(target).await {
+        Ok((credential, source)) => {
+            eprintln!("{}", start_line(profile, target, &source));
+            Some(credential)
+        }
+        Err(error) if lists_to_anyone(target) && no_credential(&error) => {
+            eprintln!(
+                "reagent: {}: {error}; listing the public models",
+                target.name
+            );
+            None
+        }
+        Err(error) => return Err(error),
+    };
     let base_url = target
         .base_url
         .clone()
         .unwrap_or_else(|| target.wire.base_url());
+    // The provider's own shape when it has one, else the wire's: only the
+    // Anthropic wire lists its models differently from the OpenRouter shape.
+    let read = target.preset.map_or_else(
+        || match target.wire {
+            Wire::Anthropic => reagent_ai::providers::anthropic::read_list,
+            _ => catalog::list::read,
+        },
+        |preset| preset.read_list,
+    );
     let mut models = catalog::fetch(
         &base_url,
         target.models_path,
         auth,
-        &credential,
+        credential.as_ref(),
         target.header.clone(),
+        read,
     )
     .await?;
     if let Some(fill) = fill {
@@ -246,8 +287,40 @@ async fn list(
     Ok(cache
         .models
         .into_iter()
-        .map(|entry| format!("{}/{}", target.name, entry.id))
+        .map(|entry| line(target.name.as_str(), &entry))
         .collect())
+}
+
+/// One output line: `name/id`, then the model's reasoning levels when its plan
+/// is known, such as `fi/m  off low high* max` or `fi/g  low high (no off)`.
+fn line(name: &str, entry: &Entry) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = format!("{name}/{}", entry.id);
+    let Some(plan) = entry.reasoning.as_ref().filter(|plan| !plan.is_empty()) else {
+        return out;
+    };
+    let start = out.len();
+    let no_off = plan.off == Some(false) || plan.mandatory;
+    if plan.off == Some(true) && !no_off {
+        out.push_str(" off");
+    }
+    for level in plan.levels.iter() {
+        let star = if plan.default == Some(level) { "*" } else { "" };
+        let _ = write!(out, " {}{star}", level.name());
+    }
+    for word in &plan.unknown {
+        out.push(' ');
+        out.push_str(word);
+    }
+    if no_off {
+        out.push_str(" (no off)");
+    }
+    // Two spaces part the id from the levels, so the first field stays the id.
+    if out.len() > start {
+        out.insert(start, ' ');
+    }
+    out
 }
 
 /// Runs the `models` command and returns the process exit code.
@@ -310,5 +383,81 @@ pub async fn run(args: ModelsArgs) -> ExitCode {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reagent_ai::levels::Reasoning;
+
+    /// An entry for `id` with the reasoning plan `reasoning`.
+    fn entry(id: &str, reasoning: Option<Reasoning>) -> Entry {
+        Entry {
+            id: id.into(),
+            context_window: None,
+            max_output: None,
+            price: None,
+            price_source: None,
+            reasoning,
+        }
+    }
+
+    #[test]
+    fn levels_follow_the_id_with_off_the_default_and_unknown_words() {
+        use reagent_ai::levels::Level;
+        let full = Reasoning {
+            off: Some(true),
+            default: Some(Level::High),
+            ..Reasoning::from_words(["low", "high", "max"])
+        };
+        assert_eq!(
+            line("fi", &entry("m", Some(full))),
+            "fi/m  off low high* max"
+        );
+        let strict = Reasoning {
+            off: Some(false),
+            ..Reasoning::from_words(["low", "ultra", "high"])
+        };
+        assert_eq!(
+            line("fi", &entry("g", Some(strict))),
+            "fi/g  low high ultra (no off)"
+        );
+        let mandatory = Reasoning {
+            mandatory: true,
+            ..Reasoning::from_words(["medium"])
+        };
+        assert_eq!(
+            line("fi", &entry("t", Some(mandatory))),
+            "fi/t  medium (no off)"
+        );
+        assert_eq!(line("fi", &entry("a", None)), "fi/a");
+        assert_eq!(line("fi", &entry("e", Some(Reasoning::default()))), "fi/e");
+    }
+
+    #[test]
+    fn reasoning_levels_the_catalogue_fills_only_a_missing_plan() {
+        let catalogue = vec![entry("m", Some(Reasoning::from_words(["low", "high"])))];
+        let fill = Fill {
+            entries: &catalogue,
+            prices: false,
+        };
+        // A provider list that names its own levels keeps them.
+        let mut listed = entry("m", Some(Reasoning::from_words(["medium"])));
+        fill.apply(&mut listed);
+        assert_eq!(listed.reasoning, Some(Reasoning::from_words(["medium"])));
+        // One that says nothing about reasoning is filled whatever the price
+        // flag says.
+        let mut blank = entry("m", None);
+        fill.apply(&mut blank);
+        assert_eq!(
+            blank.reasoning,
+            Some(Reasoning::from_words(["low", "high"]))
+        );
+        assert_eq!(blank.price, None, "the prices flag stays off");
+        // A model the catalogue does not list gets nothing.
+        let mut other = entry("n", None);
+        fill.apply(&mut other);
+        assert_eq!(other.reasoning, None);
     }
 }

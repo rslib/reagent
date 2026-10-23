@@ -1,0 +1,1 @@
+The pager reports too few pages when the item count is not a multiple of the page size, so the last items never show. The next-page button also goes backwards. Please fix the pagination helpers. Do not edit the tests.

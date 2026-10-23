@@ -21,6 +21,7 @@ use reagent_ai::openai::chat::{MessageBody as ChatBody, RequestBuilder as ChatBu
 use reagent_ai::openai::responses::request::{
     MessageBody as ResponsesBody, RequestBuilder as ResponsesBuilder,
 };
+use reagent_ai::pi::request::{MessageBody as PiBody, RequestBuilder as PiBuilder};
 use reagent_ai::{Error, MaxTokensField, Message, ReasoningField};
 
 /// dhat counts every thread, so one test at a time measures, with no other
@@ -344,6 +345,7 @@ enum History {
     Anthropic(AnthropicBuilder, Vec<AnthropicBody>),
     Chat(ChatBuilder, Vec<ChatBody>),
     Responses(ResponsesBuilder, Vec<ResponsesBody>),
+    Pi(PiBuilder, Vec<PiBody>),
 }
 
 impl History {
@@ -352,6 +354,7 @@ impl History {
             History::Anthropic(..) => "anthropic",
             History::Chat(..) => "openai-chat",
             History::Responses(..) => "openai-responses",
+            History::Pi(..) => "pi-messages",
         }
     }
 
@@ -362,6 +365,7 @@ impl History {
             History::Anthropic(builder, bodies) => blocks_of(|| builder.body_parts(bodies)),
             History::Chat(builder, bodies) => blocks_of(|| builder.body_parts(bodies)),
             History::Responses(builder, bodies) => blocks_of(|| builder.body_parts(bodies)),
+            History::Pi(builder, bodies) => blocks_of(|| builder.body_parts(bodies)),
         }
     }
 
@@ -371,6 +375,7 @@ impl History {
             History::Anthropic(builder, bodies) => allocated_of(|| builder.body_parts(bodies)),
             History::Chat(builder, bodies) => allocated_of(|| builder.body_parts(bodies)),
             History::Responses(builder, bodies) => allocated_of(|| builder.body_parts(bodies)),
+            History::Pi(builder, bodies) => allocated_of(|| builder.body_parts(bodies)),
         }
     }
 
@@ -380,6 +385,7 @@ impl History {
             History::Anthropic(builder, bodies) => builder.body_parts(bodies).len(),
             History::Chat(builder, bodies) => builder.body_parts(bodies).len(),
             History::Responses(builder, bodies) => builder.body_parts(bodies).len(),
+            History::Pi(builder, bodies) => builder.body_parts(bodies).len(),
         }
     }
 
@@ -388,7 +394,7 @@ impl History {
     fn limit(&self) -> u64 {
         match self {
             History::Anthropic(..) => 2,
-            History::Chat(..) | History::Responses(..) => 1,
+            History::Chat(..) | History::Responses(..) | History::Pi(..) => 1,
         }
     }
 }
@@ -401,7 +407,19 @@ fn bodies<T>(history: &[Message], build: impl Fn(&Message) -> Result<T, Error>) 
         .collect()
 }
 
-/// The three wires over one history of 50 tool results of 20 KB.
+/// The cached bodies of `history` for one wire that numbers them.
+fn bodies_with_index<T>(
+    history: &[Message],
+    build: impl Fn(usize, &Message) -> Result<T, Error>,
+) -> Vec<T> {
+    history
+        .iter()
+        .enumerate()
+        .map(|(index, message)| build(index, message).expect("a tool result serializes"))
+        .collect()
+}
+
+/// The four wires over one history of 50 tool results of 20 KB.
 fn histories() -> Vec<History> {
     let provider = "test";
     let history: Vec<Message> = (0..50)
@@ -428,6 +446,12 @@ fn histories() -> Vec<History> {
         History::Responses(
             ResponsesBuilder::new("m", 64, None, None, None, &tools),
             bodies(&history, |message| ResponsesBody::new(message, provider)),
+        ),
+        History::Pi(
+            PiBuilder::new("m", 64, None, None, None, &tools),
+            bodies_with_index(&history, |index, message| {
+                PiBody::new(message, provider, &[], index as u64 + 1)
+            }),
         ),
     ]
 }
@@ -476,4 +500,199 @@ fn body_pieces_of_a_large_history_hold_no_copy() {
             history.name()
         );
     }
+}
+
+/// The most blocks one pi-messages text delta may allocate.
+///
+/// The delta owns its text, so one block is the floor; the parser keeps no
+/// second copy of the line. Measured: 1.013.
+const PI_BLOCKS_PER_DELTA: f64 = 1.2;
+
+/// The most blocks one escaped pi-messages text delta may allocate: serde_json
+/// unescapes into a scratch buffer of its own, one per line, so an escaped
+/// delta costs that block and the block of its text. Measured: 2.013.
+const PI_ESCAPED_BLOCKS_PER_DELTA: f64 = 2.3;
+
+/// The body of one pi-messages reply: a text delta per line and the done line
+/// that closes it, with the delta text `text`.
+fn pi_body(text: &str) -> String {
+    format!("data: {{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"{text}\"}}\n\n")
+        .repeat(DELTAS)
+        + "data: {\"type\":\"done\",\"reason\":\"stop\"}\n\n"
+}
+
+/// The blocks and the text deltas one pi-messages body costs through the real
+/// stream glue, excluding the building of the chunks themselves.
+fn pi_measure(body: &str) -> (f64, usize) {
+    let chunks = chunks(body);
+    let profiler = Profiler::builder().testing().build();
+    let items = reagent_ai::pi::parse_chunks(chunks);
+    let (blocks, deltas) = (
+        HeapStats::get().total_blocks,
+        items
+            .iter()
+            .filter(|item| matches!(item, Ok(StreamEvent::TextDelta(_))))
+            .count(),
+    );
+    drop(items);
+    drop(profiler);
+    (blocks as f64 / deltas.max(1) as f64, deltas)
+}
+
+/// A pi-messages text delta allocates its own text and nothing else per
+/// event, escaped or not.
+#[test]
+fn a_pi_text_delta_allocates_at_most_one_point_two_blocks() {
+    let _guard = lock();
+    for (name, text, limit) in [
+        ("plain", "x", PI_BLOCKS_PER_DELTA),
+        ("escaped", "a\\nb", PI_ESCAPED_BLOCKS_PER_DELTA),
+    ] {
+        let (per_delta, deltas) = pi_measure(&pi_body(text));
+        assert_eq!(
+            deltas, DELTAS,
+            "{name}: the body carries one delta per line"
+        );
+        eprintln!("pi {name}: {per_delta:.3} blocks per delta");
+        assert!(
+            per_delta <= limit,
+            "{name}: {per_delta:.3} blocks per delta, over {limit}"
+        );
+    }
+}
+
+/// The most blocks the escaped argument deltas of one tool call may allocate.
+///
+/// The parser never unescapes an argument delta, so it keeps no text of its
+/// own: 0 per line. Measured: 0.000.
+const PI_TOOL_DELTA_BLOCKS_PER_LINE: f64 = 0.01;
+
+/// The blocks and the items one pi-messages body costs through the real glue,
+/// with no division by the events it carries.
+fn pi_blocks(body: &str) -> (u64, Vec<Result<StreamEvent, Error>>) {
+    let chunks = chunks(body);
+    let profiler = Profiler::builder().testing().build();
+    let items = reagent_ai::pi::parse_chunks(chunks);
+    let blocks = HeapStats::get().total_blocks;
+    drop(profiler);
+    (blocks, items)
+}
+
+/// A tool call's argument deltas are raw JSON fragments the parser never
+/// reads, so a thousand escaped ones allocate no block.
+#[test]
+fn pi_tool_argument_deltas_allocate_no_block() {
+    let _guard = lock();
+    let body = "data: {\"type\":\"toolcall_delta\",\"contentIndex\":1,\
+                \"delta\":\"{\\\"path\\\":\\\"a\\\"}\"}\n\n"
+        .repeat(DELTAS)
+        + "data: {\"type\":\"done\",\"reason\":\"toolUse\"}\n\n";
+    let (blocks, items) = pi_blocks(&body);
+    for item in &items {
+        assert!(item.is_ok(), "the body parses: {item:?}");
+    }
+    let per_line = blocks as f64 / DELTAS as f64;
+    eprintln!("pi tool deltas: {blocks} blocks for {DELTAS} lines = {per_line:.3}");
+    assert!(
+        per_line <= PI_TOOL_DELTA_BLOCKS_PER_LINE,
+        "pi: {blocks} blocks for {DELTAS} escaped argument deltas = {per_line:.3} per line, \
+         over {PI_TOOL_DELTA_BLOCKS_PER_LINE}"
+    );
+}
+
+/// The most bytes the build of one message body may allocate over the bytes
+/// of the body itself. Measured: 1.006.
+const PI_BODY_BYTES: f64 = 1.3;
+
+/// The blocks one message body may allocate, in tenths: 20 measured (its
+/// buffer, adopted by the `Bytes` that holds it, and the handle beside it).
+/// The builds are averaged over [`PI_BODIES`], so the few blocks `cargo test`'s
+/// harness threads allocate during the window cannot fail it.
+const PI_BODY_BLOCKS_X10: u64 = 25;
+
+/// The message bodies one measurement builds.
+const PI_BODIES: u64 = 100;
+
+/// A large message body is serialized once into the buffer it is sent as, so
+/// the build allocates one copy of the body and no second buffer.
+#[test]
+fn a_pi_message_body_allocates_one_copy_of_itself() {
+    let _guard = lock();
+    let message = Message::tool_result("call_1", "x".repeat(20_000), false);
+    let names = [("call_1", "read")];
+    let profiler = Profiler::builder().testing().build();
+    let mut bytes = 0;
+    for position in 0..PI_BODIES {
+        let body = PiBody::new(&message, "pi-messages", &names, position + 1).expect("a message");
+        bytes += body.bytes().len();
+    }
+    let stats = HeapStats::get();
+    drop(profiler);
+    let ratio = stats.total_bytes as f64 / bytes as f64;
+    let blocks_x10 = stats.total_blocks * 10 / PI_BODIES;
+    eprintln!(
+        "pi message body: {} blocks, {} bytes for {PI_BODIES} bodies of {bytes} bytes = {ratio:.3}, {blocks_x10}/10 blocks each",
+        stats.total_blocks, stats.total_bytes
+    );
+    assert!(
+        blocks_x10 <= PI_BODY_BLOCKS_X10,
+        "a body build took {blocks_x10}/10 blocks, over {PI_BODY_BLOCKS_X10}/10"
+    );
+    assert!(
+        ratio <= PI_BODY_BYTES,
+        "the build of a {bytes} byte body took {} bytes = {ratio:.3} of the body, over {PI_BODY_BYTES}",
+        stats.total_bytes
+    );
+}
+
+/// The number of models the OpenRouter-shape body of the list test carries.
+const LIST_MODELS: usize = 200;
+
+/// The most blocks one OpenRouter-shape model may cost to read.
+///
+/// Each [`reagent_ai::catalog::Entry`] owns its id `String`, so one block per
+/// model is the floor; the `Vec<Entry>` grows a few times as it fills. The
+/// prices and the effort words are borrowed from the body, so neither adds a
+/// block. Measured: 208 blocks for 200 models = 1.040 per model.
+const LIST_BLOCKS_PER_MODEL: f64 = 1.2;
+
+/// Reads a 200-model OpenRouter-shape body with efforts, allocating about one
+/// block per model: the id `String` it owns, plus the growth of the
+/// `Vec<Entry>`. A block per model more, such as a list of the effort words,
+/// is over the bound.
+#[test]
+fn perf_list_allocates_one_block_per_model() {
+    let _guard = lock();
+    let mut body = String::from("{\"data\":[");
+    for index in 0..LIST_MODELS {
+        if index > 0 {
+            body.push(',');
+        }
+        body.push_str(&format!(
+            "{{\"id\":\"model-{index}\",\"context_length\":128000,\
+             \"top_provider\":{{\"max_completion_tokens\":4096}},\
+             \"pricing\":{{\"prompt\":\"0.000001\",\"completion\":\"0.000002\",\
+             \"input_cache_read\":\"0.0000001\",\"input_cache_write\":\"0.0000012\"}},\
+             \"reasoning\":{{\"mandatory\":true,\
+             \"supported_efforts\":[\"low\",\"medium\",\"high\"],\"default_effort\":\"medium\"}}}}"
+        ));
+    }
+    body.push_str("]}");
+    let body = body.into_bytes();
+
+    let profiler = Profiler::builder().testing().build();
+    let entries = reagent_ai::catalog::list::read(&body).expect("the body parses");
+    let stats = HeapStats::get();
+    drop(entries);
+    drop(profiler);
+    let per_model = stats.total_blocks as f64 / LIST_MODELS as f64;
+    eprintln!(
+        "list read: {} blocks for {LIST_MODELS} models = {per_model:.3} per model",
+        stats.total_blocks
+    );
+    assert!(
+        per_model <= LIST_BLOCKS_PER_MODEL,
+        "{} blocks for {LIST_MODELS} models = {per_model:.3} per model, over {LIST_BLOCKS_PER_MODEL}",
+        stats.total_blocks
+    );
 }

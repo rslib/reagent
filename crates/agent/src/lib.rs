@@ -10,6 +10,7 @@ pub mod guard;
 pub mod mask;
 pub mod policy;
 pub mod repair;
+pub(crate) mod reread;
 pub mod retry;
 pub mod session;
 pub mod tool;

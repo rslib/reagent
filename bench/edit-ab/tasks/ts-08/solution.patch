@@ -1,0 +1,23 @@
+diff -ruN a/calc.ts b/calc.ts
+--- a/calc.ts
++++ b/calc.ts
+@@ -86,7 +86,7 @@
+         if (right === 0) {
+           throw new Error("division by zero");
+         }
+-        left = left * right;
++        left = left / right;
+       } else {
+         return left;
+       }
+@@ -105,6 +105,10 @@
+ 
+   // unary := "-" unary | primary
+   private unary(): number {
++    if (this.peekOp() === "-") {
++      this.pos += 1;
++      return -this.unary();
++    }
+     return this.primary();
+   }
+ 

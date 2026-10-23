@@ -8,6 +8,8 @@ pub mod freeinference;
 pub mod openai;
 pub mod opencode_go;
 pub mod openrouter;
+pub mod radius;
+pub mod synthetic;
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +22,8 @@ pub enum Wire {
     OpenAiChat,
     /// The OpenAI Responses API.
     OpenAiResponses,
+    /// The pi-messages API, which carries one JSON context per request.
+    PiMessages,
 }
 
 impl Wire {
@@ -29,14 +33,20 @@ impl Wire {
             Wire::Anthropic => "anthropic",
             Wire::OpenAiChat => "openai-chat",
             Wire::OpenAiResponses => "openai-responses",
+            Wire::PiMessages => "pi-messages",
         }
     }
 
     /// The wire with canonical name `name`.
     pub fn parse(name: &str) -> Option<Self> {
-        [Wire::Anthropic, Wire::OpenAiChat, Wire::OpenAiResponses]
-            .into_iter()
-            .find(|wire| wire.name() == name)
+        [
+            Wire::Anthropic,
+            Wire::OpenAiChat,
+            Wire::OpenAiResponses,
+            Wire::PiMessages,
+        ]
+        .into_iter()
+        .find(|wire| wire.name() == name)
     }
 
     /// The environment variable holding the key when none is named.
@@ -44,6 +54,7 @@ impl Wire {
         match self {
             Wire::Anthropic => "ANTHROPIC_API_KEY",
             Wire::OpenAiChat | Wire::OpenAiResponses => "OPENAI_API_KEY",
+            Wire::PiMessages => "RADIUS_API_KEY",
         }
     }
 }
@@ -194,41 +205,67 @@ impl Peak {
     }
 }
 
-/// A known provider.
-#[derive(Clone, Copy, Debug)]
-pub struct Preset {
-    /// The provider name.
+/// The model ids a route takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Models {
+    /// Every model.
+    Any,
+    /// The ids that start with this text.
+    Prefix(&'static str),
+    /// These ids only.
+    Exact(&'static [&'static str]),
+}
+
+impl Models {
+    /// Whether the route takes the model `id`.
+    pub fn matches(self, id: &str) -> bool {
+        match self {
+            Models::Any => true,
+            Models::Prefix(prefix) => id.starts_with(prefix),
+            Models::Exact(ids) => ids.contains(&id),
+        }
+    }
+}
+
+/// The header a route sends the key in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Auth {
+    /// The wire's own header: `x-api-key` on the Anthropic wire, else
+    /// `authorization: Bearer`.
+    Wire,
+    /// `authorization: Bearer`, on any wire.
+    Bearer,
+}
+
+/// One endpoint of a provider: the models it takes, its wire and its quirks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Route {
+    /// The route name, as an error names it.
     pub name: &'static str,
+    /// The models it takes.
+    pub models: Models,
     /// The wire protocol.
     pub wire: Wire,
     /// The endpoint, with no trailing slash.
     pub base_url: &'static str,
     /// The environment variable that replaces `base_url` when set.
     pub base_url_env: Option<&'static str>,
-    /// The environment variable holding the key.
-    pub api_key_env: &'static str,
-    /// The model list path under `base_url`.
-    pub models_path: &'static str,
+    /// The header the key goes in.
+    pub auth: Auth,
     /// How the endpoint differs from the plain wire.
     pub compat: Compat,
-    /// How the models.dev catalogue fills its model list.
-    pub models_dev: ModelsDev,
-    /// The hours that multiply a models.dev price, if any.
-    pub peak: Option<Peak>,
 }
 
-impl Preset {
-    /// A chat endpoint with the plain wire. Presets override what differs.
-    pub const DEFAULT: Preset = Preset {
-        name: "",
+impl Route {
+    /// A chat route for every model. Routes override what differs.
+    pub const DEFAULT: Route = Route {
+        name: "chat",
+        models: Models::Any,
         wire: Wire::OpenAiChat,
         base_url: "",
         base_url_env: None,
-        api_key_env: "",
-        models_path: "/models",
+        auth: Auth::Wire,
         compat: Compat::DEFAULT,
-        models_dev: ModelsDev::DEFAULT,
-        peak: None,
     };
 
     /// The endpoint: the `base_url_env` variable when set and not empty, else
@@ -238,6 +275,72 @@ impl Preset {
             .and_then(|name| std::env::var(name).ok())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| self.base_url.to_string())
+    }
+}
+
+/// A known provider.
+#[derive(Clone, Copy, Debug)]
+pub struct Preset {
+    /// The provider name.
+    pub name: &'static str,
+    /// The endpoints, in order: a run takes the first that takes its model and
+    /// the wire the user named, if any. The first route for every model is the
+    /// default, and the model list is read from it.
+    pub routes: &'static [Route],
+    /// The environment variable holding the key.
+    pub api_key_env: &'static str,
+    /// The model list path under the default route's endpoint.
+    pub models_path: &'static str,
+    /// How the models.dev catalogue fills its model list.
+    pub models_dev: ModelsDev,
+    /// The hours that multiply a models.dev price, if any.
+    pub peak: Option<Peak>,
+    /// Reads the provider's own model list in its own shape.
+    pub read_list: crate::catalog::ReadList,
+    /// Whether the endpoint lists its models without a key.
+    pub public_list: bool,
+}
+
+impl Preset {
+    /// A preset with no routes yet. Presets set the routes and override what
+    /// differs.
+    pub const DEFAULT: Preset = Preset {
+        name: "",
+        routes: &[],
+        api_key_env: "",
+        models_path: "/models",
+        models_dev: ModelsDev::DEFAULT,
+        peak: None,
+        read_list: crate::catalog::list::read,
+        public_list: false,
+    };
+
+    /// The route a run without a named wire takes for a model no other route
+    /// claims: the first route for every model.
+    pub fn default_route(&self) -> &'static Route {
+        self.routes
+            .iter()
+            .find(|route| route.models == Models::Any)
+            .expect("every preset has a route for every model")
+    }
+
+    /// The first route that takes `model` and, when one is named, `wire`.
+    pub fn route(&self, model: &str, wire: Option<Wire>) -> Option<&'static Route> {
+        self.routes
+            .iter()
+            .find(|route| route.models.matches(model) && wire.is_none_or(|wire| route.wire == wire))
+    }
+
+    /// The routes that take `model`, as `name (wire)`, for an error that
+    /// lists the wires a user may name.
+    pub fn route_names(&self, model: &str) -> String {
+        let names: Vec<String> = self
+            .routes
+            .iter()
+            .filter(|route| route.models.matches(model))
+            .map(|route| format!("{} ({})", route.name, route.wire.name()))
+            .collect();
+        names.join(", ")
     }
 }
 
@@ -251,6 +354,8 @@ pub const ALL: &[&Preset] = &[
     &commandcode::PRESET,
     &deepseek::PRESET,
     &freeinference::PRESET,
+    &radius::PRESET,
+    &synthetic::PRESET,
 ];
 
 /// The preset called `name`.
@@ -290,10 +395,48 @@ mod tests {
     }
 
     #[test]
+    fn preset_read_list_reads_the_provider_shape() {
+        use crate::catalog::list;
+        let expected: [(&str, crate::catalog::ReadList); 10] = [
+            ("anthropic", anthropic::read_list),
+            ("openai", list::read),
+            ("chatgpt", chatgpt::read_list),
+            ("openrouter", list::read),
+            ("opencode-go", list::read),
+            ("commandcode", list::read),
+            ("deepseek", deepseek::read_list),
+            ("freeinference", freeinference::read_list),
+            ("radius", radius::read_list),
+            ("synthetic", synthetic::read_list),
+        ];
+        for (name, read) in expected {
+            let preset = get(name).expect("a preset");
+            assert!(
+                std::ptr::fn_addr_eq(preset.read_list, read),
+                "{name} reads another shape"
+            );
+        }
+    }
+
+    #[test]
+    fn preset_public_list_is_only_radius() {
+        for preset in ALL {
+            assert_eq!(
+                preset.public_list,
+                preset.name == "radius",
+                "{}",
+                preset.name
+            );
+        }
+    }
+
+    #[test]
     fn each_preset_base_url_has_no_trailing_slash() {
         for preset in ALL {
-            assert!(preset.base_url.starts_with("https://"), "{}", preset.name);
-            assert!(!preset.base_url.ends_with('/'), "{}", preset.name);
+            for route in preset.routes {
+                assert!(route.base_url.starts_with("https://"), "{}", preset.name);
+                assert!(!route.base_url.ends_with('/'), "{}", preset.name);
+            }
             assert!(preset.models_path.starts_with('/'), "{}", preset.name);
         }
     }
@@ -313,16 +456,16 @@ mod tests {
     #[test]
     fn preset_wires_and_keys_match_the_design() {
         let anthropic = get("anthropic").unwrap();
-        assert_eq!(anthropic.wire, Wire::Anthropic);
+        assert_eq!(anthropic.default_route().wire, Wire::Anthropic);
         assert_eq!(anthropic.api_key_env, "ANTHROPIC_API_KEY");
         let openai = get("openai").unwrap();
-        assert_eq!(openai.wire, Wire::OpenAiResponses);
+        assert_eq!(openai.default_route().wire, Wire::OpenAiResponses);
         assert_eq!(
-            openai.compat.max_tokens_field,
+            openai.default_route().compat.max_tokens_field,
             MaxTokensField::MaxCompletionTokens
         );
         assert_eq!(
-            get("openrouter").unwrap().compat,
+            get("openrouter").unwrap().default_route().compat,
             Compat {
                 reasoning_field: ReasoningField::EffortObject,
                 reasoning_off: Some("none"),
@@ -334,8 +477,11 @@ mod tests {
     #[test]
     fn deepseek_preset_sends_none_for_off_on_the_chat_wire() {
         let deepseek = get("deepseek").expect("a deepseek preset");
-        assert_eq!(deepseek.wire, Wire::OpenAiChat);
-        assert_eq!(deepseek.base_url, "https://api.deepseek.com");
+        assert_eq!(deepseek.default_route().wire, Wire::OpenAiChat);
+        assert_eq!(
+            deepseek.default_route().base_url,
+            "https://api.deepseek.com"
+        );
         assert_eq!(deepseek.api_key_env, "DEEPSEEK_API_KEY");
         let head = |level| {
             let builder = crate::openai::chat::RequestBuilder::with_compat(
@@ -344,13 +490,37 @@ mod tests {
                 None,
                 Some(level),
                 &[],
-                deepseek.compat,
+                deepseek.default_route().compat,
             );
             std::str::from_utf8(builder.head()).unwrap().to_string()
         };
         assert!(head("off").contains(r#""reasoning_effort":"none""#));
         assert!(head("max").contains(r#""reasoning_effort":"max""#));
         assert!(head("max").contains(r#""max_tokens":1024"#));
+    }
+
+    #[test]
+    fn synthetic_preset_sends_none_for_off_and_has_a_messages_route() {
+        let synthetic = get("synthetic").expect("a synthetic preset");
+        assert_eq!(synthetic.api_key_env, "SYNTHETIC_API_KEY");
+        let chat = synthetic.route("hf:zai-org/GLM-5.3", None).unwrap();
+        assert_eq!(chat.wire, Wire::OpenAiChat);
+        assert_eq!(chat.base_url, "https://api.synthetic.new/openai/v1");
+        let builder = crate::openai::chat::RequestBuilder::with_compat(
+            "hf:zai-org/GLM-5.3",
+            1024,
+            None,
+            Some("off"),
+            &[],
+            chat.compat,
+        );
+        let head = std::str::from_utf8(builder.head()).unwrap();
+        assert!(head.contains(r#""reasoning_effort":"none""#), "{head}");
+        let messages = synthetic
+            .route("hf:zai-org/GLM-5.3", Some(Wire::Anthropic))
+            .unwrap();
+        assert_eq!(messages.name, "messages");
+        assert_eq!(messages.base_url, "https://api.synthetic.new/anthropic");
     }
 
     #[test]
@@ -409,24 +579,43 @@ mod tests {
     #[test]
     fn gateway_opencode_go_preset_sets_the_session_header() {
         let opencode = get("opencode-go").unwrap();
-        assert_eq!(opencode.compat.session_header, Some("x-opencode-session"));
-        assert_eq!(opencode.wire, Wire::OpenAiChat);
+        assert_eq!(
+            opencode.default_route().compat.session_header,
+            Some("x-opencode-session")
+        );
+        assert_eq!(opencode.default_route().wire, Wire::OpenAiChat);
         for preset in ALL.iter().filter(|preset| preset.name != "opencode-go") {
-            assert_eq!(preset.compat.session_header, None, "{}", preset.name);
+            assert_eq!(
+                preset.default_route().compat.session_header,
+                None,
+                "{}",
+                preset.name
+            );
         }
     }
 
     #[test]
     fn reasoning_off_presets_name_their_own_off_word() {
         assert_eq!(
-            get("commandcode").unwrap().compat.reasoning_off,
+            get("commandcode")
+                .unwrap()
+                .default_route()
+                .compat
+                .reasoning_off,
             Some("off")
         );
         assert_eq!(
-            get("openrouter").unwrap().compat.reasoning_off,
+            get("openrouter")
+                .unwrap()
+                .default_route()
+                .compat
+                .reasoning_off,
             Some("none")
         );
-        assert_eq!(get("openai").unwrap().compat.reasoning_off, Some("none"));
+        assert_eq!(
+            get("openai").unwrap().default_route().compat.reasoning_off,
+            Some("none")
+        );
         assert_eq!(Compat::DEFAULT.reasoning_off, None);
     }
 
@@ -452,5 +641,107 @@ mod tests {
     fn compat_override_refuses_an_unknown_flag() {
         assert!(serde_json::from_str::<CompatOverride>(r#"{"nope":true}"#).is_err());
         assert!(serde_json::from_str::<CompatOverride>(r#"{"max_tokens_field":"nope"}"#).is_err());
+    }
+
+    #[test]
+    fn route_models_take_any_a_prefix_or_exact_ids() {
+        assert!(Models::Any.matches(""));
+        assert!(Models::Prefix("claude-").matches("claude-haiku-5-5"));
+        assert!(!Models::Prefix("claude-").matches("deepseek/claude-x"));
+        assert!(Models::Exact(&["a", "b"]).matches("b"));
+        assert!(!Models::Exact(&["a", "b"]).matches("ab"));
+    }
+
+    #[test]
+    fn route_every_preset_has_a_default_and_unique_route_names() {
+        for preset in ALL {
+            assert_eq!(
+                preset.default_route().models,
+                Models::Any,
+                "{}",
+                preset.name
+            );
+            for (index, route) in preset.routes.iter().enumerate() {
+                assert!(
+                    preset.routes[..index]
+                        .iter()
+                        .all(|seen| seen.name != route.name),
+                    "{}: route {} twice",
+                    preset.name,
+                    route.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn route_commandcode_sends_claude_to_messages_and_the_rest_to_chat() {
+        let commandcode = get("commandcode").unwrap();
+        let claude = commandcode.route("claude-haiku-5-5", None).unwrap();
+        assert_eq!(claude.wire, Wire::Anthropic);
+        assert_eq!(claude.base_url, "https://api.commandcode.ai/provider");
+        let other = commandcode
+            .route("deepseek/deepseek-v4.1-flash", None)
+            .unwrap();
+        assert_eq!(other.wire, Wire::OpenAiChat);
+        assert_eq!(other.base_url, "https://api.commandcode.ai/provider/v1");
+        assert_eq!(other.compat.reasoning_off, Some("off"));
+        // A named chat wire takes the chat route even for a claude model.
+        let named = commandcode
+            .route("claude-haiku-5-5", Some(Wire::OpenAiChat))
+            .unwrap();
+        assert_eq!(named.base_url, "https://api.commandcode.ai/provider/v1");
+    }
+
+    #[test]
+    fn route_a_named_wire_picks_the_messages_route_of_deepseek_and_openrouter() {
+        let deepseek = get("deepseek").unwrap();
+        assert_eq!(
+            deepseek.route("deepseek-flash", None).unwrap().wire,
+            Wire::OpenAiChat
+        );
+        let messages = deepseek
+            .route("deepseek-flash", Some(Wire::Anthropic))
+            .unwrap();
+        assert_eq!(messages.base_url, "https://api.deepseek.com/anthropic");
+        assert_eq!(messages.auth, Auth::Wire);
+
+        let openrouter = get("openrouter").unwrap();
+        assert_eq!(
+            openrouter
+                .route("anthropic/claude-sonnet-5", None)
+                .unwrap()
+                .wire,
+            Wire::OpenAiChat
+        );
+        let messages = openrouter
+            .route("anthropic/claude-sonnet-5", Some(Wire::Anthropic))
+            .unwrap();
+        assert_eq!(messages.base_url, "https://openrouter.ai/api");
+        assert_eq!(messages.auth, Auth::Bearer);
+        assert!(
+            openrouter
+                .route("openai/gpt-5", Some(Wire::Anthropic))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn route_a_wire_no_route_takes_is_none() {
+        let deepseek = get("deepseek").unwrap();
+        assert!(
+            deepseek
+                .route("deepseek-flash", Some(Wire::OpenAiResponses))
+                .is_none()
+        );
+        assert_eq!(
+            deepseek.route_names("deepseek-flash"),
+            "chat (openai-chat), messages (anthropic)"
+        );
+        // A route that does not take the model is left out.
+        assert_eq!(
+            get("openrouter").unwrap().route_names("openai/gpt-5"),
+            "chat (openai-chat), responses (openai-responses)"
+        );
     }
 }

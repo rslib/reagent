@@ -2,12 +2,80 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use futures_util::future::BoxFuture;
 
 use reagent_ai::{Text, ToolSpec};
 use tokio_util::sync::CancellationToken;
+
+/// What one file is, so a read is matched with a later read of the same file
+/// without looking at the path again.
+///
+/// On unix it is the device and inode out of the metadata of the handle a read
+/// already opened: two integers, so no allocation and no extra syscall, the
+/// same answer for every spelling of the path including a symlink, and a new
+/// pair for a file that a write replaced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Identity {
+    /// The device and inode of a file, on a platform that has them.
+    Inode {
+        /// The device the file system is mounted from.
+        dev: u64,
+        /// The file's inode number on that device.
+        ino: u64,
+    },
+    /// The canonical path, where the metadata carries no inode.
+    #[cfg(not(unix))]
+    Canonical(PathBuf),
+}
+
+impl Identity {
+    /// The identity of the file `metadata` describes, which `path` named.
+    ///
+    /// On unix this reads two integers out of the metadata, so it costs no
+    /// syscall and no allocation. Elsewhere it canonicalizes the path.
+    pub async fn new(metadata: &std::fs::Metadata, path: &Path) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let _ = path;
+            Self::Inode {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            match tokio::fs::canonicalize(path).await {
+                Ok(canonical) => Self::Canonical(canonical),
+                Err(_) => Self::Canonical(path.to_path_buf()),
+            }
+        }
+    }
+}
+
+/// The lines of one file a read showed the model, with the file's state when
+/// it ran, so the loop can tell a re-read from a fresh one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seen {
+    /// The path as the model wrote it, for the note.
+    pub path: Text,
+    /// The file's identity, for matching; see [`Identity`], which costs no
+    /// allocation and no path lookup.
+    pub key: Identity,
+    /// The first line shown, 1-based.
+    pub start: u64,
+    /// The last line shown, 1-based, after the byte cap and the line limit.
+    pub end: u64,
+    /// The file's size when it was read.
+    pub size: u64,
+    /// The file's modified time when it was read.
+    pub modified: Option<SystemTime>,
+}
 
 /// The outcome of one tool call, sent back to the model.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,6 +84,8 @@ pub struct ToolOutput {
     pub content: Text,
     /// Whether the tool failed.
     pub is_error: bool,
+    /// The file lines a `read` showed, for the re-read note; `None` otherwise.
+    pub seen: Option<Box<Seen>>,
 }
 
 impl ToolOutput {
@@ -24,6 +94,7 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: false,
+            seen: None,
         }
     }
 
@@ -32,7 +103,17 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: true,
+            seen: None,
         }
+    }
+
+    /// Records the lines this result showed, so the loop can note a re-read.
+    #[must_use]
+    pub fn with_seen(mut self, seen: Seen) -> Self {
+        // Boxed, so a result without one stays small as it moves through the
+        // batch and the loop; only a read pays the one allocation.
+        self.seen = Some(Box::new(seen));
+        self
     }
 }
 

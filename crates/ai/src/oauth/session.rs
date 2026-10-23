@@ -11,10 +11,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::{self, Either};
 use futures_util::lock::Mutex;
-use reagent_config::auth::{self, Login};
+use reagent_config::Secret;
+use reagent_config::auth::{self, Login, Logins};
 use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 
 use super::chatgpt::{self, RefreshError};
+use super::device;
 
 /// How long before the saved expiry a token is replaced, so a request that
 /// starts now does not run past it.
@@ -96,9 +98,12 @@ impl Session {
     /// caller's runtime, so no wait here holds the runtime thread.
     pub fn load(dir: &Path, name: &str, token_url: &str, sleep: Sleeper) -> Result<Self, String> {
         let logins = auth::read(dir)?;
-        let Some(Login::Oauth {
+        let (Some(Login::Oauth {
             access, expires_at, ..
-        }) = logins.get(name)
+        })
+        | Some(Login::Device {
+            access, expires_at, ..
+        })) = logins.get(name)
         else {
             return Err(format!(
                 "no ChatGPT login for {name}; run {}",
@@ -142,7 +147,7 @@ impl Session {
         let wait = (self.sleep)(REFRESH_TIMEOUT);
         match future::select(work, wait).await {
             Either::Left((value, _)) => Ok(value),
-            Either::Right(_) => Err("chatgpt token refresh timed out".to_string()),
+            Either::Right(_) => Err(format!("{} token refresh timed out", self.name)),
         }
     }
 
@@ -156,6 +161,29 @@ impl Session {
     async fn refresh(&self) -> Result<Cached, String> {
         let _lock = Lock::wait(&self.dir.join(LOCK_FILE), &self.sleep).await?;
         let mut logins = auth::read(&self.dir)?;
+        if let Some(Login::Device {
+            provider,
+            client_id,
+            token_url,
+            access,
+            refresh,
+            expires_at,
+        }) = logins.get(&self.name).cloned()
+        {
+            return self
+                .refresh_device(
+                    &mut logins,
+                    Device {
+                        provider,
+                        client_id,
+                        token_url,
+                        access,
+                        refresh,
+                        expires_at,
+                    },
+                )
+                .await;
+        }
         let Some(Login::Oauth {
             client_id,
             host_id,
@@ -211,6 +239,71 @@ impl Session {
             header: bearer(reply.access_token.expose())?,
             expires_at,
         })
+    }
+
+    /// The refresh of a device login, under the lock `refresh` holds.
+    async fn refresh_device(&self, logins: &mut Logins, login: Device) -> Result<Cached, String> {
+        // Another run may have refreshed while this one waited for the lock.
+        if now().saturating_add(MARGIN) < login.expires_at {
+            return Ok(Cached {
+                header: bearer(login.access.expose())?,
+                expires_at: login.expires_at,
+            });
+        }
+        let refreshing =
+            device::refresh(&login.token_url, &login.client_id, login.refresh.expose());
+        let tokens = match self.within(refreshing).await? {
+            Ok(tokens) => tokens,
+            Err(device::RefreshError::Expired) => {
+                return Err(format!(
+                    "{} login expired; run reagent login {}",
+                    login.provider,
+                    login_target(&login.provider, &self.name)
+                ));
+            }
+            Err(device::RefreshError::Other(message)) => return Err(message),
+        };
+        let expires_at = now().saturating_add(tokens.expires_in);
+        logins.set(
+            &self.name,
+            Login::Device {
+                provider: login.provider,
+                client_id: login.client_id,
+                token_url: login.token_url,
+                access: tokens.access.clone(),
+                // A reply without a refresh token keeps the old one.
+                refresh: tokens.refresh.unwrap_or(login.refresh),
+                expires_at,
+            },
+        );
+        if let Err(error) = auth::write(&self.dir, logins)
+            && let Ok(mut slot) = self.warning.lock()
+        {
+            *slot = Some(error);
+        }
+        Ok(Cached {
+            header: bearer(tokens.access.expose())?,
+            expires_at,
+        })
+    }
+}
+
+/// The fields of a saved device login.
+struct Device {
+    provider: String,
+    client_id: String,
+    token_url: String,
+    access: Secret,
+    refresh: Secret,
+    expires_at: u64,
+}
+
+/// The `reagent login` arguments that save the login `name` of `provider`.
+fn login_target(provider: &str, name: &str) -> String {
+    if name == provider {
+        provider.to_string()
+    } else {
+        format!("{provider} --as {name}")
     }
 }
 
@@ -394,6 +487,73 @@ mod tests {
             refresh.expose().to_string(),
             *expires_at,
         )
+    }
+
+    /// A saved device login in `dir` that refreshes at `token_url`.
+    fn save_device(dir: &Path, name: &str, token_url: &str, expires_at: u64) {
+        let mut logins = auth::Logins::default();
+        logins.set(
+            name,
+            Login::Device {
+                provider: "radius".into(),
+                client_id: "pi-gateway".into(),
+                token_url: token_url.into(),
+                access: Secret::from("old-access"),
+                refresh: Secret::from("old-refresh"),
+                expires_at,
+            },
+        );
+        auth::write(dir, &logins).expect("writes the login");
+    }
+
+    #[tokio::test]
+    async fn device_session_refreshes_at_its_saved_endpoint() {
+        let dir = Folder::new("device-rotate");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let url = token_server(
+            200,
+            r#"{"access_token":"new-access","expires_in":3600}"#,
+            Arc::clone(&calls),
+        )
+        .await;
+        save_device(dir.path(), "radius", &url, 0);
+        // The URL given to `load` is ChatGPT's; a device login keeps its own.
+        let session =
+            Session::load(dir.path(), "radius", "http://127.0.0.1:9/none", timer()).expect("loads");
+        let (_, value) = session.header().await.expect("the header");
+        assert_eq!(value.as_bytes(), b"Bearer new-access");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let logins = auth::read(dir.path()).expect("reads");
+        let Some(Login::Device {
+            access,
+            refresh,
+            expires_at,
+            ..
+        }) = logins.get("radius")
+        else {
+            panic!("no device login");
+        };
+        assert_eq!(access.expose(), "new-access");
+        // No refresh token came back, so the old one stays.
+        assert_eq!(refresh.expose(), "old-refresh");
+        assert!(*expires_at > now() + 3000);
+        let (_, value) = session.header().await.expect("the header");
+        assert_eq!(value.as_bytes(), b"Bearer new-access");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn device_session_an_expired_login_names_its_command() {
+        let dir = Folder::new("device-expired");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let url = token_server(400, r#"{"error":"invalid_grant"}"#, Arc::clone(&calls)).await;
+        save_device(dir.path(), "radius-work", &url, 0);
+        let session = Session::load(dir.path(), "radius-work", &url, timer()).expect("loads");
+        let error = session.header().await.unwrap_err();
+        assert_eq!(
+            error,
+            "radius login expired; run reagent login radius --as radius-work"
+        );
     }
 
     #[tokio::test]

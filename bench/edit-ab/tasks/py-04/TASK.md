@@ -1,0 +1,1 @@
+Cache entries with a time to live stay readable at the exact moment they should expire. Also, when I add several entries at once to a full cache, it throws away the newest one instead of the oldest. Please fix the cache. Do not edit the tests.

@@ -1,0 +1,1 @@
+Flipping a grid left to right gives a grid with swapped width and height when the grid is not square, and asking for the neighbours of a cell in the last column returns a cell that is outside the grid. Please fix the grid code. Do not edit the tests.

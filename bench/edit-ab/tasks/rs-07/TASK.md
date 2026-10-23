@@ -1,0 +1,1 @@
+My config parser fails on files that have empty lines, cuts a value that contains an equals sign (like a URL with a query string), and does not understand on as a true value. Please fix the config parser. Do not edit the tests.

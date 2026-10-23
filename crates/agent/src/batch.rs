@@ -5,8 +5,12 @@ use futures_util::future::BoxFuture;
 use reagent_ai::{Message, ToolCall};
 
 use crate::guard::Guard;
-use crate::tool::{Registry, Tool, ToolOutput};
+use crate::tool::{Registry, Seen, Tool, ToolOutput};
 use tokio_util::sync::CancellationToken;
+
+/// One call's result: the message the reply records, and the lines a read
+/// showed for the loop's re-read note.
+pub type Outcome = (Message, Option<Box<Seen>>);
 
 /// Runs every tool call in `calls` and returns its result in call order.
 ///
@@ -31,6 +35,18 @@ pub async fn run_all_guarded<'a>(
     guard: Option<&'a Guard>,
     token: &'a CancellationToken,
 ) -> Vec<Message> {
+    let outcomes = run_all_guarded_seen(calls, registry, guard, token).await;
+    outcomes.into_iter().map(|(message, _)| message).collect()
+}
+
+/// [`run_all_guarded`], keeping each result's `seen` next to its message so
+/// the loop can note a re-read before the message is recorded.
+pub async fn run_all_guarded_seen<'a>(
+    calls: &'a [ToolCall],
+    registry: &'a Registry,
+    guard: Option<&'a Guard>,
+    token: &'a CancellationToken,
+) -> Vec<Outcome> {
     if token.is_cancelled() {
         return calls.iter().map(cancelled_message).collect();
     }
@@ -98,12 +114,17 @@ fn run_one<'a>(
     }
 }
 
-fn result_message(call: &ToolCall, output: ToolOutput) -> Message {
-    Message::tool_result(call.id.clone(), output.content, output.is_error)
+fn result_message(call: &ToolCall, output: ToolOutput) -> Outcome {
+    // The message takes the content; `seen` moves out next to it.
+    let message = Message::tool_result(call.id.clone(), output.content, output.is_error);
+    (message, output.seen)
 }
 
-fn cancelled_message(call: &ToolCall) -> Message {
-    Message::tool_result(call.id.clone(), "cancelled", true)
+fn cancelled_message(call: &ToolCall) -> Outcome {
+    (
+        Message::tool_result(call.id.clone(), "cancelled", true),
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -306,6 +327,70 @@ mod tests {
             panic!("expected a tool result");
         };
         assert!(second.is_error);
+    }
+
+    /// A read tool that reports the line range it showed.
+    struct SeenTool {
+        spec: ToolSpec,
+        seen: Seen,
+    }
+
+    impl Tool for SeenTool {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn read_only(&self) -> bool {
+            true
+        }
+
+        fn run<'a>(
+            &'a self,
+            _args: &'a str,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, ToolOutput> {
+            Box::pin(async { ToolOutput::ok("1\ta\n").with_seen(self.seen.clone()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_result_keeps_its_seen_lines_beside_the_message() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::new();
+        add_tool(&mut registry, "ro_a", true, 0, &log);
+        registry.add(SeenTool {
+            spec: ToolSpec {
+                name: "read".into(),
+                description: "A batch test read.".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            seen: Seen {
+                path: Text::from("f.txt"),
+                key: crate::tool::Identity::Inode { dev: 1, ino: 2 },
+                start: 1,
+                end: 1,
+                size: 4,
+                modified: None,
+            },
+        });
+        let seen_call = ToolCall {
+            id: "c2".into(),
+            name: "read".into(),
+            arguments: Text::from("{}"),
+        };
+        let calls = vec![call("c1", "ro_a"), seen_call, call("c3", "shell")];
+
+        let outcomes =
+            run_all_guarded_seen(&calls, &registry, None, &CancellationToken::new()).await;
+
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(content_of(&outcomes[0].0), "ro_a");
+        assert_eq!(outcomes[0].1, None, "a call with no seen keeps none");
+        assert_eq!(content_of(&outcomes[1].0), "1\ta\n");
+        let seen = outcomes[1].1.as_ref().expect("the read keeps its seen");
+        assert_eq!((seen.start, seen.end), (1, 1));
+        assert_eq!(seen.path.as_ref(), "f.txt");
+        assert_eq!(outcomes[2].1, None, "an unknown tool has no seen");
     }
 
     #[tokio::test(start_paused = true)]

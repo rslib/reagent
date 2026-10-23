@@ -7,15 +7,19 @@ pub(crate) mod cross_provider;
 pub mod fake;
 mod http;
 pub mod key;
+pub mod levels;
 pub mod oauth;
 pub mod openai;
+pub mod pi;
 pub mod providers;
 pub mod sse;
 pub mod types;
 
 pub use http::check_header;
 pub use key::Credential;
-pub use providers::{Compat, CompatOverride, MaxTokensField, Preset, ReasoningField, Wire};
+pub use providers::{
+    Auth, Compat, CompatOverride, MaxTokensField, Models, Preset, ReasoningField, Route, Wire,
+};
 
 pub use types::{
     AssistantMessage, Content, Message, Reasoning, Role, StopReason, Text, ToolCall, ToolResult,
@@ -45,6 +49,9 @@ pub enum StreamEvent {
     Usage(Usage),
     /// The reply ended, with the reason the provider gave.
     Stop(StopReason),
+    /// The wire's own fields for sending the reply back, kept as
+    /// [`AssistantMessage::replay`].
+    Replay(Text),
 }
 
 /// Retry metadata a provider sent with an error, captured from the response

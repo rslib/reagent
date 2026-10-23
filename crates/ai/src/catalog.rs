@@ -1,12 +1,17 @@
 //! The model list of a provider and its cache file.
 
+pub mod list;
 pub mod models_dev;
 
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::value::RawValue;
 
 use crate::http::{ExtraHeaders, client};
+use crate::levels::Reasoning;
 use crate::types::Usage;
 
 /// How long a cached list counts as fresh, in seconds.
@@ -67,6 +72,21 @@ pub struct Entry {
     /// lists never does. A cache file written before this field has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_source: Option<PriceSource>,
+    /// The reasoning levels of the model, when a source lists them. A cache
+    /// file written before this field has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Reasoning>,
+}
+
+impl Entry {
+    /// Fills the reasoning plan of this entry from `source` when the provider's
+    /// own list said nothing about it: the precedence the price and the limits
+    /// follow too.
+    pub fn fill_reasoning(&mut self, source: &Entry) {
+        if self.reasoning.is_none() {
+            self.reasoning.clone_from(&source.reasoning);
+        }
+    }
 }
 
 /// A cached model list.
@@ -94,80 +114,31 @@ pub enum Auth {
     XApiKey,
 }
 
-#[derive(Deserialize)]
-struct Listing {
-    #[serde(default)]
-    data: Vec<Item>,
-    /// The ChatGPT plan shape, which lists each entry with a visibility.
-    models: Option<Vec<PlanItem>>,
+/// Reads one provider's `/models` reply into entries.
+pub type ReadList = fn(&[u8]) -> Result<Vec<Entry>, serde_json::Error>;
+
+/// `raw` read as `T`, or `None` when it has another shape.
+pub(crate) fn shaped<'a, T: Deserialize<'a>>(raw: Option<&'a RawValue>) -> Option<T> {
+    serde_json::from_str(raw?.get()).ok()
 }
 
-/// One entry of the ChatGPT plan shape.
-#[derive(Deserialize)]
-struct PlanItem {
-    slug: String,
-    visibility: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Item {
-    id: String,
-    context_length: Option<u64>,
-    /// DeepSeek's own name for `context_length`.
-    context_window: Option<u64>,
-    top_provider: Option<TopProvider>,
-    /// DeepSeek's own name for `top_provider.max_completion_tokens`.
-    max_output_tokens: Option<u64>,
-    pricing: Option<Pricing>,
-}
-
-#[derive(Deserialize)]
-struct TopProvider {
-    max_completion_tokens: Option<u64>,
-}
-
-/// The `pricing` object of one listed model. OpenRouter writes each price as a
-/// string, so a listing is read as either text or a number.
-#[derive(Deserialize)]
-struct Pricing {
-    #[serde(default, deserialize_with = "amount")]
-    prompt: Option<f64>,
-    #[serde(default, deserialize_with = "amount")]
-    completion: Option<f64>,
-    #[serde(default, deserialize_with = "amount")]
-    input_cache_read: Option<f64>,
-    #[serde(default, deserialize_with = "amount")]
-    input_cache_write: Option<f64>,
-}
-
-impl Pricing {
-    /// The price, or `None` when the listing leaves out a token price or writes
-    /// one that is not a number. A cache price that is missing or bad counts as
-    /// free, which is the common case for a provider that does not say.
-    /// `None` unless every price is a finite amount of at least 0; routers
-    /// list `-1` for a price that varies.
-    fn price(self) -> Option<Price> {
-        let price = Price {
-            input: self.prompt?,
-            output: self.completion?,
-            cache_read: self.input_cache_read.unwrap_or(0.0),
-            cache_write: self.input_cache_write.unwrap_or(0.0),
-        };
-        [
-            price.input,
-            price.output,
-            price.cache_read,
-            price.cache_write,
-        ]
-        .iter()
-        .all(|amount| amount.is_finite() && *amount >= 0.0)
-        .then_some(price)
-    }
+/// `price` when every part is a finite amount of at least 0. A router lists
+/// `-1` for a price that varies, and a bad price is no price at all.
+pub(crate) fn sane(price: Price) -> Option<Price> {
+    [
+        price.input,
+        price.output,
+        price.cache_read,
+        price.cache_write,
+    ]
+    .iter()
+    .all(|amount| amount.is_finite() && *amount >= 0.0)
+    .then_some(price)
 }
 
 /// Reads one price, written as text or as a number. Anything else, and text
 /// that is not a number, is `None`.
-fn amount<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+pub(crate) fn amount<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -204,56 +175,102 @@ where
     deserializer.deserialize_any(Amount)
 }
 
-/// Reads the entries of an OpenAI-style `{"data": [...]}` reply, or of the
-/// ChatGPT plan shape, which lists `models` with a visibility and a slug.
-pub fn parse(body: &[u8]) -> Result<Vec<Entry>, serde_json::Error> {
-    let listing: Listing = serde_json::from_slice(body)?;
-    if let Some(models) = listing.models {
-        return Ok(models
-            .into_iter()
-            .filter(|model| model.visibility.as_deref() == Some("list"))
-            .map(|model| Entry {
-                id: model.slug,
-                context_window: None,
-                max_output: None,
-                price: None,
-                price_source: None,
-            })
-            .collect());
+/// Reads the entries of an OpenAI-style `{"data": [...]}` reply, converting each
+/// item to an [`Entry`] as it is read. Other top-level keys are ignored.
+///
+/// The item type is monomorphized per provider, so each provider's own shape
+/// converts as serde reads it, with no intermediate list of items.
+pub(crate) fn data<'a, T>(body: &'a [u8]) -> Result<Vec<Entry>, serde_json::Error>
+where
+    T: Deserialize<'a> + Into<Entry> + 'a,
+{
+    struct Data<'a, T>(PhantomData<&'a T>);
+
+    /// A top-level key, read as an identifier so it costs no allocation.
+    #[derive(Deserialize)]
+    #[serde(field_identifier, rename_all = "lowercase")]
+    enum Key {
+        Data,
+        #[serde(other)]
+        Other,
     }
-    Ok(listing
-        .data
-        .into_iter()
-        .map(|item| {
-            // The list may write either name; the first present wins.
-            let price = item.pricing.and_then(Pricing::price);
-            Entry {
-                id: item.id,
-                context_window: item.context_window.or(item.context_length),
-                max_output: item
-                    .max_output_tokens
-                    .or_else(|| item.top_provider.and_then(|top| top.max_completion_tokens)),
-                price_source: price.map(|_| PriceSource::Provider),
-                price,
+
+    impl<'a, T: Deserialize<'a> + Into<Entry> + 'a> Visitor<'a> for Data<'a, T> {
+        type Value = Vec<Entry>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a model list with a data array")
+        }
+
+        fn visit_map<A: MapAccess<'a>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut entries = None;
+            while let Some(key) = map.next_key::<Key>()? {
+                match key {
+                    Key::Data => entries = Some(map.next_value_seed(Items::<T>(PhantomData))?),
+                    Key::Other => {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
             }
-        })
-        .collect())
+            Ok(entries.unwrap_or_default())
+        }
+    }
+
+    struct Items<'a, T>(PhantomData<&'a T>);
+
+    impl<'a, T: Deserialize<'a> + Into<Entry> + 'a> Visitor<'a> for Items<'a, T> {
+        type Value = Vec<Entry>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a list of models")
+        }
+
+        fn visit_seq<A: SeqAccess<'a>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut entries = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(item) = seq.next_element::<T>()? {
+                entries.push(item.into());
+            }
+            Ok(entries)
+        }
+    }
+
+    impl<'a, T: Deserialize<'a> + Into<Entry> + 'a> serde::de::DeserializeSeed<'a> for Items<'a, T> {
+        type Value = Vec<Entry>;
+
+        fn deserialize<D: Deserializer<'a>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_seq(self)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let entries = deserializer.deserialize_map(Data::<T>(PhantomData))?;
+    deserializer.end()?;
+    Ok(entries)
 }
 
-/// Fetches `{base_url}/models`. No error contains the key.
+/// Fetches `{base_url}{models_path}`. No error contains the key.
+///
+/// `credential` is `None` for a provider that lists its models to anyone.
+/// `read` reads the reply in the provider's own shape.
 pub async fn fetch(
     base_url: &str,
     models_path: &str,
     auth: Auth,
-    credential: &crate::key::Credential,
+    credential: Option<&crate::key::Credential>,
     headers: Vec<(String, String)>,
+    read: ReadList,
 ) -> Result<Vec<Entry>, String> {
     let url = format!("{}{models_path}", base_url.trim_end_matches('/'));
     let mut request = ExtraHeaders::new(headers).apply(client().get(url));
     // The credential names its own header: a key is a bearer or `x-api-key`,
     // and a saved login refreshes its token and is always a bearer.
-    let (name, value) = credential.header().await?;
-    request = request.header(name, value);
+    if let Some(credential) = credential {
+        let (name, value) = credential.header().await?;
+        request = request.header(name, value);
+    }
     if auth == Auth::XApiKey {
         request = request.header("anthropic-version", "2023-06-01");
     }
@@ -263,7 +280,7 @@ pub async fn fetch(
         return Err(format!("HTTP {}", status.as_u16()));
     }
     let body = response.bytes().await.map_err(describe)?;
-    parse(&body).map_err(|error| format!("bad model list: {error}"))
+    read(&body).map_err(|error| format!("bad model list: {error}"))
 }
 
 fn describe(error: reqwest::Error) -> String {
@@ -323,109 +340,43 @@ pub fn write(dir: &Path, name: &str, cache: &Cache) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::levels::Level;
 
-    #[test]
-    fn chatgpt_preset_model_list_keeps_listed_slugs() {
-        let body = br#"{"models":[{"slug":"gpt-5","visibility":"list"},{"slug":"gpt-5-internal","visibility":"hidden"}]}"#;
-        let entries = parse(body).expect("the plan shape parses");
-        assert_eq!(entries.len(), 1, "{entries:?}");
-        assert_eq!(entries[0].id, "gpt-5");
-        assert_eq!(entries[0].context_window, None);
-        assert_eq!(entries[0].price, None);
-        // The older `data` shape still reads as it did.
-        let old = parse(br#"{"data":[{"id":"a","context_length":8000}]}"#)
-            .expect("the data shape parses");
-        assert_eq!(old[0].id, "a");
-        assert_eq!(old[0].context_window, Some(8000));
+    #[derive(Deserialize)]
+    struct Id {
+        id: String,
+    }
+
+    impl From<Id> for Entry {
+        fn from(item: Id) -> Entry {
+            Entry {
+                id: item.id,
+                context_window: None,
+                max_output: None,
+                price: None,
+                price_source: None,
+                reasoning: None,
+            }
+        }
     }
 
     #[test]
-    fn catalog_parse_reads_the_limits_when_present() {
-        let body = br#"{"data":[
-            {"id":"a","context_length":128000,"top_provider":{"max_completion_tokens":4096},"x":1},
-            {"id":"b"},
-            {"id":"c","top_provider":{}}
-        ]}"#;
-        let entries = parse(body).expect("parses");
-        let entry = |id: &str, window, output| Entry {
-            id: id.into(),
-            context_window: window,
-            max_output: output,
-            price: None,
-            price_source: None,
+    fn data_skips_other_keys_reads_no_data_as_empty_and_fails_a_bad_item() {
+        let ids = |body: &[u8]| -> Vec<String> {
+            data::<Id>(body)
+                .expect("parses")
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect()
         };
         assert_eq!(
-            entries,
-            [
-                entry("a", Some(128_000), Some(4096)),
-                entry("b", None, None),
-                entry("c", None, None)
-            ]
+            ids(br#"{"object":"list","links":{"x":[1]},"data":[{"id":"a"},{"id":"b"}],"total":2}"#),
+            ["a", "b"]
         );
+        assert!(ids(br#"{"object":"list"}"#).is_empty());
+        assert!(data::<Id>(br#"{"data":[{"id":1}]}"#).is_err());
+        assert!(data::<Id>(br#"{"data":[]} trailing"#).is_err());
     }
-
-    #[test]
-    fn catalog_limit_names_read_the_deepseek_fields() {
-        let body = br#"{"data":[{"id":"deepseek-flash","context_window":1048576,"max_output_tokens":393216}]}"#;
-        let entries = parse(body).expect("parses");
-        assert_eq!(entries[0].id, "deepseek-flash");
-        assert_eq!(entries[0].context_window, Some(1_048_576));
-        assert_eq!(entries[0].max_output, Some(393_216));
-        assert_eq!(entries[0].price, None);
-        // The first present name wins, and a price a list writes is its own.
-        let both = br#"{"data":[{
-            "id":"m","context_window":10,"context_length":20,
-            "max_output_tokens":3,"top_provider":{"max_completion_tokens":4},
-            "pricing":{"prompt":"0.000001","completion":"0.000002"}
-        }]}"#;
-        let entries = parse(both).expect("parses");
-        assert_eq!(entries[0].context_window, Some(10));
-        assert_eq!(entries[0].max_output, Some(3));
-        assert_eq!(entries[0].price_source, Some(PriceSource::Provider));
-    }
-
-    #[test]
-    fn usage_cost_is_parsed_from_the_pricing_object() {
-        let body = br#"{"data":[
-            {"id":"priced","pricing":{
-                "prompt":"0.000001","completion":"0.000002",
-                "input_cache_read":"0.0000001","input_cache_write":"0.0000012"
-            }},
-            {"id":"no-cache-prices","pricing":{"prompt":"0.000003","completion":"bad"}},
-            {"id":"prompt-only","pricing":{"prompt":"0.000001"}},
-            {"id":"empty","pricing":{}}
-        ]}"#;
-        let entries = parse(body).expect("parses");
-        assert_eq!(
-            entries[0].price,
-            Some(Price {
-                input: 0.000_001,
-                output: 0.000_002,
-                cache_read: 0.000_000_1,
-                cache_write: 0.000_001_2,
-            })
-        );
-        // A cache price that is missing or unreadable is free, but a missing
-        // token price leaves the model with no price at all.
-        assert_eq!(entries[1].price, None, "a bad completion price is no price");
-        assert_eq!(entries[2].price, None);
-        assert_eq!(entries[3].price, None);
-
-        let cache_prices = br#"{"data":[{"id":"m","pricing":{
-            "prompt":"0.000001","completion":"0.000002","input_cache_read":"nope"
-        }}]}"#;
-        let entries = parse(cache_prices).expect("parses");
-        assert_eq!(
-            entries[0].price,
-            Some(Price {
-                input: 0.000_001,
-                output: 0.000_002,
-                cache_read: 0.0,
-                cache_write: 0.0,
-            })
-        );
-    }
-
     #[test]
     fn usage_cost_from_a_price_counts_every_token_kind() {
         let price = Price {
@@ -449,21 +400,6 @@ mod tests {
     }
 
     #[test]
-    fn usage_cost_ignores_a_negative_or_non_finite_price() {
-        let body = br#"{"data":[
-            {"id":"router","pricing":{"prompt":"-1","completion":"-1"}},
-            {"id":"nan","pricing":{"prompt":"nan","completion":"0.000002"}},
-            {"id":"inf","pricing":{"prompt":"0.000001","completion":"inf"}},
-            {"id":"bad-cache","pricing":{"prompt":"0","completion":"0","input_cache_read":"-1"}}
-        ]}"#;
-        let entries = parse(body).expect("parses");
-        assert!(
-            entries.iter().all(|entry| entry.price.is_none()),
-            "{entries:?}"
-        );
-    }
-
-    #[test]
     #[expect(clippy::disallowed_methods, reason = "the test removes its folder")]
     fn usage_cost_old_cache_without_price_loads() {
         let dir = std::env::temp_dir().join(format!("reagent-catalog-old-{}", std::process::id()));
@@ -477,12 +413,11 @@ mod tests {
         let cache = read(&dir, "fi").expect("an old cache loads");
         assert_eq!(cache.models[0].price, None);
         assert_eq!(cache.models[0].context_window, Some(8000));
+        assert_eq!(
+            cache.models[0].reasoning, None,
+            "an old cache names no reasoning levels"
+        );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn catalog_parse_rejects_text_that_is_not_json() {
-        assert!(parse(b"nope").is_err());
     }
 
     #[test]
@@ -502,6 +437,7 @@ mod tests {
                     cache_write: 0.0,
                 }),
                 price_source: Some(PriceSource::Provider),
+                reasoning: None,
             }],
         };
         assert_eq!(read(&dir, "fi"), None);
@@ -527,5 +463,71 @@ mod tests {
             path(Path::new("/c"), "../x/y"),
             PathBuf::from("/c/.._x_y.json")
         );
+    }
+
+    /// An entry with no limits and no price, for the reasoning tests.
+    fn bare(id: &str, reasoning: Option<Reasoning>) -> Entry {
+        Entry {
+            id: id.into(),
+            context_window: None,
+            max_output: None,
+            price: None,
+            price_source: None,
+            reasoning,
+        }
+    }
+
+    #[test]
+    fn reasoning_levels_the_provider_list_wins_over_the_catalogue() {
+        let listed = bare("m", Some(Reasoning::from_words(["low", "high"])));
+        let catalogue = bare(
+            "m",
+            Some(Reasoning {
+                off: Some(true),
+                ..Reasoning::from_words(["medium"])
+            }),
+        );
+        let mut entry = listed.clone();
+        entry.fill_reasoning(&catalogue);
+        assert_eq!(
+            entry.reasoning, listed.reasoning,
+            "the provider's own list wins"
+        );
+        let mut missing = bare("m", None);
+        missing.fill_reasoning(&catalogue);
+        assert_eq!(
+            missing.reasoning, catalogue.reasoning,
+            "a list that says nothing about reasoning is filled"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "the test removes its folder")]
+    fn reasoning_levels_the_cache_writes_the_level_names() {
+        let dir =
+            std::env::temp_dir().join(format!("reagent-catalog-reason-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Cache {
+            fetched_at: 1,
+            models: vec![bare(
+                "m",
+                Some(Reasoning {
+                    off: Some(false),
+                    mandatory: true,
+                    default: Some(Level::High),
+                    ..Reasoning::from_words(["low", "high"])
+                }),
+            )],
+        };
+        write(&dir, "fi", &cache).expect("writes");
+        let text = std::fs::read_to_string(path(&dir, "fi")).expect("reads the cache text");
+        assert!(
+            text.contains(
+                r#""reasoning":{"levels":["low","high"],"off":false,"mandatory":true,"default":"high"}"#
+            ),
+            "{text}"
+        );
+        assert_eq!(read(&dir, "fi"), Some(cache));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

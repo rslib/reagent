@@ -384,3 +384,135 @@ fn perf_grep_searches_a_file_with_few_blocks() {
          {GREP_BLOCKS_PER_FILE_X10}/10"
     );
 }
+
+/// `read` calls in the repeated read case.
+const READ_CALLS: u64 = 20;
+
+/// The most blocks one `read` call of a small file may allocate, in tenths:
+/// 160/10 before the re-read note; now 180/10 on macOS and 183/10 on Linux,
+/// whose folder reads allocate more: the path text the note carries and the
+/// boxed `Seen`, which keeps every other tool result small. The file's identity
+/// comes out of the metadata of the handle the read already had open, so one
+/// more block per call, such as a path looked up again, fails here.
+const READ_CALL_BLOCKS_X10: u64 = 186;
+
+/// A read reports the lines it showed without costing a block more per call
+/// than it did before the note, so no `seen` field, identity or note bookkeeping
+/// allocates per read.
+#[test]
+fn reread_read_call_blocks_do_not_grow() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime");
+    let tmp = tempfile::tempdir().expect("temp dir");
+    runtime
+        .block_on(tokio::fs::write(tmp.path().join("f.txt"), "a\nb\n"))
+        .expect("write the file");
+    let read = Read::new(tmp.path());
+    let args = r#"{"path":"f.txt"}"#;
+    let cancel = CancellationToken::new();
+    // One unmeasured call, so lazy one-time setup is not counted.
+    let _ = runtime.block_on(read.run(args, &cancel));
+
+    let mut output = None;
+    let calls = blocks(|| {
+        for _ in 0..READ_CALLS {
+            output = Some(runtime.block_on(read.run(args, &cancel)));
+        }
+    });
+    let output = output.expect("the read ran");
+    assert!(!output.is_error, "{}", output.content);
+    assert!(
+        output.seen.is_some(),
+        "the measured read reports the lines it showed"
+    );
+
+    let per_call_x10 = calls * 10 / READ_CALLS;
+    eprintln!("blocks: {calls} for {READ_CALLS} reads, {per_call_x10}/10 per call");
+    assert!(
+        per_call_x10 <= READ_CALL_BLOCKS_X10,
+        "{calls} blocks for {READ_CALLS} reads, {per_call_x10}/10 per call over \
+         {READ_CALL_BLOCKS_X10}/10"
+    );
+}
+
+/// Lines in the file of the echo case.
+const ECHO_LINES_OF_FILE: usize = 200;
+
+/// The most lines the echo of one edit prints: the tool's forty line cap.
+const ECHO_SHOWN: usize = 40;
+
+/// The most blocks one single-edit replace may allocate: measured 42 for a
+/// 200-line file, and a block per echoed line would add forty more, since the
+/// echo writes into the result's own buffer.
+const ECHO_BLOCKS: u64 = 55;
+
+/// A file of `count` numbered lines.
+fn numbered(count: usize) -> String {
+    let mut text = String::with_capacity(count * 12);
+    for n in 0..count {
+        text.push_str(&format!("line {n}\n"));
+    }
+    text
+}
+
+/// The echo of a single edit slices the new text it already holds: one
+/// reservation for the reply, and no block for each line it prints or for a
+/// copy of the changed text.
+#[test]
+fn perf_edit_echo_does_not_allocate_per_line() {
+    let _serial = serial();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime");
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let text = numbered(ECHO_LINES_OF_FILE);
+    runtime
+        .block_on(tokio::fs::write(tmp.path().join("f.txt"), &text))
+        .expect("write the file");
+    // A replacement of 100 lines: the echo prints its 40 line cap, so a block
+    // per printed line would show as 40 blocks over the ones the edit needs.
+    let mut many = String::new();
+    for n in 1..=100 {
+        many.push_str(&format!("new {n}\n"));
+    }
+    let edit = Edit::new(tmp.path());
+    let args = serde_json::json!({
+        "path": "f.txt",
+        "old_string": "line 100\n",
+        "new_string": many
+    })
+    .to_string();
+    let cancel = CancellationToken::new();
+    let mut output = None;
+    let measured = stats(|| output = Some(runtime.block_on(edit.run(&args, &cancel))));
+    let output = output.expect("the edit ran");
+    assert!(!output.is_error, "{}", output.content);
+    assert!(
+        output
+            .content
+            .contains("; now:\n100\tline 99\n101\tnew 1\n"),
+        "{}",
+        &output.content[output.content.len().saturating_sub(120)..]
+    );
+    assert_eq!(
+        output
+            .content
+            .lines()
+            .filter(|line| line.contains('\t'))
+            .count(),
+        ECHO_SHOWN
+    );
+    assert!(output.content.ends_with("...\n"), "{}", output.content);
+
+    eprintln!(
+        "blocks: {} and bytes: {} for one echoed edit",
+        measured.total_blocks, measured.total_bytes
+    );
+    assert!(
+        measured.total_blocks < ECHO_BLOCKS,
+        "{} blocks for one echoed edit, over {ECHO_BLOCKS}",
+        measured.total_blocks
+    );
+}

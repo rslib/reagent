@@ -1,0 +1,33 @@
+diff -ruN a/cli_args.py b/cli_args.py
+--- a/cli_args.py
++++ b/cli_args.py
+@@ -23,7 +23,7 @@
+     """
+     return [
+         Option("jobs", short="j", takes_value=True, default=1, kind=int),
+-        Option("retries", short="r", takes_value=True, default=0, kind=int),
++        Option("retries", short="r", takes_value=True, default=3, kind=int),
+         Option("verbose", short="v", count=True, default=0),
+         Option("dry_run", short="n", default=False),
+         Option("output", short="o", takes_value=True, default=None),
+@@ -59,7 +59,10 @@
+     i = 0
+     while i < len(argv):
+         arg = argv[i]
+-        if arg.startswith("--") and len(arg) > 2:
++        if arg == "--":
++            positional.extend(argv[i + 1:])
++            break
++        if arg.startswith("--"):
+             key, eq, value = arg[2:].partition("=")
+             opt = _find(options, key, short=False)
+             if opt.takes_value and not eq:
+@@ -67,7 +70,7 @@
+                 if i >= len(argv):
+                     raise ArgError("missing value for --" + key)
+                 value = argv[i]
+-            _store(result, value, opt)
++            _store(result, opt, value)
+         elif arg.startswith("-") and len(arg) > 1:
+             letters = arg[1:]
+             for n, letter in enumerate(letters):

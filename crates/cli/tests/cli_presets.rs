@@ -20,6 +20,18 @@ const CHAT_REPLY: &str = concat!(
     "data: [DONE]\n\n"
 );
 const LIST: &str = r#"{"data":[{"id":"b"},{"id":"a"}]}"#;
+const PI_REPLY: &str = concat!(
+    "data: {\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"ok\"}\n\n",
+    "data: {\"type\":\"text_end\",\"contentIndex\":0}\n\n",
+    "data: {\"type\":\"done\",\"reason\":\"stop\"}\n\n"
+);
+/// The endpoint's own model list, as `/config` answers it.
+const RADIUS_CONFIG: &str = r#"{"baseUrl":"https://radius.pi.dev/v1","models":[
+    {"id":"balanced","name":"Balanced","contextWindow":200000,"maxTokens":64000,
+     "cost":{"input":1.0,"output":4.0,"cacheRead":0.1,"cacheWrite":1.0},"enabled":true},
+    {"id":"small","name":"Small","contextWindow":32000,"maxTokens":8000,"enabled":true},
+    {"id":"retired","name":"Retired","contextWindow":8000,"maxTokens":1000,"enabled":false}
+]}"#;
 
 /// The HTTP request the test server recorded.
 #[derive(Debug)]
@@ -128,6 +140,8 @@ async fn run(config: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
         "COMMANDCODE_API_KEY",
         "FREEINFERENCE_API_KEY",
         "DEEPSEEK_API_KEY",
+        "RADIUS_API_KEY",
+        "RADIUS_BASE_URL",
     ] {
         command.env_remove(name);
     }
@@ -246,4 +260,139 @@ async fn preset_base_url_variable_still_wins_for_openai() {
     assert_eq!(stdout(&output), "openai/a\nopenai/b\n");
     let recorded = recorded.await.expect("the server recorded the request");
     assert_eq!(recorded.request_line, "GET /v1/models HTTP/1.1");
+}
+
+#[tokio::test]
+async fn route_openrouter_messages_sends_a_bearer_key() {
+    let (base, recorded) = serve("text/event-stream", CHAT_REPLY).await;
+    let config = format!("[providers.openrouter]\nwire = \"anthropic\"\nbase_url = \"{base}\"\n");
+    let output = run(
+        &config,
+        &[
+            "--model",
+            "openrouter/anthropic/claude-sonnet-5",
+            "-p",
+            "hi",
+        ],
+        &[("OPENROUTER_API_KEY", KEY)],
+    )
+    .await;
+    // The reply is a chat stream, so only the request it sent matters here.
+    let recorded = recorded.await.expect("the server recorded the request");
+    assert_eq!(recorded.request_line, "POST /v1/v1/messages HTTP/1.1");
+    assert_eq!(
+        recorded.header("authorization"),
+        Some(format!("Bearer {KEY}").as_str())
+    );
+    assert_eq!(recorded.header("x-api-key"), None);
+    assert!(!stdout(&output).contains(KEY) && !stderr(&output).contains(KEY));
+}
+
+#[tokio::test]
+async fn radius_preset_streams_a_pi_messages_reply() {
+    let (base, recorded) = serve("text/event-stream", PI_REPLY).await;
+    let output = run(
+        "",
+        &["--model", "radius/balanced", "-p", "hi"],
+        &[("RADIUS_API_KEY", KEY), ("RADIUS_BASE_URL", &base)],
+    )
+    .await;
+    assert!(output.status.success(), "stderr {}", stderr(&output));
+    assert_eq!(stdout(&output), "ok\n");
+    let recorded = recorded.await.expect("the server recorded the request");
+    assert_eq!(recorded.request_line, "POST /v1/messages HTTP/1.1");
+    assert_eq!(
+        recorded.header("authorization"),
+        Some(format!("Bearer {KEY}").as_str())
+    );
+    assert_eq!(recorded.header("accept"), Some("text/event-stream"));
+    assert_eq!(recorded.header("content-type"), Some("application/json"));
+    assert!(
+        recorded.body.contains("\"model\":\"balanced\""),
+        "{}",
+        recorded.body
+    );
+    assert!(
+        recorded.body.contains("\"context\":{\"messages\":["),
+        "{}",
+        recorded.body
+    );
+    assert!(
+        recorded
+            .body
+            .contains("\"role\":\"user\",\"content\":\"hi\\n\\n[environment]\\n"),
+        "{}",
+        recorded.body
+    );
+    assert!(!stdout(&output).contains(KEY) && !stderr(&output).contains(KEY));
+}
+
+#[tokio::test]
+async fn radius_models_lists_the_public_config() {
+    let (base, recorded) = serve("application/json", RADIUS_CONFIG).await;
+    let output = run("", &["models", "radius"], &[("RADIUS_BASE_URL", &base)]).await;
+    assert!(output.status.success(), "stderr {}", stderr(&output));
+    assert_eq!(stdout(&output), "radius/balanced\nradius/small\n");
+    let recorded = recorded.await.expect("the server recorded the request");
+    assert_eq!(recorded.request_line, "GET /v1/config HTTP/1.1");
+    assert_eq!(
+        recorded.header("authorization"),
+        None,
+        "a public list needs no key"
+    );
+}
+
+/// The public list of the radius endpoint is what a run with no credential
+/// lists: a key the endpoint would refuse, or an auth file this build cannot
+/// read, is an error and not a reason to list the models without one.
+#[tokio::test]
+async fn radius_models_reports_a_credential_error_instead_of_the_public_list() {
+    // A key with a newline is not a header value, so the credential fails.
+    let (base, _recorded) = serve("application/json", RADIUS_CONFIG).await;
+    let output = run(
+        "",
+        &["models", "radius"],
+        &[("RADIUS_BASE_URL", &base), ("RADIUS_API_KEY", "bad\nkey")],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1), "stderr {}", stderr(&output));
+    assert_eq!(stdout(&output), "", "no list without a credential");
+    assert!(
+        stderr(&output).contains("the API key is not a valid authorization header value"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !stderr(&output).contains("listing the public models"),
+        "{}",
+        stderr(&output)
+    );
+
+    // An auth file this build refuses is an error too.
+    let state = TempDir::new().expect("a temp dir");
+    let folder = state.path().join("reagent");
+    tokio::fs::create_dir_all(&folder).await.expect("auth dir");
+    let file = folder.join("auth.json");
+    tokio::fs::write(&file, "{\"radius\":{\"key\":\"sk-fake\"}}")
+        .await
+        .expect("write the auth file");
+    tokio::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+        .await
+        .expect("widen the auth file");
+    let state = state.path().to_str().expect("a UTF-8 path").to_owned();
+    let (base, _recorded) = serve("application/json", RADIUS_CONFIG).await;
+    let output = run(
+        "",
+        &["models", "radius"],
+        &[("RADIUS_BASE_URL", &base), ("XDG_STATE_HOME", &state)],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1), "stderr {}", stderr(&output));
+    assert_eq!(stdout(&output), "", "no list from a broken auth file");
+    assert!(stderr(&output).contains("auth.json"), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("listing the public models"),
+        "{}",
+        stderr(&output)
+    );
 }

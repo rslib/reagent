@@ -32,6 +32,10 @@ use reagent_ai::openai::responses::request::{
     MessageBody as ResponsesMessage, RequestBuilder as ResponsesBuilder,
 };
 use reagent_ai::openai::responses::stream::StreamParser as ResponsesParser;
+use reagent_ai::pi::request::{
+    MessageBody as PiMessage, RequestBuilder as PiBuilder, tool_names as pi_tool_names,
+};
+use reagent_ai::pi::stream::StreamParser as PiParser;
 use reagent_ai::sse::SseSplitter;
 use reagent_ai::{
     AssistantMessage, Content, MaxTokensField, Message, ReasoningField, StopReason, StreamEvent,
@@ -51,6 +55,7 @@ const PLAIN: &str = "x";
 const ESCAPED: &str = "a\\nb";
 
 const MODEL_ANTHROPIC: &str = "claude-sonnet-4-5";
+const MODEL_PI: &str = "balanced";
 const MODEL_OPENAI: &str = "gpt-5";
 const SYSTEM: &str = "You are a careful coding agent.";
 const REASONING: &str = "medium";
@@ -88,6 +93,21 @@ fn responses_stream(text: &str) -> Vec<Bytes> {
         )
         .repeat(DELTAS),
     )
+}
+
+fn pi_stream(text: &str) -> Vec<Bytes> {
+    chunks(
+        &format!("data: {{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"{text}\"}}\n\n")
+            .repeat(DELTAS),
+    )
+}
+
+fn pi_plain() -> Vec<Bytes> {
+    pi_stream(PLAIN)
+}
+
+fn pi_escaped() -> Vec<Bytes> {
+    pi_stream(ESCAPED)
 }
 
 fn anthropic_plain() -> Vec<Bytes> {
@@ -158,6 +178,17 @@ fn sse_chat(chunks: Vec<Bytes>) -> usize {
 #[bench::escaped(setup = responses_escaped)]
 fn sse_responses(chunks: Vec<Bytes>) -> usize {
     let mut parser = ResponsesParser::new();
+    black_box(feed(&chunks, |line, out| {
+        parser.push_line(line, out).map_err(|_| ())
+    }))
+}
+
+// The same parse as `sse_chat`, on the pi-messages wire.
+#[library_benchmark]
+#[bench::plain(setup = pi_plain)]
+#[bench::escaped(setup = pi_escaped)]
+fn sse_pi(chunks: Vec<Bytes>) -> usize {
+    let mut parser = PiParser::new(None);
     black_box(feed(&chunks, |line, out| {
         parser.push_line(line, out).map_err(|_| ())
     }))
@@ -262,6 +293,38 @@ fn request_body_chat(setup: ChatBody) -> usize {
     black_box(setup.builder.body_parts(setup.bodies.bodies()).len())
 }
 
+struct PiBody {
+    builder: PiBuilder,
+    bodies: BodyCache<PiMessage>,
+}
+
+fn pi_body() -> PiBody {
+    let messages = history();
+    let tools = tools();
+    let names = pi_tool_names(&messages);
+    let mut bodies: BodyCache<PiMessage> = BodyCache::default();
+    bodies
+        .align_at(&messages, |index, message| {
+            PiMessage::new(message, "pi-messages", &names, index as u64 + 1)
+        })
+        .expect("the history serializes");
+    let builder = PiBuilder::new(
+        MODEL_PI,
+        1024,
+        Some(SYSTEM),
+        Some(REASONING),
+        Some("sess-1"),
+        &tools,
+    );
+    PiBody { builder, bodies }
+}
+
+#[library_benchmark]
+#[bench::body(setup = pi_body)]
+fn request_body_pi(setup: PiBody) -> usize {
+    black_box(setup.builder.body_parts(setup.bodies.bodies()).len())
+}
+
 struct ResponsesBody {
     builder: ResponsesBuilder,
     bodies: BodyCache<ResponsesMessage>,
@@ -295,7 +358,7 @@ fn request_body_responses(setup: ResponsesBody) -> usize {
 
 library_benchmark_group!(
     name = sse,
-    benchmarks = [sse_anthropic, sse_chat, sse_responses]
+    benchmarks = [sse_anthropic, sse_chat, sse_responses, sse_pi]
 );
 
 library_benchmark_group!(
@@ -303,7 +366,8 @@ library_benchmark_group!(
     benchmarks = [
         request_body_anthropic,
         request_body_chat,
-        request_body_responses
+        request_body_responses,
+        request_body_pi
     ]
 );
 

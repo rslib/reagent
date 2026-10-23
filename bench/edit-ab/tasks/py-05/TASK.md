@@ -1,0 +1,1 @@
+Reading a CSV line without passing a delimiter doesn't split on commas, and a quoted field with doubled quotes, like "say ""hi""", loses its quote marks. Please fix the CSV reader. Do not edit the tests.

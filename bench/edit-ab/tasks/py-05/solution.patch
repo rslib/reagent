@@ -1,0 +1,25 @@
+diff -ruN a/csvish.py b/csvish.py
+--- a/csvish.py
++++ b/csvish.py
+@@ -1,7 +1,7 @@
+ """A tiny CSV-like reader: quoted fields, a delimiter and typed columns."""
+ 
+ 
+-def parse_line(line, delimiter=";"):
++def parse_line(line, delimiter=","):
+     """Split one line into fields.
+ 
+     Fields may be wrapped in double quotes. Inside quotes the delimiter is plain
+@@ -15,7 +15,11 @@
+         ch = line[i]
+         if in_quotes:
+             if ch == '"':
+-                in_quotes = False
++                if i + 1 < len(line) and line[i + 1] == '"':
++                    current.append('"')
++                    i += 1
++                else:
++                    in_quotes = False
+             else:
+                 current.append(ch)
+         elif ch == '"':

@@ -11,11 +11,13 @@ use reagent_ai::{
 };
 
 use crate::archive::Archive;
+use crate::batch::run_all_guarded_seen;
 use crate::compact::Compact;
 use crate::event::{Event, TurnEndReason};
 use crate::guard::Guard;
 use crate::mask::Mask;
 use crate::policy::{PolicyRun, TurnPolicy, TurnView};
+use crate::reread::Ledger;
 use crate::session::Session;
 use crate::tool::Registry;
 use crate::workspace::Workspace;
@@ -88,6 +90,7 @@ pub struct Agent<'a> {
     archive: Option<Arc<Archive>>,
     compact: Option<Compact>,
     guard: Option<Guard>,
+    ledger: Ledger,
     workspace: Option<&'a dyn Workspace>,
     fingerprint: Option<u64>,
     provider_name: Text,
@@ -112,6 +115,7 @@ impl<'a> Agent<'a> {
             archive: None,
             compact: None,
             guard: None,
+            ledger: Ledger::default(),
             workspace: None,
             fingerprint: None,
             provider_name: Text::from(provider.name()),
@@ -140,6 +144,7 @@ impl<'a> Agent<'a> {
             archive: None,
             compact: None,
             guard: None,
+            ledger: Ledger::default(),
             workspace: None,
             fingerprint: None,
             provider_name: Text::from(provider.name()),
@@ -431,7 +436,7 @@ impl<'a> Agent<'a> {
     /// Streams one provider reply, records it and any tool results, and reports
     /// how the turn ended.
     async fn run_turn(
-        &self,
+        &mut self,
         history: &mut Vec<Message>,
         session: &mut Option<&mut Session>,
         events: &mpsc::Sender<Event>,
@@ -539,20 +544,38 @@ impl<'a> Agent<'a> {
                         archive.assign(&call.id);
                     }
                 }
-                let results = crate::batch::run_all_guarded(
-                    &calls,
-                    self.registry,
-                    self.guard.as_ref(),
-                    &self.token,
-                )
-                .await;
+                let results =
+                    run_all_guarded_seen(&calls, self.registry, self.guard.as_ref(), &self.token)
+                        .await;
+                // A file the reply writes loses its earlier reads, and a read
+                // of a file the reply writes is not recorded, so neither can
+                // answer a later read. A reply with nothing to drop and no read
+                // to skip resolves no tool and parses no argument, which is
+                // every turn that writes nothing.
+                let written = if self
+                    .ledger
+                    .needs_writes(results.iter().any(|(_, seen)| seen.is_some()))
+                {
+                    self.ledger.forget_writes(&calls, self.registry).await
+                } else {
+                    Vec::new()
+                };
                 // Every result reaches history before any event is sent, so a
                 // cancel or a closed receiver cannot leave a call unanswered.
                 // The results move into history, so only their event fields
                 // are kept here; nothing is cloned.
                 let mut facts: Vec<(bool, usize)> = Vec::with_capacity(results.len());
                 let mut failure = None;
-                for result in results {
+                for (result, seen) in results {
+                    // A re-read of lines the run already holds keeps its
+                    // content and gains the note, before it reaches either the
+                    // session or the model.
+                    let result = match seen {
+                        Some(seen) if !written.contains(&seen.key) => {
+                            self.ledger.apply(result, *seen, history.as_slice())
+                        }
+                        _ => result,
+                    };
                     facts.push((tool_error(&result), tool_bytes(&result)));
                     if let Some(error) = record_result(result, history, session).await {
                         failure.get_or_insert(error);
@@ -992,6 +1015,7 @@ struct Assembler {
     ready: Vec<ToolReady>,
     stop_reason: Option<StopReason>,
     usage: Usage,
+    replay: Option<Text>,
 }
 
 impl Assembler {
@@ -1004,6 +1028,7 @@ impl Assembler {
             ready: Vec::new(),
             stop_reason: None,
             usage: Usage::default(),
+            replay: None,
         }
     }
 
@@ -1073,6 +1098,7 @@ impl Assembler {
             }
             StreamEvent::Usage(usage) => self.usage = usage,
             StreamEvent::Stop(reason) => self.stop_reason = Some(reason),
+            StreamEvent::Replay(value) => self.replay = Some(value),
         }
     }
 
@@ -1134,6 +1160,7 @@ impl Assembler {
             model,
             stop_reason: self.stop_reason,
             usage: self.usage,
+            replay: self.replay,
         }
     }
 }
@@ -1141,6 +1168,33 @@ impl Assembler {
 mod tests {
     use super::*;
     use std::borrow::Cow;
+
+    #[test]
+    fn replay_a_wire_value_lands_on_the_message_once() {
+        let mut assembler = Assembler::new();
+        assembler.push(StreamEvent::TextDelta("hi".into()));
+        assembler.push(StreamEvent::Replay(r#"{"responseId":"r1"}"#.into()));
+        assembler.push(StreamEvent::Stop(StopReason::EndTurn));
+        let message = assembler.finish("radius".into(), "balanced".into());
+        assert_eq!(message.replay.as_deref(), Some(r#"{"responseId":"r1"}"#));
+        assert_eq!(message.content, vec![Content::text("hi")]);
+        // The value is the wire's own: no channel event carries it.
+        assert!(stream_event(&StreamEvent::Replay("{}".into())).is_none());
+    }
+
+    #[test]
+    fn replay_a_message_without_one_serializes_as_before() {
+        let message = Assembler::new().finish("anthropic".into(), "m".into());
+        assert_eq!(message.replay, None);
+        let json = serde_json::to_string(&message).expect("serializes");
+        assert!(!json.contains("replay"), "{json}");
+        let mut with = message;
+        with.replay = Some(r#"{"a":1}"#.into());
+        let back: AssistantMessage =
+            serde_json::from_str(&serde_json::to_string(&with).expect("serializes"))
+                .expect("parses");
+        assert_eq!(back.replay.as_deref(), Some(r#"{"a":1}"#));
+    }
 
     #[test]
     fn one_text_block_holds_every_delta_of_a_reply() {
@@ -1172,7 +1226,7 @@ mod tests {
     use serde_json::json;
 
     use crate::session::Session;
-    use crate::tool::{Tool, ToolOutput, parse_args};
+    use crate::tool::{Effects, Identity, Seen, Tool, ToolOutput, parse_args};
 
     #[derive(Deserialize)]
     struct EchoArgs<'a> {
@@ -1269,20 +1323,27 @@ mod tests {
     }
 
     fn tool_reply(call_id: &str, name: &str, args: &str) -> Vec<StreamEvent> {
-        vec![
-            StreamEvent::ToolCallStart {
-                id: Text::from(call_id),
-                name: Text::from(name),
-            },
-            StreamEvent::ToolCallDelta {
-                id: Text::from(call_id),
-                partial_json: Text::from(args),
-            },
-            StreamEvent::ToolCallEnd {
-                id: Text::from(call_id),
-            },
-            StreamEvent::Stop(StopReason::ToolUse),
-        ]
+        tool_replies(&[(call_id, name, args)])
+    }
+
+    /// One reply that calls several tools, in order, and stops for them.
+    fn tool_replies(calls: &[(&str, &str, &str)]) -> Vec<StreamEvent> {
+        let mut events = Vec::with_capacity(calls.len() * 3 + 1);
+        for (call_id, name, args) in calls {
+            events.push(StreamEvent::ToolCallStart {
+                id: Text::from(*call_id),
+                name: Text::from(*name),
+            });
+            events.push(StreamEvent::ToolCallDelta {
+                id: Text::from(*call_id),
+                partial_json: Text::from(*args),
+            });
+            events.push(StreamEvent::ToolCallEnd {
+                id: Text::from(*call_id),
+            });
+        }
+        events.push(StreamEvent::Stop(StopReason::ToolUse));
+        events
     }
 
     fn config() -> AgentConfig {
@@ -2708,5 +2769,333 @@ mod tests {
             .count();
         assert_eq!(deltas, 100);
         assert_eq!(seen.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
+    }
+
+    /// Arguments for one call of the fake read below.
+    #[derive(Deserialize)]
+    struct FakeReadArgs<'a> {
+        #[serde(borrow)]
+        path: Cow<'a, str>,
+        start: u64,
+        end: u64,
+    }
+
+    /// Arguments for one call of the fake write below.
+    #[derive(Deserialize)]
+    struct FakeWriteArgs<'a> {
+        #[serde(borrow)]
+        path: Cow<'a, str>,
+    }
+
+    /// A read tool that reports the lines it "read" of a real file.
+    struct FakeRead {
+        spec: ToolSpec,
+        dir: std::path::PathBuf,
+    }
+
+    impl Tool for FakeRead {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn read_only(&self) -> bool {
+            true
+        }
+
+        fn main_arg(&self) -> Option<&'static str> {
+            Some("path")
+        }
+
+        fn effects(&self, args: &str) -> Effects {
+            let Ok(arguments) = parse_args::<FakeReadArgs<'_>>(args) else {
+                return Effects::default();
+            };
+            Effects {
+                reads: vec![self.dir.join(arguments.path.as_ref())],
+                writes: Vec::new(),
+            }
+        }
+
+        fn run<'a>(
+            &'a self,
+            args: &'a str,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, ToolOutput> {
+            Box::pin(async move {
+                let Ok(arguments) = parse_args::<FakeReadArgs<'a>>(args) else {
+                    return ToolOutput::error("bad args");
+                };
+                let path = self.dir.join(arguments.path.as_ref());
+                let metadata = match tokio::fs::metadata(&path).await {
+                    Ok(metadata) => metadata,
+                    Err(error) => return ToolOutput::error(format!("no file: {error}")),
+                };
+                let key = Identity::new(&metadata, &path).await;
+                let mut content = String::new();
+                for number in arguments.start..=arguments.end {
+                    content.push_str(&format!("{number}\tline {number}\n"));
+                }
+                ToolOutput::ok(content).with_seen(Seen {
+                    path: Text::from(arguments.path.as_ref()),
+                    key,
+                    start: arguments.start,
+                    end: arguments.end,
+                    size: metadata.len(),
+                    modified: metadata.modified().ok(),
+                })
+            })
+        }
+    }
+
+    /// A write tool that names the file it writes.
+    struct FakeWrite {
+        spec: ToolSpec,
+        dir: std::path::PathBuf,
+    }
+
+    impl Tool for FakeWrite {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn main_arg(&self) -> Option<&'static str> {
+            Some("path")
+        }
+
+        fn effects(&self, args: &str) -> Effects {
+            let Ok(arguments) = parse_args::<FakeWriteArgs<'_>>(args) else {
+                return Effects::default();
+            };
+            Effects {
+                reads: Vec::new(),
+                writes: vec![self.dir.join(arguments.path.as_ref())],
+            }
+        }
+
+        fn run<'a>(
+            &'a self,
+            _args: &'a str,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, ToolOutput> {
+            Box::pin(async { ToolOutput::ok("wrote") })
+        }
+    }
+
+    fn read_spec() -> ToolSpec {
+        ToolSpec {
+            name: "read".into(),
+            description: "Read lines of a file.".into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn read_registry(dir: &std::path::Path, write: bool) -> Registry {
+        let mut registry = Registry::new();
+        registry.add(FakeRead {
+            spec: read_spec(),
+            dir: dir.to_path_buf(),
+        });
+        if write {
+            registry.add(FakeWrite {
+                spec: ToolSpec {
+                    name: "write".into(),
+                    description: "Write a file.".into(),
+                    input_schema: json!({"type": "object"}),
+                },
+                dir: dir.to_path_buf(),
+            });
+        }
+        registry
+    }
+
+    fn result_text(history: &[Message], index: usize) -> String {
+        match history.get(index) {
+            Some(Message::ToolResult(result)) => result.content.to_string(),
+            other => panic!("expected a tool result at {index}: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reread_the_same_range_twice_adds_the_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "a\nb\n")
+            .await
+            .unwrap();
+        let provider = FakeProvider::new(vec![
+            tool_reply("call_1", "read", r#"{"path":"f.txt","start":1,"end":2}"#),
+            tool_reply("call_2", "read", r#"{"path":"f.txt","start":1,"end":2}"#),
+            text_reply("done"),
+        ]);
+        let registry = read_registry(tmp.path(), false);
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("go")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        let first = result_text(&history, 2);
+        assert_eq!(first, "1\tline 1\n2\tline 2\n");
+        let second = result_text(&history, 4);
+        assert_eq!(
+            second,
+            concat!(
+                "1\tline 1\n2\tline 2\n",
+                "[Note: you already read lines 1-2 of f.txt in this run, and the ",
+                "file has not changed. That earlier result is still valid; you do ",
+                "not need to read this range again.]"
+            )
+        );
+        // The event counts the noted text, which is what the model sees.
+        let events = drain(tx, &mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::ToolResult { id, bytes, .. }
+                    if id.as_ref() == "call_2" && *bytes == second.len())),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reread_a_contained_range_is_noted_with_the_new_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "a\nb\nc\nd\ne\n")
+            .await
+            .unwrap();
+        let provider = FakeProvider::new(vec![
+            tool_reply("call_1", "read", r#"{"path":"f.txt","start":1,"end":5}"#),
+            tool_reply("call_2", "read", r#"{"path":"f.txt","start":2,"end":3}"#),
+            text_reply("done"),
+        ]);
+        let registry = read_registry(tmp.path(), false);
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("go")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        let second = result_text(&history, 4);
+        assert!(
+            second.starts_with("2\tline 2\n3\tline 3\n"),
+            "the content stays first: {second}"
+        );
+        assert!(
+            second.contains("you already read lines 2-3 of f.txt"),
+            "{second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reread_new_lines_are_not_noted() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "a\nb\nc\nd\n")
+            .await
+            .unwrap();
+        let provider = FakeProvider::new(vec![
+            tool_reply("call_1", "read", r#"{"path":"f.txt","start":1,"end":3}"#),
+            tool_reply("call_2", "read", r#"{"path":"f.txt","start":2,"end":4}"#),
+            text_reply("done"),
+        ]);
+        let registry = read_registry(tmp.path(), false);
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("go")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(
+            result_text(&history, 4),
+            "2\tline 2\n3\tline 3\n4\tline 4\n",
+            "a range with new lines gets no note"
+        );
+    }
+
+    #[tokio::test]
+    async fn reread_a_write_of_the_file_drops_the_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "a\nb\n")
+            .await
+            .unwrap();
+        let provider = FakeProvider::new(vec![
+            tool_reply("call_1", "read", r#"{"path":"f.txt","start":1,"end":2}"#),
+            tool_reply("call_2", "write", r#"{"path":"f.txt"}"#),
+            tool_reply("call_3", "read", r#"{"path":"f.txt","start":1,"end":2}"#),
+            text_reply("done"),
+        ]);
+        let registry = read_registry(tmp.path(), true);
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("go")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(
+            result_text(&history, 6),
+            "1\tline 1\n2\tline 2\n",
+            "the run's own write dropped the entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn reread_the_third_read_names_the_third_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "a\nb\n")
+            .await
+            .unwrap();
+        let call = || tool_reply("call", "read", r#"{"path":"f.txt","start":1,"end":2}"#);
+        let provider = FakeProvider::new(vec![call(), call(), call(), text_reply("done")]);
+        let registry = read_registry(tmp.path(), false);
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("go")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert!(
+            result_text(&history, 4).ends_with("again.]"),
+            "the second read has no count"
+        );
+        assert!(
+            result_text(&history, 6).ends_with("again.] (3rd time)"),
+            "the third read counts: {}",
+            result_text(&history, 6)
+        );
+    }
+
+    #[tokio::test]
+    async fn reread_a_reply_that_reads_and_writes_the_file_has_no_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("f.txt"), "a\nb\n")
+            .await
+            .unwrap();
+        let provider = FakeProvider::new(vec![
+            tool_replies(&[
+                ("call_1", "read", r#"{"path":"f.txt","start":1,"end":2}"#),
+                ("call_2", "write", r#"{"path":"f.txt"}"#),
+            ]),
+            tool_reply("call_3", "read", r#"{"path":"f.txt","start":1,"end":2}"#),
+            text_reply("done"),
+        ]);
+        let registry = read_registry(tmp.path(), true);
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("go")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        // The prompt, the first reply, its two results, the second reply, its
+        // result and the answer.
+        assert_eq!(history.len(), 7);
+        assert_eq!(
+            result_text(&history, 5),
+            "1\tline 1\n2\tline 2\n",
+            "a read of a file the same reply writes is never noted"
+        );
     }
 }

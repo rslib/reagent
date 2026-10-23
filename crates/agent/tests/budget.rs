@@ -49,9 +49,10 @@ const PEAK_BYTES: usize = 1_170_000;
 const MASKED_PEAK_BYTES: usize = 560_000;
 
 /// The most thread CPU one turn may take, in microseconds: about 2x the 1.6
-/// measured in release, 10x that in debug.
+/// measured in release. A debug build (15 to 18 measured) says little about
+/// speed, so its limit only catches a large regression.
 fn cpu_micros_per_turn() -> f64 {
-    if cfg!(debug_assertions) { 40.0 } else { 4.0 }
+    if cfg!(debug_assertions) { 100.0 } else { 4.0 }
 }
 
 struct Cheap {

@@ -597,7 +597,7 @@ fn to_bytes(value: &impl Serialize) -> Bytes {
 /// when the stream ends; text and summary pieces merge into one item first.
 #[derive(Debug, Default)]
 pub struct StreamParser {
-    usage: Usage,
+    usage: Option<Usage>,
     tool_ids: Vec<(u32, Text)>,
     reasoning_details: Vec<ReasoningDetail>,
     stop_reason: Option<StopReason>,
@@ -621,6 +621,9 @@ impl StreamParser {
         };
         if data == b"[DONE]" {
             self.done = true;
+            if let Some(usage) = self.usage.take() {
+                out.push(StreamEvent::Usage(usage));
+            }
             if let Some(signature) = self.take_details() {
                 out.push(StreamEvent::ThinkingSignature(signature));
             }
@@ -679,9 +682,10 @@ impl StreamParser {
                 self.stop_reason = Some(stop_reason(reason));
             }
         }
+        // Some gateways send a running total in every chunk, so only the
+        // last one is sent, at `[DONE]`.
         if let Some(usage) = chunk.usage {
-            self.usage = usage_of(usage);
-            out.push(StreamEvent::Usage(self.usage));
+            self.usage = Some(usage_of(usage));
         }
         Ok(())
     }
@@ -1188,7 +1192,7 @@ struct Delta<'a> {
     reasoning: Option<JsonStr<'a>>,
     #[serde(default)]
     reasoning_details: Option<Vec<Box<RawValue>>>,
-    #[serde(default, borrow)]
+    #[serde(default, borrow, deserialize_with = "null_as_default")]
     tool_calls: Vec<ToolCallDelta<'a>>,
 }
 
@@ -1237,10 +1241,20 @@ struct UsageJson {
     /// The USD cost of the reply. OpenRouter reports it, most do not.
     #[serde(default)]
     cost: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     prompt_tokens_details: PromptDetails,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     completion_tokens_details: CompletionDetails,
+}
+
+/// Reads `null` as the type's default: some gateways send a null details
+/// object instead of leaving it out.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// The prompt token counts, under every name a gateway uses for them.
@@ -1353,10 +1367,12 @@ mod tests {
         events
     }
 
-    /// The usage event one `data:` line carries.
+    /// The usage event one `data:` line carries, sent at `[DONE]`.
     fn usage_event(line: &[u8]) -> Usage {
         let mut parser = StreamParser::new();
-        parse_line(&mut parser, line)
+        let mut events = parse_line(&mut parser, line);
+        events.extend(parse_line(&mut parser, b"data: [DONE]"));
+        events
             .into_iter()
             .find_map(|event| match event {
                 StreamEvent::Usage(usage) => Some(usage),
@@ -1846,10 +1862,11 @@ mod tests {
     #[test]
     fn usage_cost_is_parsed_from_the_chat_usage() {
         let mut parser = StreamParser::new();
-        let events = parse_line(
+        let mut events = parse_line(
             &mut parser,
             br#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"cost":0.0123}}"#,
         );
+        events.extend(parse_line(&mut parser, b"data: [DONE]"));
         let usage = events
             .iter()
             .find_map(|event| match event {
@@ -1865,10 +1882,11 @@ mod tests {
     #[test]
     fn usage_cost_is_none_when_the_chat_usage_has_none() {
         let mut parser = StreamParser::new();
-        let events = parse_line(
+        let mut events = parse_line(
             &mut parser,
             br#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
         );
+        events.extend(parse_line(&mut parser, b"data: [DONE]"));
         let usage = events
             .iter()
             .find_map(|event| match event {
@@ -1931,6 +1949,49 @@ mod tests {
         assert_eq!(usage.cache_write_tokens, 0);
         assert_eq!(usage.reasoning_tokens, 8);
         assert_eq!(usage.cost, None);
+    }
+
+    #[test]
+    fn gateway_usage_accepts_null_detail_objects() {
+        let usage = usage_event(
+            br#"data: {"choices":[],"usage":{"prompt_tokens":15,"completion_tokens":8,"prompt_tokens_details":null,"completion_tokens_details":null}}"#,
+        );
+        assert_eq!(usage.input_tokens, 15);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn gateway_text_beside_a_null_tool_calls_list() {
+        let mut parser = StreamParser::new();
+        let line = br#"data: {"choices":[{"index":0,"delta":{"role":null,"content":"Ok","reasoning_content":null,"tool_calls":null},"finish_reason":null}]}"#;
+        assert_eq!(
+            parse_line(&mut parser, line),
+            vec![StreamEvent::TextDelta("Ok".into())]
+        );
+    }
+
+    #[test]
+    fn gateway_usage_in_every_chunk_counts_once() {
+        let mut parser = StreamParser::new();
+        let lines: [&[u8]; 4] = [
+            br#"data: {"choices":[{"index":0,"delta":{"content":"O"}}],"usage":{"prompt_tokens":157,"completion_tokens":1}}"#,
+            br#"data: {"choices":[{"index":0,"delta":{"content":"k"}}],"usage":{"prompt_tokens":157,"completion_tokens":2}}"#,
+            br#"data: {"choices":[],"usage":{"prompt_tokens":157,"completion_tokens":3}}"#,
+            b"data: [DONE]",
+        ];
+        let usages: Vec<Usage> = lines
+            .into_iter()
+            .flat_map(|line| parse_line(&mut parser, line))
+            .filter_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usages.len(), 1, "{usages:?}");
+        assert_eq!(usages[0].input_tokens, 157);
+        assert_eq!(usages[0].output_tokens, 3);
     }
 
     #[test]

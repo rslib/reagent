@@ -1,0 +1,21 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -56,14 +56,15 @@
+             return None;
+         }
+         let item = self.buf[self.head].take();
+-        self.head += 1;
++        let cap = self.buf.len();
++        self.head = (self.head + 1) % cap;
+         self.len -= 1;
+         item
+     }
+ 
+     /// The item at an offset from the oldest one, with 0 being the oldest.
+     pub fn get(&self, index: usize) -> Option<&T> {
+-        if index > self.len {
++        if index >= self.len {
+             return None;
+         }
+         let cap = self.buf.len();

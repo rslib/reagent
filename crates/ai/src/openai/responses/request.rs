@@ -756,7 +756,10 @@ mod tests {
             Some("off"),
             None,
             &[],
-            crate::providers::get("chatgpt").expect("the preset").compat,
+            crate::providers::get("chatgpt")
+                .expect("the preset")
+                .default_route()
+                .compat,
         );
         let head = std::str::from_utf8(builder.head()).unwrap();
         assert!(!head.contains("max_output_tokens"), "{head}");

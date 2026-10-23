@@ -1,0 +1,1 @@
+The word counter drops digits, so a word like 3pm or 42 vanishes, and words with equal counts come out in reverse alphabetical order in the top list. Please fix the word counting code. Do not edit the tests.

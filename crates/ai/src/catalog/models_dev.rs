@@ -11,6 +11,7 @@ use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{Entry, FRESH_SECS, Price, PriceSource, describe};
+use crate::levels::Reasoning;
 
 /// The catalogue URL.
 pub const URL: &str = "https://models.dev/api.json";
@@ -73,6 +74,9 @@ struct Model {
     cost: Option<Cost>,
     #[serde(default)]
     limit: Option<Limit>,
+    /// The reasoning levels and the toggle the catalogue lists for it.
+    #[serde(default)]
+    reasoning_options: Vec<ReasoningOption>,
 }
 
 impl Model {
@@ -89,8 +93,59 @@ impl Model {
             max_output,
             price_source: price.map(|_| PriceSource::ModelsDev),
             price,
+            reasoning: reasoning(self.reasoning_options),
         }
     }
+}
+
+/// One `reasoning_options` entry: an `effort` list of level names, a `toggle`,
+/// or a `budget_tokens` range, which reagent does not read yet.
+#[derive(Debug, Deserialize)]
+struct ReasoningOption {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    values: Vec<Word>,
+}
+
+/// One `values` entry: a word, or anything else, which is skipped so a
+/// catalogue that writes a number in the list still loads.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Word {
+    /// The word itself.
+    Text(String),
+    /// Anything else.
+    Other(IgnoredAny),
+}
+
+impl Word {
+    /// The word itself, or `None` for an entry that is not a word.
+    fn text(self) -> Option<String> {
+        match self {
+            Word::Text(text) => Some(text),
+            Word::Other(_) => None,
+        }
+    }
+}
+
+/// What the `reasoning_options` of one catalogue model say: the levels an
+/// `effort` entry names, with a `none` value turning thinking off, and a
+/// `toggle` turning it off too. A `budget_tokens` range says nothing reagent
+/// reads yet.
+fn reasoning(options: Vec<ReasoningOption>) -> Option<Reasoning> {
+    let mut words = Vec::new();
+    let mut off = None;
+    for option in options {
+        match option.kind.as_deref() {
+            Some("toggle") => off = Some(true),
+            Some("effort") => words.extend(option.values.into_iter().filter_map(Word::text)),
+            _ => {}
+        }
+    }
+    let mut plan = Reasoning::from_words(words.iter().map(String::as_str));
+    plan.off = plan.off.or(off);
+    (!plan.is_empty()).then_some(plan)
 }
 
 /// The `models` map of one provider object: the model id is the key.
@@ -329,6 +384,7 @@ async fn fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::levels::Level;
 
     /// A trimmed real catalogue reply: two providers, with the fields reagent
     /// does not read kept so a bad field would be noticed.
@@ -406,6 +462,44 @@ mod tests {
         assert_eq!(found[0].1[0].context_window, Some(8));
         assert_eq!(found[0].1[0].price, None, "no cost object is no price");
         assert_eq!(found[0].1[0].price_source, None);
+    }
+
+    #[test]
+    fn reasoning_levels_models_dev_reads_effort_and_toggle() {
+        // The sample's deepseek-flash lists a bare toggle: thinking can be
+        // turned off, and no level is named.
+        let found = extract(SAMPLE.as_bytes(), &["deepseek"]).expect("parses");
+        let flash = found[0]
+            .1
+            .iter()
+            .find(|entry| entry.id == "deepseek-flash")
+            .expect("the flash model");
+        let reasoning = flash.reasoning.as_ref().expect("a toggle plan");
+        assert_eq!(reasoning.levels.iter().count(), 0);
+        assert_eq!(reasoning.off, Some(true));
+        assert!(!reasoning.mandatory);
+        // A model with no reasoning options has no plan.
+        let pro = found[0]
+            .1
+            .iter()
+            .find(|entry| entry.id == "deepseek-v4-pro")
+            .expect("the pro model");
+        assert_eq!(pro.reasoning, None);
+
+        // An effort entry names the levels; a none value turns thinking off,
+        // a number is skipped and a budget range says nothing yet.
+        let body = br#"{"fi":{"models":{"m":{"id":"m","reasoning_options":[
+            {"type":"effort","values":["low","medium","none",7]},
+            {"type":"budget_tokens","min":1024,"max":32000}
+        ]}}}}"#;
+        let found = extract(body, &["fi"]).expect("parses");
+        let reasoning = found[0].1[0].reasoning.as_ref().expect("an effort plan");
+        assert_eq!(
+            reasoning.levels.iter().collect::<Vec<_>>(),
+            [Level::Low, Level::Medium]
+        );
+        assert_eq!(reasoning.off, Some(true), "a none value turns thinking off");
+        assert_eq!(reasoning.default, None);
     }
 
     #[test]

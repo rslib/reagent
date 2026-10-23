@@ -9,9 +9,10 @@ mod run;
 mod sandbox;
 mod snapshot;
 
-/// The estimated-token budget for the system prompt and tool specs.
+/// The estimated-token budget for the system prompt and tool specs: 1000,
+/// raised to 1024 for the edit tool's `line` argument.
 #[cfg(test)]
-const PROMPT_BUDGET: usize = 1000;
+const PROMPT_BUDGET: usize = 1024;
 
 fn main() -> std::process::ExitCode {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();

@@ -1,0 +1,21 @@
+diff -ruN a/paginate.ts b/paginate.ts
+--- a/paginate.ts
++++ b/paginate.ts
+@@ -14,7 +14,7 @@
+   if (pageSize < 1) {
+     throw new Error("pageSize must be at least 1");
+   }
+-  return Math.max(1, Math.floor(totalItems / pageSize));
++  return Math.max(1, Math.ceil(totalItems / pageSize));
+ }
+ 
+ export function clampPage(page: number, pages: number): number {
+@@ -26,7 +26,7 @@
+ }
+ 
+ export function nextPage(page: number, pages: number): number {
+-  return Math.min(Math.max(page - 1, 1), pages);
++  return Math.min(Math.max(page + 1, 1), pages);
+ }
+ 
+ export function paginate<T>(items: T[], page: number, pageSize: number): Page<T> {

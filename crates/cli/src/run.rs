@@ -24,6 +24,7 @@ use reagent_agent::policy::completion::Completion;
 use reagent_agent::policy::stuck::Stuck;
 use reagent_agent::tool::Registry;
 use reagent_agent::workspace::Workspace;
+use reagent_ai::levels::{Level, Reasoning};
 use reagent_ai::oauth::session::{Sleeper, Wait};
 use reagent_ai::{Provider, StopReason, Text, Usage};
 use reagent_config::Secret;
@@ -175,6 +176,104 @@ fn cached_entry(
     cache.models.into_iter().find(|entry| entry.id == model)
 }
 
+/// What a run sends as its reasoning text, and the note the start line prints
+/// when the model took another level than the one asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Mapped {
+    /// The text the request carries, or `None` when nothing is sent.
+    sent: Option<String>,
+    /// The note the start line appends, such as `reasoning medium -> high`.
+    note: Option<String>,
+}
+
+/// Maps the asked reasoning text to what the model takes.
+///
+/// A token budget, a word reagent does not know and a model with no reasoning
+/// data pass through unchanged: the provider is the one that reads them. A
+/// named level the model lacks becomes the next higher one it takes, else the
+/// next lower. `off` becomes a level when the model cannot turn thinking off.
+fn map_reasoning(asked: &str, reasoning: Option<&Reasoning>) -> Mapped {
+    let mut mapped = map_level(asked, reasoning);
+    let Some(reasoning) = reasoning.filter(|reasoning| !reasoning.unknown.is_empty()) else {
+        return mapped;
+    };
+    let text = asked.trim();
+    let level = match reagent_ai::Reasoning::parse(text) {
+        reagent_ai::Reasoning::Level(_) => true,
+        asked => asked.is_off(),
+    };
+    // A word the model lists is sent as written; beside any other level the
+    // words reagent cannot place are named, so the user can ask for one.
+    if level && !reasoning.takes_unknown(text) {
+        let words = format!("unknown levels {}", reasoning.unknown.join(" "));
+        mapped.note = Some(match mapped.note {
+            Some(note) => format!("{note}, {words}"),
+            None => words,
+        });
+    }
+    mapped
+}
+
+/// The level a run sends for `asked`, and the note that names a change.
+fn map_level(asked: &str, reasoning: Option<&Reasoning>) -> Mapped {
+    let text = asked.trim();
+    if text.is_empty() {
+        return Mapped {
+            sent: None,
+            note: None,
+        };
+    }
+    let unchanged = || Mapped {
+        sent: Some(text.to_string()),
+        note: None,
+    };
+    // Only a level is mapped: a budget is a number the provider reads itself.
+    let asked = reagent_ai::Reasoning::parse(text);
+    let Some(reasoning) = reasoning.filter(|reasoning| !reasoning.is_empty()) else {
+        return unchanged();
+    };
+    if reasoning.takes_unknown(text) {
+        return unchanged();
+    }
+    if asked.is_off() {
+        // Thinking that cannot be turned off starts at the model's default
+        // level, else at the lowest one it takes.
+        if reasoning.off == Some(false) || reasoning.mandatory {
+            let Some(level) = reasoning.default.or_else(|| reasoning.levels.lowest()) else {
+                return unchanged();
+            };
+            return Mapped {
+                sent: Some(level.name().to_string()),
+                note: Some(format!(
+                    "reasoning off -> {} (thinking is mandatory)",
+                    level.name()
+                )),
+            };
+        }
+        return unchanged();
+    }
+    let reagent_ai::Reasoning::Level(_) = asked else {
+        return unchanged();
+    };
+    let Some(asked) = Level::parse(text) else {
+        return unchanged();
+    };
+    if reasoning.levels.contains(asked) {
+        return unchanged();
+    }
+    let Some(level) = reasoning
+        .levels
+        .above(asked)
+        .or_else(|| reasoning.levels.below(asked))
+    else {
+        return unchanged();
+    };
+    Mapped {
+        sent: Some(level.name().to_string()),
+        note: Some(format!("reasoning {} -> {}", asked.name(), level.name())),
+    }
+}
+
 /// What a run's usage costs, and whether a peak rule applies.
 #[derive(Clone, Copy, Debug)]
 struct Billing {
@@ -277,6 +376,14 @@ pub async fn run(mut args: Args) -> ExitCode {
         args.context_window = cached.as_ref().and_then(|entry| entry.context_window);
     }
     let billing = billing(args.price, args.preset, cached.as_ref());
+    // The asked reasoning level is mapped to what the model takes before the
+    // request is built, so the start line can name the level it picked.
+    let reasoning = args.reasoning.as_deref().map(|asked| {
+        map_reasoning(
+            asked,
+            cached.as_ref().and_then(|entry| entry.reasoning.as_ref()),
+        )
+    });
     let mut task = match source {
         crate::args::TaskSource::Text(text) => text,
         crate::args::TaskSource::Stdin => match read_stdin_task().await {
@@ -294,6 +401,10 @@ pub async fn run(mut args: Args) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // The environment block starts here, before the provider is built, so its
+    // git runs overlap the provider setup. It is awaited below, just before the
+    // first message is built.
+    let probe = probe_for(&args.policy, &cwd);
     let (provider, session, source) = match build_provider(&args).await {
         Ok(built) => built,
         Err(message) => {
@@ -309,7 +420,8 @@ pub async fn run(mut args: Args) -> ExitCode {
             args.profile.as_deref(),
             args.provider_name.as_deref(),
             &args.model,
-            source.as_ref()
+            source.as_ref(),
+            reasoning.as_ref().and_then(|mapped| mapped.note.as_deref()),
         )
     );
 
@@ -344,14 +456,13 @@ pub async fn run(mut args: Args) -> ExitCode {
         model: args.model.clone(),
         max_tokens: args.max_tokens,
         system: Some(system),
-        reasoning: args.reasoning.clone(),
+        reasoning: reasoning.and_then(|mapped| mapped.sent),
         cache_key: Some(Text::from("headless-v1")),
         max_turns: Some(MAX_TURNS),
     };
 
-    // The loop policies and whether to take a pre-run environment snapshot.
+    // The loop policies.
     let mut policies: Vec<Box<dyn TurnPolicy>> = Vec::new();
-    let mut snapshot_enabled = false;
     let mut mask_enabled = false;
     let mut completion_enabled = false;
     let mut compact_enabled = false;
@@ -366,7 +477,8 @@ pub async fn run(mut args: Args) -> ExitCode {
                 args.deadline.map(Duration::from_secs),
                 Some(MAX_TURNS),
             ))),
-            "snapshot" => snapshot_enabled = true,
+            // The probe reads the list up front, so it started already.
+            "snapshot" => {}
             "mask" => mask_enabled = true,
             "compact" => compact_enabled = true,
             other => {
@@ -398,7 +510,6 @@ pub async fn run(mut args: Args) -> ExitCode {
     }
 
     let folder = Folder(cwd.clone(), args.skip.clone());
-    let snapshot_cancel = cancel.clone();
     let mut agent = if policies.is_empty() {
         Agent::new(provider.as_ref(), &registry, config, cancel)
     } else {
@@ -424,11 +535,8 @@ pub async fn run(mut args: Args) -> ExitCode {
     let out = Out::new();
     let writer = tokio::spawn(drain(rx, out, args.json, billing, args.context_window));
 
-    if snapshot_enabled {
-        let snapshot = crate::snapshot::capture_environment(&cwd, &snapshot_cancel).await;
-        if !snapshot.trim().is_empty() {
-            task = format!("{task}\n\n{} {snapshot}", crate::snapshot::header());
-        }
+    if let Some(probe) = probe {
+        task = crate::snapshot::first_message(task, &probe.block().await);
     }
     let mut history = vec![reagent_ai::Message::user(task)];
     agent.run(&mut history, None, &tx).await;
@@ -768,7 +876,9 @@ pub(crate) fn saved_session(
     };
     if !matches!(
         logins.get(name),
-        Some(reagent_config::auth::Login::Oauth { .. })
+        Some(
+            reagent_config::auth::Login::Oauth { .. } | reagent_config::auth::Login::Device { .. }
+        )
     ) {
         return Ok(None);
     }
@@ -865,22 +975,29 @@ fn key_from(
 }
 
 /// The line a run prints before its first request: the profile, the model and
-/// where the credential came from, never the key.
+/// where the credential came from, never the key, and the reasoning level it
+/// picked when the model took another one.
 fn start_line(
     profile: Option<&str>,
     provider: Option<&str>,
     model: &str,
     source: Option<&Source>,
+    note: Option<&str>,
 ) -> String {
     let target = match provider {
         Some(name) => format!("{name}/{model}"),
         None => model.to_string(),
     };
-    format!(
+    let mut line = format!(
         "reagent: profile {}, model {target}, credential {}",
         profile.unwrap_or("none"),
         source.map_or_else(|| "none".to_string(), Source::text)
-    )
+    );
+    if let Some(note) = note {
+        line.push_str(", ");
+        line.push_str(note);
+    }
+    line
 }
 
 /// Builds the provider named on the command line, or reports why not, with the
@@ -942,8 +1059,10 @@ async fn build_provider(
                     error,
                 )
             })?;
-            let credential = match &args.provider {
-                crate::args::Wire::Anthropic => reagent_ai::Credential::x_api_key(&api_key)?,
+            let credential = match (&args.provider, args.auth) {
+                (crate::args::Wire::Anthropic, reagent_ai::Auth::Wire) => {
+                    reagent_ai::Credential::x_api_key(&api_key)?
+                }
                 _ => reagent_ai::Credential::bearer(&api_key)?,
             };
             (credential, source)
@@ -967,6 +1086,11 @@ async fn build_provider(
                 None => chat,
             })
         }
+        crate::args::Wire::PiMessages => Box::new(
+            reagent_ai::pi::PiMessages::new("", base_url)
+                .with_credential(credential)
+                .with_headers(header),
+        ),
         crate::args::Wire::OpenAiResponses => {
             let responses = reagent_ai::openai::responses::OpenAiResponses::new("", base_url)
                 .with_credential(credential)
@@ -1225,6 +1349,15 @@ fn canonical(path: &std::path::Path) -> Option<std::path::PathBuf> {
     std::fs::canonicalize(path).ok()
 }
 
+/// The environment probe, when the policy list asks for one. A run without the
+/// `snapshot` policy starts nothing: no git command runs and no task exists.
+fn probe_for(policy: &[String], cwd: &std::path::Path) -> Option<crate::snapshot::Probe> {
+    policy
+        .iter()
+        .any(|name| name == "snapshot")
+        .then(|| crate::snapshot::start(cwd))
+}
+
 /// The tools a headless run offers, all rooted at `cwd`.
 fn tools(
     cwd: &std::path::Path,
@@ -1251,6 +1384,33 @@ fn tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_policy_appends_the_block_to_the_first_message() {
+        let block = "[environment]\nos: macos arm64, 12 cpu, 32G mem";
+        assert_eq!(
+            crate::snapshot::first_message("task".into(), block),
+            format!("task\n\n{block}")
+        );
+    }
+
+    #[test]
+    fn snapshot_policy_off_starts_no_probe() {
+        let cwd = std::path::Path::new("/");
+        assert!(probe_for(&["budget".into()], cwd).is_none());
+        assert!(probe_for(&[], cwd).is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_policy_on_starts_the_probe() {
+        let cwd = std::path::Path::new("/");
+        assert!(probe_for(&["budget".into(), "snapshot".into()], cwd).is_some());
+    }
+
+    #[test]
+    fn snapshot_policy_off_leaves_the_task_alone() {
+        assert_eq!(crate::snapshot::first_message("task".into(), ""), "task");
+    }
 
     /// The deepseek preset, whose price peaks in the working day.
     fn deepseek() -> &'static reagent_ai::providers::Preset {
@@ -1472,6 +1632,45 @@ mod tests {
     }
 
     #[test]
+    fn device_login_is_a_saved_session() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut logins = reagent_config::auth::Logins::default();
+        logins.set(
+            "radius",
+            reagent_config::auth::Login::Device {
+                provider: "radius".into(),
+                client_id: "pi-gateway".into(),
+                token_url: "http://token".into(),
+                access: Secret::from("access-1"),
+                refresh: Secret::from("refresh-1"),
+                expires_at: 1_800_000_000,
+            },
+        );
+        reagent_config::auth::write(dir.path(), &logins).expect("writes");
+        let saved = saved_session(
+            None,
+            None,
+            Some(dir.path()),
+            Some("radius"),
+            "http://token",
+            sleeper(),
+        )
+        .expect("reads the login");
+        assert!(saved.is_some(), "a device login signs in");
+        // A key the user named still comes first.
+        let named = saved_session(
+            Some("sk-key"),
+            None,
+            Some(dir.path()),
+            Some("radius"),
+            "http://token",
+            sleeper(),
+        )
+        .expect("reads the login");
+        assert!(named.is_none());
+    }
+
+    #[test]
     fn login_chatgpt_oauth_login_beats_the_default_env_var() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut logins = reagent_config::auth::Logins::default();
@@ -1635,6 +1834,7 @@ mod tests {
             max_output: None,
             price: None,
             price_source: None,
+            reasoning: None,
         };
         let cache = reagent_ai::catalog::Cache {
             fetched_at: 1,
@@ -1673,6 +1873,7 @@ mod tests {
                 max_output: None,
                 price: Some(price),
                 price_source: Some(reagent_ai::catalog::PriceSource::Provider),
+                reasoning: None,
             }],
         };
         reagent_ai::catalog::write(&dir, "fi", &cache).expect("writes the cache");
@@ -1750,6 +1951,7 @@ mod tests {
                 cache_write: 0.0,
             }),
             price_source: Some(reagent_ai::catalog::PriceSource::ModelsDev),
+            reasoning: None,
         };
         let config = reagent_config::ModelPrice {
             input: 1.0,
@@ -1781,6 +1983,7 @@ mod tests {
                 cache_write: 0.0,
             }),
             price_source: Some(reagent_ai::catalog::PriceSource::ModelsDev),
+            reasoning: None,
         };
         let usage = Usage {
             input_tokens: 1000,
@@ -2061,5 +2264,231 @@ mod tests {
         let mut printed = text.repeat(1000);
         printed.push('\n');
         assert_eq!(sink.bytes.borrow().as_slice(), printed.as_bytes());
+    }
+
+    /// A cached reasoning plan: `levels` ascending, with the rest as given.
+    fn plan(
+        levels: &[Level],
+        off: Option<bool>,
+        mandatory: bool,
+        default: Option<Level>,
+    ) -> Reasoning {
+        let mut reasoning = Reasoning::default();
+        for level in levels {
+            reasoning.levels.insert(*level);
+        }
+        Reasoning {
+            off,
+            mandatory,
+            default,
+            ..reasoning
+        }
+    }
+
+    #[test]
+    fn reasoning_map_exact_budget_and_unknown_words_pass_through() {
+        let cached = plan(&[Level::Low, Level::Medium, Level::High], None, false, None);
+        // A level the model takes is sent as asked.
+        assert_eq!(
+            map_reasoning("medium", Some(&cached)),
+            Mapped {
+                sent: Some("medium".into()),
+                note: None
+            }
+        );
+        // A token budget is the provider's own number.
+        assert_eq!(
+            map_reasoning("4096", Some(&cached)),
+            Mapped {
+                sent: Some("4096".into()),
+                note: None
+            }
+        );
+        // An unknown word may be the provider's own.
+        assert_eq!(
+            map_reasoning("median", Some(&cached)),
+            Mapped {
+                sent: Some("median".into()),
+                note: None
+            }
+        );
+        // No data about the model changes nothing.
+        assert_eq!(
+            map_reasoning("medium", None),
+            Mapped {
+                sent: Some("medium".into()),
+                note: None
+            }
+        );
+        // Nothing asked, nothing sent.
+        assert_eq!(
+            map_reasoning("  ", Some(&cached)),
+            Mapped {
+                sent: None,
+                note: None
+            }
+        );
+    }
+
+    #[test]
+    fn reasoning_map_a_level_the_model_lacks_moves_up_then_down() {
+        let cached = plan(&[Level::Low, Level::Medium, Level::High], None, false, None);
+        // xhigh is above the top, so it falls to the next lower level.
+        let mapped = map_reasoning("xhigh", Some(&cached));
+        assert_eq!(mapped.sent.as_deref(), Some("high"));
+        assert_eq!(mapped.note.as_deref(), Some("reasoning xhigh -> high"));
+        // minimal is below the bottom, so it rises to the lowest level.
+        let mapped = map_reasoning("minimal", Some(&cached));
+        assert_eq!(mapped.sent.as_deref(), Some("low"));
+        assert_eq!(mapped.note.as_deref(), Some("reasoning minimal -> low"));
+        // Between two levels the next higher one wins over the next lower.
+        let gaps = plan(&[Level::Low, Level::Medium], None, false, None);
+        let mapped = map_reasoning("high", Some(&gaps));
+        assert_eq!(mapped.sent.as_deref(), Some("medium"));
+        assert_eq!(mapped.note.as_deref(), Some("reasoning high -> medium"));
+        // A plan with no level at all leaves the text alone.
+        let off_only = plan(&[], Some(true), false, None);
+        assert_eq!(
+            map_reasoning("high", Some(&off_only)),
+            Mapped {
+                sent: Some("high".into()),
+                note: None
+            }
+        );
+    }
+
+    #[test]
+    fn reasoning_map_off_turns_into_a_level_when_thinking_is_mandatory() {
+        // The model's own default level, when it names one.
+        let cached = plan(
+            &[Level::Low, Level::Medium],
+            None,
+            true,
+            Some(Level::Medium),
+        );
+        let mapped = map_reasoning("off", Some(&cached));
+        assert_eq!(mapped.sent.as_deref(), Some("medium"));
+        assert_eq!(
+            mapped.note.as_deref(),
+            Some("reasoning off -> medium (thinking is mandatory)")
+        );
+        // Else the lowest level it takes, whatever word asked for off.
+        let lowest = plan(&[Level::High, Level::Max], None, true, None);
+        let mapped = map_reasoning("none", Some(&lowest));
+        assert_eq!(mapped.sent.as_deref(), Some("high"));
+        assert_eq!(
+            mapped.note.as_deref(),
+            Some("reasoning off -> high (thinking is mandatory)")
+        );
+        // A list that says thinking can never be disabled counts as mandatory.
+        let never = plan(&[Level::Low, Level::High], Some(false), false, None);
+        let mapped = map_reasoning("off", Some(&never));
+        assert_eq!(mapped.sent.as_deref(), Some("low"));
+        assert_eq!(
+            mapped.note.as_deref(),
+            Some("reasoning off -> low (thinking is mandatory)")
+        );
+    }
+
+    #[test]
+    fn reasoning_map_a_zero_budget_is_off() {
+        // Every wire reads a budget of 0 as off, so a mandatory thinker maps it
+        // like `off`; any other budget passes through.
+        let mandatory = plan(&[Level::Low, Level::High], None, true, Some(Level::High));
+        let mapped = map_reasoning("0", Some(&mandatory));
+        assert_eq!(mapped.sent.as_deref(), Some("high"));
+        assert_eq!(
+            mapped.note.as_deref(),
+            Some("reasoning off -> high (thinking is mandatory)")
+        );
+        assert_eq!(
+            map_reasoning("2048", Some(&mandatory)),
+            Mapped {
+                sent: Some("2048".into()),
+                note: None
+            }
+        );
+    }
+
+    #[test]
+    fn reasoning_map_off_stays_when_thinking_may_be_disabled() {
+        let may = plan(&[Level::Low, Level::High], Some(true), false, None);
+        assert_eq!(
+            map_reasoning("off", Some(&may)),
+            Mapped {
+                sent: Some("off".into()),
+                note: None
+            }
+        );
+        // A source that does not say whether thinking may be disabled leaves
+        // the off text to the provider.
+        let unknown = plan(&[Level::Low, Level::High], None, false, None);
+        assert_eq!(
+            map_reasoning("none", Some(&unknown)),
+            Mapped {
+                sent: Some("none".into()),
+                note: None
+            }
+        );
+    }
+
+    #[test]
+    fn reasoning_map_the_start_line_names_the_level_it_picked() {
+        let mapped = map_reasoning(
+            "medium",
+            Some(&plan(&[Level::Low, Level::High], None, false, None)),
+        );
+        assert_eq!(
+            start_line(Some("work"), Some("fi"), "m", None, mapped.note.as_deref()),
+            "reagent: profile work, model fi/m, credential none, reasoning medium -> high"
+        );
+        // A run with nothing to say keeps the old line exactly.
+        assert_eq!(
+            start_line(Some("work"), Some("fi"), "m", None, None),
+            "reagent: profile work, model fi/m, credential none"
+        );
+    }
+
+    fn with_unknown(mut reasoning: Reasoning, words: &[&str]) -> Reasoning {
+        reasoning.unknown = words.iter().map(|word| word.to_string()).collect();
+        reasoning
+    }
+
+    #[test]
+    fn reasoning_map_unknown_word_the_model_lists_is_sent_as_written() {
+        let model = with_unknown(
+            plan(&[Level::Low, Level::High], None, false, None),
+            &["ultra"],
+        );
+        let mapped = map_reasoning("Ultra", Some(&model));
+        assert_eq!(mapped.sent.as_deref(), Some("Ultra"));
+        assert_eq!(mapped.note, None);
+    }
+
+    #[test]
+    fn reasoning_map_unknown_words_are_named_beside_another_level() {
+        let model = with_unknown(
+            plan(&[Level::Low, Level::High], None, false, None),
+            &["ultra"],
+        );
+        let mapped = map_reasoning("medium", Some(&model));
+        assert_eq!(mapped.sent.as_deref(), Some("high"));
+        assert_eq!(
+            start_line(None, Some("fi"), "m", None, mapped.note.as_deref()),
+            "reagent: profile none, model fi/m, credential none, reasoning medium -> high, unknown levels ultra"
+        );
+        let exact = map_reasoning("low", Some(&model));
+        assert_eq!(exact.sent.as_deref(), Some("low"));
+        assert_eq!(exact.note.as_deref(), Some("unknown levels ultra"));
+        // A budget is not a level, so the words are not named.
+        assert_eq!(map_reasoning("2048", Some(&model)).note, None);
+    }
+
+    #[test]
+    fn reasoning_map_unknown_words_alone_send_the_asked_level() {
+        let model = with_unknown(Reasoning::default(), &["deep", "wide"]);
+        let mapped = map_reasoning("high", Some(&model));
+        assert_eq!(mapped.sent.as_deref(), Some("high"));
+        assert_eq!(mapped.note.as_deref(), Some("unknown levels deep wide"));
     }
 }

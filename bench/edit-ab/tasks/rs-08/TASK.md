@@ -1,0 +1,1 @@
+Durations print wrong once they pass an hour, for example 2h 2m comes out with a huge minute count, 0 seconds prints as an empty string, and parsing 1h30m gives the wrong number of seconds. Please fix the duration code. Do not edit the tests.

@@ -800,15 +800,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cancel = CancellationToken::new();
         let child_cancel = cancel.clone();
-        tokio::spawn(async move {
+        // Timed from the cancel, so a slow process start on a loaded machine
+        // does not count against the limit.
+        let cancelled_at = tokio::spawn(async move {
             sleep(Duration::from_millis(20)).await;
             child_cancel.cancel();
+            std::time::Instant::now()
         });
-        let start = std::time::Instant::now();
         let output = tool(&tmp)
             .run(r#"{"command":"sleep 60","timeout_ms":60000}"#, &cancel)
             .await;
-        let elapsed = start.elapsed();
+        let ended = std::time::Instant::now();
+        let elapsed = ended.duration_since(cancelled_at.await.expect("the cancel task"));
         assert!(
             elapsed < Duration::from_millis(100),
             "cancel took {elapsed:?}"

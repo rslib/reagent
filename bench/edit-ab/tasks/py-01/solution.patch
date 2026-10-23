@@ -1,0 +1,26 @@
+diff -ruN a/inventory.py b/inventory.py
+--- a/inventory.py
++++ b/inventory.py
+@@ -58,7 +58,7 @@
+         return item.qty
+ 
+     def ship(self, sku, qty):
+-        if qty < 0:
++        if qty <= 0:
+             raise StockError("ship needs a positive quantity")
+         item = self.get(sku)
+         if qty > item.qty:
+@@ -70,11 +70,11 @@
+         """SKUs whose quantity is at or below the threshold, sorted."""
+         found = []
+         for item in self._items.values():
+-            if item.qty < threshold:
++            if item.qty <= threshold:
+                 found.append(item.sku)
+         return sorted(found)
+ 
+-    def restock_plan(self, target=10):
++    def restock_plan(self, target=20):
+         """How many units to order per SKU to reach target (default 20)."""
+         plan = {}
+         for item in self._items.values():

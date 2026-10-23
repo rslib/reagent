@@ -418,3 +418,49 @@ async fn sandbox_backend_links_no_gpl_crate() {
         .collect();
     assert!(gpl.is_empty(), "GPL crates: {gpl:?}");
 }
+
+/// Runs `bash -c script` in the helper, with the network when `network`.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+async fn helper_bash(write: &Path, network: bool, script: &str) -> std::process::Output {
+    let mut command = Command::new(BIN);
+    command.args(["--sandbox-exec", "--write"]).arg(write);
+    if network {
+        command.arg("--network");
+    }
+    command
+        .args(["--", "bash", "-c", script])
+        .current_dir(write)
+        .output()
+        .await
+        .expect("the binary runs")
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[tokio::test]
+async fn sandbox_backend_refuses_udp_without_network() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let script = "echo x > /dev/udp/127.0.0.1/9 && echo sent";
+    let output = helper_bash(tmp.path(), false, script).await;
+    if unavailable(&output) || bash_on_path().is_none() {
+        return;
+    }
+    assert_ne!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "sent",
+        "UDP went out with the network off"
+    );
+
+    let output = helper_bash(tmp.path(), true, script).await;
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "sent",
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

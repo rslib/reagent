@@ -78,6 +78,9 @@ fn mix_meta(hasher: &mut DefaultHasher, meta: &std::fs::Metadata) {
 
 async fn git_fingerprint(root: &Path) -> GitState {
     let top = Command::new("git")
+        // A repo's `core.fsmonitor` names a program git would run, outside
+        // the sandbox; see `git_status_hash`.
+        .args(["-c", "core.fsmonitor=false"])
         .arg("--no-optional-locks")
         .arg("-C")
         .arg(root)
@@ -105,6 +108,9 @@ async fn git_fingerprint(root: &Path) -> GitState {
 
 async fn git_status_hash(root: &Path, top: &[u8]) -> Option<u64> {
     let run = Command::new("git")
+        // `git status` runs the program a repo's `core.fsmonitor` names, so a
+        // cloned repo would get code run outside the sandbox.
+        .args(["-c", "core.fsmonitor=false"])
         .arg("--no-optional-locks")
         .arg("-C")
         .arg(root)
@@ -229,6 +235,31 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fsmonitor_of_the_repo_never_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        if !git_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        assert!(git(&repo, &["init", "-q"]));
+        std::fs::write(repo.join("a.txt"), "one").unwrap();
+        let ran = dir.path().join("ran");
+        let script = dir.path().join("monitor.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(git(
+            &repo,
+            &["config", "core.fsmonitor", &script.display().to_string()]
+        ));
+
+        assert!(fingerprint(&repo).await.is_some());
+        assert!(!ran.exists(), "the repo's fsmonitor program ran");
     }
 
     #[tokio::test]

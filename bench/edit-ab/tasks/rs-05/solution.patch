@@ -1,0 +1,32 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -3,7 +3,7 @@
+ use std::collections::BTreeMap;
+ 
+ /// Yearly interest in basis points (1/100 of a percent): 2.5 percent.
+-pub const DEFAULT_RATE_BP: u64 = 25;
++pub const DEFAULT_RATE_BP: u64 = 250;
+ 
+ #[derive(Debug, PartialEq, Eq)]
+ pub enum BankError {
+@@ -55,7 +55,7 @@
+             .accounts
+             .get_mut(name)
+             .ok_or_else(|| BankError::NoSuchAccount(name.to_string()))?;
+-        if amount >= *balance {
++        if amount > *balance {
+             return Err(BankError::InsufficientFunds {
+                 needed: amount,
+                 available: *balance,
+@@ -71,8 +71,8 @@
+             return Err(BankError::SameAccount);
+         }
+         self.balance(to)?;
+-        self.withdraw(to, amount)?;
+-        self.deposit(from, amount)?;
++        self.withdraw(from, amount)?;
++        self.deposit(to, amount)?;
+         Ok(())
+     }
+ 

@@ -20,8 +20,11 @@ const OPENROUTER: &str = "openrouter";
 /// The provider OpenAI's "Sign in with ChatGPT" is saved under.
 const CHATGPT: &str = "chatgpt";
 
+/// The provider the Radius device login is saved under.
+const RADIUS: &str = "radius";
+
 /// Every provider `login` names.
-const PROVIDERS: &str = "openrouter, chatgpt";
+const PROVIDERS: &str = "openrouter, chatgpt, radius";
 
 /// The path of the ChatGPT callback, part of its redirect URI.
 const CHATGPT_PATH: &str = "/auth/callback";
@@ -180,8 +183,67 @@ async fn login(args: &[OsString]) -> Result<(), String> {
             )
             .await
         }
+        RADIUS => {
+            device_login(
+                RADIUS,
+                &account,
+                &dir,
+                &oauth::device::Endpoints::radius(),
+                browser,
+                &crate::run::sleeper(),
+                announce_code,
+            )
+            .await
+        }
         other => Err(format!("login supports: {PROVIDERS}; there is no {other}")),
     }
+}
+
+/// Prints the page to open and the code to enter there.
+fn announce_code(page: &str, code: &str) {
+    eprintln!("Open {page} and enter the code {code}");
+}
+
+/// The device-code login of `provider` at `endpoints`, saved as `name` in
+/// `dir`.
+///
+/// The code and the page are all that is shown; the tokens go to the file
+/// only.
+async fn device_login(
+    provider: &str,
+    name: &str,
+    dir: &Path,
+    endpoints: &oauth::device::Endpoints,
+    browser: bool,
+    sleep: &reagent_ai::oauth::session::Sleeper,
+    announce: impl Fn(&str, &str),
+) -> Result<(), String> {
+    let code = oauth::device::start(endpoints).await?;
+    announce(&code.page, &code.user_code);
+    if browser {
+        opener(&code.page);
+    }
+    let tokens = oauth::device::wait(endpoints, &code, sleep).await?;
+    let refresh = tokens
+        .refresh
+        .ok_or_else(|| "the login gave no refresh token".to_string())?;
+    let login = Login::Device {
+        provider: provider.to_string(),
+        client_id: endpoints.client_id.clone(),
+        token_url: endpoints.token.clone(),
+        access: tokens.access,
+        refresh,
+        expires_at: now().saturating_add(tokens.expires_in),
+    };
+    let (dir, account) = (dir.to_path_buf(), name.to_string());
+    auth_task(move || {
+        let mut logins = auth::read(&dir)?;
+        logins.set(&account, login);
+        auth::write(&dir, &logins)
+    })
+    .await?;
+    eprintln!("reagent: logged in to {provider} as {name}");
+    Ok(())
 }
 
 /// Prints the URL to open, and the way to paste it instead.
@@ -1041,7 +1103,7 @@ mod tests {
         let error = two(&[]).unwrap_err();
         assert_eq!(
             error,
-            "login needs a provider; login supports: openrouter, chatgpt"
+            "login needs a provider; login supports: openrouter, chatgpt, radius"
         );
         assert!(two(&["openrouter", "--nope"]).is_err());
         assert!(two(&["a", "b"]).is_err());
@@ -1686,6 +1748,95 @@ mod tests {
                 .expect("logs out");
             assert!(removed);
             assert!(auth::read(dir.path()).expect("reads").is_empty());
+        }
+    }
+
+    /// Serves one `(status, body)` reply per request, in order.
+    async fn device_server(replies: Vec<(u16, &'static str)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            for (status, reply) in replies {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut chunk = [0u8; 4096];
+                let _ = socket.read(&mut chunk).await;
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn device_login_saves_the_tokens_and_shows_only_the_code() {
+        let base = device_server(vec![
+            (
+                200,
+                r#"{"device_code":"device-secret","user_code":"ABCD-EFGH","verification_uri":"https://radius.earendil.com/device","expires_in":60,"interval":1}"#,
+            ),
+            (400, r#"{"error":"authorization_pending"}"#),
+            (
+                200,
+                r#"{"access_token":"access-secret","refresh_token":"refresh-secret","expires_in":3600}"#,
+            ),
+        ])
+        .await;
+        let endpoints = oauth::device::Endpoints {
+            device: format!("{base}/device"),
+            token: format!("{base}/token"),
+            ..oauth::device::Endpoints::radius()
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let shown = std::sync::Mutex::new(Vec::new());
+        let instant: reagent_ai::oauth::session::Sleeper =
+            std::sync::Arc::new(|_| Box::pin(std::future::ready(())));
+        device_login(
+            RADIUS,
+            "radius-work",
+            dir.path(),
+            &endpoints,
+            false,
+            &instant,
+            |page, code| shown.lock().unwrap().push(format!("{page} {code}")),
+        )
+        .await
+        .expect("the login");
+        assert_eq!(
+            *shown.lock().unwrap(),
+            vec!["https://radius.earendil.com/device ABCD-EFGH".to_string()]
+        );
+        let logins = auth::read(dir.path()).expect("reads");
+        let Some(Login::Device {
+            provider,
+            client_id,
+            token_url,
+            access,
+            refresh,
+            expires_at,
+        }) = logins.get("radius-work")
+        else {
+            panic!("no device login");
+        };
+        assert_eq!(provider, "radius");
+        assert_eq!(client_id, "pi-gateway");
+        assert_eq!(token_url, &format!("{base}/token"));
+        assert_eq!(access.expose(), "access-secret");
+        assert_eq!(refresh.expose(), "refresh-secret");
+        assert!(*expires_at > now() + 3000);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = tokio::fs::metadata(auth::path(dir.path()))
+                .await
+                .expect("the file")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
         }
     }
 }

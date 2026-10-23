@@ -157,6 +157,10 @@ pub struct AssistantMessage {
     /// Token counts for the reply.
     #[serde(default)]
     pub usage: Usage,
+    /// Fields the wire that made the reply needs back on the next turn, as
+    /// one JSON object it wrote; every other wire leaves it alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<Text>,
 }
 
 impl AssistantMessage {
@@ -168,6 +172,7 @@ impl AssistantMessage {
             model: model.into(),
             stop_reason: None,
             usage: Usage::default(),
+            replay: None,
         }
     }
 }

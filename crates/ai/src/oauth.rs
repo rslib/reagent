@@ -2,6 +2,7 @@
 //! challenge, a random token, and reading the code out of a callback URL.
 
 pub mod chatgpt;
+pub mod device;
 pub mod jwt;
 pub mod openrouter;
 pub mod session;

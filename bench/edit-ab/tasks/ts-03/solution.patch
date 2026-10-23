@@ -1,0 +1,21 @@
+diff -ruN a/slug.ts b/slug.ts
+--- a/slug.ts
++++ b/slug.ts
+@@ -26,13 +26,13 @@
+ // are not letters or digits by one separator, and cut it to maxLength
+ // (default 50) without leaving a separator at either end.
+ export function slugify(title: string, options: SlugOptions = {}): string {
+-  const maxLength = options.maxLength ?? 20;
++  const maxLength = options.maxLength ?? 50;
+   const separator = options.separator ?? "-";
+   let text = stripAccents(title.toLowerCase());
+-  text = text.replace(/[^a-z0-9]/g, separator);
++  text = text.replace(/[^a-z0-9]+/g, separator);
+   text = trimSeparator(text, separator);
+-  if (text.length > maxLength - 1) {
+-    text = text.slice(0, maxLength - 1);
++  if (text.length > maxLength) {
++    text = text.slice(0, maxLength);
+   }
+   return trimSeparator(text, separator);
+ }
