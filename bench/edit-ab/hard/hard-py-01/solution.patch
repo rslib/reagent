@@ -1,0 +1,48 @@
+diff -ruN a/book.py b/book.py
+--- a/book.py
++++ b/book.py
+@@ -105,7 +105,7 @@
+     def reduce(self, order, amount):
+         """Shrink an order that stays in the queue."""
+         order.remaining -= amount
+-        self.total -= order.remaining
++        self.total -= amount
+ 
+ 
+ class OrderBook:
+@@ -252,7 +252,7 @@
+         if limit is None:
+             return True
+         if order.side == BUY:
+-            return level_price < limit
++            return level_price <= limit
+         return level_price >= limit
+ 
+     def _match(self, order, limit):
+@@ -346,6 +346,8 @@
+         order = self.get(order_id)
+         level = self._levels(order.side)[order.price]
+         level.remove(order)
++        if len(level) == 0:
++            self._drop_price(order.side, order.price)
+         del self._orders[order.id]
+         order.status = CANCELLED
+         self._log("cancel", order)
+@@ -425,7 +427,7 @@
+         """Total ask quantity at prices of at most limit_price."""
+         total = 0
+         for price in self._ask_prices:
+-            if price >= limit_price:
++            if price <= limit_price:
+                 total += self._asks[price].total
+         return total
+ 
+@@ -552,7 +554,7 @@
+ 
+     def _fee(self, notional, bps):
+         """Fee in whole currency units, rounded half up."""
+-        return (notional * bps) // 10000
++        return (notional * bps + 5000) // 10000
+ 
+     def fee_for(self, trade):
+         """Returns (maker_fee, taker_fee) for one trade."""

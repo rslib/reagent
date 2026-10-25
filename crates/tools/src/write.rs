@@ -7,9 +7,10 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{Effects, Repaired, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
+use crate::repair::{Kind, Touched};
 use crate::resolve;
 
 /// Arguments for one `write` call.
@@ -50,6 +51,7 @@ fn is_string(raw: &RawValue) -> bool {
 pub struct Write {
     spec: ToolSpec,
     working_dir: PathBuf,
+    touched: Touched,
 }
 
 impl Write {
@@ -58,7 +60,15 @@ impl Write {
         Self {
             spec: spec(),
             working_dir: working_dir.into(),
+            touched: Touched::default(),
         }
+    }
+
+    /// Shares `touched`, the files the run's file tools read or changed,
+    /// which a repaired call may use.
+    pub fn with_touched(mut self, touched: Touched) -> Self {
+        self.touched = touched;
+        self
     }
 
     async fn run_inner(&self, args: &Args<'_>) -> Result<ToolOutput, String> {
@@ -87,6 +97,13 @@ impl Tool for Write {
 
     fn main_arg(&self) -> Option<&'static str> {
         Some("path")
+    }
+
+    fn repair<'a>(
+        &'a self,
+        args: &'a str,
+    ) -> Option<futures_util::future::BoxFuture<'a, Repaired>> {
+        crate::repair::repair(Kind::Write, &self.working_dir, &self.touched, args)
     }
 
     fn effects(&self, args: &str) -> Effects {
@@ -123,7 +140,13 @@ impl Tool for Write {
                 Err(output) => return output,
             };
             match self.run_inner(&arguments).await {
-                Ok(output) => output,
+                Ok(output) => {
+                    if !output.is_error {
+                        let path = std::path::Path::new(arguments.path.as_ref());
+                        self.touched.note(&self.working_dir, path);
+                    }
+                    output
+                }
                 Err(message) => ToolOutput::error(message),
             }
         })

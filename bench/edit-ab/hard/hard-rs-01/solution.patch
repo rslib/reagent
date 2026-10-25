@@ -1,0 +1,48 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -65,7 +65,7 @@
+ 
+     /// True when the two share at least one minute. Touching ends do not count.
+     pub fn overlaps(&self, other: &Interval) -> bool {
+-        self.start <= other.end && other.start <= self.end
++        self.start < other.end && other.start < self.end
+     }
+ 
+     /// True when they overlap or one starts exactly where the other ends.
+@@ -151,7 +151,7 @@
+     for next in sorted {
+         match out.last_mut() {
+             Some(cur) if next.start <= cur.end => {
+-                cur.end = next.end;
++                cur.end = cur.end.max(next.end);
+             }
+             _ => out.push(next),
+         }
+@@ -177,7 +177,7 @@
+             if c.start >= b.end {
+                 break;
+             }
+-            if c.start >= start {
++            if c.start > start {
+                 out.push(Interval { start, end: c.start });
+             }
+             start = start.max(c.end);
+@@ -239,7 +239,7 @@
+     for gap in complement(window, busy).into_iter().rev() {
+         let (gap_start, gap_end) = (gap.start, gap.end);
+         if gap_end - gap_start >= duration {
+-            let candidate = gap_start;
++            let candidate = gap_end - duration;
+             return Some(Interval {
+                 start: candidate,
+                 end: candidate + duration,
+@@ -492,7 +492,7 @@
+ /// `count` copies of an event, one every `every_weeks` weeks.
+ pub fn weekly(first: Interval, count: usize, every_weeks: i64) -> Vec<Interval> {
+     (0..count as i64)
+-        .map(|i| first.shift(i * MINUTES_PER_WEEK))
++        .map(|i| first.shift(i * every_weeks * MINUTES_PER_WEEK))
+         .collect()
+ }
+ 

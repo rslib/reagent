@@ -4,9 +4,9 @@
 # line and exits 2 on a platform with no line.
 #
 # Each budget is the measured size plus 5%, rounded up to a multiple of 4096.
-# darwin-arm64: measured 3110128 bytes on 2026-10-22 (after the radius wire and
-# the environment snapshot), budget 3268608.
-darwin-arm64 3268608
+# darwin-arm64: measured 3275584 bytes on 2026-10-24 (tool-call repair: leaked
+# calls, schema conversion; trunk 7220906 was 3242496), budget 3440640.
+darwin-arm64 3440640
 # linux-x86_64: measured 3914408 bytes on 2026-10-22 (dftu-gate, Debian 13),
 # budget 4112384.
 linux-x86_64 4112384

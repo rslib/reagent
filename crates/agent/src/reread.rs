@@ -251,6 +251,7 @@ mod tests {
             end,
             size,
             modified: Some(SystemTime::UNIX_EPOCH),
+            cut: false,
         }
     }
 

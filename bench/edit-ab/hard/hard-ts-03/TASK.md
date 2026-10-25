@@ -1,0 +1,1 @@
+My spreadsheet formula engine has a few faults. A number with a negative exponent like `1e-3` is a syntax error, `2^3^2` gives the wrong answer, column Z (and AZ, and so on) comes out with the wrong name, MAX returns the smallest value, and ROUND on a negative half goes the wrong way. Please fix the formula code. Do not edit the tests.

@@ -1,0 +1,51 @@
+diff -ruN a/merge.py b/merge.py
+--- a/merge.py
++++ b/merge.py
+@@ -32,7 +32,7 @@
+         ch = path[i]
+         if ch == "\\" and i + 1 < len(path) and path[i + 1] == ".":
+             buf += "."
+-            i += 1
++            i += 2
+             continue
+         if ch == ".":
+             if buf:
+@@ -180,7 +180,7 @@
+ 
+ def _apply_prepend(base, extra):
+     """Items of extra before the items of base."""
+-    return list(_as_list(base)) + list(_as_list(extra))
++    return list(_as_list(extra)) + list(_as_list(base))
+ 
+ 
+ def _apply_remove(base, gone):
+@@ -337,7 +337,7 @@
+     match = _REF.search(text)
+     if match is None:
+         return text
+-    if match.end() == len(text):
++    if match.span() == (0, len(text)):
+         return _lookup(match.group(1), root, env, stack)
+ 
+     def swap(found):
+diff -ruN a/schema.py b/schema.py
+--- a/schema.py
++++ b/schema.py
+@@ -53,7 +53,7 @@
+     if isinstance(value, int) and value in (0, 1):
+         return bool(value)
+     if isinstance(value, str):
+-        word = value.strip()
++        word = value.strip().lower()
+         if word in TRUE_WORDS:
+             return True
+         if word in FALSE_WORDS:
+@@ -129,7 +129,7 @@
+     if field.type in ("int", "float"):
+         if field.min is not None and value < field.min:
+             errors.append("%s: %s is below the minimum %s" % (where, value, field.min))
+-        if field.max is not None and value >= field.max:
++        if field.max is not None and value > field.max:
+             errors.append("%s: %s is above the maximum %s" % (where, value, field.max))
+     if field.type in ("str", "list", "dict"):
+         if field.min_len is not None and len(value) < field.min_len:

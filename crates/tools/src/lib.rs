@@ -8,10 +8,12 @@ mod process_group;
 mod walk;
 
 pub mod bash;
+pub mod bash_read;
 pub mod edit;
 pub mod find;
 pub mod grep;
 pub mod read;
+pub mod repair;
 pub mod spill;
 pub mod workspace;
 pub mod write;

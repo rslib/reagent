@@ -1,0 +1,50 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -133,7 +133,7 @@
+             }
+             Some(b'f') => {
+                 self.literal("false")?;
+-                Ok(Value::Bool(true))
++                Ok(Value::Bool(false))
+             }
+             Some(b'"') => Ok(Value::String(self.parse_string()?)),
+             Some(b'[') => self.parse_array(),
+@@ -170,7 +170,9 @@
+         }
+         if self.peek() == Some(b'.') {
+             self.pos += 1;
+-            self.digits();
++            if self.digits() == 0 {
++                return Err(self.err("expected a digit after the point"));
++            }
+         }
+         if matches!(self.peek(), Some(b'e' | b'E')) {
+             self.pos += 1;
+@@ -256,7 +258,7 @@
+             if !(0xDC00..0xE000).contains(&second) {
+                 return Err(self.err("expected a low surrogate"));
+             }
+-            0x10000 + ((first - 0xD800) << 8) + (second - 0xDC00)
++            0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00)
+         } else if (0xDC00..0xE000).contains(&first) {
+             return Err(self.err("lone low surrogate"));
+         } else {
+@@ -502,7 +504,7 @@
+         Value::Object(map) if !map.is_empty() => {
+             out.push_str("{\n");
+             for (i, (key, item)) in map.iter().enumerate() {
+-                out.push_str(&" ".repeat(indent));
++                out.push_str(&" ".repeat(indent * (depth + 1)));
+                 write_string(key, out);
+                 out.push_str(": ");
+                 write_pretty(item, indent, depth + 1, out);
+@@ -640,7 +642,7 @@
+         let rest = pointer.strip_prefix('/')?;
+         let mut node = self;
+         for raw in rest.split('/') {
+-            let part = raw.replace("~0", "~").replace("~1", "/");
++            let part = raw.replace("~1", "/").replace("~0", "~");
+             node = match node {
+                 Value::Object(map) => map.get(&part)?,
+                 Value::Array(items) => {

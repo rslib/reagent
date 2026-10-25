@@ -1,0 +1,46 @@
+diff -ruN a/cache.ts b/cache.ts
+--- a/cache.ts
++++ b/cache.ts
+@@ -109,7 +109,7 @@
+   }
+ 
+   private isExpired(node: Node<K, V>): boolean {
+-    return this.clock() > node.expiresAt;
++    return this.clock() >= node.expiresAt;
+   }
+ 
+   private weightOf(key: K, value: V): number {
+@@ -167,6 +167,7 @@
+       this.totalWeight += weight - existing.weight;
+       existing.value = value;
+       existing.weight = weight;
++      existing.expiresAt = this.expiryFor(ttl);
+       this.touch(existing);
+     } else {
+       const node: Node<K, V> = {
+@@ -198,6 +199,7 @@
+     if (!node) return false;
+     this.unlink(node);
+     this.map.delete(key);
++    this.totalWeight -= node.weight;
+     this.opts.onEvict?.(node.key, node.value, "deleted");
+     return true;
+   }
+@@ -321,7 +323,7 @@
+     let node = this.tail;
+     while (node && out.length < n) {
+       out.push(node.key);
+-      node = node.next;
++      node = node.prev;
+     }
+     return out;
+   }
+@@ -440,7 +442,7 @@
+   hitRate(): number {
+     const a = this.first.stats();
+     const b = this.second.stats();
+-    const hits = a.hits;
++    const hits = a.hits + b.hits;
+     const reads = a.hits + a.misses;
+     return reads === 0 ? 0 : hits / reads;
+   }

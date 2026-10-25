@@ -75,6 +75,8 @@ pub struct Seen {
     pub size: u64,
     /// The file's modified time when it was read.
     pub modified: Option<SystemTime>,
+    /// Whether a shown line was cut at the line cap.
+    pub cut: bool,
 }
 
 /// The outcome of one tool call, sent back to the model.
@@ -126,8 +128,17 @@ pub fn parse_args<'a, T>(args: &'a str) -> Result<T, ToolOutput>
 where
     T: serde::Deserialize<'a>,
 {
-    serde_json::from_str(args)
-        .map_err(|error| ToolOutput::error(format!("invalid arguments: {error}")))
+    serde_json::from_str(args).map_err(|error| {
+        // Arguments that end early are a reply cut short, most often a long
+        // file write; saying so gets a smaller call instead of the same one.
+        if error.is_eof() && !args.trim().is_empty() {
+            return ToolOutput::error(format!(
+                "invalid arguments: they were cut off at byte {} before the JSON ended; send a shorter call, and split a long file write into parts",
+                args.len()
+            ));
+        }
+        ToolOutput::error(format!("invalid arguments: {error}"))
+    })
 }
 
 /// The files a tool call reads and writes.
@@ -161,9 +172,47 @@ pub trait Tool: Send + Sync {
         Effects::default()
     }
 
+    /// Arguments to run in place of a call's own when the call names its file
+    /// in a way the tool can fix, such as an alias or a mistyped path. The
+    /// batch checks the rules against what this returns. `None`, the default
+    /// and the answer for a well-formed call, costs nothing.
+    fn repair<'a>(&'a self, _args: &'a str) -> Option<BoxFuture<'a, Repaired>> {
+        None
+    }
+
+    /// Another tool's call that does the same work, such as a `read` for a
+    /// bash `cat`: the batch runs it instead when the rules allow both calls,
+    /// and runs this call when it fails. `None`, the default, costs nothing.
+    fn reroute<'a>(&'a self, _args: &'a str) -> Option<BoxFuture<'a, Option<Reroute>>> {
+        None
+    }
+
     /// Runs one call. `cancel` fires when the caller asks the loop to stop.
     fn run<'a>(&'a self, args: &'a str, cancel: &'a CancellationToken)
     -> BoxFuture<'a, ToolOutput>;
+}
+
+/// What [`Tool::repair`] made of a call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Repaired {
+    /// The call runs as sent.
+    Keep,
+    /// The call runs with `args`. With a note its result starts with
+    /// `[repaired: note]`; a change of shape alone is silent.
+    Args { args: String, note: Option<String> },
+    /// The call fails with this text and does not run.
+    Refuse(String),
+}
+
+/// A call to run in place of another; see [`Tool::reroute`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reroute {
+    /// The tool to call.
+    pub tool: &'static str,
+    /// Its JSON arguments.
+    pub args: String,
+    /// The words the result starts with, as `[label: lines A-B of PATH]`.
+    pub label: &'static str,
 }
 
 /// A set of tools offered to the model, ordered by name.
@@ -220,14 +269,24 @@ impl Registry {
     }
 
     /// Looks up the tool a model's call means: the exact name, else the one
-    /// name equal after trimming, dropping a leading `functions.` and
-    /// ignoring ASCII case. Open models and their hosts send such names.
+    /// name equal after cutting a leaked tag such as `</arg_key>`, trimming,
+    /// dropping a leading `functions.` and ignoring ASCII case, else the same
+    /// cleanup applied to the text after the last `>`, which is where a
+    /// leaked `<tool_call>` tag ends. Open models and their hosts send such
+    /// names.
     pub fn resolve(&self, name: &str) -> Option<&dyn Tool> {
         if let Some(tool) = self.get(name) {
             return Some(tool);
         }
-        let trimmed = name.trim();
-        let wanted = trimmed.strip_prefix("functions.").unwrap_or(trimmed);
+        let trimmed = name.split('<').next().unwrap_or(name).trim();
+        self.resolve_cleaned(trimmed)
+            .or_else(|| self.resolve_after_tag(name))
+    }
+
+    /// Looks up the one tool whose name equals `wanted` after dropping a
+    /// leading `functions.`, ignoring ASCII case. Two names are no answer.
+    fn resolve_cleaned(&self, wanted: &str) -> Option<&dyn Tool> {
+        let wanted = wanted.strip_prefix("functions.").unwrap_or(wanted);
         let mut found = self
             .tools
             .iter()
@@ -236,6 +295,24 @@ impl Registry {
             (Some((_, tool)), None) => Some(tool.as_ref()),
             _ => None,
         }
+    }
+
+    /// Looks up the tool a call ends with: the cleanup of
+    /// [`Registry::resolve`] applied to the text after the last `>`, when the
+    /// text before it holds a `<` and so ends a tag such as `<tool_call>`. An
+    /// empty text is no answer, and neither is a shell redirect, as in
+    /// `echo hi > edit`, so a command that leaked into the name stays
+    /// unresolved. Builds no `String`.
+    fn resolve_after_tag(&self, name: &str) -> Option<&dyn Tool> {
+        let (before, after) = name.rsplit_once('>')?;
+        if !before.contains('<') {
+            return None;
+        }
+        let after = after.trim();
+        if after.is_empty() {
+            return None;
+        }
+        self.resolve_cleaned(after)
     }
 
     /// The number of registered tools.
@@ -496,5 +573,64 @@ mod tests {
                 .as_ref(),
             "first"
         );
+    }
+
+    #[test]
+    fn broken_call_a_tag_after_a_real_name_resolves() {
+        let registry = registry_of(&["bash", "read"]);
+        assert!(registry.resolve("read</arg_key>").is_some());
+        assert!(registry.resolve("found_missing_output</arg_key>").is_none());
+        assert!(registry.resolve("grep -n x f.py</arg_value>").is_none());
+    }
+
+    #[test]
+    fn resolve_junk_a_name_after_a_tag_resolves() {
+        let registry = registry_of(&["edit", "read"]);
+        let tool = registry
+            .resolve("读出 And fix the parse_line function entirely:<tool_call>edit")
+            .unwrap();
+        assert_eq!(tool.spec().name, "edit");
+    }
+
+    #[test]
+    fn resolve_junk_a_shell_command_after_a_tag_stays_unresolved() {
+        let registry = registry_of(&["bash", "grep"]);
+        assert!(registry.resolve("grep -n x f.py</arg_value>").is_none());
+    }
+
+    #[test]
+    fn resolve_junk_a_shell_redirect_before_a_name_stays_unresolved() {
+        let registry = registry_of(&["bash", "edit"]);
+        assert!(registry.resolve("echo hi > edit").is_none());
+    }
+
+    #[test]
+    fn resolve_junk_two_tool_words_are_no_answer() {
+        let registry = registry_of(&["edit", "read"]);
+        assert!(registry.resolve("read then edit").is_none());
+    }
+
+    #[test]
+    fn resolve_junk_a_name_after_a_tag_in_other_case_resolves() {
+        let registry = registry_of(&["edit"]);
+        let tool = registry.resolve("x:<tool_call>functions.EDIT ").unwrap();
+        assert_eq!(tool.spec().name, "edit");
+    }
+
+    #[test]
+    fn resolve_junk_whole_words_only() {
+        let registry = registry_of(&["edit"]);
+        assert!(registry.resolve("<tool_call>editor").is_none());
+    }
+
+    #[test]
+    fn broken_call_cut_off_arguments_say_so() {
+        let error = parse_args::<serde_json::Value>("{\"command\":\"cat << EOF > a.py\\nprint(1)")
+            .unwrap_err();
+        assert!(error.is_error);
+        assert!(error.content.contains("cut off"), "{}", error.content);
+        assert!(error.content.contains("shorter call"), "{}", error.content);
+        let empty = parse_args::<serde_json::Value>("").unwrap_err();
+        assert!(!empty.content.contains("cut off"), "{}", empty.content);
     }
 }

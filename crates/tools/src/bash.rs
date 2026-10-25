@@ -15,7 +15,7 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{Reroute, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
 use crate::process_group::{self, GroupGuard};
@@ -112,6 +112,8 @@ pub struct Bash {
     working_dir: PathBuf,
     launcher: Option<Launcher>,
     disabled: AtomicBool,
+    /// Whether a plain file read runs as a `read` call; see [`crate::bash_read`].
+    reads: bool,
     /// The writes that reached the spill file of the last call. A test shows
     /// that the buffering costs one write per `BUF` bytes.
     #[cfg(test)]
@@ -126,9 +128,16 @@ impl Bash {
             working_dir: working_dir.into(),
             launcher: None,
             disabled: AtomicBool::new(false),
+            reads: true,
             #[cfg(test)]
             spill_writes: AtomicU64::new(0),
         }
+    }
+
+    /// Turns the running of plain file reads as `read` calls on or off.
+    pub fn with_reads(mut self, reads: bool) -> Self {
+        self.reads = reads;
+        self
     }
 
     /// Runs commands through `launcher` instead of starting bash directly.
@@ -652,6 +661,27 @@ impl Tool for Bash {
 
     fn main_arg(&self) -> Option<&'static str> {
         Some("command")
+    }
+
+    fn reroute<'a>(
+        &'a self,
+        args: &'a str,
+    ) -> Option<futures_util::future::BoxFuture<'a, Option<Reroute>>> {
+        if !self.reads {
+            return None;
+        }
+        let arguments = parse_args::<Args<'a>>(args).ok()?;
+        // The pure parse first: a command that is no read form allocates no
+        // future and touches no file.
+        let read = crate::bash_read::classify(&arguments.command)?.into_owned();
+        Some(Box::pin(async move {
+            let args = crate::bash_read::read_call(&self.working_dir, read).await?;
+            Some(Reroute {
+                tool: crate::read::NAME,
+                args,
+                label: "bash ran this as read",
+            })
+        }))
     }
 
     fn run<'a>(

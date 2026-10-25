@@ -1,0 +1,48 @@
+diff -ruN a/formula.ts b/formula.ts
+--- a/formula.ts
++++ b/formula.ts
+@@ -26,7 +26,7 @@
+   while (n > 0) {
+     const rem = (n - 1) % 26;
+     name = String.fromCharCode(65 + rem) + name;
+-    n = Math.floor(n / 26);
++    n = Math.floor((n - 1) / 26);
+   }
+   return name;
+ }
+@@ -84,7 +84,7 @@
+       }
+       if (src[i] === "e" || src[i] === "E") {
+         let j = i + 1;
+-        if (src[j] === "+") j++;
++        if (src[j] === "+" || src[j] === "-") j++;
+         if (isDigit(src[j] ?? "")) {
+           while (j < src.length && isDigit(src[j])) j++;
+           i = j;
+@@ -167,7 +167,7 @@
+   "-": { bp: 30, right: false },
+   "*": { bp: 40, right: false },
+   "/": { bp: 40, right: false },
+-  "^": { bp: 50, right: false },
++  "^": { bp: 50, right: true },
+ };
+ 
+ /** Unary minus binds tighter than * and looser than ^, so -2^2 is -4. */
+@@ -523,7 +523,7 @@
+   COUNT: numeric("COUNT", (n) => n.length),
+   AVG: numeric("AVG", (n) => (n.length === 0 ? DIV0 : n.reduce((a, b) => a + b, 0) / n.length)),
+   MIN: numeric("MIN", (n) => (n.length === 0 ? 0 : n.reduce((a, b) => (b < a ? b : a)))),
+-  MAX: numeric("MAX", (n) => (n.length === 0 ? 0 : n.reduce((a, b) => (b < a ? b : a)))),
++  MAX: numeric("MAX", (n) => (n.length === 0 ? 0 : n.reduce((a, b) => (b > a ? b : a)))),
+   ABS: (args, ctx) => {
+     const n = toNumber(one(args, ctx));
+     return isError(n) ? n : Math.abs(n);
+@@ -535,7 +535,7 @@
+     if (isError(x)) return x;
+     if (isError(d)) return d;
+     const f = Math.pow(10, Math.trunc(d));
+-    return Math.round(x * f) / f;
++    return (Math.sign(x) * Math.round(Math.abs(x) * f)) / f;
+   },
+   IF: (args, ctx) => {
+     if (args.length < 2 || args.length > 3) return VALUE;

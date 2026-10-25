@@ -438,7 +438,13 @@ pub async fn run(mut args: Args) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let registry = tools(&cwd, &args.skip, archive.as_ref(), launcher);
+    let registry = tools(
+        &cwd,
+        &args.skip,
+        archive.as_ref(),
+        launcher,
+        args.bash_reads,
+    );
     if let Err(message) = check_rule_tools(&args.rules, &registry) {
         eprintln!("reagent: {message}");
         return ExitCode::from(2);
@@ -1364,14 +1370,18 @@ fn tools(
     skip: &[String],
     archive: Option<&Arc<Archive>>,
     launcher: Option<Launcher>,
+    bash_reads: bool,
 ) -> Registry {
     let mut registry = Registry::new();
-    registry.add(Read::new(cwd));
-    registry.add(Write::new(cwd));
-    registry.add(Edit::new(cwd));
+    // One list of touched files, so an edit can name the file a read found.
+    let touched = reagent_tools::repair::Touched::default();
+    registry.add(Read::new(cwd).with_touched(touched.clone()));
+    registry.add(Write::new(cwd).with_touched(touched.clone()));
+    registry.add(Edit::new(cwd).with_touched(touched));
+    let bash = Bash::new(cwd).with_reads(bash_reads);
     registry.add(match launcher {
-        Some(launcher) => Bash::new(cwd).with_launcher(launcher),
-        None => Bash::new(cwd),
+        Some(launcher) => bash.with_launcher(launcher),
+        None => bash,
     });
     registry.add(Grep::new(cwd).with_skip(skip.iter().cloned()));
     registry.add(Find::new(cwd).with_skip(skip.iter().cloned()));
@@ -1819,7 +1829,7 @@ mod tests {
 
     #[test]
     fn tools_are_bash_edit_find_grep_read_and_write() {
-        let registry = tools(std::path::Path::new("."), &[], None, None);
+        let registry = tools(std::path::Path::new("."), &[], None, None, true);
         let names: Vec<&str> = registry.names().collect();
         assert_eq!(names, ["bash", "edit", "find", "grep", "read", "write"]);
     }
@@ -2127,7 +2137,7 @@ mod tests {
             },
         };
         let rules = Rules::from_layers(&[layer], std::path::Path::new("/w"), None).unwrap();
-        let registry = tools(std::path::Path::new("."), &[], None, None);
+        let registry = tools(std::path::Path::new("."), &[], None, None, true);
         let error = check_rule_tools(&rules, &registry).unwrap_err();
         assert!(error.contains("Bsh(git push:*)"), "{error}");
         let ok = reagent_config::Layer {
@@ -2147,7 +2157,7 @@ mod tests {
     #[test]
     fn compact_policy_offers_expand() {
         let archive = Archive::new();
-        let registry = tools(std::path::Path::new("."), &[], Some(&archive), None);
+        let registry = tools(std::path::Path::new("."), &[], Some(&archive), None, true);
         assert!(registry.names().any(|name| name == "expand"));
     }
 
@@ -2490,5 +2500,23 @@ mod tests {
         let mapped = map_reasoning("high", Some(&model));
         assert_eq!(mapped.sent.as_deref(), Some("high"));
         assert_eq!(mapped.note.as_deref(), Some("unknown levels deep wide"));
+    }
+
+    #[test]
+    fn bash_reads_off_keeps_every_command_in_bash() {
+        let cwd = std::path::Path::new(".");
+        let args = r#"{"command":"cat Cargo.toml"}"#;
+        let on = tools(cwd, &[], None, None, true);
+        assert!(
+            on.resolve("bash")
+                .and_then(|bash| bash.reroute(args))
+                .is_some()
+        );
+        let off = tools(cwd, &[], None, None, false);
+        assert!(
+            off.resolve("bash")
+                .and_then(|bash| bash.reroute(args))
+                .is_none()
+        );
     }
 }

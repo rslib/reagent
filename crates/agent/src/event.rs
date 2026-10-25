@@ -51,6 +51,9 @@ pub enum Event {
         is_error: bool,
         /// The UTF-8 length of the output text the model receives.
         bytes: usize,
+        /// The output text of a failed call, shared with history; `None`
+        /// when the call succeeded.
+        error: Option<Text>,
     },
     /// Running token counts for this turn.
     Usage(Usage),

@@ -1,0 +1,51 @@
+diff -ruN a/layout.ts b/layout.ts
+--- a/layout.ts
++++ b/layout.ts
+@@ -65,7 +65,7 @@
+     if (current.length === 0) {
+       current = [word];
+       used = w;
+-    } else if (used + 1 + w >= limit()) {
++    } else if (used + 1 + w > limit()) {
+       flush();
+       current = [word];
+       used = w;
+@@ -88,7 +88,7 @@
+   const extra = spaces % gaps;
+   let out = list[0];
+   for (let i = 0; i < gaps; i++) {
+-    out += " ".repeat(base + (i <= extra ? 1 : 0)) + list[i + 1];
++    out += " ".repeat(base + (i < extra ? 1 : 0)) + list[i + 1];
+   }
+   return out;
+ }
+@@ -380,7 +380,7 @@
+  */
+ export function columns(lines: string[], colWidth: number, count: number, gap = 2): string[] {
+   if (count < 1) throw new LayoutError("need at least one column");
+-  const rows = Math.floor(lines.length / count);
++  const rows = Math.ceil(lines.length / count);
+   const out: string[] = [];
+   for (let r = 0; r < rows; r++) {
+     const cells: string[] = [];
+diff -ruN a/measure.ts b/measure.ts
+--- a/measure.ts
++++ b/measure.ts
+@@ -5,7 +5,7 @@
+ export function charWidth(cp: number): number {
+   if (cp === 0) return 0;
+   if (cp < 32 || (cp >= 0x7f && cp < 0xa0)) return 0;
+-  if (cp >= 0x0300 && cp < 0x036f) return 0; // combining marks
++  if (cp >= 0x0300 && cp <= 0x036f) return 0; // combining marks
+   if (cp >= 0x200b && cp <= 0x200f) return 0; // zero width spaces and marks
+   if (cp === 0xfe0f) return 0; // emoji variation selector
+   if (
+@@ -97,7 +97,7 @@
+ /** Pad on the right until the text is width columns wide. */
+ export function padEnd(text: string, width: number, fill = " "): string {
+   const gap = Math.floor((width - stringWidth(text)) / stringWidth(fill));
+-  return gap > 0 ? fill.repeat(gap) + text : text;
++  return gap > 0 ? text + fill.repeat(gap) : text;
+ }
+ 
+ /** Center text. The extra column of an odd gap goes to the right. */

@@ -1,0 +1,47 @@
+diff -ruN a/limiter.ts b/limiter.ts
+--- a/limiter.ts
++++ b/limiter.ts
+@@ -61,6 +61,7 @@
+     const now = this.clock();
+     const elapsed = Math.max(0, now - this.last);
+     this.tokens = Math.min(this.capacity, this.tokens + (elapsed / 1000) * this.perSecond);
++    this.last = now;
+   }
+ 
+   available(): number {
+@@ -87,7 +88,7 @@
+   retryAfterMs(cost = 1): number {
+     this.refill();
+     if (this.tokens >= cost) return 0;
+-    return Math.floor(((cost - this.tokens) / this.perSecond) * 1000);
++    return Math.ceil(((cost - this.tokens) / this.perSecond) * 1000);
+   }
+ 
+   reset(): void {
+@@ -213,7 +214,7 @@
+   /** Drop entries that are a full window old or older. */
+   private prune(now: number): void {
+     let drop = 0;
+-    while (drop < this.log.length && this.log[drop] < now - this.windowMs) drop++;
++    while (drop < this.log.length && this.log[drop] <= now - this.windowMs) drop++;
+     if (drop > 0) this.log.splice(0, drop);
+   }
+ 
+@@ -361,7 +362,7 @@
+ 
+   private roll(): number {
+     const now = this.clock();
+-    const bucket = Math.floor(now / 60_000);
++    const bucket = Math.floor(now / 3_600_000);
+     if (bucket !== this.bucket) {
+       this.bucket = bucket;
+       this.count = 0;
+@@ -404,7 +405,7 @@
+   }
+ 
+   canTake(cost = 1): boolean {
+-    return this.limiters.some((l) => l.canTake(cost));
++    return this.limiters.every((l) => l.canTake(cost));
+   }
+ 
+   take(cost = 1): Decision {

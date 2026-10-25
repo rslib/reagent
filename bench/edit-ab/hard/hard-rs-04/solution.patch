@@ -1,0 +1,47 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -75,7 +75,7 @@
+ 
+ fn div_half_down(n: i128, d: i128) -> i128 {
+     let (q, r) = (n / d, n % d);
+-    if r.abs() * 2 >= d.abs() {
++    if r.abs() * 2 > d.abs() {
+         q + n.signum() * d.signum()
+     } else {
+         q
+@@ -120,7 +120,7 @@
+ fn group_thousands(digits: &str) -> String {
+     let mut out = String::new();
+     for (i, ch) in digits.chars().enumerate() {
+-        if (digits.len() - i) % 3 == 0 {
++        if i > 0 && (digits.len() - i) % 3 == 0 {
+             out.push(',');
+         }
+         out.push(ch);
+@@ -155,7 +155,7 @@
+             Some(r) => (true, r),
+             None => (false, t.strip_prefix('+').unwrap_or(t)),
+         };
+-        let rest = rest.replace(',', "");
++        let rest = rest.trim_start_matches('$').replace(',', "");
+         let (whole, frac) = rest.split_once('.').unwrap_or((rest.as_str(), ""));
+         let digits_only = |s: &str| s.chars().all(|c| c.is_ascii_digit());
+         if whole.is_empty() && frac.is_empty() {
+@@ -211,6 +211,7 @@
+             .map(|(i, &w)| (i, abs * w as i128 % sum))
+             .collect();
+         let mut left = abs - parts.iter().sum::<i128>();
++        remainders.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+         for (i, _) in remainders {
+             if left == 0 {
+                 break;
+@@ -490,7 +491,7 @@
+                 discount.allocate(&weights)?
+             };
+             for ((line, net), share) in self.lines.iter().zip(&nets).zip(&shares) {
+-                let taxable = *net;
++                let taxable = *net - *share;
+                 tax += tax_on(taxable, line.tax_bps, self.rounding);
+             }
+         }

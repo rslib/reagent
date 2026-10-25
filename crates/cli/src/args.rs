@@ -155,6 +155,8 @@ pub struct Args {
     pub policy: Vec<String>,
     /// Folder names from the config that searches leave out.
     pub skip: Vec<String>,
+    /// Whether a plain file read in bash runs as a `read` call.
+    pub bash_reads: bool,
     /// The profile file the run read, if any.
     pub profile: Option<String>,
     /// The permission rules of the config files.
@@ -928,6 +930,7 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
         cwd,
         policy,
         skip: settings.skip,
+        bash_reads: settings.bash_reads.unwrap_or(true),
         rules,
         context_window: model_table.context_window,
         price: model_table.price,
@@ -1018,6 +1021,16 @@ mod tests {
         assert_eq!(args.sandbox, SandboxMode::Auto);
         assert!(args.network);
         assert_eq!(args.write, [PathBuf::from("/data")]);
+    }
+
+    #[test]
+    fn bash_reads_comes_from_the_config() {
+        assert!(run_with(&["-p", "x"], Settings::default()).bash_reads);
+        let off = Settings {
+            bash_reads: Some(false),
+            ..Settings::default()
+        };
+        assert!(!run_with(&["-p", "x"], off).bash_reads);
     }
 
     #[test]

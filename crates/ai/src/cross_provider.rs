@@ -1,16 +1,19 @@
 //! Rules that apply when one history is rendered to more than one provider.
 
 use crate::Request;
-use crate::types::{Content, Message};
+use crate::types::{Content, Message, Reasoning};
 
 /// The reasoning text Anthropic may enable for a request.
 ///
-/// Thinking is turned off when the last assistant message calls a tool and has
-/// no Anthropic thinking block. The Anthropic API rejects a tool use without a
-/// thinking block while thinking is enabled, and thinking from another
-/// provider is dropped on the wire.
+/// A token budget is turned off when the last assistant message calls a tool
+/// with no Anthropic thinking block, which budget thinking rejects. A level
+/// stays on: adaptive thinking accepts that tool use, and Claude skips thinking
+/// on most tool turns, so a drop would lose the effort and the messages cache.
 pub(crate) fn anthropic_reasoning<'a>(request: &Request<'a>) -> Option<&'a str> {
     let reasoning = request.reasoning?;
+    if !matches!(Reasoning::parse(reasoning), Reasoning::Budget(_)) {
+        return Some(reasoning);
+    }
     let tool_use_without_thinking = request
         .messages
         .iter()
@@ -108,13 +111,13 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_turns_thinking_off_for_a_foreign_tool_use() {
+    fn anthropic_budget_turns_thinking_off_for_a_foreign_tool_use() {
         let history = vec![
             Message::user("hello"),
             assistant("openai", vec![Content::text("hi"), tool_call()]),
             Message::tool_result("call_01", "ok", false),
         ];
-        let request = request(Some("high"), &history);
+        let request = request(Some("4096"), &history);
         let body = Anthropic::new("key", "http://localhost")
             .request_body(&request)
             .unwrap();
@@ -149,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_turns_thinking_off_for_a_tool_use_without_thinking() {
+    fn anthropic_budget_turns_thinking_off_for_a_tool_use_without_thinking() {
         let history = vec![
             Message::user("hello"),
             assistant(
@@ -158,7 +161,7 @@ mod tests {
             ),
             Message::tool_result("call_01", "ok", false),
         ];
-        let request = request(Some("high"), &history);
+        let request = request(Some("4096"), &history);
         let body = Anthropic::new("key", "http://localhost")
             .request_body(&request)
             .unwrap();
@@ -168,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_turns_thinking_off_for_a_foreign_tool_use_with_thinking() {
+    fn anthropic_budget_turns_thinking_off_for_a_foreign_tool_use_with_thinking() {
         let history = vec![
             Message::user("hello"),
             assistant(
@@ -183,13 +186,68 @@ mod tests {
             ),
             Message::tool_result("call_01", "ok", false),
         ];
-        let request = request(Some("high"), &history);
+        let request = request(Some("4096"), &history);
         let body = Anthropic::new("key", "http://localhost")
             .request_body(&request)
             .unwrap();
         let body = std::str::from_utf8(&body).unwrap();
         assert!(!body.contains("thinking"));
         assert!(body.contains("tool_use"));
+    }
+
+    fn adaptive_body(provider: &str, content: Vec<Content>) -> String {
+        let history = vec![
+            Message::user("hello"),
+            assistant(provider, content),
+            Message::tool_result("call_01", "ok", false),
+        ];
+        let request = request(Some("high"), &history);
+        let body = Anthropic::new("key", "http://localhost")
+            .request_body(&request)
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn anthropic_level_keeps_thinking_after_a_tool_use_without_thinking() {
+        let body = adaptive_body(
+            crate::anthropic::PROVIDER,
+            vec![Content::text("hi"), tool_call()],
+        );
+        assert!(body.contains(r#""thinking":{"type":"adaptive"}"#), "{body}");
+        assert!(
+            body.contains(r#""output_config":{"effort":"high"}"#),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn anthropic_level_keeps_thinking_after_a_foreign_tool_use() {
+        let body = adaptive_body("openai", vec![Content::text("hi"), tool_call()]);
+        assert!(body.contains(r#""thinking":{"type":"adaptive"}"#), "{body}");
+        assert!(
+            body.contains(r#""output_config":{"effort":"high"}"#),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn anthropic_level_keeps_thinking_after_a_foreign_tool_use_with_thinking() {
+        let body = adaptive_body(
+            "openai",
+            vec![
+                Content::Thinking {
+                    thinking: "plan".into(),
+                    signature: Some("sig".into()),
+                },
+                tool_call(),
+            ],
+        );
+        assert!(body.contains(r#""thinking":{"type":"adaptive"}"#), "{body}");
+        assert!(
+            !body.contains("plan"),
+            "foreign thinking is still dropped: {body}"
+        );
     }
 
     #[test]
@@ -203,8 +261,13 @@ mod tests {
             "no reasoning was requested"
         );
         assert!(
-            anthropic_reasoning(&request(Some("low"), &history)).is_none(),
-            "a tool use without thinking disables thinking"
+            anthropic_reasoning(&request(Some("4096"), &history)).is_none(),
+            "a tool use without thinking disables budget thinking"
+        );
+        assert_eq!(
+            anthropic_reasoning(&request(Some("low"), &history)),
+            Some("low"),
+            "a level keeps adaptive thinking"
         );
     }
 

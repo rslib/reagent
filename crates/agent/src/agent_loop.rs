@@ -446,7 +446,7 @@ impl<'a> Agent<'a> {
         let mut retries: u32 = 0;
         // How many empty replies were already requested again.
         let mut empty_retries: u32 = 0;
-        let mut message = loop {
+        let (mut message, broken, repaired) = loop {
             // None when the stream ended cleanly, else the error that stopped it
             // and, on the last allowed attempt, ends the turn.
             let mut stop_error: Option<Error> = None;
@@ -484,10 +484,20 @@ impl<'a> Agent<'a> {
                 return TurnOutcome::Error(Text::from(error.to_string()));
             }
 
-            let message = assembler.finish(self.provider_name.clone(), self.model.clone());
+            let broken = std::mem::take(&mut assembler.broken);
+            let repaired = std::mem::take(&mut assembler.repaired);
+            let mut message = assembler.finish(self.provider_name.clone(), self.model.clone());
+            split_think(&mut message);
+            if let Some(call) = self.leaked_call(&mut message, history.len())
+                && emit_call(events, &self.token, call).await
+            {
+                return TurnOutcome::Cancelled;
+            }
             // Gateways now and then send a reply with no content at all, though
-            // they bill output tokens for it. The same request usually answers.
-            if message.content.is_empty()
+            // they bill output tokens for it, and a weak model now and then
+            // ends its turn after only reasoning. The same request usually
+            // answers.
+            if (message.content.is_empty() || reasoning_only(&message))
                 && message.stop_reason != Some(StopReason::Refusal)
                 && empty_retries < EMPTY_RETRIES
                 && !self.token.is_cancelled()
@@ -509,7 +519,7 @@ impl<'a> Agent<'a> {
                 empty_retries += 1;
                 continue;
             }
-            break message;
+            break (message, broken, repaired);
         };
 
         // An empty reply is never pushed. A refusal with no content is still
@@ -535,10 +545,17 @@ impl<'a> Agent<'a> {
                 if let Err(error) = record(Message::assistant(message), history, session).await {
                     return TurnOutcome::Error(error);
                 }
-                let calls = match history.last() {
+                let mut calls = match history.last() {
                     Some(Message::Assistant(assistant)) => tool_calls(assistant),
                     _ => Vec::new(),
                 };
+                // A broken call runs on what the model sent, so its error
+                // says what went wrong.
+                for (at, sent) in broken {
+                    if let Some(call) = calls.get_mut(at) {
+                        call.arguments = sent;
+                    }
+                }
                 if let Some(archive) = &self.archive {
                     for call in &calls {
                         archive.assign(&call.id);
@@ -564,9 +581,19 @@ impl<'a> Agent<'a> {
                 // cancel or a closed receiver cannot leave a call unanswered.
                 // The results move into history, so only their event fields
                 // are kept here; nothing is cloned.
-                let mut facts: Vec<(bool, usize)> = Vec::with_capacity(results.len());
+                let mut facts: Vec<(usize, Option<Text>)> = Vec::with_capacity(results.len());
                 let mut failure = None;
-                for (result, seen) in results {
+                for (at, (result, seen)) in results.into_iter().enumerate() {
+                    // A note says how the agent itself read the call, so a
+                    // weak model stops sending the same shape. Only a result
+                    // with such a note is touched.
+                    let result = match calls
+                        .get(at)
+                        .and_then(|call| agent_note(call, at, &repaired))
+                    {
+                        Some(note) => with_note(result, note),
+                        None => result,
+                    };
                     // A re-read of lines the run already holds keeps its
                     // content and gains the note, before it reaches either the
                     // session or the model.
@@ -576,7 +603,7 @@ impl<'a> Agent<'a> {
                         }
                         _ => result,
                     };
-                    facts.push((tool_error(&result), tool_bytes(&result)));
+                    facts.push((tool_bytes(&result), tool_error(&result)));
                     if let Some(error) = record_result(result, history, session).await {
                         failure.get_or_insert(error);
                     }
@@ -584,11 +611,12 @@ impl<'a> Agent<'a> {
                 if let Some(error) = failure {
                     return TurnOutcome::Error(error);
                 }
-                for (call, (is_error, bytes)) in calls.iter().zip(facts) {
+                for (call, (bytes, error)) in calls.iter().zip(facts) {
                     let event = Event::ToolResult {
                         id: call.id.clone(),
-                        is_error,
+                        is_error: error.is_some(),
                         bytes,
+                        error,
                     };
                     if emit(events, &self.token, event).await {
                         return TurnOutcome::Cancelled;
@@ -627,6 +655,77 @@ impl<'a> Agent<'a> {
                 TurnOutcome::Stopped(reason)
             }
         }
+    }
+
+    /// Turns a tool call a model wrote into the visible text of a reply that
+    /// sent no call, or ended its reasoning with, into a real call when it
+    /// names a registered tool, and returns it for its events. A call cut out
+    /// of the text leaves the rest of that text behind. `turn` makes the call
+    /// id unique.
+    fn leaked_call(&self, message: &mut AssistantMessage, turn: usize) -> Option<ToolCall> {
+        if message.stop_reason != Some(StopReason::EndTurn)
+            || message
+                .content
+                .iter()
+                .any(|content| matches!(content, Content::ToolCall(_)))
+        {
+            return None;
+        }
+        // A call in the visible text is cut out of it and the rest of the text
+        // stays. Else, in a reply with no text, the end of the last reasoning
+        // block, which is not changed: a reply with an answer is finished.
+        let in_text = message
+            .content
+            .iter()
+            .enumerate()
+            .find_map(|(index, content)| {
+                let Content::Text { text } = content else {
+                    return None;
+                };
+                crate::leak::in_text(text).map(|leaked| (index, leaked))
+            });
+        let (name, arguments, cut) = match in_text {
+            Some((index, leaked)) => (leaked.name, leaked.arguments, Some((index, leaked.span))),
+            None => {
+                let answered = message.content.iter().any(
+                    |content| matches!(content, Content::Text { text } if !text.trim().is_empty()),
+                );
+                if answered {
+                    return None;
+                }
+                let thinking = message
+                    .content
+                    .iter()
+                    .rev()
+                    .find_map(|content| match content {
+                        Content::Thinking { thinking, .. } => Some(thinking),
+                        _ => None,
+                    })?;
+                let leaked = crate::leak::at_end(thinking)?;
+                (leaked.name, leaked.arguments, None)
+            }
+        };
+        let tool = self.registry.resolve(name)?;
+        let call = ToolCall {
+            id: Text::from(format!("{LEAKED_CALL_ID}{turn}")),
+            name: Text::from(tool.spec().name.as_str()),
+            arguments: Text::from(arguments),
+        };
+        if let Some((index, span)) = cut
+            && let Content::Text { text } = &message.content[index]
+        {
+            let mut rest = String::with_capacity(text.len() - span.len());
+            rest.push_str(&text[..span.start]);
+            rest.push_str(&text[span.end..]);
+            if rest.trim().is_empty() {
+                message.content.remove(index);
+            } else {
+                message.content[index] = Content::text(rest);
+            }
+        }
+        message.content.push(Content::ToolCall(call.clone()));
+        message.stop_reason = Some(StopReason::ToolUse);
+        Some(call)
     }
 
     /// Streams one provider reply into `assembler`, cancelling on the token.
@@ -969,8 +1068,154 @@ fn tool_calls(message: &AssistantMessage) -> Vec<ToolCall> {
         .collect()
 }
 
-fn tool_error(message: &Message) -> bool {
-    matches!(message, Message::ToolResult(result) if result.is_error)
+/// Whether `message` ended its turn with reasoning and nothing else.
+fn reasoning_only(message: &AssistantMessage) -> bool {
+    message.stop_reason == Some(StopReason::EndTurn)
+        && message.content.iter().all(|content| match content {
+            Content::Thinking { .. } | Content::RedactedThinking { .. } => true,
+            Content::Text { text } => text.trim().is_empty(),
+            _ => false,
+        })
+}
+
+/// Moves a think block a host without a reasoning parser served as visible
+/// text, as `<think>plan</think>answer` or `plan</think>answer` when the chat
+/// template already opened the tag, into the reasoning of the reply.
+fn split_think(message: &mut AssistantMessage) {
+    // A reply that reasoned on its own needs no reasoning read out of its
+    // text, and a bare closing tag there is likely just a mention of one.
+    let reasoned = message.content.iter().any(|block| {
+        matches!(
+            block,
+            Content::Thinking { .. } | Content::RedactedThinking { .. }
+        )
+    });
+    let tagged = message.content.iter().any(|block| {
+        matches!(block, Content::Text { text } if split_think_text(text, !reasoned).is_some())
+    });
+    if !tagged {
+        return;
+    }
+    let mut content = Vec::with_capacity(message.content.len() + 1);
+    for block in std::mem::take(&mut message.content) {
+        let Content::Text { text } = &block else {
+            content.push(block);
+            continue;
+        };
+        let Some((thinking, rest)) = split_think_text(text, !reasoned) else {
+            content.push(block);
+            continue;
+        };
+        if !thinking.trim().is_empty() {
+            content.push(Content::Thinking {
+                thinking: Text::from(thinking),
+                signature: None,
+            });
+        }
+        let rest = rest.trim_start();
+        if !rest.is_empty() {
+            content.push(Content::text(rest));
+        }
+    }
+    message.content = content;
+}
+
+/// Splits one text block into the reasoning before its closing think tag and
+/// the text after it, or `None` when the block carries no think tag.
+///
+/// The bare closing tag, with no opening one, is read as the end of a block
+/// only when `bare` allows it and only where a block can end: at the end of
+/// the text or before a newline. An answer that mentions `</think>` mid
+/// sentence keeps its text.
+fn split_think_text(text: &str, bare: bool) -> Option<(&str, &str)> {
+    const CLOSE: &str = "</think>";
+    if let Some(opened) = text.trim_start().strip_prefix("<think>") {
+        // An opening tag with no closing one makes all of the rest reasoning.
+        return Some(match opened.find(CLOSE) {
+            Some(end) => (&opened[..end], &opened[end + CLOSE.len()..]),
+            None => (opened, ""),
+        });
+    }
+    if !bare {
+        return None;
+    }
+    let end = text.find(CLOSE)?;
+    let rest = &text[end + CLOSE.len()..];
+    let after_spaces = rest.trim_start_matches([' ', '\t']);
+    if !(after_spaces.is_empty() || after_spaces.starts_with('\n')) {
+        return None;
+    }
+    Some((&text[..end], rest))
+}
+
+/// Sends the start and ready events of a call taken from the reasoning.
+/// Returns whether the run was cancelled.
+async fn emit_call(
+    events: &mpsc::Sender<Event>,
+    token: &CancellationToken,
+    call: ToolCall,
+) -> bool {
+    let start = Event::ToolStart {
+        id: call.id.clone(),
+        name: call.name.clone(),
+    };
+    if emit(events, token, start).await {
+        return true;
+    }
+    let ready = Event::ToolCallReady {
+        id: call.id,
+        name: call.name,
+        arguments: call.arguments,
+    };
+    emit(events, token, ready).await
+}
+
+/// The id prefix of a call [`Agent::leaked_call`] read out of the reply text.
+const LEAKED_CALL_ID: &str = "leaked_call_";
+
+/// The note for the agent's own repair of `call`, whose place among the
+/// reply's calls is `at`.
+fn agent_note(call: &ToolCall, at: usize, repaired: &[usize]) -> Option<&'static str> {
+    if call.id.starts_with(LEAKED_CALL_ID) {
+        return Some("call read from the reply text; send calls as tool calls");
+    }
+    repaired
+        .contains(&at)
+        .then_some("arguments were not plain JSON; fixed")
+}
+
+/// `message` after a first line that says how the agent read the call, joined
+/// into the line a note from the batch already starts.
+fn with_note(message: Message, note: &str) -> Message {
+    const PREFIX: &str = "[repaired: ";
+    let mut result = match message {
+        Message::ToolResult(result) => result,
+        other => return other,
+    };
+    let content = result.content.as_ref();
+    let mut text = String::with_capacity(content.len() + PREFIX.len() + note.len() + 2);
+    text.push_str(PREFIX);
+    text.push_str(note);
+    match content.strip_prefix(PREFIX) {
+        Some(rest) => {
+            text.push_str("; ");
+            text.push_str(rest);
+        }
+        None => {
+            text.push_str("]\n");
+            text.push_str(content);
+        }
+    }
+    result.content = Text::from(text);
+    Message::ToolResult(result)
+}
+
+/// The text of a failed result, shared with the message, or `None`.
+fn tool_error(message: &Message) -> Option<Text> {
+    match message {
+        Message::ToolResult(result) if result.is_error => Some(Text::clone(&result.content)),
+        _ => None,
+    }
 }
 
 fn tool_bytes(message: &Message) -> usize {
@@ -1013,6 +1258,16 @@ struct Assembler {
     thinking: Option<OpenThinking>,
     tools: Vec<OpenTool>,
     ready: Vec<ToolReady>,
+    /// How many tool calls the content holds.
+    calls: usize,
+    /// The arguments as sent of each call, by its place among the calls,
+    /// whose arguments are no JSON object. The content holds `{}` for them,
+    /// as a provider rejects a history that sends them back.
+    broken: Vec<(usize, Text)>,
+    /// The place among the calls of each call whose arguments were not plain
+    /// JSON and were repaired from a string, a fence, trailing text or an
+    /// escape.
+    repaired: Vec<usize>,
     stop_reason: Option<StopReason>,
     usage: Usage,
     replay: Option<Text>,
@@ -1026,6 +1281,9 @@ impl Assembler {
             thinking: None,
             tools: Vec::new(),
             ready: Vec::new(),
+            calls: 0,
+            broken: Vec::new(),
+            repaired: Vec::new(),
             stop_reason: None,
             usage: Usage::default(),
             replay: None,
@@ -1079,16 +1337,28 @@ impl Assembler {
                 if let Some(index) = self.tools.iter().position(|tool| *tool.id == *id) {
                     let tool = self.tools.remove(index);
                     // A call with no or only-whitespace arguments is an empty object.
-                    let arguments = if tool.args.trim().is_empty() {
-                        Text::from("{}")
+                    let (arguments, sent) = if tool.args.trim().is_empty() {
+                        (Text::from("{}"), None)
                     } else {
-                        Text::from(crate::repair::arguments(tool.args))
+                        match crate::repair::arguments(tool.args) {
+                            Ok((arguments, repaired)) => {
+                                if repaired {
+                                    self.repaired.push(self.calls);
+                                }
+                                (Text::from(arguments), None)
+                            }
+                            Err(raw) => (Text::from("{}"), Some(Text::from(raw))),
+                        }
                     };
                     self.ready.push(ToolReady {
                         id: tool.id.clone(),
                         name: tool.name.clone(),
-                        arguments: arguments.clone(),
+                        arguments: sent.clone().unwrap_or_else(|| arguments.clone()),
                     });
+                    if let Some(sent) = sent {
+                        self.broken.push((self.calls, sent));
+                    }
+                    self.calls += 1;
                     self.content.push(Content::ToolCall(ToolCall {
                         id: tool.id,
                         name: tool.name,
@@ -2842,6 +3112,7 @@ mod tests {
                     end: arguments.end,
                     size: metadata.len(),
                     modified: metadata.modified().ok(),
+                    cut: false,
                 })
             })
         }
@@ -3097,5 +3368,470 @@ mod tests {
             "1\tline 1\n2\tline 2\n",
             "a read of a file the same reply writes is never noted"
         );
+    }
+
+    fn calls_in(history: &[Message]) -> Vec<&ToolCall> {
+        history
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .flat_map(|assistant| assistant.content.iter())
+            .filter_map(|content| match content {
+                Content::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The texts of the assistant replies in `history`.
+    fn texts_in(history: &[Message]) -> Vec<&str> {
+        history
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .flat_map(|assistant| assistant.content.iter())
+            .filter_map(|content| match content {
+                Content::Text { text } => Some(&**text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The reasoning blocks of the assistant replies in `history`.
+    fn thinkings_in(history: &[Message]) -> Vec<&str> {
+        history
+            .iter()
+            .filter_map(|message| match message {
+                Message::Assistant(assistant) => Some(assistant),
+                _ => None,
+            })
+            .flat_map(|assistant| assistant.content.iter())
+            .filter_map(|content| match content {
+                Content::Thinking { thinking, .. } => Some(&**thinking),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn results_in(history: &[Message]) -> Vec<&str> {
+        history
+            .iter()
+            .filter_map(|message| match message {
+                Message::ToolResult(result) => Some(&*result.content),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reasoning_reply(thinking: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ThinkingDelta(Text::from(thinking)),
+            StreamEvent::Stop(StopReason::EndTurn),
+        ]
+    }
+
+    #[tokio::test]
+    async fn broken_arguments_are_answered_and_sent_back_as_an_empty_object() {
+        let provider = FakeProvider::new(vec![
+            tool_reply("c1", "echo", r#"{"message":"x"#),
+            text_reply("done"),
+        ]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        let calls = calls_in(&history);
+        assert_eq!(calls.len(), 1, "{history:?}");
+        assert_eq!(&*calls[0].arguments, "{}");
+        let results = results_in(&history);
+        assert!(results[0].contains("cut off"), "{results:?}");
+        assert_eq!(provider.seen().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn repair_note_string_arguments_say_they_were_not_plain_json() {
+        let provider = FakeProvider::new(vec![
+            tool_reply("c1", "echo", r#""{\"message\":\"hi\"}""#),
+            text_reply("done"),
+        ]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        let results = results_in(&history);
+        assert_eq!(
+            results[0],
+            "[repaired: arguments were not plain JSON; fixed]\nhi"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_note_a_leaked_call_says_where_it_came_from() {
+        let provider = FakeProvider::new(vec![
+            text_reply(
+                r#"Let me echo.<tool_call>{"name":"echo","arguments":{"message":"hi"}}</tool_call>"#,
+            ),
+            text_reply("done"),
+        ]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        let results = results_in(&history);
+        assert_eq!(
+            results[0],
+            "[repaired: call read from the reply text; send calls as tool calls]\nhi"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_note_a_plain_call_has_none() {
+        let provider = FakeProvider::new(vec![
+            tool_reply("c1", "echo", r#"{"message":"hi"}"#),
+            text_reply("done"),
+        ]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(results_in(&history), vec!["hi"]);
+    }
+
+    #[tokio::test]
+    async fn repair_note_a_note_joins_the_first_line_a_result_has() {
+        let message = Message::tool_result("c1", "[repaired: used a.rs]\nedited a.rs", false);
+
+        let noted = with_note(message, "arguments were not plain JSON; fixed");
+
+        assert_eq!(
+            results_in(std::slice::from_ref(&noted)),
+            vec!["[repaired: arguments were not plain JSON; fixed; used a.rs]\nedited a.rs"]
+        );
+    }
+
+    #[tokio::test]
+    async fn leaked_call_runs_a_call_from_the_text() {
+        let provider = FakeProvider::new(vec![
+            text_reply(
+                r#"Let me read it.<tool_call>{"name":"echo","arguments":{"message":"hi"}}</tool_call>"#,
+            ),
+            text_reply("done"),
+        ]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        let calls = calls_in(&history);
+        assert_eq!(calls.len(), 1, "{history:?}");
+        assert_eq!(&*calls[0].name, "echo");
+        assert_eq!(
+            results_in(&history),
+            vec!["[repaired: call read from the reply text; send calls as tool calls]\nhi"]
+        );
+        assert_eq!(texts_in(&history), vec!["Let me read it.", "done"]);
+        assert_eq!(provider.seen().len(), 2, "the run continues");
+    }
+
+    #[tokio::test]
+    async fn leaked_call_runs_a_harmony_call_from_the_text() {
+        let provider = FakeProvider::new(vec![
+            text_reply(
+                "<|channel|>commentary to=functions.echo<|constrain|>json<|message|>\
+                    {\"message\":\"hi\"}<|call|>",
+            ),
+            text_reply("done"),
+        ]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        let calls = calls_in(&history);
+        assert_eq!(calls.len(), 1, "{history:?}");
+        assert_eq!(&*calls[0].name, "echo");
+        assert_eq!(
+            results_in(&history),
+            vec!["[repaired: call read from the reply text; send calls as tool calls]\nhi"]
+        );
+        assert_eq!(
+            texts_in(&history),
+            vec!["done"],
+            "the call was all the text"
+        );
+    }
+
+    #[tokio::test]
+    async fn leaked_call_skips_a_call_in_the_text_that_names_no_tool() {
+        let provider = FakeProvider::new(vec![text_reply(
+            r#"Hi.<tool_call>{"name":"nosuch","arguments":{}}</tool_call>"#,
+        )]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert!(calls_in(&history).is_empty(), "{history:?}");
+        assert!(results_in(&history).is_empty());
+        assert_eq!(provider.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn leaked_call_runs_a_glm_call_from_the_reasoning() {
+        let provider = FakeProvider::new(vec![
+            reasoning_reply(
+                "Let me echo.<tool_call>echo<arg_key>message</arg_key><arg_value>hi</arg_value></tool_call>",
+            ),
+            text_reply("done"),
+        ]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        let calls = calls_in(&history);
+        assert_eq!(calls.len(), 1, "{history:?}");
+        assert_eq!(&*calls[0].name, "echo");
+        assert_eq!(
+            results_in(&history),
+            vec!["[repaired: call read from the reply text; send calls as tool calls]\nhi"]
+        );
+        let events = drain(tx, &mut rx);
+        assert!(
+            events.iter().any(
+                |event| matches!(event, Event::ToolCallReady { name, .. } if &**name == "echo")
+            ),
+            "{events:?}"
+        );
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
+    }
+
+    #[tokio::test]
+    async fn leaked_call_in_the_reasoning_of_an_answer_does_not_run() {
+        let provider = FakeProvider::new(vec![vec![
+            StreamEvent::ThinkingDelta(Text::from(
+                "<tool_call>echo<arg_key>message</arg_key><arg_value>hi</arg_value></tool_call>",
+            )),
+            StreamEvent::TextDelta(Text::from("All done.")),
+            StreamEvent::Stop(StopReason::EndTurn),
+        ]]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert!(calls_in(&history).is_empty(), "{history:?}");
+        assert_eq!(provider.seen().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leaked_call_skips_an_unknown_name() {
+        let provider = FakeProvider::new(vec![
+            reasoning_reply(
+                "<tool_call>nosuch<arg_key>a</arg_key><arg_value>b</arg_value></tool_call>",
+            ),
+            text_reply("done"),
+        ]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert!(calls_in(&history).is_empty(), "{history:?}");
+        assert!(results_in(&history).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reasoning_only_reply_is_requested_again() {
+        let provider = FakeProvider::new(vec![reasoning_reply("thinking"), text_reply("done")]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(provider.seen().len(), 2, "the reply is requested again");
+        assert_eq!(history.len(), 2, "{history:?}");
+        let events = drain(tx, &mut rx);
+        assert!(
+            events.iter().any(
+                |event| matches!(event, Event::Retry { error, .. } if &**error == "empty reply")
+            ),
+            "{events:?}"
+        );
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
+    }
+
+    #[tokio::test]
+    async fn think_tag_a_leaked_block_becomes_the_reasoning() {
+        let provider = FakeProvider::new(vec![text_reply("<think>plan</think>done")]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(thinkings_in(&history), vec!["plan"]);
+        assert_eq!(texts_in(&history), vec!["done"]);
+        assert_eq!(provider.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn think_tag_a_closed_tag_without_the_open_tag_becomes_the_reasoning() {
+        let provider = FakeProvider::new(vec![text_reply("plan</think>\n\ndone")]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(thinkings_in(&history), vec!["plan"]);
+        assert_eq!(texts_in(&history), vec!["done"]);
+        assert_eq!(provider.seen().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn think_tag_an_unclosed_block_is_all_reasoning() {
+        // A reply with only reasoning is requested again, so the retries are
+        // filled to reach the reply that is recorded.
+        let provider = FakeProvider::new(vec![
+            text_reply("<think>only thinking");
+            EMPTY_RETRIES as usize + 1
+        ]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(thinkings_in(&history), vec!["only thinking"]);
+        assert!(texts_in(&history).is_empty(), "{history:?}");
+    }
+
+    #[tokio::test]
+    async fn think_tag_text_with_no_think_tag_is_unchanged() {
+        let provider = FakeProvider::new(vec![text_reply("a < b and </b> tags")]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert!(thinkings_in(&history).is_empty(), "{history:?}");
+        assert_eq!(texts_in(&history), vec!["a < b and </b> tags"]);
+    }
+
+    #[tokio::test]
+    async fn think_tag_a_call_after_the_block_still_runs() {
+        let provider = FakeProvider::new(vec![
+            text_reply(
+                r#"<think>I will call it</think><tool_call>{"name":"echo","arguments":{"message":"hi"}}</tool_call>"#,
+            ),
+            text_reply("done"),
+        ]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(thinkings_in(&history), vec!["I will call it"]);
+        let calls = calls_in(&history);
+        assert_eq!(calls.len(), 1, "{history:?}");
+        assert_eq!(&*calls[0].name, "echo");
+        assert_eq!(
+            results_in(&history),
+            vec!["[repaired: call read from the reply text; send calls as tool calls]\nhi"]
+        );
+        assert_eq!(provider.seen().len(), 2, "the run continues");
+    }
+
+    #[tokio::test]
+    async fn think_tag_a_mention_of_the_closing_tag_stays_text() {
+        let provider = FakeProvider::new(vec![text_reply(
+            "I fixed the parser so `</think>` closes the block.",
+        )]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert!(thinkings_in(&history).is_empty(), "{history:?}");
+        assert_eq!(
+            texts_in(&history),
+            vec!["I fixed the parser so `</think>` closes the block."]
+        );
+    }
+
+    #[tokio::test]
+    async fn think_tag_a_closing_tag_beside_reasoning_stays_text() {
+        let provider = FakeProvider::new(vec![vec![
+            StreamEvent::ThinkingDelta(Text::from("why")),
+            StreamEvent::TextDelta(Text::from("x</think>\ny")),
+            StreamEvent::Stop(StopReason::EndTurn),
+        ]]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("task")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(thinkings_in(&history), vec!["why"]);
+        assert_eq!(texts_in(&history), vec!["x</think>\ny"]);
     }
 }

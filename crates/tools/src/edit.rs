@@ -10,9 +10,10 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{Effects, Repaired, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
+use crate::repair::{Kind, Touched};
 use crate::{atomic, resolve};
 
 mod fuzzy;
@@ -191,6 +192,7 @@ struct ListOutcome {
 pub struct Edit {
     spec: ToolSpec,
     working_dir: PathBuf,
+    touched: Touched,
 }
 
 impl Edit {
@@ -199,7 +201,15 @@ impl Edit {
         Self {
             spec: spec(),
             working_dir: working_dir.into(),
+            touched: Touched::default(),
         }
+    }
+
+    /// Shares `touched`, the files the run's file tools read or changed,
+    /// which a repaired call may use.
+    pub fn with_touched(mut self, touched: Touched) -> Self {
+        self.touched = touched;
+        self
     }
 
     async fn run_inner(&self, args: &Args<'_>) -> Result<ToolOutput, String> {
@@ -411,8 +421,42 @@ fn shifted(offset: usize, hits: &[Hit], news: &[Cow<'_, str>]) -> usize {
     (offset as isize + delta).max(0) as usize
 }
 
+/// Turns `\\`, `\'` and `\"` into `\`, `'` and `"`; any other backslash stays.
+fn unescape_once(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\'
+            && let Some(&next) = chars.peek()
+            && matches!(next, '\\' | '\'' | '"')
+        {
+            out.push(next);
+            chars.next();
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// `old` and `new` with one level of escapes removed, and where the text holds
+/// that `old`.
+fn unescaped_match(text: &str, old: &str, new: &str) -> Option<(String, String, usize)> {
+    if !old.contains('\\') {
+        return None;
+    }
+    let old_text = unescape_once(old);
+    if old_text == old {
+        return None;
+    }
+    let new_text = unescape_once(new);
+    let (o, n) = line_endings_of(text, &old_text, &new_text);
+    let found = first_match(text, &o)?;
+    Some((o.into_owned(), n.into_owned(), found))
+}
+
 /// Matches one edit against `text` with the tiers in order: exact, the read
-/// prefix strip, then fuzzy.
+/// prefix strip, one level of backslash escapes removed, then fuzzy.
 fn match_edit<'a>(text: &str, path: &Path, edit: &'a Replacement<'a>) -> Resolution<'a> {
     let old = edit.old_string.as_ref();
     if old.is_empty() {
@@ -437,8 +481,31 @@ fn match_edit<'a>(text: &str, path: &Path, edit: &'a Replacement<'a>) -> Resolut
         stripped = true;
     }
 
+    let mut unescaped = false;
+    if first.is_none()
+        && let Some((o, n, found)) = unescaped_match(text, &old, &new)
+    {
+        old = Cow::Owned(o);
+        new = Cow::Owned(n);
+        first = Some(found);
+        unescaped = true;
+        if old == new {
+            return Resolution::Failed("changes nothing".into());
+        }
+    }
+
     if let Some(first) = first {
-        let note = stripped.then(|| "matched after removing read line numbers".to_string());
+        let note = match (stripped, unescaped) {
+            (true, true) => Some(
+                "matched after removing read line numbers and one level of backslash escapes"
+                    .to_string(),
+            ),
+            (false, true) => {
+                Some("matched after removing one level of backslash escapes".to_string())
+            }
+            (true, false) => Some("matched after removing read line numbers".to_string()),
+            (false, false) => None,
+        };
         // A line hint picks one of several matches instead of failing on them.
         if !replace_all
             && let Some(hint) = edit.line
@@ -705,6 +772,16 @@ fn apply(
         stripped = true;
     }
 
+    let mut unescaped = false;
+    if first.is_none()
+        && let Some((o, n, found)) = unescaped_match(text, &old, &new)
+    {
+        old = Cow::Owned(o);
+        new = Cow::Owned(n);
+        first = Some(found);
+        unescaped = true;
+    }
+
     let note = if stripped {
         "removing read line numbers"
     } else {
@@ -762,7 +839,10 @@ fn apply(
         });
     };
 
-    let suffix = if stripped {
+    let suffix = if unescaped {
+        let and = if stripped { " and" } else { "" };
+        format!(" (matched after {note}{and} removing one level of backslash escapes)")
+    } else if stripped {
         format!(" (matched after {note})")
     } else {
         String::new()
@@ -1203,6 +1283,8 @@ fn nearest_match(text: &str, needle: &str, line: usize) -> usize {
             best = start;
         }
         at = start + needle.len();
+        // The scan resumes after the match, so its own newlines count here.
+        number += newlines(needle);
     }
     best
 }
@@ -1229,6 +1311,13 @@ impl Tool for Edit {
 
     fn main_arg(&self) -> Option<&'static str> {
         Some("path")
+    }
+
+    fn repair<'a>(
+        &'a self,
+        args: &'a str,
+    ) -> Option<futures_util::future::BoxFuture<'a, Repaired>> {
+        crate::repair::repair(Kind::Edit, &self.working_dir, &self.touched, args)
     }
 
     fn effects(&self, args: &str) -> Effects {
@@ -1273,7 +1362,13 @@ impl Tool for Edit {
                 Err(output) => return output,
             };
             match self.run_inner(&arguments).await {
-                Ok(output) => output,
+                Ok(output) => {
+                    if !output.is_error {
+                        let path = std::path::Path::new(arguments.path.as_ref());
+                        self.touched.note(&self.working_dir, path);
+                    }
+                    output
+                }
                 Err(message) => ToolOutput::error(message),
             }
         })
@@ -1531,6 +1626,76 @@ mod tests {
             output.content
         );
         assert_eq!(read(&tmp, "f.txt").await, "a\r\n  B\r\n  C\r\n");
+    }
+
+    #[tokio::test]
+    async fn escape_level_removed_matches_a_doubled_backslash() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.rs", "if s != \"\\n\" {\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({
+                "path": "f.rs",
+                "old_string": "if s != \"\\\\n\" {",
+                "new_string": "if s == \"\\\\n\" {"
+            }),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output
+                .content
+                .contains("removing one level of backslash escapes"),
+            "{}",
+            output.content
+        );
+        assert_eq!(read(&tmp, "f.rs").await, "if s == \"\\n\" {\n");
+    }
+
+    #[tokio::test]
+    async fn escape_level_removed_matches_an_escaped_quote() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.py", "x = 'yes'\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({
+                "path": "f.py",
+                "old_string": "x = \\'yes\\'",
+                "new_string": "x = \\'no\\'"
+            }),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output
+                .content
+                .contains("removing one level of backslash escapes"),
+            "{}",
+            output.content
+        );
+        assert_eq!(read(&tmp, "f.py").await, "x = 'no'\n");
+    }
+
+    #[tokio::test]
+    async fn escape_level_no_match_still_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.rs", "if s != \"\\n\" {\n").await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({
+                "path": "f.rs",
+                "old_string": "if t != \"\\\\n\" {",
+                "new_string": "if t == \"\\\\n\" {"
+            }),
+        )
+        .await;
+        assert!(output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("text not found"),
+            "{}",
+            output.content
+        );
+        assert_eq!(read(&tmp, "f.rs").await, "if s != \"\\n\" {\n");
     }
 
     #[tokio::test]
@@ -2337,6 +2502,33 @@ mod tests {
         let lines = lines_of(&tmp, "f.txt").await;
         assert_eq!(lines[9], "target");
         assert_eq!(lines[29], "hit");
+    }
+
+    #[tokio::test]
+    async fn edit_line_hint_counts_lines_inside_a_multi_line_match() {
+        // The block starts on lines 10 and 20, so line 15 is a tie and the
+        // earlier copy wins. Counting the second copy from the end of the
+        // first, without the two newlines inside it, put it on line 18.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut text = String::new();
+        for n in 1..=30 {
+            match n {
+                10 | 20 => text.push_str("a\n"),
+                11 | 21 => text.push_str("b\n"),
+                12 | 22 => text.push_str("c\n"),
+                _ => text.push_str(&format!("line {n}\n")),
+            }
+        }
+        write(&tmp, "f.txt", &text).await;
+        let output = run_edit(
+            &tmp,
+            serde_json::json!({"path":"f.txt","old_string":"a\nb\nc","new_string":"x\ny\nz","line":15}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        let lines = lines_of(&tmp, "f.txt").await;
+        assert_eq!(&lines[9..12], ["x", "y", "z"]);
+        assert_eq!(&lines[19..22], ["a", "b", "c"]);
     }
 
     #[tokio::test]

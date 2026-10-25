@@ -197,6 +197,7 @@ impl Reads {
             end: start,
             size: 4,
             modified: None,
+            cut: false,
         }
     }
 }

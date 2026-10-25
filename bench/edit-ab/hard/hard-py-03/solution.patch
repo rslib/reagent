@@ -1,0 +1,47 @@
+diff -ruN a/ledger.py b/ledger.py
+--- a/ledger.py
++++ b/ledger.py
+@@ -37,7 +37,7 @@
+         raise LedgerError("bad amount %r" % text)
+     if len(frac) > 2:
+         raise LedgerError("too many decimals in %r" % text)
+-    cents = int(whole) * 100 + int(frac.zfill(2))
++    cents = int(whole) * 100 + int((frac + "00")[:2])
+     return -cents if negative else cents
+ 
+ 
+@@ -86,6 +86,7 @@
+             if ch == '"':
+                 if i + 1 < len(line) and line[i + 1] == '"':
+                     buf.append('"')
++                    i += 1
+                 else:
+                     in_quotes = False
+             else:
+@@ -143,7 +144,7 @@
+ 
+ def under(account, root):
+     """True when account is root or sits somewhere below it."""
+-    return account == root or account.startswith(root)
++    return account == root or account.startswith(root + ":")
+ 
+ 
+ def sum_debits(entries):
+@@ -159,7 +160,7 @@
+     """Total of the negative amounts, as a positive number."""
+     total = 0
+     for entry in entries:
+-        if entry.amount > 0:
++        if entry.amount < 0:
+             total -= entry.amount
+     return total
+ 
+@@ -498,7 +499,7 @@
+         best = None
+         for other in free:
+             gap = abs((entry.date - other.date).days)
+-            if other.amount == entry.amount and gap < window_days:
++            if other.amount == entry.amount and gap <= window_days:
+                 if best is None or gap < best[0]:
+                     best = (gap, other)
+         if best is None:

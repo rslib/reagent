@@ -18,7 +18,7 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TASKS = os.path.join(HERE, "tasks")
+SETS = {"small": os.path.join(HERE, "tasks"), "hard": os.path.join(HERE, "hard")}
 # Files the agent must not see in its copy of the task.
 HIDDEN = {"solution.patch", "TASK.md"}
 DIFF_SKIP = ["target", "__pycache__", ".git", "Cargo.lock", "node_modules"]
@@ -89,7 +89,7 @@ def copy_task(src, dest):
 
 
 def run_one(task, args):
-    src = os.path.join(TASKS, task)
+    src = os.path.join(SETS[args.set], task)
     stem = "%s.%s" % (task, args.arm)
     tmp = tempfile.mkdtemp(prefix="edit-ab-%s-" % stem)
     work = os.path.join(tmp, "work")
@@ -148,7 +148,8 @@ def run_one(task, args):
 
     record = {
         "task": task,
-        "lang": task.split("-")[0],
+        "set": args.set,
+        "lang": task.rsplit("-", 1)[0].split("-")[-1],
         "arm": args.arm,
         "flags": args.extra,
         "model": args.model,
@@ -177,6 +178,8 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--arm", required=True,
                         help="name of this arm; the words after -- go to reagent")
+    parser.add_argument("--set", choices=sorted(SETS), default="small",
+                        help="task set: small (tasks/) or hard (hard/)")
     parser.add_argument("--tasks", default="*", help="glob over task names, for example 'py-*'")
     parser.add_argument("--out", required=True, help="directory for the run files")
     parser.add_argument("--jobs", type=int, default=2)
@@ -193,16 +196,18 @@ def main():
     if not args.arm.replace("-", "").replace("_", "").isalnum():
         sys.exit("--arm must be letters, digits, - or _")
 
-    tasks = sorted(t for t in os.listdir(TASKS) if fnmatch.fnmatch(t, args.tasks)
-                   and os.path.isdir(os.path.join(TASKS, t)))
+    root = SETS[args.set]
+    tasks = sorted(t for t in os.listdir(root) if fnmatch.fnmatch(t, args.tasks)
+                   and os.path.isdir(os.path.join(root, t)))
     if not tasks:
         sys.exit("no task matches %r" % args.tasks)
     os.makedirs(args.out, exist_ok=True)
     results = os.path.join(args.out, "results.jsonl")
     if os.path.exists(results):
         with open(results, encoding="utf-8") as handle:
-            seen = {(r["task"], r.get("arm") or r["mode"]) for r in map(json.loads, filter(str.strip, handle))}
-        clash = [t for t in tasks if (t, args.arm) in seen]
+            seen = {(r.get("set", "small"), r["task"], r.get("arm") or r["mode"])
+                    for r in map(json.loads, filter(str.strip, handle))}
+        clash = [t for t in tasks if (args.set, t, args.arm) in seen]
         if clash:
             sys.exit("%s already has results for %s; use a fresh --out, runs must be fresh"
                      % (args.out, ", ".join(clash)))

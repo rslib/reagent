@@ -30,6 +30,8 @@ pub struct Settings {
     /// Folder names that searches leave out.
     #[serde(default)]
     pub skip: Vec<String>,
+    /// Whether a plain file read in bash runs as a `read` call; on when unset.
+    pub bash_reads: Option<bool>,
     /// The provider tables by name. Only the global file and a profile may
     /// hold them.
     #[serde(default)]
@@ -401,6 +403,7 @@ fn apply(merged: &mut Settings, settings: &Settings, profile: bool) {
     over(&mut merged.max_tokens, &settings.max_tokens);
     over(&mut merged.reasoning, &settings.reasoning);
     over(&mut merged.policy, &settings.policy);
+    over(&mut merged.bash_reads, &settings.bash_reads);
     for name in &settings.skip {
         if !merged.skip.contains(name) {
             merged.skip.push(name.clone());

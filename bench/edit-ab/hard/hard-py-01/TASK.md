@@ -1,0 +1,1 @@
+My order book is off in a few places. Depth shows the wrong size after a partial fill, a bid and an ask at the same price do not trade, cancelling the last order at a price leaves that price on the book, fill-or-kill orders get accepted or refused wrongly, and the fee on a trade comes out one unit low. Please fix the book code. Do not edit the tests.

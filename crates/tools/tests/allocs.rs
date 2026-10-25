@@ -516,3 +516,31 @@ fn perf_edit_echo_does_not_allocate_per_line() {
         measured.total_blocks
     );
 }
+
+/// A well-formed call with a relative path is checked with one borrowed
+/// parse, and a repeat of the newest touched file, relative or absolute,
+/// records nothing new: neither costs a block, so the repair layer adds no
+/// allocation to an ordinary read or edit.
+#[test]
+fn perf_repair_and_touched_cost_no_block_on_the_common_path() {
+    use reagent_tools::repair::{Kind, Touched, repair};
+    let _serial = serial();
+    let root = std::path::Path::new("/var/x/w");
+    let touched = Touched::default();
+    touched.note(root, std::path::Path::new("a.rs"));
+    let args = r#"{"path":"a.rs","edits":[{"old_string":"x","new_string":"y","line":4}]}"#;
+    let measured = stats(|| {
+        for _ in 0..100 {
+            assert!(repair(Kind::Edit, root, &touched, args).is_none());
+            touched.note(root, std::path::Path::new("a.rs"));
+            touched.note(root, std::path::Path::new("/private/var/x/w/a.rs"));
+        }
+    });
+    // Measured 0 alone; a full run sees a few stray blocks from other tests'
+    // threads. A block per call would be 100 or more.
+    assert!(
+        measured.total_blocks < 10,
+        "{} blocks for 100 calls",
+        measured.total_blocks
+    );
+}

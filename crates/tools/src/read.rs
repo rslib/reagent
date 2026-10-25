@@ -9,9 +9,10 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Effects, Identity, Seen, Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{Effects, Identity, Repaired, Seen, Tool, ToolOutput, parse_args};
 use reagent_ai::{Text, ToolSpec};
 
+use crate::repair::{Kind, Touched};
 use crate::resolve;
 
 /// Bytes read from the start of a file to decide whether it is binary.
@@ -40,6 +41,7 @@ pub struct Args<'a> {
 pub struct Read {
     spec: ToolSpec,
     working_dir: PathBuf,
+    touched: Touched,
 }
 
 impl Read {
@@ -48,7 +50,15 @@ impl Read {
         Self {
             spec: spec(),
             working_dir: working_dir.into(),
+            touched: Touched::default(),
         }
+    }
+
+    /// Shares `touched`, the files the run's file tools read or changed,
+    /// which a repaired call may use.
+    pub fn with_touched(mut self, touched: Touched) -> Self {
+        self.touched = touched;
+        self
     }
 
     async fn run_inner(&self, args: &Args<'_>) -> Result<(String, Option<Seen>), String> {
@@ -123,6 +133,7 @@ impl Read {
             end: number - 1,
             size,
             modified,
+            cut: feed.cut,
         };
         Ok((out, Some(seen)))
     }
@@ -135,6 +146,13 @@ impl Tool for Read {
 
     fn main_arg(&self) -> Option<&'static str> {
         Some("path")
+    }
+
+    fn repair<'a>(
+        &'a self,
+        args: &'a str,
+    ) -> Option<futures_util::future::BoxFuture<'a, Repaired>> {
+        crate::repair::repair(Kind::Read, &self.working_dir, &self.touched, args)
     }
 
     fn effects(&self, args: &str) -> Effects {
@@ -170,10 +188,13 @@ impl Tool for Read {
                 biased;
                 () = cancel.cancelled() => ToolOutput::error("cancelled"),
                 result = self.run_inner(&arguments) => match result {
-                    Ok((text, seen)) => match seen {
-                        Some(seen) => ToolOutput::ok(text).with_seen(seen),
-                        None => ToolOutput::ok(text),
-                    },
+                    Ok((text, seen)) => {
+                        self.touched.note(&self.working_dir, Path::new(arguments.path.as_ref()));
+                        match seen {
+                            Some(seen) => ToolOutput::ok(text).with_seen(seen),
+                            None => ToolOutput::ok(text),
+                        }
+                    }
                     Err(message) => ToolOutput::error(message),
                 },
             }
@@ -195,6 +216,8 @@ struct LineFeed<R> {
     /// The line being read, emptied and refilled for every line so that a read
     /// costs no allocation per line.
     line: Line,
+    /// Whether a line pushed so far was cut at the line cap.
+    cut: bool,
 }
 
 impl<R: AsyncBufRead + Unpin> LineFeed<R> {
@@ -203,6 +226,7 @@ impl<R: AsyncBufRead + Unpin> LineFeed<R> {
             reader,
             consumed: 0,
             line: Line::default(),
+            cut: false,
         }
     }
 
@@ -214,6 +238,7 @@ impl<R: AsyncBufRead + Unpin> LineFeed<R> {
             return Ok(false);
         }
         self.line.push_to(out, number);
+        self.cut |= self.line.cut;
         Ok(true)
     }
 

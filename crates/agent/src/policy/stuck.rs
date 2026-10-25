@@ -5,9 +5,10 @@
 //! its threshold, injects exactly one note that names it. Every distinct
 //! repeated thing gets its own note, once.
 //!
-//! Thresholds: the same tool call 3 times, the same error text 3 times, or
-//! `edit`/`write` on the same path 5 times. Keys are short hashes, so the map
-//! stays small and each call is O(1).
+//! Thresholds: the same tool call 3 times, the same error text 3 times,
+//! `edit`/`write` on the same path 5 times, or 40 turns in a row with no
+//! successful `edit`/`write` after the first one. Keys are short hashes, so the
+//! map stays small and each call is O(1).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -33,8 +34,13 @@ const CALLS_LIMIT: u32 = 3;
 const ERRORS_LIMIT: u32 = 3;
 /// How many `edit`/`write` calls on one path count as stuck.
 const EDIT_LIMIT: u32 = 5;
+/// How many turns in a row may pass with no successful `edit`/`write` before
+/// the run is told to change its approach: in logged runs, a passing run went
+/// at most 35 turns without a successful edit after its first one.
+const NO_PROGRESS_TURNS: u32 = 40;
 
-/// Counts repeated calls, errors and file rewrites.
+/// Counts repeated calls, errors and file rewrites, and turns without a
+/// successful write.
 ///
 /// A call counts only while it repeats back to back: running the same test
 /// again after an edit is normal work. Errors and file rewrites count over
@@ -46,6 +52,10 @@ pub struct Stuck {
     counters: HashMap<u64, (u32, bool)>,
     last_call: Option<u64>,
     streak: u32,
+    /// Whether a successful `edit`/`write` has happened yet.
+    wrote: bool,
+    /// Turns in a row with no successful `edit`/`write` since then.
+    no_progress: u32,
 }
 
 impl Stuck {
@@ -110,13 +120,32 @@ impl TurnPolicy for Stuck {
             }
 
             // edit/write on the same path repeated.
-            if matches!(&*call.name, "edit" | "write")
+            if is_write(&call.name)
                 && let Some(path) = path_of(&call.arguments)
             {
                 let path_key = key("file", &[&path]);
                 if let Some(n) = self.count(path_key, EDIT_LIMIT) {
                     notes.push(self.note(&format!("You wrote or edited `{path}` {n} times.",)));
                 }
+            }
+        }
+
+        // A successful edit or write is progress. A run that goes many turns
+        // without one is likely stuck on an approach that does not work, so
+        // count those turns and say so once per streak.
+        if turn
+            .tools
+            .iter()
+            .any(|(call, result)| is_write(&call.name) && !result.is_error)
+        {
+            self.wrote = true;
+            self.no_progress = 0;
+        } else if self.wrote {
+            self.no_progress += 1;
+            if self.no_progress == NO_PROGRESS_TURNS {
+                notes.push(self.note(&format!(
+                    "No edit or write has succeeded in {NO_PROGRESS_TURNS} turns. Change your approach, or make sure your best working solution is saved and finish."
+                )));
             }
         }
 
@@ -128,6 +157,15 @@ impl TurnPolicy for Stuck {
             Decision::Inject(Text::from(join_notes(notes)))
         }
     }
+}
+
+/// Whether a call writes a file, which is what makes progress in a run.
+///
+/// Open models send the name with a `functions.` prefix and in their own case,
+/// and the registry reads such a call as the tool it means, so this does too.
+fn is_write(name: &str) -> bool {
+    let name = name.strip_prefix("functions.").unwrap_or(name);
+    name.eq_ignore_ascii_case("edit") || name.eq_ignore_ascii_case("write")
 }
 
 /// Joins one turn's notes into a single injected message.
@@ -261,6 +299,111 @@ mod tests {
             changed_files: None,
         };
         policy.after_turn(&view)
+    }
+
+    /// Runs one turn of a distinct `bash` call, so only the no-progress
+    /// counter moves.
+    fn bash_turn(policy: &mut Stuck, n: u32) -> Decision {
+        let command = format!(r#"{{"command":"cmd{n}"}}"#);
+        turn_with(policy, &[(call("c", "bash", &command), ok("c", "ok"))])
+    }
+
+    /// Runs one turn of a successful `edit` of `a.rs`.
+    fn edit_turn(policy: &mut Stuck, n: u32) -> Decision {
+        let args = format!(r#"{{"path":"a.rs","old_string":"x","new_string":"y{n}"}}"#);
+        turn_with(policy, &[(call("e", "edit", &args), ok("e", "ok"))])
+    }
+
+    #[test]
+    fn no_progress_note_fires_at_forty_turns_without_an_edit() {
+        let mut policy = Stuck::default();
+        assert_eq!(edit_turn(&mut policy, 1), Decision::Continue);
+        for n in 1..NO_PROGRESS_TURNS {
+            assert_eq!(bash_turn(&mut policy, n), Decision::Continue, "turn {n}");
+        }
+        let Decision::Inject(text) = bash_turn(&mut policy, NO_PROGRESS_TURNS) else {
+            panic!("expected a note on the {NO_PROGRESS_TURNS}th turn without an edit");
+        };
+        assert!(
+            text.contains("No edit or write has succeeded in 40 turns"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn no_progress_note_does_not_fire_twice_in_one_streak() {
+        let mut policy = Stuck::default();
+        assert_eq!(edit_turn(&mut policy, 1), Decision::Continue);
+        for n in 1..=NO_PROGRESS_TURNS {
+            let _ = bash_turn(&mut policy, n);
+        }
+        assert_eq!(
+            bash_turn(&mut policy, NO_PROGRESS_TURNS + 1),
+            Decision::Continue,
+            "the turn after the note is quiet"
+        );
+    }
+
+    #[test]
+    fn no_progress_count_resets_on_a_successful_edit() {
+        let mut policy = Stuck::default();
+        assert_eq!(edit_turn(&mut policy, 1), Decision::Continue);
+        for n in 1..10 {
+            assert_eq!(bash_turn(&mut policy, n), Decision::Continue, "turn {n}");
+        }
+        assert_eq!(edit_turn(&mut policy, 2), Decision::Continue);
+        // Without the reset the count would have crossed the limit by now.
+        for n in 10..10 + (NO_PROGRESS_TURNS - 1) {
+            assert_eq!(bash_turn(&mut policy, n), Decision::Continue, "turn {n}");
+        }
+    }
+
+    #[test]
+    fn no_progress_an_edit_in_another_spelling_resets_the_count() {
+        let mut policy = Stuck::default();
+        assert_eq!(edit_turn(&mut policy, 1), Decision::Continue);
+        for n in 1..10 {
+            assert_eq!(bash_turn(&mut policy, n), Decision::Continue, "turn {n}");
+        }
+        let args = r#"{"path":"a.rs","old_string":"x","new_string":"y2"}"#;
+        let tools = [(call("e", "functions.Edit", args), ok("e", "ok"))];
+        assert_eq!(turn_with(&mut policy, &tools), Decision::Continue);
+        // Without the reset the count would have crossed the limit by now.
+        for n in 10..10 + (NO_PROGRESS_TURNS - 1) {
+            assert_eq!(bash_turn(&mut policy, n), Decision::Continue, "turn {n}");
+        }
+    }
+
+    #[test]
+    fn no_progress_a_failed_edit_does_not_reset_the_count() {
+        let mut policy = Stuck::default();
+        assert_eq!(edit_turn(&mut policy, 1), Decision::Continue);
+        for n in 1..NO_PROGRESS_TURNS {
+            assert_eq!(bash_turn(&mut policy, n), Decision::Continue, "turn {n}");
+        }
+        let tools = [(
+            call(
+                "e",
+                "edit",
+                r#"{"path":"a.rs","old_string":"x","new_string":"y2"}"#,
+            ),
+            err("e", "no match"),
+        )];
+        let Decision::Inject(text) = turn_with(&mut policy, &tools) else {
+            panic!("a failed edit is no progress, so the note still fires");
+        };
+        assert!(
+            text.contains("No edit or write has succeeded in 40 turns"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn no_progress_without_any_edit_never_notes() {
+        let mut policy = Stuck::default();
+        for n in 0..50 {
+            assert_eq!(bash_turn(&mut policy, n), Decision::Continue, "turn {n}");
+        }
     }
 
     #[test]

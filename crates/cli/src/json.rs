@@ -29,6 +29,8 @@ enum Line<'a> {
         id: &'a str,
         is_error: bool,
         bytes: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'a str>,
     },
     Usage {
         input: u64,
@@ -106,10 +108,12 @@ pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
             id,
             is_error,
             bytes,
+            error,
         } => Line::ToolResult {
             id,
             is_error: *is_error,
             bytes: *bytes,
+            error: error.as_deref(),
         },
         Event::Usage(usage) => Line::Usage {
             input: usage.input_tokens,
@@ -327,8 +331,18 @@ mod tests {
                     id: "c1".into(),
                     is_error: true,
                     bytes: 1234,
+                    error: Some("old_string not found in a.rs".into()),
                 },
-                json!({ "type": "tool_result", "id": "c1", "is_error": true, "bytes": 1234 }),
+                json!({ "type": "tool_result", "id": "c1", "is_error": true, "bytes": 1234, "error": "old_string not found in a.rs" }),
+            ),
+            (
+                Event::ToolResult {
+                    id: "c2".into(),
+                    is_error: false,
+                    bytes: 10,
+                    error: None,
+                },
+                json!({ "type": "tool_result", "id": "c2", "is_error": false, "bytes": 10 }),
             ),
             (
                 Event::Usage(usage()),

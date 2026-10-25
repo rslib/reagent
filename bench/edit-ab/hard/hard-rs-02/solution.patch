@@ -1,0 +1,54 @@
+diff -ruN a/src/diff.rs b/src/diff.rs
+--- a/src/diff.rs
++++ b/src/diff.rs
+@@ -7,7 +7,7 @@
+     if text.is_empty() {
+         return Vec::new();
+     }
+-    let body = text;
++    let body = text.strip_suffix('\n').unwrap_or(text);
+     body.split('\n').collect()
+ }
+ 
+@@ -146,7 +146,7 @@
+ 
+ /// Number of deleted lines.
+ pub fn removed(edits: &[Edit<'_>]) -> usize {
+-    edits.iter().filter(|e| matches!(e, Edit::Insert(_))).count()
++    edits.iter().filter(|e| matches!(e, Edit::Delete(_))).count()
+ }
+ 
+ /// Number of lines that did not change.
+@@ -332,7 +332,7 @@
+     let mut groups: Vec<(usize, usize)> = Vec::new();
+     for &i in &changes {
+         match groups.last_mut() {
+-            Some((_, last)) if i - *last - 1 < 2 * context => *last = i,
++            Some((_, last)) if i - *last - 1 <= 2 * context => *last = i,
+             _ => groups.push((i, i)),
+         }
+     }
+diff -ruN a/src/patch.rs b/src/patch.rs
+--- a/src/patch.rs
++++ b/src/patch.rs
+@@ -280,7 +280,7 @@
+     let mut drift: isize = 0;
+     for (n, h) in patch.hunks.iter().enumerate() {
+         // A hunk with an empty old side names the line it goes after.
+-        let base = h.old_start.saturating_sub(1);
++        let base = if h.old_len == 0 { h.old_start } else { h.old_start - 1 };
+         let old_side: Vec<&str> = h
+             .lines
+             .iter()
+@@ -319,9 +319,9 @@
+             .iter()
+             .map(|h| PatchHunk {
+                 old_start: h.new_start,
+-                old_len: h.old_len,
++                old_len: h.new_len,
+                 new_start: h.old_start,
+-                new_len: h.new_len,
++                new_len: h.old_len,
+                 lines: h.lines.iter().map(Line::inverted).collect(),
+             })
+             .collect(),
