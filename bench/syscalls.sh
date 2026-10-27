@@ -10,7 +10,7 @@
 #   bench/syscalls.sh --measure [N]  build, run every scenario N times (default
 #                                    10), and print a budget file where each
 #                                    line is the highest count times 1.15,
-#                                    rounded up, and at least 24 over it
+#                                    rounded up, and at least 48 over it
 #   bench/syscalls.sh --self-test    build, run the gate, check that a budget a
 #                                    count under a count fails, and check the
 #                                    thread filter on
@@ -76,8 +76,10 @@ export MCP_FAKE='{"tools": [{"name": "echo"}, {"name": "sleep"}]}'
 # A key the run never uses: the scripted provider answers every request.
 TEST_API_KEY=sk-ant-test-syscalls
 
-# The scenarios, in run order, one script each in $SCENARIO_DIR.
-SCENARIOS=(turn tools bash codemode mcp)
+# The scenarios, in run order, one script each in $SCENARIO_DIR. The last
+# five make one reply of several calls to one file tool, so a count over
+# `turn` is the cost of those calls.
+SCENARIOS=(turn tools bash codemode mcp read write edit grep find)
 SCENARIO_LIST=${SCENARIOS[*]}
 
 # The syscall groups, in print order, and the syscalls each one holds.
@@ -105,9 +107,11 @@ total 8'
 # How a --measure count becomes a budget line: the highest count times this
 # factor, rounded up, and at least this many syscalls over the highest count.
 # One more tokio blocking-pool thread costs about 11 syscalls, more than 15%
-# of a small group, so the slack holds two of them.
+# of a small group, and a scenario with parallel jobs (find, grep) can make
+# three or four more threads in one run than in another, so the slack holds
+# four of them.
 BUDGET_FACTOR=1.15
-BUDGET_SLACK=24
+BUDGET_SLACK=48
 MEASURE_RUNS=10
 
 # The widths of the check table, in characters.
@@ -167,7 +171,7 @@ BUDGET_HEADER='# Syscall budgets for the fixed reagent runs of bench/syscalls.sh
 # budget means nothing on another OS or architecture.
 #
 # Each line is, per scenario and group, the highest count of N runs times 1.15,
-# rounded up and at least 24 over that count, from bench/syscalls.sh
+# rounded up and at least 48 over that count, from bench/syscalls.sh
 # --measure N. Use at least the
 # default ten: the threads a run makes with the tokio blocking pool vary
 # with timing, and a small sample can miss the high count, which a later run

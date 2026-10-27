@@ -41,6 +41,10 @@ async fn run_bash(work: &Path, command: &str, config: Option<&str>) -> std::proc
         .expect("make work folder");
     Command::new(BIN)
         .env("XDG_CONFIG_HOME", &xdg)
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
         .args(["--provider", &format!("fake:{}", script.display())])
         .args(["-p", "run it"])

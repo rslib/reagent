@@ -3,8 +3,11 @@
 //! long file, a `find` over a tree that a root `.gitignore` filters, a `grep`
 //! over 500 files, and a `bash` call whose output spills 8 MB.
 //!
-//! Every file and folder is built in a `setup` function, so only the tool call
-//! is counted. Each bench call runs once: the `edit` bench rewrites its file,
+//! Every file and folder is built in a `setup` function with `std::fs`, so only
+//! the tool call is counted. The tools do their file work in tokio blocking
+//! jobs on pool threads, which Callgrind counts only inside a toggle, so the
+//! toggle below adds each blocking job to the count; a setup that ran a
+//! blocking job would be counted too. Each bench call runs once: the `edit` bench rewrites its file,
 //! which is why it can be run only once on a fixture.
 //!
 //! The `bash` bench starts a shell, so Callgrind counts this process (the read
@@ -21,6 +24,7 @@
 
 use std::hint::black_box;
 
+use gungraun::Callgrind;
 use gungraun::prelude::*;
 use reagent_agent::tool::Tool;
 use reagent_tools::bash::Bash;
@@ -67,12 +71,8 @@ struct EditCase {
 fn edit_crlf() -> EditCase {
     let runtime = runtime();
     let tmp = tempfile::tempdir().expect("a temp dir");
-    runtime.block_on(async {
-        let text = "alpha\r\n".repeat(CRLF_LINES);
-        tokio::fs::write(tmp.path().join("crlf.txt"), text)
-            .await
-            .expect("the file writes");
-    });
+    std::fs::write(tmp.path().join("crlf.txt"), "alpha\r\n".repeat(CRLF_LINES))
+        .expect("the file writes");
     EditCase {
         runtime,
         tool: Edit::new(tmp.path()),
@@ -105,12 +105,8 @@ struct ReadCase {
 fn read_lines() -> ReadCase {
     let runtime = runtime();
     let tmp = tempfile::tempdir().expect("a temp dir");
-    runtime.block_on(async {
-        let text = "x\n".repeat(READ_LINES);
-        tokio::fs::write(tmp.path().join("lines.txt"), text)
-            .await
-            .expect("the file writes");
-    });
+    std::fs::write(tmp.path().join("lines.txt"), "x\n".repeat(READ_LINES))
+        .expect("the file writes");
     ReadCase {
         runtime,
         tool: Read::new(tmp.path()),
@@ -142,28 +138,19 @@ struct FindCase {
 fn find_files() -> FindCase {
     let runtime = runtime();
     let tmp = tempfile::tempdir().expect("a temp dir");
-    runtime.block_on(async {
-        let root = tmp.path();
-        tokio::fs::create_dir(root.join(".git"))
-            .await
-            .expect("the repository marker");
-        tokio::fs::write(root.join(".gitignore"), "*.log\nbuild/\n")
-            .await
-            .expect("the ignore file writes");
-        let per_folder = FIND_FILES / FIND_FOLDERS;
-        for folder in 0..FIND_FOLDERS {
-            let dir = root.join("sub").join(format!("m{folder:02}"));
-            tokio::fs::create_dir_all(&dir).await.expect("the folder");
-            for file in 0..per_folder {
-                tokio::fs::write(dir.join(format!("f{file:03}.rs")), "fn main() {}\n")
-                    .await
-                    .expect("the file writes");
-            }
-            tokio::fs::write(dir.join("debug.log"), "")
-                .await
-                .expect("the ignored file writes");
+    let root = tmp.path();
+    std::fs::create_dir(root.join(".git")).expect("the repository marker");
+    std::fs::write(root.join(".gitignore"), "*.log\nbuild/\n").expect("the ignore file writes");
+    let per_folder = FIND_FILES / FIND_FOLDERS;
+    for folder in 0..FIND_FOLDERS {
+        let dir = root.join("sub").join(format!("m{folder:02}"));
+        std::fs::create_dir_all(&dir).expect("the folder");
+        for file in 0..per_folder {
+            std::fs::write(dir.join(format!("f{file:03}.rs")), "fn main() {}\n")
+                .expect("the file writes");
         }
-    });
+        std::fs::write(dir.join("debug.log"), "").expect("the ignored file writes");
+    }
     FindCase {
         runtime,
         tool: Find::new(tmp.path()),
@@ -197,15 +184,11 @@ struct GrepCase {
 fn grep_files() -> GrepCase {
     let runtime = runtime();
     let tmp = tempfile::tempdir().expect("a temp dir");
-    runtime.block_on(async {
-        let sub = tmp.path().join("sub");
-        tokio::fs::create_dir(&sub).await.expect("the folder");
-        for n in 0..GREP_FILES {
-            tokio::fs::write(sub.join(format!("f{n:03}.txt")), "needle\n")
-                .await
-                .expect("the file writes");
-        }
-    });
+    let sub = tmp.path().join("sub");
+    std::fs::create_dir(&sub).expect("the folder");
+    for n in 0..GREP_FILES {
+        std::fs::write(sub.join(format!("f{n:03}.txt")), "needle\n").expect("the file writes");
+    }
     GrepCase {
         runtime,
         tool: Grep::new(tmp.path()),
@@ -256,4 +239,10 @@ fn capture(case: CaptureCase) -> usize {
     black_box(output.content.len())
 }
 
-main!(library_benchmark_groups = tools);
+/// The function each tokio blocking job runs in on a pool thread.
+const BLOCKING_JOB: &str = "--toggle-collect=tokio::runtime::task::raw::poll::<tokio::runtime::blocking::task::BlockingTask*";
+
+main!(
+    config = LibraryBenchmarkConfig::default().tool(Callgrind::with_args([BLOCKING_JOB])),
+    library_benchmark_groups = tools
+);

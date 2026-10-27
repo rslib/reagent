@@ -1,0 +1,6 @@
+{
+  "replies": [
+    {"calls": [{"name": "write", "arguments": {"path": "w1.txt", "content": "written 1\n"}}, {"name": "write", "arguments": {"path": "w2.txt", "content": "written 2\n"}}, {"name": "write", "arguments": {"path": "w3.txt", "content": "written 3\n"}}, {"name": "write", "arguments": {"path": "w4.txt", "content": "written 4\n"}}, {"name": "write", "arguments": {"path": "w5.txt", "content": "written 5\n"}}]},
+    {"text": "all done"}
+  ]
+}

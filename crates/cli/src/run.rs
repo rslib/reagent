@@ -410,8 +410,61 @@ fn kilo(tokens: u64) -> String {
 pub async fn run(mut args: Args) -> ExitCode {
     // Resolve the task text before anything runs: `-p -` reads the whole task
     // from standard input, and an empty or non-UTF-8 task input exits 2.
-    // The task moves out of `args`; `args` is still borrowed below.
-    let source = std::mem::replace(&mut args.task, crate::args::TaskSource::Stdin);
+    // The task moves out of `args`; `args` is still borrowed below. A continue
+    // or a resume may run with no message at all.
+    let source = args.task.take();
+    let mut task = match source {
+        None => None,
+        Some(crate::args::TaskSource::Text(text)) => Some(text),
+        Some(crate::args::TaskSource::Stdin) => match read_stdin_task().await {
+            Ok(task) => Some(task),
+            Err(message) => {
+                eprintln!("reagent: {message}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let cwd = match tokio::fs::canonicalize(&args.cwd).await {
+        Ok(cwd) if tokio::fs::metadata(&cwd).await.is_ok_and(|m| m.is_dir()) => cwd,
+        _ => {
+            eprintln!("reagent: --cwd {} is not a folder", args.cwd.display());
+            return ExitCode::from(2);
+        }
+    };
+    let title = task
+        .as_deref()
+        .map(reagent_store::list::title)
+        .unwrap_or_default();
+    // A resumed run keeps the provider and the model the session ran with,
+    // unless the arguments name one. Naming them before the part is planned
+    // puts them in its header and its list entry, so the session shows the
+    // model the run uses.
+    if !args.model_given && args.profile.is_none() {
+        match stored_model(&args, &cwd, &title, !args.provider_given).await {
+            Ok(Some(model)) => {
+                match tokio::task::spawn_blocking(move || crate::args::reparse(&model))
+                    .await
+                    .unwrap_or_else(|error| Err(format!("could not read the config: {error}")))
+                {
+                    Ok(crate::args::Outcome::Run(next)) => {
+                        let mut next = *next;
+                        next.task = None;
+                        args = next;
+                    }
+                    Ok(_) => {}
+                    Err(message) => {
+                        eprintln!("reagent: {message}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(message) => {
+                eprintln!("reagent: {message}");
+                return ExitCode::from(1);
+            }
+        }
+    }
     // The models cache names the context window and the price of the model, so
     // it is read once for both.
     let cached = crate::models::cache_dir()
@@ -428,21 +481,29 @@ pub async fn run(mut args: Args) -> ExitCode {
             cached.as_ref().and_then(|entry| entry.reasoning.as_ref()),
         )
     });
-    let mut task = match source {
-        crate::args::TaskSource::Text(text) => text,
-        crate::args::TaskSource::Stdin => match read_stdin_task().await {
-            Ok(task) => task,
-            Err(message) => {
-                eprintln!("reagent: {message}");
-                return ExitCode::from(2);
+    // The session this run writes, and what it continues from.
+    if matches!(args.sessions, crate::args::Sessions::Resume(None)) {
+        let cwd = cwd.clone();
+        match tokio::task::spawn_blocking(move || crate::session::list(&cwd)).await {
+            Ok(Ok(entries)) => {
+                crate::session::print_list(&entries);
+                return ExitCode::SUCCESS;
             }
-        },
-    };
-    let cwd = match tokio::fs::canonicalize(&args.cwd).await {
-        Ok(cwd) if tokio::fs::metadata(&cwd).await.is_ok_and(|m| m.is_dir()) => cwd,
-        _ => {
-            eprintln!("reagent: --cwd {} is not a folder", args.cwd.display());
-            return ExitCode::from(2);
+            Ok(Err(message)) => {
+                eprintln!("reagent: {message}");
+                return ExitCode::from(1);
+            }
+            Err(_) => {
+                eprintln!("reagent: the session store failed");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    let plan = match plan_session(&args, &cwd, &title).await {
+        Ok(plan) => plan,
+        Err(message) => {
+            eprintln!("reagent: {message}");
+            return ExitCode::from(1);
         }
     };
     // The environment block starts here, before the provider is built, so its
@@ -603,12 +664,89 @@ pub async fn run(mut args: Args) -> ExitCode {
     let out = Out::new();
     let writer = tokio::spawn(drain(rx, out, args.json, billing, args.context_window));
 
-    if let Some(probe) = probe {
-        task = crate::snapshot::first_message(task, &probe.block().await);
+    if let Some(probe) = probe
+        && let Some(text) = task.take()
+    {
+        task = Some(crate::snapshot::first_message(text, &probe.block().await));
     }
-    let mut history = vec![reagent_ai::Message::user(task)];
-    agent.run(&mut history, None, &tx).await;
+    // The history a resumed run continues. The calls its last reply left open
+    // run first, so the message this run adds follows their results and the
+    // journal writes the whole history in order.
+    let resumed = plan.as_ref().and_then(|plan| plan.resumed.as_ref());
+    let mut history: Vec<reagent_ai::Message> = match resumed {
+        Some(resumed) => resumed.history.clone(),
+        None => Vec::new(),
+    };
+    let pending = resumed
+        .map(|resumed| resumed.pending.clone())
+        .unwrap_or_default();
+    let carried = crate::session::carried(resumed);
+    // The turn numbers run on across a session: this run's first turn is the
+    // one after the last turn the session recorded.
+    agent = agent.with_first_turn(carried + 1);
+    let mut journal = match open_journal(plan.as_ref()).await {
+        Ok(journal) => journal,
+        Err(message) => {
+            stop_servers(servers).await;
+            eprintln!("reagent: {message}");
+            return ExitCode::from(1);
+        }
+    };
+    // Recording the entry opens a list and writes it, so it runs on the
+    // blocking pool like every other store call.
+    if let Some(plan) = journal.as_ref().map(|(_, plan)| plan) {
+        let plan = clone_plan(plan);
+        match tokio::task::spawn_blocking(move || crate::session::started(&plan, carried)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("reagent: warning: could not record the session: {error}")
+            }
+            Err(_) => eprintln!("reagent: warning: the session store failed"),
+        }
+    }
+    let mut pending_reason = TurnEndReason::EndTurn;
+    if let Some((journal, _)) = journal.as_mut() {
+        pending_reason = agent
+            .run_pending(&mut history, &mut Some(journal), &tx, &pending)
+            .await;
+    }
+    // A resumed run whose provider or model changed writes them down, so the
+    // next resume takes the ones this run used.
+    if let Some(resumed) = resumed
+        && (resumed.provider != provider.name() || resumed.model != args.model)
+        && let Some((journal, _)) = journal.as_mut()
+        && let Err(error) = journal
+            .model(provider.name(), &args.model)
+            .and_then(|()| journal.commit())
+    {
+        eprintln!("reagent: warning: could not record the model: {error}");
+    }
+    if matches!(pending_reason, TurnEndReason::Error) {
+        eprintln!("reagent: the pending tool calls could not run");
+    }
+    let mut asked = task.is_some();
+    if let Some(text) = task {
+        history.push(reagent_ai::Message::user(text));
+    }
+    // A crash in the first request of a turn leaves its message with no reply,
+    // and the continue asks for that reply.
+    asked = asked
+        || resumed.is_none_or(|resumed| resumed.open_turn || history.len() > resumed.recorded);
+    if !matches!(pending_reason, TurnEndReason::Error)
+        && (asked || !pending.is_empty() || resumed.is_none())
+    {
+        agent
+            .run(
+                &mut history,
+                journal.as_mut().map(|(journal, _)| &mut *journal),
+                &tx,
+            )
+            .await;
+    }
     drop(tx);
+    // The turns the session has now: the number of the last turn this run
+    // ended, or the one it found when it ended no turn.
+    let turns = agent.last_turn();
     // A refresh that could not be saved costs the next run a refresh; the run
     // that traded the tokens keeps going, so this is a warning, printed once.
     if let Some(warning) = session.as_ref().and_then(|session| session.take_warning()) {
@@ -618,12 +756,158 @@ pub async fn run(mut args: Args) -> ExitCode {
         timer.abort();
     }
     // The writer task never panics; a join error would mean a runtime bug.
-    let reason = writer
+    let mut reason = writer
         .await
         .unwrap_or_else(|_| panic!("writer task failed"));
+    // A run whose pending calls failed ends with that reason: the exit code and
+    // the list entry say the run did not finish.
+    if matches!(pending_reason, TurnEndReason::Error) {
+        reason = TurnEndReason::Error;
+    }
 
     stop_servers(servers).await;
+    // The part is closed and the list entry says how the run ended, so a crash
+    // before this leaves the entry open.
+    if let Some((journal, plan)) = journal.take() {
+        let state = crate::session::state_of(matches!(
+            reason,
+            TurnEndReason::EndTurn | TurnEndReason::MaxTurns
+        ));
+        let closed = tokio::task::spawn_blocking(move || {
+            crate::session::close(journal, &plan, state, turns)
+        })
+        .await;
+        match closed {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => {
+                eprintln!("reagent: warning: could not close the session: {message}")
+            }
+            Err(_) => eprintln!("reagent: warning: the session writer stopped"),
+        }
+    }
+    // Deleting the sessions the limits no longer keep runs after the final
+    // output, so it costs the run no latency, and at most once a day. The run
+    // is done either way, so a failure only warns.
+    if let Some(plan) = &plan {
+        let (keep, limits) = (plan.dir.clone(), crate::gc::Limits::from(args.session));
+        match tokio::task::spawn_blocking(move || crate::gc::after_run(&keep, limits)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(message)) => {
+                eprintln!("reagent: warning: could not delete old sessions: {message}")
+            }
+            Err(_) => eprintln!("reagent: warning: the session sweep failed"),
+        }
+    }
     exit_code(&reason, Cause::from_u8(cause.load(Ordering::SeqCst)))
+}
+
+/// The provider and model of the session a run continues, as one `--model`
+/// value, or `None` when this run starts a session or already names them.
+///
+/// `with_provider` is off for a run that named a provider: it takes the model
+/// of the session, not the provider. Reading the session header blocks, so it
+/// runs on the blocking pool.
+async fn stored_model(
+    args: &Args,
+    cwd: &std::path::Path,
+    title: &str,
+    with_provider: bool,
+) -> Result<Option<String>, String> {
+    let sessions = args.sessions.clone();
+    let cwd = cwd.to_path_buf();
+    let profile = args.profile.clone();
+    let provider = args.provider_name.clone().unwrap_or_default();
+    let model = args.model.clone();
+    let title = title.to_owned();
+    let stored = tokio::task::spawn_blocking(move || {
+        let ask = crate::session::Ask {
+            sessions: &sessions,
+            cwd: &cwd,
+            profile: profile.as_deref(),
+            provider: &provider,
+            model: &model,
+            title: &title,
+        };
+        crate::session::stored(&ask)
+    })
+    .await
+    .map_err(|_| "the session store failed".to_string())??;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    // The value a `--model` flag takes: `provider/model`, or the model alone
+    // when the session named no provider or the run named one of its own.
+    let named = if with_provider && !stored.provider.is_empty() {
+        format!("{}/{}", stored.provider, stored.model)
+    } else {
+        stored.model
+    };
+    let now = match args.provider_name.as_deref().filter(|_| with_provider) {
+        Some(name) => format!("{name}/{}", args.model),
+        None => args.model.clone(),
+    };
+    if named.is_empty() || named == now {
+        return Ok(None);
+    }
+    Ok(Some(named))
+}
+
+/// Plans the session of a run, on the blocking pool.
+async fn plan_session(
+    args: &Args,
+    cwd: &std::path::Path,
+    title: &str,
+) -> Result<Option<crate::session::Plan>, String> {
+    let sessions = args.sessions.clone();
+    let cwd = cwd.to_path_buf();
+    let profile = args.profile.clone();
+    let provider = args.provider_name.clone().unwrap_or_default();
+    let model = args.model.clone();
+    let title = title.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let ask = crate::session::Ask {
+            sessions: &sessions,
+            cwd: &cwd,
+            profile: profile.as_deref(),
+            provider: &provider,
+            model: &model,
+            title: &title,
+        };
+        crate::session::plan(&ask)
+    })
+    .await
+    .map_err(|_| "the session store failed".to_string())?
+}
+
+/// Opens the journal of a planned part, on the blocking pool.
+async fn open_journal(
+    plan: Option<&crate::session::Plan>,
+) -> Result<Option<(reagent_agent::journal::Journal, crate::session::Plan)>, String> {
+    let Some(plan) = plan else {
+        return Ok(None);
+    };
+    let dir = plan.dir.clone();
+    let header = plan.header.clone();
+    let recorded = plan.resumed.as_ref().map(|resumed| resumed.recorded);
+    let journal = tokio::task::spawn_blocking(move || match recorded {
+        Some(recorded) => reagent_agent::journal::Journal::resumed(&dir, header, recorded),
+        None => reagent_agent::journal::Journal::create(&dir, header),
+    })
+    .await
+    .map_err(|_| "the session store failed".to_string())?
+    .map_err(|error| format!("could not open the session: {error}"))?;
+    Ok(Some((journal, clone_plan(plan))))
+}
+
+/// The plan a run keeps after its journal took the header.
+fn clone_plan(plan: &crate::session::Plan) -> crate::session::Plan {
+    crate::session::Plan {
+        folder: plan.folder.clone(),
+        dir: plan.dir.clone(),
+        id: plan.id.clone(),
+        header: plan.header.clone(),
+        resumed: None,
+    }
 }
 
 /// The bytes of JSON lines the drain loop takes from the channel before one

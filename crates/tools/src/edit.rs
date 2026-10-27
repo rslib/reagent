@@ -10,11 +10,11 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Effects, Repaired, Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{EffectClass, Effects, Repaired, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
 use crate::repair::{Kind, Touched};
-use crate::{atomic, resolve};
+use crate::{atomic, blocking, resolve};
 
 mod fuzzy;
 
@@ -50,8 +50,8 @@ pub struct Args<'a> {
     /// A 1-based line near the intended match, which picks one of several.
     line: Option<usize>,
     /// Several replacements; each one matches the file text as it was read.
-    #[serde(default, borrow)]
-    edits: Option<Vec<Replacement<'a>>>,
+    #[serde(default)]
+    edits: Option<Vec<Replacement>>,
 }
 
 /// The arguments an effect check reads: the path, and the shape of the edits.
@@ -91,11 +91,9 @@ fn is_string(raw: &RawValue) -> bool {
 
 /// One replacement in an `edits` list.
 #[derive(Debug, Deserialize)]
-pub struct Replacement<'a> {
-    #[serde(borrow)]
-    old_string: Cow<'a, str>,
-    #[serde(borrow)]
-    new_string: Cow<'a, str>,
+pub struct Replacement {
+    old_string: String,
+    new_string: String,
     /// Replace every occurrence of this text instead of requiring one match.
     replace_all: Option<bool>,
     /// A 1-based line near the intended match, which picks one of several.
@@ -105,37 +103,37 @@ pub struct Replacement<'a> {
 /// The error for a call that gives neither form, or both.
 const INVALID_FORM: &str = "invalid arguments: give old_string and new_string, or an edits list";
 
-/// The replacements a call asks for, after the shape check.
-enum Plan<'a> {
+/// The replacements a call asks for, after the shape check. The texts are
+/// owned, so the plan moves into the blocking job that applies it.
+enum Plan {
     Single {
-        old: &'a str,
-        new: &'a str,
+        old: String,
+        new: String,
         replace_all: bool,
         hint: Option<usize>,
     },
     Many {
-        edits: &'a [Replacement<'a>],
+        edits: Vec<Replacement>,
     },
 }
 
-impl<'a> Plan<'a> {
-    /// Checks that the call gives exactly one of the two forms.
-    fn of(args: &'a Args<'a>) -> Result<Self, String> {
-        let edits = args.edits.as_deref().filter(|edits| !edits.is_empty());
-        match (
-            args.old_string.as_deref(),
-            args.new_string.as_deref(),
-            edits,
-        ) {
-            (Some(old), Some(new), None) => Ok(Self::Single {
-                old,
-                new,
+impl Plan {
+    /// Checks that the call gives exactly one of the two forms, and takes the
+    /// replacements out of `args` with the path the call names, so that the
+    /// shape fault is reported before the path one.
+    fn of(args: Args<'_>) -> Result<(Cow<'_, str>, Self), String> {
+        let edits = args.edits.filter(|edits| !edits.is_empty());
+        let plan = match (args.old_string, args.new_string, edits) {
+            (Some(old), Some(new), None) => Self::Single {
+                old: old.into_owned(),
+                new: new.into_owned(),
                 replace_all: args.replace_all.unwrap_or(false),
                 hint: args.line,
-            }),
-            (None, None, Some(edits)) => Ok(Self::Many { edits }),
-            _ => Err(INVALID_FORM.into()),
-        }
+            },
+            (None, None, Some(edits)) => Self::Many { edits },
+            _ => return Err(INVALID_FORM.into()),
+        };
+        Ok((args.path, plan))
     }
 }
 
@@ -212,44 +210,78 @@ impl Edit {
         self
     }
 
-    async fn run_inner(&self, args: &Args<'_>) -> Result<ToolOutput, String> {
-        let plan = Plan::of(args)?;
-        let path = resolve(&self.working_dir, &args.path)?;
-        let original = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-
-        let (text, content, is_error) = match plan {
-            Plan::Single {
-                old,
-                new,
-                replace_all,
-                hint,
-            } => {
-                let applied = apply(&original, &path, old, new, replace_all, hint)?;
-                let content = success_line(&path, &applied);
-                (Some(applied.text), content, false)
-            }
-            Plan::Many { edits } => {
-                let done = apply_edits(&path, &original, edits);
-                (done.text, done.content, done.is_error)
-            }
-        };
-
-        if let Some(text) = text {
-            atomic::write(&path, text.as_bytes()).await?;
-        }
-        Ok(if is_error {
-            ToolOutput::error(content)
+    async fn run_inner(&self, args: Args<'_>) -> Result<ToolOutput, String> {
+        let (named, plan) = Plan::of(args)?;
+        let path = resolve(&self.working_dir, &named)?;
+        let (edited, hints) =
+            blocking::run(move || (edit_file(path, plan), hints_built_here())).await;
+        #[cfg(test)]
+        HINTS_BUILT.with(|built| built.set(built.get() + hints));
+        #[cfg(not(test))]
+        let _ = hints;
+        let edited = edited?;
+        let output = if edited.is_error {
+            ToolOutput::error(edited.content)
         } else {
-            ToolOutput::ok(content)
-        })
+            ToolOutput::ok(edited.content)
+        };
+        if !output.is_error {
+            self.touched
+                .note(&self.working_dir, Path::new(named.as_ref()));
+        }
+        Ok(output)
     }
+}
+
+/// The file work of one edit, in the one blocking job it runs in: the read,
+/// the match, and the atomic write of the new text.
+#[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]
+fn edit_file(path: PathBuf, plan: Plan) -> Result<Edited, String> {
+    let original = std::fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+
+    let (text, content, is_error) = match plan {
+        Plan::Single {
+            old,
+            new,
+            replace_all,
+            hint,
+        } => {
+            let applied = apply(&original, &path, &old, &new, replace_all, hint)?;
+            let content = success_line(&path, &applied);
+            (Some(applied.text), content, false)
+        }
+        Plan::Many { edits } => {
+            let done = apply_edits(&path, &original, &edits);
+            (done.text, done.content, done.is_error)
+        }
+    };
+
+    if let Some(text) = text {
+        atomic::write_atomic(&path, text.as_bytes())?;
+    }
+    Ok(Edited { content, is_error })
+}
+
+/// What the job of one edit produced: the reply for the model and whether it
+/// is an error.
+struct Edited {
+    content: String,
+    is_error: bool,
+}
+
+/// Takes the not-found hints this thread built since the last call, read on
+/// the job's own thread, where they were counted; always 0 outside tests.
+fn hints_built_here() -> usize {
+    #[cfg(test)]
+    return HINTS_BUILT.with(std::cell::Cell::take);
+    #[cfg(not(test))]
+    0
 }
 
 /// Applies an `edits` list: every edit matches the text as it was read, and the
 /// edits that matched are applied together in one pass.
-fn apply_edits(path: &Path, original: &str, edits: &[Replacement<'_>]) -> ListOutcome {
+fn apply_edits(path: &Path, original: &str, edits: &[Replacement]) -> ListOutcome {
     let mut resolutions: Vec<Resolution<'_>> = edits
         .iter()
         .map(|edit| match_edit(original, path, edit))
@@ -457,12 +489,12 @@ fn unescaped_match(text: &str, old: &str, new: &str) -> Option<(String, String, 
 
 /// Matches one edit against `text` with the tiers in order: exact, the read
 /// prefix strip, one level of backslash escapes removed, then fuzzy.
-fn match_edit<'a>(text: &str, path: &Path, edit: &'a Replacement<'a>) -> Resolution<'a> {
-    let old = edit.old_string.as_ref();
+fn match_edit<'a>(text: &str, path: &Path, edit: &'a Replacement) -> Resolution<'a> {
+    let old: &str = &edit.old_string;
     if old.is_empty() {
         return Resolution::Failed("invalid arguments: old_string must not be empty".into());
     }
-    if old == edit.new_string.as_ref() {
+    if old == edit.new_string.as_str() {
         return Resolution::Failed("changes nothing".into());
     }
     let replace_all = edit.replace_all.unwrap_or(false);
@@ -684,8 +716,8 @@ fn fail_overlaps(resolutions: &mut [Resolution<'_>]) {
 }
 
 /// Whether an edit that matched nowhere is already in the file.
-fn already_applied(crlf: bool, original: &str, edit: &Replacement<'_>) -> bool {
-    let new = edit.new_string.as_ref();
+fn already_applied(crlf: bool, original: &str, edit: &Replacement) -> bool {
+    let new: &str = &edit.new_string;
     if new.is_empty() {
         return false;
     }
@@ -1313,6 +1345,10 @@ impl Tool for Edit {
         Some("path")
     }
 
+    fn effect(&self) -> EffectClass {
+        EffectClass::LocalReversible
+    }
+
     fn repair<'a>(
         &'a self,
         args: &'a str,
@@ -1361,14 +1397,8 @@ impl Tool for Edit {
                 Ok(arguments) => arguments,
                 Err(output) => return output,
             };
-            match self.run_inner(&arguments).await {
-                Ok(output) => {
-                    if !output.is_error {
-                        let path = std::path::Path::new(arguments.path.as_ref());
-                        self.touched.note(&self.working_dir, path);
-                    }
-                    output
-                }
+            match self.run_inner(arguments).await {
+                Ok(output) => output,
                 Err(message) => ToolOutput::error(message),
             }
         })
@@ -2361,6 +2391,53 @@ mod tests {
     /// How many not-found hints this thread has built so far.
     fn hints_built() -> usize {
         HINTS_BUILT.with(std::cell::Cell::get)
+    }
+
+    /// The read, the match and the atomic write are one blocking job.
+    #[tokio::test]
+    async fn one_hop_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "aaa bbb ccc\n").await;
+        crate::blocking::reset_hops();
+        let output = tool(&tmp)
+            .run(
+                r#"{"path":"f.txt","old_string":"bbb","new_string":"BBB"}"#,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("f.txt"))
+                .await
+                .unwrap(),
+            "aaa BBB ccc\n"
+        );
+        assert_eq!(crate::blocking::hops(), 1);
+    }
+
+    /// An edit that matches nothing fails in that same one job, with the hint
+    /// the file text builds.
+    #[tokio::test]
+    async fn one_hop_edit_no_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "one\ntwo\n").await;
+        crate::blocking::reset_hops();
+        let output = tool(&tmp)
+            .run(
+                r#"{"path":"f.txt","old_string":"nowhere","new_string":"x"}"#,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error);
+        assert!(
+            output.content.starts_with(&format!(
+                "text not found in {}; closest match is near line 1:\n",
+                tmp.path().join("f.txt").display()
+            )),
+            "{}",
+            output.content
+        );
+        assert_eq!(crate::blocking::hops(), 1);
     }
 
     #[tokio::test]

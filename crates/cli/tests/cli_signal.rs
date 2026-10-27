@@ -128,10 +128,10 @@ async fn spawn_run_and_stop(dir: &Path, signal: &str) -> u32 {
 async fn wait_for_pid(path: &Path) -> u32 {
     let began = Instant::now();
     loop {
-        if let Ok(text) = tokio::fs::read_to_string(path).await {
-            if let Ok(pid) = text.trim().parse() {
-                return pid;
-            }
+        if let Ok(text) = tokio::fs::read_to_string(path).await
+            && let Ok(pid) = text.trim().parse()
+        {
+            return pid;
         }
         assert!(
             began.elapsed() < READY_LIMIT,

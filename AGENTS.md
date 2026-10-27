@@ -16,7 +16,7 @@ cargo nextest run --release -p reagent-agent --test budget                    # 
 cargo nextest run --release -p reagent --features testing --test footprint    # process RSS and CPU budgets
 cargo nextest run -p reagent-ai --features testing --test allocs   # heap blocks per stream event and body build
 cargo nextest run -p reagent-tools --test allocs                   # heap blocks for edit, read, walk and effects
-cargo nextest run -p reagent-agent --test session_allocs           # heap blocks per session line and stuck turn
+cargo nextest run -p reagent-agent --test journal_allocs           # heap blocks per journal record and stuck turn
 bash bench/instructions.sh                                         # Linux: Callgrind instruction counts against the merge base
 bash bench/syscalls.sh   # Linux: syscalls of fixed scenarios against bench/syscall-budget.txt
 bash bench/size.sh   # size build against bench/size-budget.txt
@@ -48,10 +48,11 @@ A feature that does not move 1 or 2 in a measured run does not ship as a default
 |---|---|---|
 | Small helpers with no domain types: text cuts, number writing, path normalizing, borrowed JSON reading | `crates/util` (`reagent-util`) | no other reagent crate |
 | OS sandbox for one process and its children: Seatbelt on macOS, Landlock on Linux | `crates/sandbox` (`reagent-sandbox`) | no other reagent crate |
+| Durable append-only session log: frames, fields, CRC, part writer and reader, recovery, fork pointers, zstd stream, session list. No message types | `crates/store` (`reagent-store`) | no other reagent crate |
 | Config files, providers and models, permission rules and their shell lexer and glob | `crates/config` (`reagent-config`) | depends on util |
 | Shared OAuth (PKCE, device flow, JWT, loopback callback) and the HTTP client | `crates/oauth` (`reagent-oauth`) | depends on config |
 | Message types, providers, SSE, `FakeProvider`, OAuth logins | `crates/ai` (`reagent-ai`) | `reagent-config` (the auth file) and oauth |
-| Loop, events, session, context policy, `Tool` trait, the permission guard | `crates/agent` (`reagent-agent`) | depends on ai, config and util |
+| Loop, events, session journal, context policy, `Tool` trait, the permission guard | `crates/agent` (`reagent-agent`) | depends on ai, config, store and util |
 | Native tools | `crates/tools` (`reagent-tools`) | depends on agent, config and util |
 | The `codemode` tool: a QuickJS script that calls the other tools | `crates/script` (`reagent-script`) | depends on agent, ai and tools |
 | MCP client and its OAuth login | `crates/mcp` (`reagent-mcp`) | depends on agent, ai, oauth and config |
@@ -71,7 +72,7 @@ Design decisions and their reasons: `docs/plans/architecture.md` (local only, ig
 - Serialize each finished message once and reuse the bytes in every later request.
 - Never rewrite an earlier message in a request. It breaks the prompt cache.
 - Never hold a whole session file or a whole tool output in RAM. Cap and spill to a file.
-- All I/O is async: `tokio::fs`, `tokio::process`, `tokio::net`, `tokio::time`. `clippy.toml` bans the `std` versions, in tests too. Heavy CPU work goes in `tokio::task::spawn_blocking`. The runtime is `current_thread`.
+- All I/O is async: `tokio::fs`, `tokio::process`, `tokio::net`, `tokio::time`. `clippy.toml` bans the `std` versions, in tests too. Heavy CPU work goes in `tokio::task::spawn_blocking`. The runtime is `current_thread`. The file work of one tool call runs in one `spawn_blocking` job (`crates/tools/src/blocking.rs`), and `std::fs` is allowed only inside such a job, with an `#[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]` (or `disallowed_types` for `std::fs::File`). The store (`crates/store`) is the other exception: its reads run inside `spawn_blocking` and its writer runs on its own thread, so it uses `std::fs` with the same `#[expect]` and a reason.
 - A new dependency needs `default-features = false` and only the features it uses. Add it with `cargo add -p <package> <dep> --no-default-features -F <features>`.
 - Claim a speed or size gain only with a measured number and the command that produced it.
 - A hot path runs per stream event, per request, per tool call or per line or file a tool touches. A change to one keeps its `allocs` test, `bench/instructions.sh` and `bench/syscalls.sh` passing (2% on instructions and estimated cycles, 12% for `find`, `grep` and `capture`, which touch the file system or a child process). A new hot path adds a dhat case that fails on the old code, with the bound set near the measured value. Raise a bound only with the old and new number in the commit body.

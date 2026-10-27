@@ -1,0 +1,6 @@
+{
+  "replies": [
+    {"calls": [{"name": "edit", "arguments": {"path": "a.txt", "old_string": "alpha", "new_string": "alpha edited"}}, {"name": "edit", "arguments": {"path": "b.txt", "old_string": "delta", "new_string": "delta edited"}}, {"name": "edit", "arguments": {"path": "sub/c.txt", "old_string": "zeta", "new_string": "zeta edited"}}]},
+    {"text": "all done"}
+  ]
+}

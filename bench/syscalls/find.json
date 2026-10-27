@@ -1,0 +1,6 @@
+{
+  "replies": [
+    {"calls": [{"name": "find", "arguments": {"pattern": "*.txt"}}, {"name": "find", "arguments": {"pattern": "a*"}}, {"name": "find", "arguments": {"pattern": "sub/*"}}, {"name": "find", "arguments": {"pattern": "*.md"}}, {"name": "find", "arguments": {"pattern": "c.txt"}}]},
+    {"text": "all done"}
+  ]
+}

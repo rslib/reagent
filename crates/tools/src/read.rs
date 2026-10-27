@@ -2,20 +2,18 @@
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
-use std::io;
+use std::io::{self, BufRead, BufReader, Read as _};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 use serde::Deserialize;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
 use reagent_agent::tool::{
-    Effects, Identity, Object, Repaired, Seen, Tool, ToolOutput, parse_args,
+    EffectClass, Effects, Identity, Object, Repaired, Seen, Tool, ToolOutput, parse_args,
 };
 use reagent_ai::{Text, ToolSpec};
 
+use crate::blocking;
 use crate::repair::{Kind, Touched};
 use crate::resolve;
 
@@ -72,93 +70,131 @@ impl Read {
             return Err("invalid arguments: limit must be at least 1".into());
         }
         let path = resolve(&self.working_dir, &args.path)?;
-        let failed = |error: io::Error| format!("cannot read {}: {error}", path.display());
-
-        let mut file = tokio::fs::File::open(&path)
-            .await
-            .map_err(|error| open_error(&path, &error))?;
-        // The identity, the size and the modified time come from the open
-        // handle's own metadata, so they name the file this read actually saw.
-        // On unix the identity is the device and inode already in the
-        // metadata, so it costs no syscall and no allocation.
-        let metadata = file.metadata().await.map_err(failed)?;
-        let key = Identity::new(&metadata, &path).await;
-        let size = metadata.len();
-        let modified = metadata.modified().ok();
-        let mut probe = [0_u8; BINARY_PROBE];
-        let probe_len = file.read(&mut probe).await.map_err(failed)?;
-        if probe[..probe_len].contains(&0) {
-            return Err(format!(
-                "{} is a binary file; read only text files",
-                path.display()
-            ));
-        }
-        // The probe bytes are the start of the file, so the reader takes them
-        // from the slice already in hand instead of seeking back for them.
-        // When the probe holds every byte the file has, the read needs no
-        // read-ahead buffer. A short read alone proves no end of file (NFS and
-        // FUSE return them), so the probe must match the file's size.
-        let whole = metadata.is_file() && probe_len as u64 == metadata.len();
-        let mut feed = if whole {
-            LineFeed::new(Source::Probe(&probe[..probe_len]), Some(probe_len as u64))
-        } else {
-            LineFeed::new(Source::File(reader(&probe[..probe_len], file)), None)
-        };
-
-        let mut number: u64 = 1;
-        while number < offset {
-            if !feed.skip().await.map_err(failed)? {
-                break;
-            }
-            number += 1;
-        }
-
-        let mut out = String::with_capacity(out_capacity(size));
-        let mut printed = 0;
-        while printed < limit && out.len() < BYTE_CAP {
-            if !feed.push_next(&mut out, number).await.map_err(failed)? {
-                break;
-            }
-            number += 1;
-            printed += 1;
-        }
-        if printed == 0 {
-            let text = match number - 1 {
-                0 => format!("{} is empty", path.display()),
-                lines => format!(
-                    "{} has {lines} line(s); offset={offset} is past the end",
-                    path.display()
-                ),
-            };
-            return Ok(ReadOut {
-                text,
-                seen: None,
-                object: read_object(offset, offset.saturating_sub(1), None),
-            });
-        }
-        let more = feed.has_more().await.map_err(failed)?;
-        if more {
-            let rest = size.saturating_sub(feed.consumed);
-            out.push_str(&format!("[{rest} more bytes; use offset={number}]\n"));
-        }
-        let start = offset;
-        let end = number - 1;
-        let object = read_object(start, end, more.then_some(number));
-        let seen = Seen {
+        let loaded = blocking::run(move || read_file(path, offset, limit)).await?;
+        // On unix the identity is the device and inode already in the metadata
+        // the job returned, so it costs no syscall and no allocation.
+        let key = Identity::new(&loaded.metadata, &loaded.path).await;
+        let size = loaded.metadata.len();
+        let modified = loaded.metadata.modified().ok();
+        let seen = loaded.shown.map(|shown| Seen {
             path: Text::from(args.path.as_ref()),
             key,
-            start,
-            end,
+            start: shown.start,
+            end: shown.end,
             size,
             modified,
-            cut: feed.cut,
-        };
+            cut: shown.cut,
+        });
         Ok(ReadOut {
-            text: out,
-            seen: Some(seen),
-            object,
+            text: loaded.text,
+            seen,
+            object: loaded.object,
         })
     }
+}
+
+/// The file work of one read, in the one blocking job it runs in: the open,
+/// the metadata, the probe and every line it prints.
+#[expect(clippy::disallowed_types, reason = "runs inside spawn_blocking")]
+fn read_file(path: PathBuf, offset: u64, limit: usize) -> Result<Loaded, String> {
+    let failed = |error: io::Error| format!("cannot read {}: {error}", path.display());
+    let mut file = std::fs::File::open(&path).map_err(|error| open_error(&path, &error))?;
+    // The size and the modified time, which the re-read note keeps, come from
+    // the open handle's own metadata: they name the file this read saw.
+    let metadata = file.metadata().map_err(failed)?;
+    let size = metadata.len();
+    let mut probe = [0_u8; BINARY_PROBE];
+    let probe_len = file.read(&mut probe).map_err(failed)?;
+    if probe[..probe_len].contains(&0) {
+        return Err(format!(
+            "{} is a binary file; read only text files",
+            path.display()
+        ));
+    }
+    // The probe bytes are the start of the file, so the reader takes them
+    // from the slice already in hand instead of seeking back for them.
+    // When the probe holds every byte the file has, the read needs no
+    // read-ahead buffer. A short read alone proves no end of file (NFS and
+    // FUSE return them), so the probe must match the file's size.
+    let whole = metadata.is_file() && probe_len as u64 == size;
+    let mut held: &[u8] = &probe[..probe_len];
+    let mut reader;
+    let source: &mut dyn BufRead = if whole {
+        &mut held
+    } else {
+        reader = BufReader::with_capacity(READ_BUF, (&probe[..probe_len]).chain(file));
+        &mut reader
+    };
+    let mut lines = Lines::new(source, whole.then_some(probe_len as u64));
+
+    let mut number: u64 = 1;
+    while number < offset {
+        if !lines.skip().map_err(failed)? {
+            break;
+        }
+        number += 1;
+    }
+
+    let mut out = String::with_capacity(out_capacity(size));
+    let mut printed = 0;
+    while printed < limit && out.len() < BYTE_CAP {
+        if !lines.push_next(&mut out, number).map_err(failed)? {
+            break;
+        }
+        number += 1;
+        printed += 1;
+    }
+    if printed == 0 {
+        let text = match number - 1 {
+            0 => format!("{} is empty", path.display()),
+            shown => format!(
+                "{} has {shown} line(s); offset={offset} is past the end",
+                path.display()
+            ),
+        };
+        return Ok(Loaded {
+            path,
+            metadata,
+            text,
+            shown: None,
+            object: read_object(offset, offset.saturating_sub(1), None),
+        });
+    }
+    let more = lines.has_more().map_err(failed)?;
+    if more {
+        let rest = size.saturating_sub(lines.consumed);
+        out.push_str(&format!("[{rest} more bytes; use offset={number}]\n"));
+    }
+    let end = number - 1;
+    let object = read_object(offset, end, more.then_some(number));
+    Ok(Loaded {
+        path,
+        metadata,
+        text: out,
+        shown: Some(Shown {
+            start: offset,
+            end,
+            cut: lines.cut,
+        }),
+        object,
+    })
+}
+
+/// What the job of one read produced: the file it opened and the state it saw,
+/// the text for the model, the lines it showed, and the object a script reads.
+struct Loaded {
+    path: PathBuf,
+    metadata: std::fs::Metadata,
+    text: String,
+    shown: Option<Shown>,
+    object: Object,
+}
+
+/// The lines one read showed.
+struct Shown {
+    start: u64,
+    end: u64,
+    cut: bool,
 }
 
 /// What one read produced: the text for the model, the lines it showed, and
@@ -214,6 +250,10 @@ impl Tool for Read {
         true
     }
 
+    fn effect(&self) -> EffectClass {
+        EffectClass::Read
+    }
+
     fn returns(&self) -> &'static str {
         "{output, start, end, next_offset?}"
     }
@@ -249,54 +289,10 @@ impl Tool for Read {
     }
 }
 
-/// The reader around the file, buffered so that skipping lines reads the file
-/// in `READ_BUF` pieces.
-fn reader<R: AsyncRead + Unpin>(probe: &[u8], file: R) -> BufReader<tokio::io::Chain<&[u8], R>> {
-    BufReader::with_capacity(READ_BUF, probe.chain(file))
-}
-
-/// The bytes a read looks at: the probe alone when it holds the whole file, or
-/// the probe and then the file.
-enum Source<'a, R> {
-    /// A whole file, already in the probe, so it needs no buffer of its own.
-    Probe(&'a [u8]),
-    /// The probe, then the rest of the file.
-    File(BufReader<tokio::io::Chain<&'a [u8], R>>),
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for Source<'_, R> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Probe(probe) => Pin::new(probe).poll_read(cx, buf),
-            Self::File(file) => Pin::new(file).poll_read(cx, buf),
-        }
-    }
-}
-
-impl<R: AsyncRead + Unpin> AsyncBufRead for Source<'_, R> {
-    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
-        match self.get_mut() {
-            Self::Probe(probe) => Pin::new(probe).poll_fill_buf(cx),
-            Self::File(file) => Pin::new(file).poll_fill_buf(cx),
-        }
-    }
-
-    fn consume(self: Pin<&mut Self>, amount: usize) {
-        match self.get_mut() {
-            Self::Probe(probe) => Pin::new(probe).consume(amount),
-            Self::File(file) => Pin::new(file).consume(amount),
-        }
-    }
-}
-
-/// Streams a file line by line from the reader's own buffer, keeping at most
+/// Streams a file line by line from the reader's buffer, keeping at most
 /// `LINE_CAP` bytes of a line even when the line is huge.
-struct LineFeed<R> {
-    reader: R,
+struct Lines<'a> {
+    reader: &'a mut dyn BufRead,
     consumed: u64,
     /// The bytes the file holds, when the probe holds all of them.
     end: Option<u64>,
@@ -307,9 +303,9 @@ struct LineFeed<R> {
     cut: bool,
 }
 
-impl<R: AsyncBufRead + Unpin> LineFeed<R> {
-    fn new(reader: R, end: Option<u64>) -> Self {
-        Self {
+impl Lines<'_> {
+    fn new(reader: &mut dyn BufRead, end: Option<u64>) -> Lines<'_> {
+        Lines {
             reader,
             consumed: 0,
             end,
@@ -325,9 +321,9 @@ impl<R: AsyncBufRead + Unpin> LineFeed<R> {
 
     /// Reads the next line and appends it to `out` as `{number}\t{text}\n`.
     /// Returns false at the end of the stream.
-    async fn push_next(&mut self, out: &mut String, number: u64) -> io::Result<bool> {
+    fn push_next(&mut self, out: &mut String, number: u64) -> io::Result<bool> {
         self.line.reset();
-        if !self.scan(true).await? {
+        if !self.scan(true)? {
             return Ok(false);
         }
         self.line.push_to(out, number);
@@ -336,26 +332,26 @@ impl<R: AsyncBufRead + Unpin> LineFeed<R> {
     }
 
     /// Skips the next line. Returns false at the end of the stream.
-    async fn skip(&mut self) -> io::Result<bool> {
-        self.scan(false).await
+    fn skip(&mut self) -> io::Result<bool> {
+        self.scan(false)
     }
 
-    async fn has_more(&mut self) -> io::Result<bool> {
+    fn has_more(&mut self) -> io::Result<bool> {
         if self.ended() {
             return Ok(false);
         }
-        Ok(!self.reader.fill_buf().await?.is_empty())
+        Ok(!self.reader.fill_buf()?.is_empty())
     }
 
     /// Consumes one line, copying it into the line buffer when `keep`. Returns
     /// false when the stream had already ended.
-    async fn scan(&mut self, keep: bool) -> io::Result<bool> {
+    fn scan(&mut self, keep: bool) -> io::Result<bool> {
         if self.ended() {
             return Ok(false);
         }
         let mut any = false;
         loop {
-            let buf = self.reader.fill_buf().await?;
+            let buf = self.reader.fill_buf()?;
             if buf.is_empty() {
                 return Ok(any);
             }
@@ -462,9 +458,7 @@ pub fn spec() -> ToolSpec {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::pin::Pin;
     use std::rc::Rc;
-    use std::task::{Context, Poll};
 
     use super::*;
 
@@ -758,26 +752,22 @@ mod tests {
         reads: Rc<Cell<usize>>,
     }
 
-    impl AsyncRead for Counted {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
+    impl io::Read for Counted {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             self.reads.set(self.reads.get() + 1);
-            let take = (self.bytes.len() - self.at).min(buf.remaining());
+            let take = (self.bytes.len() - self.at).min(buf.len());
             let end = self.at + take;
-            buf.put_slice(&self.bytes[self.at..end]);
+            buf[..take].copy_from_slice(&self.bytes[self.at..end]);
             self.at = end;
-            Poll::Ready(Ok(()))
+            Ok(take)
         }
     }
 
     /// Skipping lines must read the file in `READ_BUF` pieces: the 8 KB
     /// default would cost eight times as many read hops on a network file
     /// system. The reads that reach the file are counted, not the lines.
-    #[tokio::test]
-    async fn skipping_lines_reads_the_file_in_large_buffers() {
+    #[test]
+    fn skipping_lines_reads_the_file_in_large_buffers() {
         let line = format!("{}\n", "x".repeat(99));
         let text = line.repeat(1000);
         let size = text.len();
@@ -787,9 +777,10 @@ mod tests {
             at: 0,
             reads: Rc::clone(&reads),
         };
-        let mut feed = LineFeed::new(reader(b"", file), None);
+        let mut reader = BufReader::with_capacity(READ_BUF, (&b""[..]).chain(file));
+        let mut feed = Lines::new(&mut reader, None);
         let mut lines = 0;
-        while feed.skip().await.unwrap() {
+        while feed.skip().unwrap() {
             lines += 1;
         }
         assert_eq!(lines, 1000);
@@ -935,6 +926,59 @@ mod tests {
         assert_eq!(field(&object, "start"), Some(1));
         assert_eq!(field(&object, "end"), Some(0));
         assert_eq!(object.fields.get("next_offset"), None);
+    }
+
+    /// A three-line file: the open, the metadata and the probe are one job.
+    #[tokio::test]
+    async fn one_hop_read_small() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "a\nb\nc\n").await;
+        crate::blocking::reset_hops();
+        let output = tool(&tmp)
+            .run(r#"{"path":"f.txt"}"#, &CancellationToken::new())
+            .await;
+        assert_eq!(output.content.as_ref(), "1\ta\n2\tb\n3\tc\n");
+        assert_eq!(crate::blocking::hops(), 1);
+    }
+
+    /// A file over `READ_BUF`: the skip and the lines it prints are read in
+    /// the same job that opened the file.
+    #[tokio::test]
+    async fn one_hop_read_large() {
+        let tmp = tempfile::tempdir().unwrap();
+        let line = format!("{}\n", "x".repeat(99));
+        write(&tmp, "big.txt", &line.repeat(1000)).await;
+        crate::blocking::reset_hops();
+        let output = tool(&tmp)
+            .run(
+                r#"{"path":"big.txt","offset":500,"limit":3}"#,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.starts_with("500\t"), "{}", output.content);
+        assert_eq!(crate::blocking::hops(), 1);
+    }
+
+    /// A missing file fails in the one job, with the same error text.
+    #[tokio::test]
+    async fn one_hop_read_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::blocking::reset_hops();
+        let output = tool(&tmp)
+            .run(r#"{"path":"nope.txt"}"#, &CancellationToken::new())
+            .await;
+        let missing = tmp.path().join("nope.txt");
+        assert!(output.is_error);
+        assert!(
+            output.content.starts_with(&format!(
+                "cannot open {}: the file does not exist",
+                missing.display()
+            )),
+            "{}",
+            output.content
+        );
+        assert_eq!(crate::blocking::hops(), 1);
     }
 
     #[test]

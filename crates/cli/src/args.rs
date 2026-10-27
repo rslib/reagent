@@ -139,11 +139,39 @@ impl Wire {
     }
 }
 
+/// What a run does with its session log.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Sessions {
+    /// Start a new session; the default.
+    #[default]
+    New,
+    /// Write no session log at all.
+    None,
+    /// Continue the newest session of the working folder.
+    Continue,
+    /// Resume the session a reference names, or list the sessions when the
+    /// reference is absent.
+    Resume(Option<String>),
+    /// Start a new session forked from a reference after one of its turns.
+    Fork {
+        /// The session to fork: an id prefix or a session folder.
+        reference: String,
+        /// The turn to fork after, or the last one when absent.
+        turn: Option<u64>,
+    },
+}
+
 /// The parsed command line.
 #[derive(Debug)]
 pub struct Args {
     /// The task the agent should complete, or where to read it from.
-    pub task: TaskSource,
+    pub task: Option<TaskSource>,
+    /// What the run does with the session store.
+    pub sessions: Sessions,
+    /// Whether `--model` named the model.
+    pub model_given: bool,
+    /// Whether `--provider` named the provider wire.
+    pub provider_given: bool,
     /// Print one JSON object per event.
     pub json: bool,
     /// The provider model id.
@@ -179,6 +207,8 @@ pub struct Args {
     pub deadline: Option<u64>,
     /// The `[codemode]` table, merged from the config files.
     pub codemode: reagent_config::CodemodeSettings,
+    /// The `[session]` table, merged from the config files.
+    pub session: reagent_config::SessionSettings,
     /// The tools the run offers, resolved and sorted.
     pub tools: Vec<String>,
     /// The MCP servers the run starts, picked and sorted by name.
@@ -505,6 +535,21 @@ pub fn parse() -> Result<Outcome, String> {
     parse_from(lexopt::Parser::from_env(), &load_settings)
 }
 
+/// Parses the process arguments again with `model` named.
+///
+/// A run that continues a session takes the provider and the model that
+/// session ran with, and naming them here resolves them exactly as a `--model`
+/// flag does: the provider table or preset, its endpoint, key variable, headers
+/// and auth. A caller names them only when the arguments name no model,
+/// provider or profile of their own. It reads the config files, so call it
+/// inside `spawn_blocking`.
+pub fn reparse(model: &str) -> Result<Outcome, String> {
+    let argv = std::env::args_os()
+        .skip(1)
+        .chain(["--model".into(), model.into()]);
+    parse_from(lexopt::Parser::from_args(argv), &load_settings)
+}
+
 /// Checks the policy and tool lists of `layer`, expanding `all` and `none`,
 /// and names the file when one is wrong.
 fn check_lists(layer: &mut Layer) -> Result<(), String> {
@@ -531,6 +576,16 @@ fn check_lists(layer: &mut Layer) -> Result<(), String> {
     Ok(())
 }
 
+/// The `[session]` limits the config files of `cwd` set, read the way a run
+/// reads them: the global file first, then the profile the environment names.
+///
+/// Reading the files blocks, so call it in `spawn_blocking`.
+pub fn session_limits(cwd: &Path) -> Result<reagent_config::SessionSettings, String> {
+    let profile = profile_from(None, std::env::var("REAGENT_PROFILE").ok());
+    let (settings, _, _) = load_settings(cwd, profile.as_deref())?;
+    Ok(settings.session)
+}
+
 /// Loads the config files for `cwd` and the profile `profile`, checks their
 /// lists, merges them, parses their permission rules and reads their servers.
 fn load_settings(cwd: &Path, profile: Option<&str>) -> Result<Loaded, String> {
@@ -542,7 +597,7 @@ fn load_settings(cwd: &Path, profile: Option<&str>) -> Result<Loaded, String> {
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "the config is read before the runtime starts"
+    reason = "the config is read before the runtime starts or in spawn_blocking"
 )]
 fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path)
@@ -782,10 +837,58 @@ type Loaded = (Settings, Rules, McpConfig);
 /// working folder and a profile.
 type LoadSettings<'a> = dyn Fn(&Path, Option<&str>) -> Result<Loaded, String> + 'a;
 
+/// Sets the session choice, refusing a second one: the four flags exclude
+/// each other.
+fn choose(sessions: &mut Sessions, picked: Sessions) -> Result<(), String> {
+    if !matches!(sessions, Sessions::New) {
+        return Err("use only one of -c, -r, --fork and --no-session".into());
+    }
+    *sessions = picked;
+    Ok(())
+}
+
+/// Sets the reference of a `-r` whose value is not attached to the flag.
+///
+/// `-r` alone asks for the list, and the argument after it names the session,
+/// so the two are one choice rather than a second one.
+fn resume_ref(sessions: &mut Sessions, reference: String) -> Result<(), String> {
+    if matches!(sessions, Sessions::Resume(None)) {
+        *sessions = Sessions::Resume(Some(reference));
+        return Ok(());
+    }
+    choose(sessions, Sessions::Resume(Some(reference)))
+}
+
+/// Splits a `--fork` value into its reference and the turn to fork after.
+fn fork_ref(text: &str) -> Result<(String, Option<u64>), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(bad("--fork"));
+    }
+    match text.rsplit_once('@') {
+        Some((reference, turn))
+            if !reference.is_empty()
+                && !turn.is_empty()
+                && turn.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            Ok((
+                reference.to_string(),
+                Some(turn.parse().map_err(|_| bad("--fork"))?),
+            ))
+        }
+        _ => Ok((text.to_string(), None)),
+    }
+}
+
 /// Parses `args` (the arguments after the program name) into an outcome.
 /// `load` reads the settings for the working directory; a flag beats them.
 fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome, String> {
     let mut task: Option<TaskSource> = None;
+    let mut sessions = Sessions::New;
+    let mut model_given = false;
+    let mut provider_given = false;
+    // A `--resume` whose reference is the next argument.
+    let mut resume_value = false;
     let mut json = false;
     let mut model = None;
     let mut provider = None;
@@ -830,13 +933,39 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
                     .value()
                     .map_err(|_| "missing value for --model".to_string())?;
                 model = Some(value.into_string().map_err(|_| bad("--model"))?);
+                model_given = true;
             }
+            lexopt::Arg::Short('c') | lexopt::Arg::Long("continue") => {
+                choose(&mut sessions, Sessions::Continue)?;
+            }
+            lexopt::Arg::Short('r') | lexopt::Arg::Long("resume") => {
+                match parser.optional_value() {
+                    Some(value) => {
+                        let reference = value.into_string().map_err(|_| bad("--resume"))?;
+                        resume_ref(&mut sessions, reference)?;
+                    }
+                    None => {
+                        resume_value = true;
+                        choose(&mut sessions, Sessions::Resume(None))?;
+                    }
+                }
+            }
+            lexopt::Arg::Long("fork") => {
+                let value = parser
+                    .value()
+                    .map_err(|_| "missing value for --fork".to_string())?;
+                let text = value.into_string().map_err(|_| bad("--fork"))?;
+                let (reference, turn) = fork_ref(&text)?;
+                choose(&mut sessions, Sessions::Fork { reference, turn })?;
+            }
+            lexopt::Arg::Long("no-session") => choose(&mut sessions, Sessions::None)?,
             lexopt::Arg::Long("provider") => {
                 let value = parser
                     .value()
                     .map_err(|_| "missing value for --provider".to_string())?;
                 let text = value.into_string().map_err(|_| bad("--provider"))?;
                 provider = Some(parse_provider(&text)?);
+                provider_given = true;
             }
             lexopt::Arg::Long("base-url") => {
                 let value = parser
@@ -923,6 +1052,11 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
                 profile = Some(value.into_string().map_err(|_| bad("--profile"))?);
             }
             lexopt::Arg::Long("refresh") => refresh = true,
+            lexopt::Arg::Value(value) if resume_value => {
+                resume_value = false;
+                let reference = value.into_string().map_err(|_| bad("--resume"))?;
+                resume_ref(&mut sessions, reference)?;
+            }
             lexopt::Arg::Value(value) if models.is_some() || (at_start && value == "models") => {
                 let text = value.into_string().map_err(|_| bad("argument"))?;
                 match &mut models {
@@ -976,12 +1110,17 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
     if refresh {
         return Err("--refresh needs the models command".into());
     }
-    let Some(task) = task else {
+    // Only a continue or a resume may run with no message: the run answers
+    // the calls its ledger left open.
+    let open = matches!(sessions, Sessions::Continue | Sessions::Resume(_));
+    if task.is_none() {
         if json {
             return Err("the --json flag needs a task; use -p <task>".into());
         }
-        return Err("missing task; use -p <task>".into());
-    };
+        if !open {
+            return Err("missing task; use -p <task>".into());
+        }
+    }
     let cwd = cwd.unwrap_or_else(|| PathBuf::from("."));
     let (settings, rules, servers) = load(&cwd, profile.as_deref())?;
     check_provider_names(&settings)?;
@@ -1132,6 +1271,9 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
 
     Ok(Outcome::Run(Box::new(Args {
         task,
+        sessions,
+        model_given,
+        provider_given,
         json,
         model: model_id,
         provider,
@@ -1160,6 +1302,7 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
         }),
         deadline,
         codemode: settings.codemode,
+        session: settings.session,
         tools,
         mcp_servers,
         warn_many_direct: servers.warn_many_direct,

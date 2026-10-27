@@ -15,7 +15,7 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Object, Reroute, Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{EffectClass, Object, Reroute, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
 use crate::process_group::{self, GroupGuard};
@@ -692,6 +692,10 @@ impl Tool for Bash {
 
     fn main_arg(&self) -> Option<&'static str> {
         Some("command")
+    }
+
+    fn effect(&self) -> EffectClass {
+        EffectClass::LocalReversible
     }
 
     fn returns(&self) -> &'static str {

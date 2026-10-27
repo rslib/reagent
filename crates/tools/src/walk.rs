@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::blocking;
 use crate::gitignore::{self, Chain};
 
 /// Folders that are never entered, ignored or not.
@@ -106,26 +107,31 @@ struct DirOutput {
 /// Lists the files under `root` that git would not ignore: entries named in
 /// [`SKIP_DIRS`] or `skip` and entries that a `.gitignore` or the global excludes
 /// match are left out, and ignored folders are never entered. Symbolic links
-/// are skipped, as ripgrep does by default.
+/// are skipped, as ripgrep does by default. A `root` that is not a folder has
+/// no files.
 pub(crate) async fn walk(
     root: &Path,
     skip: &Skip,
     cancel: &CancellationToken,
 ) -> Result<Listing, Cancelled> {
-    let global = match gitignore::global_excludes_path() {
-        Some(path) => tokio::fs::read(path).await.ok(),
-        None => None,
+    Ok(walk_folder(root, skip, cancel).await?.unwrap_or_default())
+}
+
+/// [`walk`], and `None` when `root` is not a folder: the check is the walk's
+/// first job, so a caller pays no second round trip to name a file mistake.
+pub(crate) async fn walk_folder(
+    root: &Path,
+    skip: &Skip,
+    cancel: &CancellationToken,
+) -> Result<Option<Listing>, Cancelled> {
+    let first = {
+        let (root, skip) = (root.to_path_buf(), skip.clone());
+        blocking::run(move || root_dir(root, skip)).await
     };
-    let mut ignores = global.and_then(|text| Chain::add(None, b"", &text));
-    for (above, text) in ancestor_ignores(root).await {
-        ignores = Chain::add_above(ignores, &above, &text);
-    }
-    let mut queue = VecDeque::from([Dir {
-        skip: skip.clone(),
-        path: root.to_path_buf(),
-        rel: Vec::new(),
-        ignores,
-    }]);
+    let Some(first) = first else {
+        return Ok(None);
+    };
+    let mut queue = VecDeque::from([first]);
     let mut tasks = JoinSet::new();
     let mut listing = Listing::default();
     loop {
@@ -133,6 +139,8 @@ pub(crate) async fn walk(
             && let Some(dir) = queue.pop_front()
         {
             tasks.spawn_blocking(move || read_dir(dir));
+            #[cfg(test)]
+            blocking::count_hop();
         }
         let next = tokio::select! {
             biased;
@@ -161,32 +169,46 @@ pub(crate) async fn walk(
         }
     }
     listing.files.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
-    Ok(listing)
+    Ok(Some(listing))
+}
+
+/// The first directory of a walk, with the ignore chain that applies to it, or
+/// `None` when `root` is not a folder. This is the walk's first blocking job:
+/// the root's stat and every ignore file above it happen here, once.
+#[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]
+fn root_dir(root: PathBuf, skip: Skip) -> Option<Dir> {
+    if !std::fs::metadata(&root).is_ok_and(|metadata| metadata.is_dir()) {
+        return None;
+    }
+    let global = gitignore::global_excludes_path().and_then(|path| std::fs::read(path).ok());
+    let mut ignores = global.and_then(|text| Chain::add(None, b"", &text));
+    for (above, text) in ancestor_ignores(&root) {
+        ignores = Chain::add_above(ignores, &above, &text);
+    }
+    Some(Dir {
+        skip,
+        path: root,
+        rel: Vec::new(),
+        ignores,
+    })
 }
 
 /// The `.gitignore` files of the folders above `root`, up to the folder that
 /// holds `.git`, outermost first, each with `root`'s path relative to its
 /// folder. Git applies them to a walk of a subfolder too. Outside a
 /// repository there are none.
-async fn ancestor_ignores(root: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let root = tokio::fs::canonicalize(root)
-        .await
-        .unwrap_or_else(|_| root.to_path_buf());
-    if tokio::fs::try_exists(root.join(".git"))
-        .await
-        .unwrap_or(false)
-    {
+#[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]
+fn ancestor_ignores(root: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if root.join(".git").try_exists().unwrap_or(false) {
         return Vec::new();
     }
     let mut found = Vec::new();
     for dir in root.ancestors().skip(1) {
-        if let Ok(text) = tokio::fs::read(dir.join(".gitignore")).await {
+        if let Ok(text) = std::fs::read(dir.join(".gitignore")) {
             found.push((dir.to_path_buf(), text));
         }
-        if tokio::fs::try_exists(dir.join(".git"))
-            .await
-            .unwrap_or(false)
-        {
+        if dir.join(".git").try_exists().unwrap_or(false) {
             return found
                 .into_iter()
                 .rev()

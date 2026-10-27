@@ -1,6 +1,7 @@
 //! The agent loop: stream a reply, run its tool calls, repeat.
 
 use futures_util::{FutureExt, StreamExt};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -15,11 +16,13 @@ use crate::batch::run_all_guarded_seen;
 use crate::compact::Compact;
 use crate::event::{Event, TurnEndReason};
 use crate::guard::Guard;
+use crate::journal::Journal;
+use crate::journal::resume::PendingCall;
+use crate::journal::state::State;
 use crate::mask::Mask;
 use crate::policy::{PolicyRun, TurnPolicy, TurnView};
 use crate::reread::Ledger;
-use crate::session::Session;
-use crate::tool::Registry;
+use crate::tool::{EffectClass, Registry};
 use crate::workspace::Workspace;
 
 /// Renames a tool call whose id an earlier call already used, so each call
@@ -95,6 +98,13 @@ pub struct Agent<'a> {
     fingerprint: Option<u64>,
     provider_name: Text,
     model: Text,
+    /// How many compactions replaced the history so far, for the base record.
+    compactions: u32,
+    /// The turns the last run of this loop made.
+    completed: u32,
+    /// The number this run gives its first turn: a run that continues a
+    /// session numbers its turns after the ones the session already has.
+    first_turn: u64,
 }
 
 impl<'a> Agent<'a> {
@@ -120,6 +130,9 @@ impl<'a> Agent<'a> {
             fingerprint: None,
             provider_name: Text::from(provider.name()),
             model: Text::from(config.model.as_str()),
+            compactions: 0,
+            completed: 0,
+            first_turn: 1,
             config,
         }
     }
@@ -149,8 +162,21 @@ impl<'a> Agent<'a> {
             fingerprint: None,
             provider_name: Text::from(provider.name()),
             model: Text::from(config.model.as_str()),
+            compactions: 0,
+            completed: 0,
+            first_turn: 1,
             config,
         }
+    }
+
+    /// Numbers the first turn of this run `first`.
+    ///
+    /// A resumed run gives the turn after the last one the session recorded,
+    /// so a `TURN_END` names the turn of the session and not of the run.
+    #[must_use]
+    pub fn with_first_turn(mut self, first: u64) -> Self {
+        self.first_turn = first.max(1);
+        self
     }
 
     /// Turns on observation masking: before each request, old large tool
@@ -199,15 +225,17 @@ impl<'a> Agent<'a> {
     /// Runs the conversation until a reply has no tool call, a cap is reached
     /// or the run is cancelled.
     ///
-    /// Appends the assistant replies and tool results to `history`, records one
-    /// [`crate::session::Entry`] per message in `session` (when given, flushed
-    /// at each turn end) and reports streamed [`Event`]s on `events`. After
-    /// each normal turn the configured policies run and may inject a message
-    /// or stop the run; with no policies the loop acts exactly as without them.
+    /// Appends the assistant replies and tool results to `history`, records
+    /// every message in `journal` (when given: a base at the start, a synced
+    /// call start before each tool that is not a read, a commit after each
+    /// result, and a synced turn end) and reports streamed [`Event`]s on
+    /// `events`. After each normal turn the configured policies run and may
+    /// inject a message or stop the run; with no policies the loop acts
+    /// exactly as without them.
     pub async fn run(
         &mut self,
         history: &mut Vec<Message>,
-        mut session: Option<&mut Session>,
+        mut journal: Option<&mut Journal>,
         events: &mpsc::Sender<Event>,
     ) {
         let started = std::time::Instant::now();
@@ -217,6 +245,20 @@ impl<'a> Agent<'a> {
             Some(workspace) if !self.policies.is_empty() => workspace.fingerprint().await,
             _ => None,
         };
+        // A new session starts with a base: the state and the history. A
+        // resumed run's parent part holds the history already, so it writes
+        // only what came after it (a new message, an interrupted result).
+        if let Some(journal) = journal.as_mut()
+            && let Err(error) = match journal.recorded() {
+                None => write_base(journal, self, history),
+                Some(recorded) => write_after(journal, &history[recorded.min(history.len())..]),
+            }
+        {
+            let error = journal_error(&error);
+            emit(events, &self.token, Event::Error(error)).await;
+            emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
+            return;
+        }
         let mut run_reason = loop {
             if self.config.max_turns.is_some_and(|cap| turns >= cap) {
                 break TurnEndReason::MaxTurns;
@@ -226,15 +268,28 @@ impl<'a> Agent<'a> {
             }
             turns += 1;
 
-            if let (Some(compact), Some(archive)) = (&self.compact, &self.archive)
-                && let Some(done) = compact.apply(history, archive).await
-            {
+            let compacted = match (&self.compact, &self.archive) {
+                (Some(compact), Some(archive)) => compact.apply(history, archive).await,
+                _ => None,
+            };
+            if let Some(done) = compacted {
                 let event = Event::Compacted {
                     before: done.before,
                     replaced: done.replaced as u32,
                     bytes: done.bytes as u32,
                 };
-                if emit(events, &self.token, event).await {
+                let closed = emit(events, &self.token, event).await;
+                self.compactions += 1;
+                // A compaction replaced the history: a base records the state
+                // and the history the run continues with.
+                if let Some(journal) = journal.as_mut()
+                    && let Err(error) = write_base(journal, self, history)
+                {
+                    let error = journal_error(&error);
+                    emit(events, &self.token, Event::Error(error)).await;
+                    break TurnEndReason::Error;
+                }
+                if closed {
                     break TurnEndReason::Cancelled;
                 }
             }
@@ -243,13 +298,15 @@ impl<'a> Agent<'a> {
             {
                 archive.flush().await;
             }
-            let mut outcome = self.run_turn(history, &mut session, events).await;
-            // Every turn end flushes, whatever ended the turn.
-            if let Some(session) = session.as_mut()
-                && let Err(error) = session.flush().await
+            let before = history.len();
+            let mut outcome = self.run_turn(history, &mut journal, events).await;
+            // Every turn end records the turn and syncs it, whatever ended it.
+            let usage = turn_usage(&history[before..]);
+            if let Some(journal) = journal.as_mut()
+                && let Err(error) = end_turn(journal, self.turn_number(turns), usage).await
                 && !matches!(outcome, TurnOutcome::Error(_))
             {
-                outcome = TurnOutcome::Error(session_error(&error));
+                outcome = TurnOutcome::Error(journal_error(&error));
             }
             match outcome {
                 TurnOutcome::Stopped(StopReason::MaxTokens)
@@ -257,7 +314,7 @@ impl<'a> Agent<'a> {
                 {
                     max_tokens_streak += 1;
                     outcome = self
-                        .recover_from_max_tokens(history, &mut session, events)
+                        .recover_from_max_tokens(history, &mut journal, events)
                         .await;
                 }
                 TurnOutcome::Continue | TurnOutcome::Finish => max_tokens_streak = 0,
@@ -265,7 +322,7 @@ impl<'a> Agent<'a> {
             }
 
             let (turn_reason, run_end) = self
-                .after_turn(outcome, turns, started, history, &mut session, events)
+                .after_turn(outcome, turns, started, history, &mut journal, events)
                 .await;
             let closed = emit(events, &self.token, Event::TurnEnd(turn_reason)).await;
             if let Some(reason) = run_end {
@@ -279,7 +336,105 @@ impl<'a> Agent<'a> {
         if self.token.is_cancelled() {
             run_reason = TurnEndReason::Cancelled;
         }
+        self.completed = turns;
         emit(events, &self.token, Event::RunEnd(run_reason)).await;
+    }
+
+    /// The turns the last [`Agent::run`] made.
+    pub fn turns(&self) -> u32 {
+        self.completed
+    }
+
+    /// The number of the last turn this run ended, in the session's numbering.
+    ///
+    /// A run that made no turn leaves the turn count where it found it, so a
+    /// caller takes the session's count from here.
+    pub fn last_turn(&self) -> u64 {
+        self.turn_number(self.completed)
+    }
+
+    /// The number of turn `turns` of this run, which counts from 1.
+    fn turn_number(&self, turns: u32) -> u64 {
+        self.first_turn.saturating_sub(1) + u64::from(turns)
+    }
+
+    /// Runs the tool calls of the last assistant message that have no result.
+    ///
+    /// A resumed run calls this before [`Agent::run`]: every call the journal
+    /// found pending is recorded and synced like a turn's, run here, and
+    /// answered in history and in the journal, so the next request carries a
+    /// result for each one. Returns how the calls ended.
+    pub async fn run_pending(
+        &mut self,
+        history: &mut Vec<Message>,
+        journal: &mut Option<&mut Journal>,
+        events: &mpsc::Sender<Event>,
+        pending: &[PendingCall],
+    ) -> TurnEndReason {
+        if pending.is_empty() {
+            return TurnEndReason::EndTurn;
+        }
+        let calls = unanswered(history, pending);
+        if calls.is_empty() {
+            return TurnEndReason::EndTurn;
+        }
+        // The history a resume rebuilt may hold a message the parent part does
+        // not: the interrupted result a crash left is in history but not in the
+        // log. It is written before the results this run makes, so a later
+        // resume reads the history in the order the model saw it.
+        if let Err(error) = write_pending(journal, history) {
+            let error = journal_error(&error);
+            emit(events, &self.token, Event::Error(error)).await;
+            emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
+            return TurnEndReason::Error;
+        }
+        // A call that may change the world is on the disk, synced, before it
+        // runs, exactly as in a turn.
+        if let Err(error) = note_calls(&calls, self.registry, journal).await {
+            for call in &calls {
+                let message = Message::tool_result(call.id.clone(), error.clone(), true);
+                let _ = record_result(message, history, journal);
+            }
+            mark_recorded(journal, history.len());
+            emit(events, &self.token, Event::Error(error)).await;
+            emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
+            return TurnEndReason::Error;
+        }
+        let results =
+            run_all_guarded_seen(&calls, self.registry, self.guard.as_ref(), &self.token).await;
+        // Every result reaches history before any event is sent, so a cancel
+        // or a closed receiver cannot leave a call unanswered.
+        let mut facts: Vec<(usize, Option<Text>)> = Vec::with_capacity(results.len());
+        let mut failure = None;
+        for (result, _seen) in results {
+            facts.push((tool_bytes(&result), tool_error(&result)));
+            if let Some(error) = record_result(result, history, journal) {
+                failure.get_or_insert(error);
+            }
+        }
+        mark_recorded(journal, history.len());
+        if let Some(error) = failure {
+            emit(events, &self.token, Event::Error(error)).await;
+            // The run ends here: the reason the calls ended with is the reason
+            // of the run, so the exit code and the list entry say it failed.
+            emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
+            return TurnEndReason::Error;
+        }
+        for (call, (bytes, error)) in calls.iter().zip(facts) {
+            let event = Event::ToolResult {
+                id: call.id.clone(),
+                is_error: error.is_some(),
+                bytes,
+                error,
+            };
+            if emit(events, &self.token, event).await {
+                return TurnEndReason::Cancelled;
+            }
+        }
+        if self.token.is_cancelled() {
+            return TurnEndReason::Cancelled;
+        }
+        TurnEndReason::EndTurn
     }
 
     /// Maps a turn outcome to its turn-end reason and whether the run stops.
@@ -294,19 +449,19 @@ impl<'a> Agent<'a> {
         index: u32,
         started: std::time::Instant,
         history: &mut Vec<Message>,
-        session: &mut Option<&mut Session>,
+        journal: &mut Option<&mut Journal>,
         events: &mpsc::Sender<Event>,
     ) -> (TurnEndReason, Option<TurnEndReason>) {
         match outcome {
             TurnOutcome::Continue => {
                 let run_end = self
-                    .apply_policies(index, true, started, history, session, events)
+                    .apply_policies(index, true, started, history, journal, events)
                     .await;
                 (TurnEndReason::EndTurn, run_end)
             }
             TurnOutcome::Finish => {
                 let run_end = self
-                    .apply_policies(index, false, started, history, session, events)
+                    .apply_policies(index, false, started, history, journal, events)
                     .await;
                 (TurnEndReason::EndTurn, run_end)
             }
@@ -330,14 +485,14 @@ impl<'a> Agent<'a> {
     async fn recover_from_max_tokens(
         &mut self,
         history: &mut Vec<Message>,
-        session: &mut Option<&mut Session>,
+        journal: &mut Option<&mut Journal>,
         events: &mpsc::Sender<Event>,
     ) -> TurnOutcome {
         let message = Message::user(MAX_TOKENS_NOTE);
-        if let Some(session) = session.as_mut()
-            && let Err(error) = session.append(&message).await
+        if let Some(journal) = journal.as_mut()
+            && let Err(error) = journal.message(&message)
         {
-            return TurnOutcome::Error(session_error(&error));
+            return TurnOutcome::Error(journal_error(&error));
         }
         history.push(message);
         if emit(
@@ -357,17 +512,17 @@ impl<'a> Agent<'a> {
     /// Returns the run-end reason when the run stops after this turn.
     ///
     /// An injected user message (after a no-tool turn) is emitted as a
-    /// `PolicyNote` and, when a session is open, appended to it like any other
+    /// `PolicyNote` and, when a journal is open, appended to it like any other
     /// message. An injected text on a tool turn is appended in place to the
-    /// last tool result, which was already recorded to the session as that
-    /// result; the append is not re-recorded because a session is append-only.
+    /// last tool result, which was already recorded as that result; the
+    /// append is not re-recorded because a journal is append-only.
     async fn apply_policies(
         &mut self,
         index: u32,
         ran_tools: bool,
         started: std::time::Instant,
         history: &mut Vec<Message>,
-        session: &mut Option<&mut Session>,
+        journal: &mut Option<&mut Journal>,
         events: &mpsc::Sender<Event>,
     ) -> Option<TurnEndReason> {
         if self.policies.is_empty() {
@@ -422,10 +577,10 @@ impl<'a> Agent<'a> {
                 append_to_last_tool_result(history, &text);
             } else {
                 let message = Message::user(text.clone());
-                if let Some(session) = session.as_mut()
-                    && let Err(error) = session.append(&message).await
+                if let Some(journal) = journal.as_mut()
+                    && let Err(error) = journal.message(&message)
                 {
-                    emit(events, &self.token, Event::Error(session_error(&error))).await;
+                    emit(events, &self.token, Event::Error(journal_error(&error))).await;
                 }
                 history.push(message);
             }
@@ -438,7 +593,7 @@ impl<'a> Agent<'a> {
     async fn run_turn(
         &mut self,
         history: &mut Vec<Message>,
-        session: &mut Option<&mut Session>,
+        journal: &mut Option<&mut Journal>,
         events: &mpsc::Sender<Event>,
     ) -> TurnOutcome {
         let mut assembler = Assembler::new();
@@ -542,7 +697,7 @@ impl<'a> Agent<'a> {
             Some(StopReason::ToolUse) => {
                 // The reply is recorded once, then borrowed back from history
                 // for its tool calls; no message is cloned.
-                if let Err(error) = record(Message::assistant(message), history, session).await {
+                if let Err(error) = record(Message::assistant(message), history, journal) {
                     return TurnOutcome::Error(error);
                 }
                 let mut calls = match history.last() {
@@ -560,6 +715,17 @@ impl<'a> Agent<'a> {
                     for call in &calls {
                         archive.assign(&call.id);
                     }
+                }
+                // A call that may change the world is on the disk, synced,
+                // before it runs.
+                if let Err(error) = note_calls(&calls, self.registry, journal).await {
+                    // No tool ran: each call still gets an answer in history,
+                    // so a later request never carries a call without one.
+                    for call in &calls {
+                        let message = Message::tool_result(call.id.clone(), error.clone(), true);
+                        let _ = record_result(message, history, journal);
+                    }
+                    return TurnOutcome::Error(error);
                 }
                 let results =
                     run_all_guarded_seen(&calls, self.registry, self.guard.as_ref(), &self.token)
@@ -596,7 +762,7 @@ impl<'a> Agent<'a> {
                     };
                     // A re-read of lines the run already holds keeps its
                     // content and gains the note, before it reaches either the
-                    // session or the model.
+                    // journal or the model.
                     let result = match seen {
                         Some(seen) if !written.contains(&seen.key) => {
                             self.ledger.apply(result, *seen, history.as_slice())
@@ -604,7 +770,7 @@ impl<'a> Agent<'a> {
                         _ => result,
                     };
                     facts.push((tool_bytes(&result), tool_error(&result)));
-                    if let Some(error) = record_result(result, history, session).await {
+                    if let Some(error) = record_result(result, history, journal) {
                         failure.get_or_insert(error);
                     }
                 }
@@ -628,7 +794,7 @@ impl<'a> Agent<'a> {
                 TurnOutcome::Continue
             }
             Some(StopReason::EndTurn) => {
-                match record(Message::assistant(message), history, session).await {
+                match record(Message::assistant(message), history, journal) {
                     Ok(()) => TurnOutcome::Finish,
                     Err(error) => TurnOutcome::Error(error),
                 }
@@ -648,7 +814,7 @@ impl<'a> Agent<'a> {
                 });
                 let reason = reason.unwrap_or(StopReason::Error);
                 if !message.content.is_empty()
-                    && let Err(error) = record(Message::assistant(message), history, session).await
+                    && let Err(error) = record(Message::assistant(message), history, journal)
                 {
                     return TurnOutcome::Error(error);
                 }
@@ -806,42 +972,150 @@ impl<'a> Agent<'a> {
     }
 }
 
-/// Appends `message` to the session, then to history. A session error leaves
+/// Appends `message` to the journal, then to history. A journal error leaves
 /// history unchanged.
-async fn record(
+fn record(
     message: Message,
     history: &mut Vec<Message>,
-    session: &mut Option<&mut Session>,
+    journal: &mut Option<&mut Journal>,
 ) -> Result<(), Text> {
-    if let Some(session) = session.as_mut() {
-        session
-            .append(&message)
-            .await
-            .map_err(|error| session_error(&error))?;
-    }
+    write(journal, &message)?;
     history.push(message);
     Ok(())
 }
 
-/// Records one tool result, which reaches history even when the session write
-/// fails: a failed write must not drop the answer to a call.
+/// Writes one message to the journal, when one is open.
+fn write(journal: &mut Option<&mut Journal>, message: &Message) -> Result<(), Text> {
+    match journal.as_mut() {
+        Some(journal) => journal
+            .message(message)
+            .map_err(|error| journal_error(&error)),
+        None => Ok(()),
+    }
+}
+
+/// Records one tool result, which reaches history even when the journal write
+/// fails: a failed write must not drop the answer to a call. The commit after
+/// the write keeps it on the disk without an fdatasync.
 ///
-/// Returns the session error, if any.
-async fn record_result(
+/// Returns the journal error, if any.
+fn record_result(
     message: Message,
     history: &mut Vec<Message>,
-    session: &mut Option<&mut Session>,
+    journal: &mut Option<&mut Journal>,
 ) -> Option<Text> {
-    let error = match session.as_mut() {
-        Some(session) => session
-            .append(&message)
-            .await
+    let error = match journal.as_mut() {
+        Some(journal) => journal
+            .message(&message)
+            .and_then(|()| journal.commit())
             .err()
-            .map(|error| session_error(&error)),
+            .map(|error| journal_error(&error)),
         None => None,
     };
     history.push(message);
     error
+}
+
+/// Writes a base, then the history the run continues with, and commits both.
+///
+/// A resume starts at the last base, so the records after it must hold every
+/// message the run continues with, not only the ones recorded after it.
+fn write_base(
+    journal: &mut Journal,
+    agent: &Agent<'_>,
+    history: &[Message],
+) -> std::io::Result<()> {
+    let state = State::new(
+        agent.provider_name.as_ref(),
+        agent.model.as_ref(),
+        agent.compactions,
+    );
+    journal.base(&state)?;
+    for message in history {
+        journal.message(message)?;
+    }
+    journal.commit()
+}
+
+/// Writes the messages a resumed run adds to the history it continues with.
+fn write_after(journal: &mut Journal, added: &[Message]) -> std::io::Result<()> {
+    for message in added {
+        journal.message(message)?;
+    }
+    journal.commit()
+}
+
+/// Writes the messages a resumed run rebuilt that its parent part lacks.
+///
+/// The interrupted result a crash left is in the history but not in the log,
+/// and the parent part never wrote it. It goes in before the results this run
+/// makes, so a later resume reads the log in the order the model saw it. A
+/// journal of a new session holds no message yet and writes nothing here.
+fn write_pending(journal: &mut Option<&mut Journal>, history: &[Message]) -> std::io::Result<()> {
+    let Some(journal) = journal.as_mut() else {
+        return Ok(());
+    };
+    let Some(recorded) = journal.recorded() else {
+        return Ok(());
+    };
+    if history.len() <= recorded {
+        return Ok(());
+    }
+    write_after(journal, &history[recorded..])?;
+    crate::journal::resume::mark_recorded(journal, history.len());
+    Ok(())
+}
+
+/// Writes a call start for each call that is not a read, then syncs once.
+///
+/// A call that may change the world is on the disk before it runs, so a crash
+/// leaves its start without a result and the resume reports it instead of
+/// running it again.
+async fn note_calls(
+    calls: &[ToolCall],
+    registry: &Registry,
+    journal: &mut Option<&mut Journal>,
+) -> Result<(), Text> {
+    let Some(journal) = journal.as_mut() else {
+        return Ok(());
+    };
+    let mut wrote = false;
+    for call in calls {
+        let class = registry
+            .resolve(&call.name)
+            .map_or(EffectClass::LocalReversible, |tool| tool.effect());
+        if class == EffectClass::Read {
+            continue;
+        }
+        journal
+            .call_start(&call.id, &call.name, class)
+            .map_err(|error| journal_error(&error))?;
+        wrote = true;
+    }
+    if wrote {
+        journal
+            .sync()
+            .await
+            .map_err(|error| journal_error(&error))?;
+    }
+    Ok(())
+}
+
+/// Writes the end of a turn and waits until it is on the disk.
+async fn end_turn(journal: &mut Journal, turn: u64, usage: Usage) -> std::io::Result<()> {
+    journal.turn_end(turn, usage)?;
+    journal.sync().await
+}
+
+/// The usage of the assistant reply of the messages one turn added.
+fn turn_usage(messages: &[Message]) -> Usage {
+    messages
+        .iter()
+        .find_map(|message| match message {
+            Message::Assistant(reply) => Some(reply.usage),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Borrows the assistant message of the last turn and pairs its tool calls
@@ -888,8 +1162,8 @@ fn append_to_last_tool_result(history: &mut [Message], text: &str) {
     }
 }
 
-fn session_error(error: &std::io::Error) -> Text {
-    Text::from(format!("session write failed: {error}"))
+fn journal_error(error: &std::io::Error) -> Text {
+    Text::from(format!("journal write failed: {error}"))
 }
 
 impl std::fmt::Debug for Agent<'_> {
@@ -1066,6 +1340,42 @@ fn tool_calls(message: &AssistantMessage) -> Vec<ToolCall> {
             _ => None,
         })
         .collect()
+}
+
+/// The calls of the last assistant message that `pending` names and that no
+/// result answers yet, with the arguments the model sent.
+fn unanswered(history: &[Message], pending: &[PendingCall]) -> Vec<ToolCall> {
+    let Some(Message::Assistant(reply)) = history
+        .iter()
+        .rev()
+        .find(|message| matches!(message, Message::Assistant(_)))
+    else {
+        return Vec::new();
+    };
+    let ask = tool_calls(reply);
+    if ask.is_empty() {
+        return Vec::new();
+    }
+    let answered: HashSet<&str> = history
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResult(result) => Some(result.call_id.as_ref()),
+            _ => None,
+        })
+        .collect();
+    ask.into_iter()
+        .filter(|call| {
+            !answered.contains(call.id.as_ref())
+                && pending.iter().any(|want| want.id == call.id.as_ref())
+        })
+        .collect()
+}
+
+/// Tells the journal that the first `len` messages are already recorded.
+fn mark_recorded(journal: &mut Option<&mut Journal>, len: usize) {
+    if let Some(journal) = journal.as_mut() {
+        crate::journal::resume::mark_recorded(journal, len);
+    }
 }
 
 /// Whether `message` ended its turn with reasoning and nothing else.
@@ -1486,17 +1796,55 @@ mod tests {
         assert_eq!(texts, ["ab", "cd"]);
         assert!(matches!(message.content[1], Content::Thinking { .. }));
     }
+    use std::path::Path;
     use std::time::Duration;
 
+    use bytes::Bytes;
     use futures_util::future::BoxFuture;
     use reagent_ai::Error;
     use reagent_ai::fake::FakeProvider;
     use reagent_ai::{Role, ToolSpec};
+    use reagent_store::{Header, Session};
     use serde::Deserialize;
     use serde_json::json;
 
-    use crate::session::Session;
+    use crate::journal::Journal;
+    use crate::journal::record::{self, Record};
     use crate::tool::{Effects, Identity, Seen, Tool, ToolOutput, parse_args};
+
+    /// Opens a journal over `dir`, as a run does.
+    fn journal(dir: &Path) -> Journal {
+        let header = Header::new(
+            "session".into(),
+            reagent_store::paths::now_ms(),
+            None,
+            Bytes::new(),
+        );
+        Journal::create(dir, header).expect("create the journal")
+    }
+
+    /// Every record of the newest part, decoded, read without closing the journal.
+    fn read_records(dir: &Path) -> Vec<Record> {
+        let session = Session::open(dir).expect("open the session");
+        session
+            .records()
+            .map(|record| {
+                let record = record.expect("read a record");
+                record::decode(record.kind, &record.payload).expect("decode a record")
+            })
+            .collect()
+    }
+
+    /// The messages of `records`, in order.
+    fn messages(records: &[Record]) -> Vec<Message> {
+        records
+            .iter()
+            .filter_map(|record| match record {
+                Record::Message(message) => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[derive(Deserialize)]
     struct EchoArgs<'a> {
@@ -2525,9 +2873,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn records_each_message_to_the_session() {
+    async fn records_each_message_to_the_journal() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("run.jsonl");
         let provider = FakeProvider::new(vec![
             tool_reply("call_1", "echo", r#"{"message":"hi"}"#),
             text_reply("done"),
@@ -2535,28 +2882,95 @@ mod tests {
         let registry = registry();
         let (tx, _rx) = mpsc::channel(64);
         let mut history = vec![Message::user("hello")];
-        let mut session = Session::open(&path).await.expect("open session");
+        let mut journal = journal(dir.path());
 
         Agent::new(&provider, &registry, config(), CancellationToken::new())
-            .run(&mut history, Some(&mut session), &tx)
+            .run(&mut history, Some(&mut journal), &tx)
             .await;
-        session.close().await.expect("close session");
+        journal.close().expect("close the journal");
 
-        let text = tokio::fs::read_to_string(&path)
-            .await
-            .expect("read session");
-        let entries: Vec<serde_json::Value> = text
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("parse entry"))
-            .collect();
-        // The session records the three messages the run added: assistant(tool
-        // call), tool result and assistant(done). The seeded user message was
-        // already in history and is not re-recorded.
-        assert_eq!(entries.len(), 3);
-        // A chain of ids: each entry's parent is the previous entry's id.
-        for pair in entries.windows(2) {
-            assert_eq!(pair[1]["parentId"], pair[0]["id"]);
+        // The base re-records the history the run starts with, then the run
+        // records assistant(tool call), the tool result and
+        // assistant(done).
+        let records = read_records(dir.path());
+        assert_eq!(messages(&records), history);
+        let turn_ends = records
+            .iter()
+            .filter(|record| matches!(record, Record::TurnEnd(_)))
+            .count();
+        assert_eq!(turn_ends, 2, "one per turn");
+    }
+
+    /// A tool whose result is too big for a record of the log.
+    struct Huge {
+        spec: ToolSpec,
+    }
+
+    impl Tool for Huge {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
         }
+
+        fn read_only(&self) -> bool {
+            true
+        }
+
+        fn run<'a>(
+            &'a self,
+            _args: &'a str,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, ToolOutput> {
+            Box::pin(async move {
+                // One byte over the largest payload a frame takes, so the
+                // record of this result cannot be written.
+                ToolOutput::ok("x".repeat(reagent_store::frame::MAX_PAYLOAD + 1))
+            })
+        }
+    }
+
+    /// A pending call whose result the log cannot hold ends the run as an
+    /// error, not as a run that finished.
+    #[tokio::test]
+    async fn a_pending_result_the_log_cannot_hold_ends_the_run_as_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut tools = Registry::new();
+        tools.add(Huge {
+            spec: ToolSpec {
+                name: "huge".into(),
+                description: "A result no record can hold.".into(),
+                input_schema: json!({"type": "object"}),
+            },
+        });
+        let provider = FakeProvider::new(Vec::new());
+        let mut assembler = Assembler::new();
+        for event in tool_reply("call_1", "huge", "{}") {
+            assembler.push(event);
+        }
+        let mut history = vec![
+            Message::user("hello"),
+            Message::Assistant(assembler.finish("fake".into(), "fake-model".into())),
+        ];
+        let pending = [PendingCall {
+            id: "call_1".into(),
+            name: "huge".into(),
+            class: Some(EffectClass::Read),
+        }];
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut journal = journal(dir.path());
+
+        let reason = Agent::new(&provider, &tools, config(), CancellationToken::new())
+            .run_pending(&mut history, &mut Some(&mut journal), &tx, &pending)
+            .await;
+
+        assert_eq!(reason, TurnEndReason::Error);
+        // The run ends with the reason of its pending calls, so the exit code
+        // and the list entry say the run failed.
+        let events = drain(tx, &mut rx);
+        assert_eq!(
+            events.last(),
+            Some(&Event::RunEnd(TurnEndReason::Error)),
+            "{events:?}"
+        );
     }
 
     fn two_slow_calls() -> Vec<StreamEvent> {
@@ -2575,8 +2989,8 @@ mod tests {
     /// Runs a reply with two slow calls, cancels while they run and returns
     /// the history and every event the loop sent.
     async fn cancel_two_slow_calls(
-        session: Option<Session>,
-    ) -> (Vec<Message>, Vec<Event>, Option<Session>) {
+        journal: Option<Journal>,
+    ) -> (Vec<Message>, Vec<Event>, Option<Journal>) {
         let provider = FakeProvider::new(vec![two_slow_calls()]);
         let registry = registry_with_slow_tool();
         let (tx, mut rx) = mpsc::channel(64);
@@ -2585,19 +2999,19 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             let mut history = vec![Message::user("hello")];
-            let mut session = session;
+            let mut journal = journal;
             Agent::new(&provider, &registry, config(), token)
-                .run(&mut history, session.as_mut(), &tx)
+                .run(&mut history, journal.as_mut(), &tx)
                 .await;
-            (history, session, tx)
+            (history, journal, tx)
         });
         tokio::time::sleep(Duration::from_millis(10)).await;
         cancellation.cancel();
-        let (history, session, tx) = tokio::time::timeout(Duration::from_millis(100), handle)
+        let (history, journal, tx) = tokio::time::timeout(Duration::from_millis(100), handle)
             .await
             .expect("the loop stops after cancel")
             .expect("runner finishes");
-        (history, drain(tx, &mut rx), session)
+        (history, drain(tx, &mut rx), journal)
     }
 
     #[tokio::test(start_paused = true)]
@@ -2632,20 +3046,23 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_cancelled_tool_turn_flushes_the_session() {
+    #[tokio::test]
+    async fn a_cancelled_tool_turn_syncs_the_journal() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("run.jsonl");
-        let session = Session::open(&path).await.expect("open session");
+        let journal = journal(dir.path());
 
-        let (history, _, session) = cancel_two_slow_calls(Some(session)).await;
+        let (history, _, journal) = cancel_two_slow_calls(Some(journal)).await;
 
-        // Read before close: only the turn-end flush can have written the lines.
-        let text = tokio::fs::read_to_string(&path)
-            .await
-            .expect("read session");
-        assert_eq!(text.lines().count(), history.len() - 1, "{text}");
-        drop(session);
+        // Read before the journal closes: only the turn-end sync can have
+        // written the turn end.
+        let records = read_records(dir.path());
+        assert_eq!(messages(&records), history);
+        let turn_ends = records
+            .iter()
+            .filter(|record| matches!(record, Record::TurnEnd(_)))
+            .count();
+        assert_eq!(turn_ends, 1, "{records:?}");
+        drop(journal);
     }
 
     fn thinking_only_max_tokens() -> Vec<StreamEvent> {

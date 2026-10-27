@@ -17,6 +17,10 @@ async fn run(tmp: &Path, args: &[&str]) -> std::process::Output {
     Command::new(BIN)
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .env_remove("REAGENT_PROFILE")
         .env("TMPDIR", tmp)
         .args(args)

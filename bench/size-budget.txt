@@ -4,10 +4,11 @@
 # line and exits 2 on a platform with no line.
 #
 # Each budget is the measured size plus 5%, rounded up to a multiple of 4096.
-# darwin-arm64: measured 4409552 bytes on 2026-10-26 (MCP client, OAuth login,
-# mcp.toml writer and `reagent mcp`; trunk 8843433 was 4045024), budget 4632576.
-darwin-arm64 4632576
-# linux-x86_64: measured 5464904 bytes on 2026-10-26 (dftu-gate, Debian 13;
-# MCP client, OAuth login, mcp.toml writer and `reagent mcp`; 4964744 before),
-# budget 5738496.
-linux-x86_64 5738496
+# darwin-arm64: measured 5038864 bytes on 2026-10-27 (durable sessions: the
+# store crate with the zstd C library, the journal and the session commands;
+# 4409552 before), budget 5292032.
+darwin-arm64 5292032
+# linux-x86_64: measured 6199368 bytes on 2026-10-27 (dftu-gate, Debian 13;
+# durable sessions: the store crate with the zstd C library, the journal and
+# the session commands; 5464904 before), budget 6512640.
+linux-x86_64 6512640

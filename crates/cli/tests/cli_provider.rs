@@ -95,6 +95,10 @@ async fn run(args: &[&str], env: &[(&str, &str)]) -> Output {
     command.args(args);
     // The user's real config must not change the test.
     command.env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config");
+    command.env(
+        "XDG_STATE_HOME",
+        std::env::temp_dir().join("reagent-test-state"),
+    );
     command.env_remove("ANTHROPIC_API_KEY");
     command.env_remove("OPENAI_API_KEY");
     for (name, value) in env {

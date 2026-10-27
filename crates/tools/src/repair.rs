@@ -18,6 +18,8 @@ use serde_json::{Map, Value};
 
 use reagent_agent::tool::Repaired;
 
+use crate::blocking;
+
 /// The most files [`Touched`] keeps.
 const TOUCHED_CAP: usize = 16;
 /// The most files a missing-path refusal names.
@@ -202,7 +204,8 @@ pub fn repair<'a>(
     }
     // A well-formed absolute path is parsed again only when it names no file.
     Some(Box::pin(async move {
-        match is_file(Path::new(path.as_ref())).await {
+        let probed = PathBuf::from(path.as_ref());
+        match blocking::run(move || is_file(&probed)).await {
             true => Repaired::Keep,
             false => repair_slow(kind, working_dir, touched, args).await,
         }
@@ -238,11 +241,13 @@ async fn repair_slow(kind: Kind, working_dir: &Path, touched: &Touched, args: &s
             }
         }
         Some(given) if kind != Kind::Write && Path::new(&given).is_absolute() => {
-            let given_path = Path::new(&given);
-            let found = match is_file(given_path).await {
+            let given_path = PathBuf::from(&given);
+            let dir = working_dir.to_path_buf();
+            let found = blocking::run(move || match is_file(&given_path) {
                 true => None,
-                false => near_file(working_dir, given_path).await,
-            };
+                false => near_file(&dir, &given_path),
+            })
+            .await;
             if let Some(found) = found {
                 if kind == Kind::Edit && !touched.contains(Path::new(&found)) {
                     return Repaired::Refuse(format!(
@@ -362,7 +367,8 @@ async fn fill_path(
     let [file] = files.as_slice() else {
         return Err(refuse());
     };
-    let Ok(text) = tokio::fs::read_to_string(working_dir.join(file)).await else {
+    let path = working_dir.join(file);
+    let Ok(text) = blocking::run(move || read_text(&path)).await else {
         return Err(refuse());
     };
     let mut olds: Vec<&str> = Vec::new();
@@ -383,6 +389,12 @@ async fn fill_path(
     Ok(shown(file))
 }
 
+/// The text of `path`, read inside a blocking job.
+#[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]
+fn read_text(path: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(path)
+}
+
 /// The part of the absolute `path` after `working_dir`, with or without a
 /// macOS `/private` prefix on either, borrowed; `None` outside it.
 fn inside<'p>(working_dir: &Path, path: &'p Path) -> Option<&'p str> {
@@ -399,21 +411,21 @@ fn shown(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-async fn is_file(path: &Path) -> bool {
-    tokio::fs::metadata(path)
-        .await
-        .is_ok_and(|meta| meta.is_file())
+#[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]
+fn is_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
 /// The one file in `working_dir` that `given` names with a mistyped folder:
 /// the same trailing names, and a leading part within [`MAX_TYPOS`] changed
 /// characters of the working folder. A macOS `/private` prefix counts as no
 /// change. `None` when no tail or more than one tail fits.
-async fn near_file(working_dir: &Path, given: &Path) -> Option<String> {
+#[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]
+fn near_file(working_dir: &Path, given: &Path) -> Option<String> {
     let parts: Vec<Component<'_>> = given.components().collect();
     let roots = [
         working_dir.to_path_buf(),
-        tokio::fs::canonicalize(working_dir).await.ok()?,
+        std::fs::canonicalize(working_dir).ok()?,
     ];
     let mut found: Option<String> = None;
     for cut in 1..parts.len() {
@@ -429,7 +441,7 @@ async fn near_file(working_dir: &Path, given: &Path) -> Option<String> {
         let close = roots
             .iter()
             .any(|root| typos(&unprivate(&head), &unprivate(root)) <= MAX_TYPOS);
-        if !close || !is_file(&working_dir.join(&tail)).await {
+        if !close || !is_file(&working_dir.join(&tail)) {
             continue;
         }
         let tail = tail.to_string_lossy().into_owned();
@@ -494,6 +506,24 @@ mod tests {
             ),
             other => panic!("expected repaired arguments, got {other:?}"),
         }
+    }
+
+    /// A well-formed absolute path that exists is checked in one blocking job.
+    #[tokio::test]
+    async fn one_hop_repair_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("a.rs");
+        tokio::fs::write(&file, "fn a() {}\n").await.unwrap();
+        let touched = Touched::default();
+        let call = serde_json::json!({
+            "path": file.display().to_string(),
+            "old_string": "fn a()",
+            "new_string": "fn b()"
+        });
+        crate::blocking::reset_hops();
+        let repaired = run(Kind::Edit, tmp.path(), &touched, call).await;
+        assert_eq!(repaired, Some(Repaired::Keep));
+        assert_eq!(crate::blocking::hops(), 1);
     }
 
     #[tokio::test]

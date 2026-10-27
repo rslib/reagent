@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 mod atomic;
+mod blocking;
 mod gitignore;
 mod process_group;
 mod walk;
@@ -25,4 +26,29 @@ fn resolve(working_dir: &Path, path: &str) -> Result<PathBuf, String> {
         return Err("invalid arguments: path must not be empty".into());
     }
     Ok(working_dir.join(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use reagent_agent::tool::{EffectClass, Tool as _};
+
+    use crate::bash::Bash;
+    use crate::edit::Edit;
+    use crate::find::Find;
+    use crate::grep::Grep;
+    use crate::read::Read;
+    use crate::write::Write;
+
+    #[test]
+    fn tool_effect_classes() {
+        let dir = Path::new("/tmp/reagent-effect-class");
+        assert_eq!(Read::new(dir).effect(), EffectClass::Read);
+        assert_eq!(Grep::new(dir).effect(), EffectClass::Read);
+        assert_eq!(Find::new(dir).effect(), EffectClass::Read);
+        assert_eq!(Edit::new(dir).effect(), EffectClass::LocalReversible);
+        assert_eq!(Write::new(dir).effect(), EffectClass::LocalReversible);
+        assert_eq!(Bash::new(dir).effect(), EffectClass::LocalReversible);
+    }
 }

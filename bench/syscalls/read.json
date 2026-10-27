@@ -1,0 +1,6 @@
+{
+  "replies": [
+    {"calls": [{"name": "read", "arguments": {"path": "a.txt"}}, {"name": "read", "arguments": {"path": "b.txt"}}, {"name": "read", "arguments": {"path": "sub/c.txt"}}, {"name": "read", "arguments": {"path": "a.txt"}}, {"name": "read", "arguments": {"path": "b.txt"}}]},
+    {"text": "all done"}
+  ]
+}

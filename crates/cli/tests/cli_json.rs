@@ -18,6 +18,10 @@ async fn run(tmp: &Path, args: &[&str]) -> std::process::Output {
     Command::new(BIN)
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .args(args)
         .current_dir(tmp)
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
@@ -357,6 +361,10 @@ async fn usage_cost_and_context_tokens_in_the_summary() {
         .args(["-p", "hi"])
         .current_dir(tmp.path())
         .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .env("XDG_CACHE_HOME", tmp.path().join("cache"))
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
         .output()
@@ -434,6 +442,10 @@ async fn usage_cost_comes_from_the_cached_price() {
         .args(["-p", "hi"])
         .current_dir(tmp.path())
         .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .env("XDG_CACHE_HOME", tmp.path().join("cache"))
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
         .output()
@@ -485,6 +497,10 @@ async fn cli_json_a_transport_error_never_prints_the_api_key() {
     let output = Command::new(BIN)
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .args(["--json", "-p", "hi", "--deadline", "3"])
         .current_dir(tmp.path())
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
@@ -596,6 +612,10 @@ async fn cli_json_a_denied_call_names_the_rule() {
         .args(["-p", "hi"])
         .current_dir(tmp.path())
         .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
         .output()
         .await

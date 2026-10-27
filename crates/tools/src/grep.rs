@@ -15,10 +15,11 @@ use serde::Deserialize;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{EffectClass, Effects, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 use reagent_util::{decimal, text};
 
+use crate::blocking;
 use crate::gitignore::wildmatch;
 use crate::resolve;
 use crate::walk::{File, MAX_FILES, Skip, walk};
@@ -55,7 +56,7 @@ pub struct Args<'a> {
 #[derive(Debug)]
 pub struct Grep {
     spec: ToolSpec,
-    working_dir: PathBuf,
+    working_dir: Arc<Path>,
     skip: Skip,
 }
 
@@ -64,7 +65,7 @@ impl Grep {
     pub fn new(working_dir: impl Into<PathBuf>) -> Self {
         Self {
             spec: spec(),
-            working_dir: working_dir.into(),
+            working_dir: Arc::from(working_dir.into()),
             skip: Skip::default(),
         }
     }
@@ -90,40 +91,73 @@ impl Grep {
                 Ok(root) => root,
                 Err(message) => return ToolOutput::error(message),
             },
-            None => self.working_dir.clone(),
+            None => self.working_dir.to_path_buf(),
         };
-        let meta = match tokio::fs::metadata(&root).await {
-            Ok(meta) => meta,
-            Err(error) => {
-                return ToolOutput::error(format!("cannot search {}: {error}", root.display()));
+        let given: Option<Arc<str>> = args.path.as_deref().map(Arc::from);
+        // The root's stat and, when it is one file, that file's read and match
+        // are one job, so a search of one file costs one round trip.
+        let probed = {
+            let (dir, matcher) = (Arc::clone(&self.working_dir), Arc::clone(&matcher));
+            let given = given.clone();
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return ToolOutput::error("cancelled"),
+                probed = blocking::run(move || one_file(root, dir, matcher, given)) => probed,
             }
         };
-        let mut truncated = false;
-        // `File.rel` is relative to this folder: the walk root, or the working
-        // folder for the one file the caller named.
-        let (files, base) = if meta.is_file() {
-            let rel = args.path.as_deref().unwrap_or_default().to_string();
-            (vec![File { rel, raw: None }], self.working_dir.clone())
-        } else {
-            let Ok(listing) = walk(&root, &self.skip, cancel).await else {
-                return ToolOutput::error("cancelled");
-            };
-            truncated = listing.truncated;
-            let mut files = listing.files;
-            if let Some(glob) = args.glob.as_deref() {
-                files.retain(|file| glob_matches(glob, &file.rel));
-            }
-            (files, root)
+        let (root, one) = match probed {
+            Ok(probed) => probed,
+            Err(message) => return ToolOutput::error(message),
         };
+        if let Some(hits) = one {
+            return ToolOutput::ok(render(&[hits], false));
+        }
+        // `File.rel` is relative to the walk root.
+        let Ok(listing) = walk(&root, &self.skip, cancel).await else {
+            return ToolOutput::error("cancelled");
+        };
+        let truncated = listing.truncated;
+        let mut files = listing.files;
+        if let Some(glob) = args.glob.as_deref() {
+            files.retain(|file| glob_matches(glob, &file.rel));
+        }
         // The prefix goes on printed lines only, not on every listed file.
-        let prefix: Option<Arc<str>> = match args.path.as_deref() {
-            Some(path) if !meta.is_file() => Some(Arc::from(path.trim_end_matches('/'))),
-            _ => None,
-        };
-        let Some(hits) = search(files, Arc::from(base), matcher, prefix, cancel).await else {
+        let prefix = given.map(without_trailing_slashes);
+        let Some(hits) = search(files, Arc::from(root), matcher, prefix, cancel).await else {
             return ToolOutput::error("cancelled");
         };
         ToolOutput::ok(render(&hits, truncated))
+    }
+}
+
+/// The one file a call names, read and matched in the job that also checks the
+/// root, or `None` when the root is a folder to walk; the root comes back so
+/// that a walk needs no copy of it. An unreadable root is the error text the
+/// tool has always given.
+#[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]
+fn one_file(
+    root: PathBuf,
+    dir: Arc<Path>,
+    matcher: Arc<Matcher>,
+    given: Option<Arc<str>>,
+) -> Result<(PathBuf, Option<Hits>), String> {
+    match std::fs::metadata(&root) {
+        Ok(meta) if meta.is_file() => {
+            let rel = given.as_deref().unwrap_or_default().to_string();
+            let hits = search_batch(&[File { rel, raw: None }], &dir, &matcher, None);
+            Ok((root, Some(hits)))
+        }
+        Ok(_) => Ok((root, None)),
+        Err(error) => Err(format!("cannot search {}: {error}", root.display())),
+    }
+}
+
+/// `given` without its trailing slashes, sharing the text when it has none.
+fn without_trailing_slashes(given: Arc<str>) -> Arc<str> {
+    let trimmed = given.trim_end_matches('/');
+    match trimmed.len() == given.len() {
+        true => given,
+        false => Arc::from(trimmed),
     }
 }
 
@@ -145,7 +179,7 @@ impl Tool for Grep {
                 Ok(path) => path,
                 Err(_) => return Effects::default(),
             },
-            None => self.working_dir.clone(),
+            None => self.working_dir.to_path_buf(),
         };
         Effects {
             reads: vec![path],
@@ -155,6 +189,10 @@ impl Tool for Grep {
 
     fn read_only(&self) -> bool {
         true
+    }
+
+    fn effect(&self) -> EffectClass {
+        EffectClass::Read
     }
 
     fn run<'a>(
@@ -224,6 +262,8 @@ async fn search(
                     search_batch(&batch, &base, &matcher, prefix.as_deref()),
                 )
             });
+            #[cfg(test)]
+            blocking::count_hop();
         }
         let next = tokio::select! {
             biased;
@@ -629,6 +669,23 @@ mod tests {
         output.content.lines().map(str::to_string).collect()
     }
 
+    /// A grep of one file path is one job: the root's stat, its read and its
+    /// match.
+    #[tokio::test]
+    async fn one_hop_grep_one_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "f.txt", "aaa\nneedle\n");
+        crate::blocking::reset_hops();
+        let output = grep(
+            tmp.path(),
+            serde_json::json!({"pattern": "needle", "path": "f.txt"}),
+        )
+        .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(output.content.as_ref(), "f.txt:2:needle");
+        assert_eq!(crate::blocking::hops(), 1);
+    }
+
     #[test]
     fn spec_is_named_grep() {
         assert_eq!(spec().name, "grep");
@@ -888,6 +945,19 @@ mod tests {
         cancel.cancel();
         let output = Grep::new(tmp.path())
             .run(r#"{"pattern":"abc"}"#, &cancel)
+            .await;
+        assert!(output.is_error);
+        assert_eq!(output.content.as_ref(), "cancelled");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_search_of_one_file_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "a.txt", "abc\n");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let output = Grep::new(tmp.path())
+            .run(r#"{"pattern":"abc","path":"a.txt"}"#, &cancel)
             .await;
         assert!(output.is_error);
         assert_eq!(output.content.as_ref(), "cancelled");

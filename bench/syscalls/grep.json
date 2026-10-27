@@ -1,0 +1,6 @@
+{
+  "replies": [
+    {"calls": [{"name": "grep", "arguments": {"pattern": "alpha"}}, {"name": "grep", "arguments": {"pattern": "beta"}}, {"name": "grep", "arguments": {"pattern": "delta"}}, {"name": "grep", "arguments": {"pattern": "zeta"}}, {"name": "grep", "arguments": {"pattern": "eta"}}]},
+    {"text": "all done"}
+  ]
+}

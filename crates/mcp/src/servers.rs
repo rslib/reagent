@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
-use reagent_agent::tool::{Object, Tool as AgentTool, ToolOutput};
+use reagent_agent::tool::{EffectClass, Object, Tool as AgentTool, ToolOutput};
 use reagent_ai::ToolSpec;
 use reagent_config::mcp::McpDirect;
 use reagent_config::{McpServer, McpTransport};
@@ -700,6 +700,12 @@ impl AgentTool for McpTool {
         self.read_only
     }
 
+    fn effect(&self) -> EffectClass {
+        // An annotation may only make a class stricter, and no server is
+        // trusted yet, so every MCP tool counts as reaching the outside world.
+        EffectClass::External
+    }
+
     fn returns(&self) -> &'static str {
         self.returns
     }
@@ -741,5 +747,30 @@ impl AgentTool for McpTool {
                 _ => ToolOutput::ok(output.text),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_tool_effect_class_is_external() {
+        let tool = McpTool {
+            spec: ToolSpec {
+                name: "mcp__server__tool".into(),
+                description: String::new(),
+                input_schema: Value::Null,
+            },
+            name: "tool".into(),
+            server: "server".into(),
+            timeout: Duration::from_secs(1),
+            client: Weak::new(),
+            read_only: true,
+            returns: "string",
+            output_schema: None,
+        };
+        assert!(AgentTool::read_only(&tool), "a read-only annotation");
+        assert_eq!(AgentTool::effect(&tool), EffectClass::External);
     }
 }

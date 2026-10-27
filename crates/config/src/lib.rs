@@ -60,6 +60,9 @@ pub struct Settings {
     /// The `[sandbox]` table. Only the global file and a profile may hold it.
     #[serde(default)]
     pub sandbox: Sandbox,
+    /// The `[session]` table. Only the global file and a profile may hold it.
+    #[serde(default)]
+    pub session: SessionSettings,
 }
 
 /// The `[sandbox]` table: how bash commands are fenced in.
@@ -73,6 +76,34 @@ pub struct Sandbox {
     /// Folders commands may write besides the working and temp folders.
     #[serde(default)]
     pub write: Vec<String>,
+}
+
+/// Days a session is kept after its last write when `keep_days` is unset.
+pub const DEFAULT_KEEP_DAYS: u64 = 30;
+
+/// MiB all sessions may take when `max_mb` is unset.
+pub const DEFAULT_MAX_MB: u64 = 1024;
+
+/// The `[session]` table: when saved sessions are deleted.
+#[derive(Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSettings {
+    /// Days a session is kept after its last write; 0 keeps every age.
+    pub keep_days: Option<u64>,
+    /// MiB the sessions of all folders may take; 0 means no cap.
+    pub max_mb: Option<u64>,
+}
+
+impl SessionSettings {
+    /// Days a session is kept, [`DEFAULT_KEEP_DAYS`] when unset; 0 keeps every age.
+    pub fn keep_days(&self) -> u64 {
+        self.keep_days.unwrap_or(DEFAULT_KEEP_DAYS)
+    }
+
+    /// MiB all sessions may take, [`DEFAULT_MAX_MB`] when unset; 0 means no cap.
+    pub fn max_mb(&self) -> u64 {
+        self.max_mb.unwrap_or(DEFAULT_MAX_MB)
+    }
 }
 
 /// The `[codemode]` table: the limits of one `codemode` script.
@@ -350,6 +381,12 @@ fn load_file(path: Option<&Path>, repo: bool) -> Result<Option<Layer>, String> {
             path.display()
         ));
     }
+    if repo && settings.session != SessionSettings::default() {
+        return Err(format!(
+            "{}: session may be set only in the global config",
+            path.display()
+        ));
+    }
     if repo && (!settings.permissions.allow.is_empty() || settings.permissions.default.is_some()) {
         return Err(format!(
             "{}: permissions.allow and permissions.default may be set only in the global config",
@@ -561,6 +598,8 @@ fn apply(merged: &mut Settings, settings: &Settings, profile: bool) {
     } else if merged.sandbox == Sandbox::default() {
         merged.sandbox = settings.sandbox.clone();
     }
+    over(&mut merged.session.keep_days, &settings.session.keep_days);
+    over(&mut merged.session.max_mb, &settings.session.max_mb);
 }
 
 /// Merges a profile's `[providers.<name>]` table over the global one: each
@@ -907,6 +946,40 @@ mod tests {
             layers[0].settings.permissions.deny,
             vec!["Bash(git push:*)"]
         );
+    }
+
+    #[test]
+    fn session_table_defaults_and_merges() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let none = settings(None, None);
+        assert_eq!(none.session.keep_days(), DEFAULT_KEEP_DAYS);
+        assert_eq!(none.session.max_mb(), DEFAULT_MAX_MB);
+        let global = write(
+            dir.path(),
+            "g.toml",
+            "[session]\nkeep_days = 7\nmax_mb = 512\n",
+        );
+        let profile = write(dir.path(), "p.toml", "[session]\nmax_mb = 0\n");
+        let merged = merge_all(&Layers {
+            global: load_file(Some(&global), false).expect("loads"),
+            profile: load_file(Some(&profile), false).expect("loads"),
+            repo: None,
+        });
+        assert_eq!(merged.session.keep_days(), 7);
+        assert_eq!(merged.session.max_mb(), 0, "0 turns the cap off");
+    }
+
+    #[test]
+    fn session_table_is_refused_in_a_repo_file_and_checks_its_keys() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = write(dir.path(), "repo.toml", "[session]\nkeep_days = 1\n");
+        let error = load(None, Some(&repo)).unwrap_err();
+        assert!(
+            error.contains("repo.toml") && error.contains("session"),
+            "{error}"
+        );
+        let typo = write(dir.path(), "t.toml", "[session]\nkeep_day = 1\n");
+        assert!(load(Some(&typo), None).unwrap_err().contains("keep_day"));
     }
 
     #[test]

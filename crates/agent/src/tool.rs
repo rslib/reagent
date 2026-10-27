@@ -201,6 +201,25 @@ pub struct Effects {
     pub writes: Vec<PathBuf>,
 }
 
+/// How far a tool call's effect reaches, from a read to the outside world.
+///
+/// The journal writes a class before a call that is not [`EffectClass::Read`]
+/// runs, so a resumed run reruns a read and reports anything else as
+/// interrupted. Ordering is from the least to the most effect, so `max` of a
+/// group of tools is the strictest class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EffectClass {
+    /// Reads state and changes nothing.
+    Read,
+    /// Changes this machine inside a snapshot's reach: an edit, a write, a
+    /// sandboxed shell.
+    LocalReversible,
+    /// Changes this machine outside a snapshot's reach.
+    LocalIrreversible,
+    /// Changes something outside this machine: the network, an MCP server.
+    External,
+}
+
 /// A named tool the model can call.
 pub trait Tool: Send + Sync {
     /// The spec offered to the provider.
@@ -209,6 +228,18 @@ pub trait Tool: Send + Sync {
     /// Whether the tool only reads state, so a batch of calls may run together.
     fn read_only(&self) -> bool {
         false
+    }
+
+    /// How far this tool's call reaches, for the journal's crash rule.
+    ///
+    /// Default: [`EffectClass::Read`] for a read-only tool, else
+    /// [`EffectClass::LocalReversible`].
+    fn effect(&self) -> EffectClass {
+        if self.read_only() {
+            EffectClass::Read
+        } else {
+            EffectClass::LocalReversible
+        }
     }
 
     /// The return shape a script sees, as its signature line shows it.

@@ -20,6 +20,7 @@ reagent-sandbox = { path = "crates/sandbox" }
 reagent-script = { path = "crates/script" }
 reagent-mcp = { path = "crates/mcp" }
 reagent-tui = { path = "crates/tui" }
+reagent-store = { path = "crates/store" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

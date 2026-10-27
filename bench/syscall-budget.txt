@@ -5,7 +5,7 @@
 # budget means nothing on another OS or architecture.
 #
 # Each line is, per scenario and group, the highest count of N runs times 1.15,
-# rounded up and at least 24 over that count, from bench/syscalls.sh
+# rounded up and at least 48 over that count, from bench/syscalls.sh
 # --measure N. Use at least the
 # default ten: the threads a run makes with the tokio blocking pool vary
 # with timing, and a small sample can miss the high count, which a later run
@@ -13,40 +13,79 @@
 #
 # The groups are io, wait, fs, mem, proc and other, plus a total. The other
 # group holds every syscall no group names.
-# made from 36 runs on linux-x86_64: each line is the highest of three
-# --measure budgets (16, 10 and 10 runs).
-turn io 67
-turn wait 86
-turn fs 93
-turn mem 91
-turn proc 89
-turn other 123
-turn total 465
-tools io 127
-tools wait 382
-tools fs 149
-tools mem 91
-tools proc 89
-tools other 367
-tools total 1140
-bash io 103
-bash wait 140
-bash fs 158
-bash mem 95
-bash proc 108
-bash other 285
-bash total 838
-codemode io 87
-codemode wait 228
-codemode fs 115
-codemode mem 190
-codemode proc 191
-codemode other 235
-codemode total 994
-mcp io 98
-mcp wait 116
-mcp fs 114
-mcp mem 74
-mcp proc 78
-mcp other 206
-mcp total 618
+# made from 50 runs on linux-x86_64 after durable sessions: each line is the
+# higher of the --measure budgets of 20 and 30 runs. Every run now saves its
+# session (a writer thread, the part file, a sync at each turn end and before
+# each side-effect tool, and the session list), about 160 to 180 syscalls
+# more per run than before. Find and grep make from 0 to about 11 more
+# blocking threads from run to run, so their proc and mem lines are wide.
+turn io 115
+turn wait 150
+turn fs 167
+turn mem 117
+turn proc 115
+turn other 198
+turn total 658
+tools io 203
+tools wait 338
+tools fs 223
+tools mem 125
+tools proc 126
+tools other 341
+tools total 1219
+bash io 210
+bash wait 267
+bash fs 232
+bash mem 130
+bash proc 145
+bash other 410
+bash total 1256
+codemode io 144
+codemode wait 216
+codemode fs 185
+codemode mem 158
+codemode proc 139
+codemode other 271
+codemode total 932
+mcp io 180
+mcp wait 216
+mcp fs 188
+mcp mem 108
+mcp proc 115
+mcp other 318
+mcp total 955
+read io 142
+read wait 214
+read fs 182
+read mem 151
+read proc 159
+read other 233
+read total 910
+write io 147
+write wait 206
+write fs 217
+write mem 125
+write proc 126
+write other 243
+write total 887
+edit io 145
+edit wait 183
+edit fs 201
+edit mem 117
+edit proc 115
+edit other 231
+edit total 809
+grep io 177
+grep wait 370
+grep fs 326
+grep mem 236
+grep proc 269
+grep other 336
+grep total 1625
+find io 142
+find wait 275
+find fs 289
+find mem 236
+find proc 269
+find other 277
+find total 1377

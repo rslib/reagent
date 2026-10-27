@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Effects, Repaired, Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{EffectClass, Effects, Repaired, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
 use crate::repair::{Kind, Touched};
@@ -73,21 +73,28 @@ impl Write {
 
     async fn run_inner(&self, args: &Args<'_>) -> Result<ToolOutput, String> {
         let path = resolve(&self.working_dir, &args.path)?;
-        let bytes = args.content.as_bytes();
-
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                format!("cannot create parent folder {}: {error}", parent.display())
-            })?;
-        }
-
-        crate::atomic::write(&path, bytes).await?;
+        // The job owns its text: the content is borrowed from the call.
+        let bytes = args.content.as_bytes().to_vec();
+        let len = bytes.len();
+        let path = crate::blocking::run(move || write_file(path, &bytes)).await?;
         Ok(ToolOutput::ok(format!(
-            "wrote {} byte(s) to {}",
-            bytes.len(),
+            "wrote {len} byte(s) to {}",
             path.display()
         )))
     }
+}
+
+/// The file work of one write, in the one blocking job it runs in: the parent
+/// folders and the atomic write.
+#[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]
+fn write_file(path: PathBuf, bytes: &[u8]) -> Result<PathBuf, String> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!("cannot create parent folder {}: {error}", parent.display())
+        })?;
+    }
+    crate::atomic::write_atomic(&path, bytes)?;
+    Ok(path)
 }
 
 impl Tool for Write {
@@ -97,6 +104,10 @@ impl Tool for Write {
 
     fn main_arg(&self) -> Option<&'static str> {
         Some("path")
+    }
+
+    fn effect(&self) -> EffectClass {
+        EffectClass::LocalReversible
     }
 
     fn repair<'a>(
@@ -250,6 +261,27 @@ mod tests {
         }
         names.sort();
         assert_eq!(names, vec!["f.txt".to_string()], "{names:?}");
+    }
+
+    /// The parent folders and the file are written in one blocking job.
+    #[tokio::test]
+    async fn one_hop_write_new_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::blocking::reset_hops();
+        let output = tool(&tmp)
+            .run(
+                r#"{"path":"deep/nested/dir/f.txt","content":"x"}"#,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("deep/nested/dir/f.txt"))
+                .await
+                .unwrap(),
+            "x"
+        );
+        assert_eq!(crate::blocking::hops(), 1);
     }
 
     #[test]

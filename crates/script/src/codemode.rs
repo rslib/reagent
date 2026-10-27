@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use reagent_agent::batch::run_one;
 use reagent_agent::guard::Guard;
 use reagent_agent::tool::{
-    Effects, Object, Registry, Repaired, Reroute, Tool, ToolOutput, parse_args,
+    EffectClass, Effects, Object, Registry, Repaired, Reroute, Tool, ToolOutput, parse_args,
 };
 use reagent_ai::{Text, ToolCall, ToolSpec};
 use serde_json::Value as JsonValue;
@@ -585,6 +585,10 @@ impl Tool for Boxed {
         self.0.read_only()
     }
 
+    fn effect(&self) -> EffectClass {
+        self.0.effect()
+    }
+
     fn returns(&self) -> &'static str {
         self.0.returns()
     }
@@ -621,6 +625,18 @@ impl Tool for Codemode {
 
     fn read_only(&self) -> bool {
         false
+    }
+
+    fn effect(&self) -> EffectClass {
+        // A script may call any tool in its registry, so its class is the
+        // strictest of theirs.
+        self.registry
+            .names()
+            .filter(|name| *name != self.spec.name)
+            .filter_map(|name| self.registry.get(name))
+            .map(Tool::effect)
+            .max()
+            .unwrap_or(EffectClass::Read)
     }
 
     fn run<'a>(
@@ -1702,6 +1718,28 @@ mod tests {
     async fn run_code(codemode: &Codemode, code: &str) -> ToolOutput {
         let args = json!({ "code": code }).to_string();
         codemode.run(&args, &CancellationToken::new()).await
+    }
+
+    #[test]
+    fn codemode_effect_class_is_the_strictest_tool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut reads = Registry::new();
+        reads.add(Read::new(tmp.path()));
+        reads.add(Grep::new(tmp.path()));
+        assert_eq!(
+            Codemode::new(Arc::new(reads)).effect(),
+            EffectClass::Read,
+            "only reads are reachable"
+        );
+
+        let mut mixed = Registry::new();
+        mixed.add(Read::new(tmp.path()));
+        mixed.add(reagent_tools::bash::Bash::new(tmp.path()));
+        assert_eq!(
+            Codemode::new(Arc::new(mixed)).effect(),
+            EffectClass::LocalReversible,
+            "a script may reach the shell"
+        );
     }
 
     #[test]

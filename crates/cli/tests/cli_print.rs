@@ -23,6 +23,10 @@ async fn run(tmp: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin())
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .env_remove("REAGENT_PROFILE")
         .args(args)
         .current_dir(tmp)
@@ -95,6 +99,10 @@ async fn run_with_stdin(fake: &str, input: &[u8]) -> std::process::Output {
     let mut child = Command::new(bin())
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .args(["--provider", fake, "-p", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -185,6 +193,10 @@ async fn a_missing_key_exits_2() {
     let output = Command::new(bin())
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .args(["-p", "hi"])
         .current_dir(tmp.path())
         .env_remove("ANTHROPIC_API_KEY")
@@ -219,6 +231,10 @@ async fn ctrl_c_exits_130() {
     let child = Command::new(bin())
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .args(["--provider", &fake, "-p", "hi"])
         .current_dir(tmp.path())
         .stdout(std::process::Stdio::null())
@@ -313,6 +329,10 @@ async fn start_line_names_the_profile_a_run_reads() {
     let fake = script(tmp.path(), r#"{"replies": [{"text": "ok"}]}"#).await;
     let output = Command::new(bin())
         .env("XDG_CONFIG_HOME", tmp.path().join("config"))
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .env("HOME", tmp.path())
         .env_remove("REAGENT_PROFILE")
         .args(["--provider", &fake, "--profile", "work", "-p", "hi"])
@@ -379,6 +399,10 @@ async fn start_line_names_the_env_var_and_never_the_key() {
     let output = Command::new(bin())
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .env("XDG_CACHE_HOME", tmp.path().join("cache"))
         .env("HOME", tmp.path())
         .env("PRINT_START_KEY", KEY)
@@ -435,6 +459,10 @@ async fn a_retried_turn_prints_only_the_text_of_the_last_attempt() {
     let output = Command::new(BIN)
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
+        .env(
+            "XDG_STATE_HOME",
+            std::env::temp_dir().join("reagent-test-state"),
+        )
         .args(["--provider", &script_arg, "-p", "hi"])
         .current_dir(tmp.path())
         .env("ANTHROPIC_API_KEY", "sk-ant-test")

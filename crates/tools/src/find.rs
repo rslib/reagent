@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Effects, Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{EffectClass, Effects, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
 use crate::gitignore::wildmatch;
@@ -59,15 +59,12 @@ impl Find {
             Some(path) => resolve(&self.working_dir, path)?,
             None => self.working_dir.clone(),
         };
-        let is_folder = tokio::fs::metadata(&root)
-            .await
-            .is_ok_and(|meta| meta.is_dir());
-        if !is_folder {
-            let shown = args.path.as_deref().unwrap_or(".");
-            return Err(format!("not a folder: {shown}"));
-        }
-        let listing = match walk::walk(&root, &self.skip, cancel).await {
-            Ok(listing) => listing,
+        let listing = match walk::walk_folder(&root, &self.skip, cancel).await {
+            Ok(Some(listing)) => listing,
+            Ok(None) => {
+                let shown = args.path.as_deref().unwrap_or(".");
+                return Err(format!("not a folder: {shown}"));
+            }
             Err(Cancelled) => return Err("cancelled".into()),
         };
 
@@ -139,6 +136,10 @@ impl Tool for Find {
 
     fn read_only(&self) -> bool {
         true
+    }
+
+    fn effect(&self) -> EffectClass {
+        EffectClass::Read
     }
 
     fn run<'a>(
@@ -297,6 +298,23 @@ mod tests {
         let output = find(&tmp, r#"{"pattern":"a","path":"a.rs"}"#).await;
         assert!(output.is_error);
         assert_eq!(output.content.as_ref(), "not a folder: a.rs");
+    }
+
+    /// A folder of three files, no subfolder, costs two jobs: the root's own
+    /// checks with the ignore chain above it, then the folder. It cost 19
+    /// before, here: the root stat, a `.gitignore` read and a `.git` look in
+    /// each of the seven folders above the temp folder, and the folder.
+    #[tokio::test]
+    async fn one_hop_find_flat() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "a.rs");
+        write(tmp.path(), "b.rs");
+        write(tmp.path(), "c.rs");
+        crate::blocking::reset_hops();
+        let output = find(&tmp, r#"{"pattern":"**/*.rs"}"#).await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(output.content.as_ref(), "a.rs\nb.rs\nc.rs\n");
+        assert_eq!(crate::blocking::hops(), 2);
     }
 
     #[test]
