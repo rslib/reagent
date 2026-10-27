@@ -7,6 +7,30 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
+bytes = { version = "1.12.1", default-features = false }
+nix = { version = "0.31.3", default-features = false, features = ["signal", "process"] }
 reagent-agent.workspace = true
+reagent-ai.workspace = true
+reagent-config.workspace = true
+reagent-oauth.workspace = true
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "stream"] }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["raw_value", "std"] }
+tokio = { version = "1.53.3", default-features = false, features = ["rt", "io-std", "io-util", "process", "sync", "time"] }
+tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }
+
+[[bin]]
+name = "reagent-mcp-fake"
+path = "src/bin/reagent-mcp-fake.rs"
+
 [lints]
 workspace = true
+
+[dev-dependencies]
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+nix = { version = "0.31.3", default-features = false, features = ["signal", "process"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+tempfile = { version = "3.27.0", default-features = false }
+tokio = { version = "1.53.3", default-features = false, features = ["rt", "macros", "time", "sync", "fs", "net"] }
+tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }

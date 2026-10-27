@@ -1,0 +1,52 @@
+# Syscall budgets for the fixed reagent runs of bench/syscalls.sh, one line
+# per scenario and group: <scenario> <group> <max>.
+#
+# linux-x86_64 only: the counts are those of the Linux build of reagent, so a
+# budget means nothing on another OS or architecture.
+#
+# Each line is, per scenario and group, the highest count of N runs times 1.15,
+# rounded up and at least 24 over that count, from bench/syscalls.sh
+# --measure N. Use at least the
+# default ten: the threads a run makes with the tokio blocking pool vary
+# with timing, and a small sample can miss the high count, which a later run
+# would then be over.
+#
+# The groups are io, wait, fs, mem, proc and other, plus a total. The other
+# group holds every syscall no group names.
+# made from 36 runs on linux-x86_64: each line is the highest of three
+# --measure budgets (16, 10 and 10 runs).
+turn io 67
+turn wait 86
+turn fs 93
+turn mem 91
+turn proc 89
+turn other 123
+turn total 465
+tools io 127
+tools wait 382
+tools fs 149
+tools mem 91
+tools proc 89
+tools other 367
+tools total 1140
+bash io 103
+bash wait 140
+bash fs 158
+bash mem 95
+bash proc 108
+bash other 285
+bash total 838
+codemode io 87
+codemode wait 228
+codemode fs 115
+codemode mem 190
+codemode proc 191
+codemode other 235
+codemode total 994
+mcp io 98
+mcp wait 116
+mcp fs 114
+mcp mem 74
+mcp proc 78
+mcp other 206
+mcp total 618

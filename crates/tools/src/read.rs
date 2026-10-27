@@ -4,12 +4,16 @@ use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use serde::Deserialize;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Effects, Identity, Repaired, Seen, Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{
+    Effects, Identity, Object, Repaired, Seen, Tool, ToolOutput, parse_args,
+};
 use reagent_ai::{Text, ToolSpec};
 
 use crate::repair::{Kind, Touched};
@@ -61,7 +65,7 @@ impl Read {
         self
     }
 
-    async fn run_inner(&self, args: &Args<'_>) -> Result<(String, Option<Seen>), String> {
+    async fn run_inner(&self, args: &Args<'_>) -> Result<ReadOut, String> {
         let offset = args.offset.unwrap_or(1).max(1) as u64;
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
         if limit == 0 {
@@ -91,7 +95,15 @@ impl Read {
         }
         // The probe bytes are the start of the file, so the reader takes them
         // from the slice already in hand instead of seeking back for them.
-        let mut feed = LineFeed::new(reader(&probe[..probe_len], file));
+        // When the probe holds every byte the file has, the read needs no
+        // read-ahead buffer. A short read alone proves no end of file (NFS and
+        // FUSE return them), so the probe must match the file's size.
+        let whole = metadata.is_file() && probe_len as u64 == metadata.len();
+        let mut feed = if whole {
+            LineFeed::new(Source::Probe(&probe[..probe_len]), Some(probe_len as u64))
+        } else {
+            LineFeed::new(Source::File(reader(&probe[..probe_len], file)), None)
+        };
 
         let mut number: u64 = 1;
         while number < offset {
@@ -111,32 +123,62 @@ impl Read {
             printed += 1;
         }
         if printed == 0 {
-            return Ok((
-                match number - 1 {
-                    0 => format!("{} is empty", path.display()),
-                    lines => format!(
-                        "{} has {lines} line(s); offset={offset} is past the end",
-                        path.display()
-                    ),
-                },
-                None,
-            ));
+            let text = match number - 1 {
+                0 => format!("{} is empty", path.display()),
+                lines => format!(
+                    "{} has {lines} line(s); offset={offset} is past the end",
+                    path.display()
+                ),
+            };
+            return Ok(ReadOut {
+                text,
+                seen: None,
+                object: read_object(offset, offset.saturating_sub(1), None),
+            });
         }
-        if feed.has_more().await.map_err(failed)? {
+        let more = feed.has_more().await.map_err(failed)?;
+        if more {
             let rest = size.saturating_sub(feed.consumed);
             out.push_str(&format!("[{rest} more bytes; use offset={number}]\n"));
         }
+        let start = offset;
+        let end = number - 1;
+        let object = read_object(start, end, more.then_some(number));
         let seen = Seen {
             path: Text::from(args.path.as_ref()),
             key,
-            start: offset,
-            end: number - 1,
+            start,
+            end,
             size,
             modified,
             cut: feed.cut,
         };
-        Ok((out, Some(seen)))
+        Ok(ReadOut {
+            text: out,
+            seen: Some(seen),
+            object,
+        })
     }
+}
+
+/// What one read produced: the text for the model, the lines it showed, and
+/// the object a script reads in place of the text.
+struct ReadOut {
+    text: String,
+    seen: Option<Seen>,
+    object: Object,
+}
+
+/// The object a script reads for the lines `start..=end`, with `next` when the
+/// read stopped before the end of the file.
+fn read_object(start: u64, end: u64, next: Option<u64>) -> Object {
+    let mut object = Object::new(serde_json::Map::new()).numbered();
+    object.fields.insert("start".into(), start.into());
+    object.fields.insert("end".into(), end.into());
+    if let Some(next) = next {
+        object.fields.insert("next_offset".into(), next.into());
+    }
+    object
 }
 
 impl Tool for Read {
@@ -172,6 +214,10 @@ impl Tool for Read {
         true
     }
 
+    fn returns(&self) -> &'static str {
+        "{output, start, end, next_offset?}"
+    }
+
     fn run<'a>(
         &'a self,
         args: &'a str,
@@ -188,11 +234,12 @@ impl Tool for Read {
                 biased;
                 () = cancel.cancelled() => ToolOutput::error("cancelled"),
                 result = self.run_inner(&arguments) => match result {
-                    Ok((text, seen)) => {
+                    Ok(out) => {
                         self.touched.note(&self.working_dir, Path::new(arguments.path.as_ref()));
-                        match seen {
-                            Some(seen) => ToolOutput::ok(text).with_seen(seen),
-                            None => ToolOutput::ok(text),
+                        let output = ToolOutput::ok(out.text).with_object(out.object);
+                        match out.seen {
+                            Some(seen) => output.with_seen(seen),
+                            None => output,
                         }
                     }
                     Err(message) => ToolOutput::error(message),
@@ -208,11 +255,51 @@ fn reader<R: AsyncRead + Unpin>(probe: &[u8], file: R) -> BufReader<tokio::io::C
     BufReader::with_capacity(READ_BUF, probe.chain(file))
 }
 
+/// The bytes a read looks at: the probe alone when it holds the whole file, or
+/// the probe and then the file.
+enum Source<'a, R> {
+    /// A whole file, already in the probe, so it needs no buffer of its own.
+    Probe(&'a [u8]),
+    /// The probe, then the rest of the file.
+    File(BufReader<tokio::io::Chain<&'a [u8], R>>),
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Source<'_, R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Probe(probe) => Pin::new(probe).poll_read(cx, buf),
+            Self::File(file) => Pin::new(file).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncBufRead for Source<'_, R> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        match self.get_mut() {
+            Self::Probe(probe) => Pin::new(probe).poll_fill_buf(cx),
+            Self::File(file) => Pin::new(file).poll_fill_buf(cx),
+        }
+    }
+
+    fn consume(self: Pin<&mut Self>, amount: usize) {
+        match self.get_mut() {
+            Self::Probe(probe) => Pin::new(probe).consume(amount),
+            Self::File(file) => Pin::new(file).consume(amount),
+        }
+    }
+}
+
 /// Streams a file line by line from the reader's own buffer, keeping at most
 /// `LINE_CAP` bytes of a line even when the line is huge.
 struct LineFeed<R> {
     reader: R,
     consumed: u64,
+    /// The bytes the file holds, when the probe holds all of them.
+    end: Option<u64>,
     /// The line being read, emptied and refilled for every line so that a read
     /// costs no allocation per line.
     line: Line,
@@ -221,13 +308,19 @@ struct LineFeed<R> {
 }
 
 impl<R: AsyncBufRead + Unpin> LineFeed<R> {
-    fn new(reader: R) -> Self {
+    fn new(reader: R, end: Option<u64>) -> Self {
         Self {
             reader,
             consumed: 0,
+            end,
             line: Line::default(),
             cut: false,
         }
+    }
+
+    /// Whether every byte `end` names is read, so a read would find nothing.
+    fn ended(&self) -> bool {
+        self.end.is_some_and(|end| self.consumed >= end)
     }
 
     /// Reads the next line and appends it to `out` as `{number}\t{text}\n`.
@@ -248,12 +341,18 @@ impl<R: AsyncBufRead + Unpin> LineFeed<R> {
     }
 
     async fn has_more(&mut self) -> io::Result<bool> {
+        if self.ended() {
+            return Ok(false);
+        }
         Ok(!self.reader.fill_buf().await?.is_empty())
     }
 
     /// Consumes one line, copying it into the line buffer when `keep`. Returns
     /// false when the stream had already ended.
     async fn scan(&mut self, keep: bool) -> io::Result<bool> {
+        if self.ended() {
+            return Ok(false);
+        }
         let mut any = false;
         loop {
             let buf = self.reader.fill_buf().await?;
@@ -688,7 +787,7 @@ mod tests {
             at: 0,
             reads: Rc::clone(&reads),
         };
-        let mut feed = LineFeed::new(reader(b"", file));
+        let mut feed = LineFeed::new(reader(b"", file), None);
         let mut lines = 0;
         while feed.skip().await.unwrap() {
             lines += 1;
@@ -778,6 +877,64 @@ mod tests {
             .run(r#"{"path":"empty.txt"}"#, &CancellationToken::new())
             .await;
         assert_eq!(empty.seen, None, "an empty file shows no lines");
+    }
+
+    /// The number a read object holds under `field`.
+    fn field(object: &Object, field: &str) -> Option<u64> {
+        object.fields.get(field).and_then(serde_json::Value::as_u64)
+    }
+
+    #[tokio::test]
+    async fn read_object_has_start_end_and_next_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "a\nb\nc\nd\ne\n").await;
+        let output = tool(&tmp)
+            .run(r#"{"path":"f.txt","limit":2}"#, &CancellationToken::new())
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(
+            output.content.as_ref(),
+            "1\ta\n2\tb\n[6 more bytes; use offset=3]\n"
+        );
+        let object = output.object.expect("a read gives a script an object");
+        assert!(object.numbered, "the object's lines are numbered");
+        assert_eq!(object.tail, None);
+        assert_eq!(field(&object, "start"), Some(1));
+        assert_eq!(field(&object, "end"), Some(2));
+        assert_eq!(field(&object, "next_offset"), Some(3));
+    }
+
+    #[tokio::test]
+    async fn read_object_whole_file_has_no_next_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "a\nb\nc\n").await;
+        let output = tool(&tmp)
+            .run(r#"{"path":"f.txt"}"#, &CancellationToken::new())
+            .await;
+        assert_eq!(output.content.as_ref(), "1\ta\n2\tb\n3\tc\n");
+        let object = output.object.expect("a read gives a script an object");
+        assert_eq!(field(&object, "start"), Some(1));
+        assert_eq!(field(&object, "end"), Some(3));
+        assert_eq!(object.fields.get("next_offset"), None);
+    }
+
+    #[tokio::test]
+    async fn read_object_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp, "f.txt", "").await;
+        let output = tool(&tmp)
+            .run(r#"{"path":"f.txt"}"#, &CancellationToken::new())
+            .await;
+        assert!(
+            output.content.ends_with("f.txt is empty"),
+            "{}",
+            output.content
+        );
+        let object = output.object.expect("a read gives a script an object");
+        assert!(object.numbered);
+        assert_eq!(field(&object, "start"), Some(1));
+        assert_eq!(field(&object, "end"), Some(0));
+        assert_eq!(object.fields.get("next_offset"), None);
     }
 
     #[test]

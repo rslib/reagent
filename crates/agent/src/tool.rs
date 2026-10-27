@@ -88,6 +88,45 @@ pub struct ToolOutput {
     pub is_error: bool,
     /// The file lines a `read` showed, for the re-read note; `None` otherwise.
     pub seen: Option<Box<Seen>>,
+    /// The object a script gets in place of the text; `None` for a text result.
+    pub object: Option<Box<Object>>,
+}
+
+/// What a script gets in place of a result's text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Object {
+    /// The fields of the object.
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    /// When set, the object also gets `output`: the content without its last this many bytes.
+    pub tail: Option<usize>,
+    /// When set, `output` keeps only the lines that start with a line number
+    /// and a tab, without that prefix; any other line is a note and is left out.
+    pub numbered: bool,
+}
+
+impl Object {
+    /// An object with `fields` and no `output`.
+    pub fn new(fields: serde_json::Map<String, serde_json::Value>) -> Self {
+        Self {
+            fields,
+            tail: None,
+            numbered: false,
+        }
+    }
+
+    /// Adds `output`: the content without its last `tail` bytes.
+    #[must_use]
+    pub fn with_tail(mut self, tail: usize) -> Self {
+        self.tail = Some(tail);
+        self
+    }
+
+    /// Makes `output` the numbered lines of the content, without the numbers.
+    #[must_use]
+    pub fn numbered(mut self) -> Self {
+        self.numbered = true;
+        self
+    }
 }
 
 impl ToolOutput {
@@ -97,6 +136,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             seen: None,
+            object: None,
         }
     }
 
@@ -106,6 +146,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             seen: None,
+            object: None,
         }
     }
 
@@ -115,6 +156,14 @@ impl ToolOutput {
         // Boxed, so a result without one stays small as it moves through the
         // batch and the loop; only a read pays the one allocation.
         self.seen = Some(Box::new(seen));
+        self
+    }
+
+    /// Makes a script read this result as `object` instead of as its text.
+    #[must_use]
+    pub fn with_object(mut self, object: Object) -> Self {
+        // Boxed like `seen`, so the result grows by one pointer.
+        self.object = Some(Box::new(object));
         self
     }
 }
@@ -160,6 +209,16 @@ pub trait Tool: Send + Sync {
     /// Whether the tool only reads state, so a batch of calls may run together.
     fn read_only(&self) -> bool {
         false
+    }
+
+    /// The return shape a script sees, as its signature line shows it.
+    fn returns(&self) -> &'static str {
+        "string"
+    }
+
+    /// The JSON schema of what the tool returns, when it names one.
+    fn output_schema(&self) -> Option<&serde_json::Value> {
+        None
     }
 
     /// The argument a permission rule's pattern matches, such as `command` or `path`; `None` when no pattern applies.

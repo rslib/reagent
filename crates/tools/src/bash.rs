@@ -15,7 +15,7 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::tool::{Reroute, Tool, ToolOutput, parse_args};
+use reagent_agent::tool::{Object, Reroute, Tool, ToolOutput, parse_args};
 use reagent_ai::ToolSpec;
 
 use crate::process_group::{self, GroupGuard};
@@ -83,6 +83,11 @@ impl Outcome {
 const UNAVAILABLE: &str = "reagent: sandbox unavailable: ";
 /// The exit code with which a launcher says it could not start.
 const UNAVAILABLE_CODE: i32 = 125;
+/// The object's field for the spill file that holds a cut output.
+const FULL_OUTPUT_PATH: &str = "full_output_path";
+/// The line the text gets when a background process outlives the shell.
+const PIPE_HELD: &str =
+    "[a background process still holds the output pipe; its later output is not shown]\n";
 
 /// What the bash tool does when the sandbox helper reports it cannot start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +213,11 @@ impl Bash {
         self.spill_writes.store(collect.writes, Ordering::Relaxed);
 
         let mut text = collect.view();
+        let truncated = collect.total > CUT_AT;
+        let full_output_path = match (&collect.spill, truncated) {
+            (Spill::Open { path, .. }, true) => Some(path.display().to_string()),
+            _ => None,
+        };
         let unavailable = match &outcome {
             Outcome::Exited(status)
                 if status.code() == Some(UNAVAILABLE_CODE) && launcher.is_some() =>
@@ -217,17 +227,38 @@ impl Bash {
             }
             _ => None,
         };
+        // The summary is the last part of the text and not command output, so
+        // a script gets the output as the text without its last `tail` bytes.
+        let summary = outcome.summary();
+        let mut tail = summary.len();
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
+            tail += 1;
         }
         if pipe_held {
-            text.push_str("[a background process still holds the output pipe; its later output is not shown]\n");
+            text.push_str(PIPE_HELD);
+            tail += PIPE_HELD.len();
         }
-        text.push_str(&outcome.summary());
+        text.push_str(&summary);
+        let mut fields = serde_json::Map::new();
+        fields.insert("exit_code".into(), exit_code(&outcome));
+        fields.insert("truncated".into(), truncated.into());
+        if let Some(path) = full_output_path {
+            fields.insert(FULL_OUTPUT_PATH.into(), path.into());
+        }
         Ran {
-            output: ToolOutput::ok(text),
+            output: ToolOutput::ok(text).with_object(Object::new(fields).with_tail(tail)),
             unavailable,
         }
+    }
+}
+
+/// The exit code of the command as an object field, `null` when it did not
+/// exit with a code.
+fn exit_code(outcome: &Outcome) -> serde_json::Value {
+    match outcome {
+        Outcome::Exited(status) => status.code().map_or(serde_json::Value::Null, Into::into),
+        _ => serde_json::Value::Null,
     }
 }
 
@@ -663,6 +694,10 @@ impl Tool for Bash {
         Some("command")
     }
 
+    fn returns(&self) -> &'static str {
+        "{output, exit_code, truncated, full_output_path?}"
+    }
+
     fn reroute<'a>(
         &'a self,
         args: &'a str,
@@ -1023,6 +1058,64 @@ mod tests {
         let text = output.content.as_ref();
         assert!(!text.contains("[output cut"), "cut too early");
         assert_eq!(text.len() as u64, CUT_AT + "\nexit code: 0".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn bash_object_has_exit_code_and_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = run(&tmp, r#"{"command":"echo hi && exit 3"}"#).await;
+        assert_eq!(output.content.as_ref(), "hi\nexit code: 3");
+        let object = output.object.expect("no object");
+        assert_eq!(object.fields.get("exit_code"), Some(&serde_json::json!(3)));
+        assert_eq!(
+            object.fields.get("truncated"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(
+            !object.fields.contains_key(FULL_OUTPUT_PATH),
+            "{:?}",
+            object.fields
+        );
+        let tail = object.tail.expect("no tail");
+        let shown = &output.content[..output.content.len() - tail];
+        assert_eq!(shown, "hi\n", "{shown:?}");
+    }
+
+    #[tokio::test]
+    async fn bash_object_cut_output_names_the_spill_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = run(&tmp, r#"{"command":"seq 1 50000","timeout_ms":8000}"#).await;
+        let object = output.object.expect("no object");
+        assert_eq!(object.fields.get("exit_code"), Some(&serde_json::json!(0)));
+        assert_eq!(
+            object.fields.get("truncated"),
+            Some(&serde_json::json!(true))
+        );
+        let path = object
+            .fields
+            .get(FULL_OUTPUT_PATH)
+            .and_then(|path| path.as_str())
+            .expect("no spill file");
+        let spilled = tokio::fs::read_to_string(path).await.unwrap();
+        assert!(spilled.starts_with("1\n2\n3\n"), "{}", &spilled[..20]);
+        assert!(spilled.ends_with("49999\n50000\n"), "{}", &spilled[..20]);
+        let tail = object.tail.expect("no tail");
+        let shown = &output.content[..output.content.len() - tail];
+        assert!(shown.starts_with("[output cut: "), "{shown}");
+        assert!(shown.ends_with("49999\n50000\n"), "{}", &shown[..200]);
+    }
+
+    #[tokio::test]
+    async fn bash_object_signal_has_null_exit_code() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = run(&tmp, r#"{"command":"kill -9 $$"}"#).await;
+        assert_eq!(output.content.as_ref(), "killed by signal 9");
+        let object = output.object.expect("no object");
+        assert_eq!(
+            object.fields.get("exit_code"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(object.tail, Some(output.content.len()));
     }
 
     #[test]

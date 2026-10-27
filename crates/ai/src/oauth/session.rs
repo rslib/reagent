@@ -4,8 +4,6 @@
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +15,8 @@ use reqwest::header::{AUTHORIZATION, HeaderName, HeaderValue};
 
 use super::chatgpt::{self, RefreshError};
 use super::device;
+
+pub use reagent_oauth::{Sleeper, Wait};
 
 /// How long before the saved expiry a token is replaced, so a request that
 /// starts now does not run past it.
@@ -34,14 +34,6 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the refresh request and its body may take.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The wait a [`Session`] awaits.
-///
-/// `reagent-ai` has no runtime and so no timer: the caller hands one in, which
-/// keeps every wait off the thread the process runs on.
-pub type Wait = Pin<Box<dyn Future<Output = ()> + Send>>;
-
-/// Makes a wait of a duration, given by the caller at construction.
-pub type Sleeper = Arc<dyn Fn(Duration) -> Wait + Send + Sync>;
 /// The seconds since the epoch, or 0 before 1970.
 fn now() -> u64 {
     SystemTime::now()

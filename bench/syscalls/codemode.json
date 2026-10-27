@@ -1,0 +1,6 @@
+{
+  "replies": [
+    {"calls": [{"name": "codemode", "arguments": {"code": "const reads = await Promise.all([tools.read({path: 'a.txt'}), tools.read({path: 'b.txt'}), tools.read({path: 'sub/c.txt'}), tools.read({path: 'a.txt'})]);\nconst greps = await Promise.all([tools.grep({pattern: 'beta', path: 'a.txt'}), tools.grep({pattern: 'zeta', path: 'sub/c.txt'})]);\nprint(reads.length, greps.length);\n"}}]},
+    {"text": "all done"}
+  ]
+}

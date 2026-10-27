@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod glob;
+pub mod mcp;
 pub mod permissions;
 pub mod shell;
 
@@ -12,6 +13,9 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 pub use toml::Table;
+
+/// The MCP server types a run starts with.
+pub use mcp::{McpOAuth, McpServer, McpTransport, load_mcp, load_mcp_for};
 
 /// The settings a config file may hold. A key that is absent keeps the
 /// built-in default.
@@ -27,9 +31,22 @@ pub struct Settings {
     pub reasoning: Option<String>,
     /// The loop policy names, as written in the file.
     pub policy: Option<Vec<String>>,
+    /// The tool names, as written in the file.
+    pub tools: Option<Vec<String>>,
+    /// The MCP server names to start, with the `+name`/`-name` edits.
+    pub mcp: Option<Vec<String>>,
+    /// An `mcp_servers` table, refused: servers belong in `mcp.toml`.
+    #[serde(default)]
+    pub mcp_servers: Option<Table>,
+    /// A `servers` table, refused the same way.
+    #[serde(default)]
+    pub servers: Option<Table>,
     /// Folder names that searches leave out.
     #[serde(default)]
     pub skip: Vec<String>,
+    /// The `[codemode]` table.
+    #[serde(default)]
+    pub codemode: CodemodeSettings,
     /// Whether a plain file read in bash runs as a `read` call; on when unset.
     pub bash_reads: Option<bool>,
     /// The provider tables by name. Only the global file and a profile may
@@ -56,6 +73,14 @@ pub struct Sandbox {
     /// Folders commands may write besides the working and temp folders.
     #[serde(default)]
     pub write: Vec<String>,
+}
+
+/// The `[codemode]` table: the limits of one `codemode` script.
+#[derive(Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodemodeSettings {
+    /// The longest one script may run, in seconds; 600 when unset.
+    pub wall_time: Option<u64>,
 }
 
 /// A secret string. Its `Debug` output hides the text, so settings printed
@@ -237,9 +262,9 @@ pub fn global_path() -> Option<PathBuf> {
 }
 
 /// The text of a file and whether group or others may read it.
-struct Text {
-    text: String,
-    shared: bool,
+pub(crate) struct Text {
+    pub(crate) text: String,
+    pub(crate) shared: bool,
 }
 
 #[expect(
@@ -269,7 +294,7 @@ fn read(path: &Path) -> Result<Option<Text>, String> {
 
 /// The parse error with its place and message but not the source line, which
 /// could hold an api_key.
-fn parse_error(path: &Path, text: &str, error: &toml::de::Error) -> String {
+pub(crate) fn parse_error(path: &Path, text: &str, error: &toml::de::Error) -> String {
     // An "invalid type" or "invalid value" message quotes the value it got.
     let message = match error.message().split_once(", expected ") {
         Some((head, expected)) if head.starts_with("invalid ") => {
@@ -286,6 +311,12 @@ fn parse_error(path: &Path, text: &str, error: &toml::de::Error) -> String {
     format!("{}:{line}:{column}: {message}", path.display())
 }
 
+/// The text of a config file and whether others may read it, or `None` when
+/// the file is absent.
+pub(crate) fn read_text(path: &Path) -> Result<Option<Text>, String> {
+    read(path)
+}
+
 fn load_file(path: Option<&Path>, repo: bool) -> Result<Option<Layer>, String> {
     let Some(path) = path else {
         return Ok(None);
@@ -295,6 +326,12 @@ fn load_file(path: Option<&Path>, repo: bool) -> Result<Option<Layer>, String> {
     };
     let settings: Settings =
         toml::from_str(&text).map_err(|error| parse_error(path, &text, &error))?;
+    if settings.mcp_servers.is_some() || settings.servers.is_some() {
+        return Err(format!(
+            "servers belong in mcp.toml, not in {}",
+            path.display()
+        ));
+    }
     if !repo && shared && settings.providers.values().any(|p| p.api_key.is_some()) {
         return Err(format!(
             "{0}: holds an api_key, so only you may read it; run chmod 600 {0}",
@@ -369,10 +406,99 @@ fn load_profile(name: &str) -> Result<Layer, String> {
     }
 }
 
-/// Merges the layers of a run, a later layer over an earlier one for
-/// `model`, `max_tokens`, `reasoning` and `policy`; `skip` lists are
-/// appended and de-duplicated in order. Providers and the sandbox come from
-/// the global file, and a profile's tables merge over them field by field.
+/// The error a list that mixes plain names and `+name`/`-name` edits gets.
+pub const LIST_MIXED: &str = "a list takes plain names or +name/-name edits, not both";
+
+/// Whether `entry` adds or removes a name, written with a `+` or `-` prefix.
+pub fn is_edit(entry: &str) -> bool {
+    entry.starts_with(['+', '-'])
+}
+
+/// The name `entry` adds or removes: the entry without its `+` or `-`.
+pub fn list_name(entry: &str) -> &str {
+    entry.strip_prefix(['+', '-']).unwrap_or(entry)
+}
+
+/// Checks that `layer` is plain names or edits, never both in one list.
+pub fn check_list(layer: &[String]) -> Result<(), String> {
+    if layer.iter().any(|entry| is_edit(entry)) && !layer.iter().all(|entry| is_edit(entry)) {
+        return Err(LIST_MIXED.to_string());
+    }
+    Ok(())
+}
+
+/// Folds one layer's list into `merged`, or errors when it mixes the two forms.
+///
+/// Plain names replace `merged`, or add to it when `replace` is false; the
+/// edits of a later layer are appended in order.
+pub fn fold_list(merged: &mut Vec<String>, layer: &[String], replace: bool) -> Result<(), String> {
+    check_list(layer)?;
+    fold(merged, layer, replace);
+    Ok(())
+}
+
+/// [`fold_list`] for a layer that [`check_list`] already passed.
+fn fold(merged: &mut Vec<String>, layer: &[String], replace: bool) {
+    if layer.iter().any(|entry| is_edit(entry)) {
+        merged.extend(layer.iter().cloned());
+        return;
+    }
+    if replace {
+        merged.clear();
+        merged.extend(layer.iter().cloned());
+        if layer.is_empty() {
+            merged.push(EMPTY.to_string());
+        }
+        return;
+    }
+    // After an earlier layer's edits, a plain name must land after them, or a
+    // `-name` of that earlier layer would remove it again.
+    if merged.iter().any(|entry| is_edit(entry)) {
+        merged.extend(layer.iter().map(|name| format!("+{name}")));
+        return;
+    }
+    for name in layer {
+        if !merged.iter().any(|kept| kept == name) {
+            merged.push(name.clone());
+        }
+    }
+}
+
+/// The plain part of a list that a layer replaced with an empty list, so that
+/// [`resolve_list`] can tell it from a list that no layer replaced.
+const EMPTY: &str = "";
+
+/// Turns a folded list into the names it selects, sorted and de-duplicated.
+///
+/// The plain part is the base, or `default` when no layer replaced it; then
+/// the edits apply in order.
+pub fn resolve_list(merged: &[String], default: &[&str]) -> Vec<String> {
+    let plain = merged.iter().take_while(|entry| !is_edit(entry)).count();
+    let mut names: Vec<String> = if plain == 0 {
+        default.iter().map(|name| (*name).to_string()).collect()
+    } else {
+        merged[..plain]
+            .iter()
+            .filter(|name| name.as_str() != EMPTY)
+            .cloned()
+            .collect()
+    };
+    for entry in &merged[plain..] {
+        match entry.strip_prefix('-') {
+            Some(name) => names.retain(|kept| kept != name),
+            None => names.push(list_name(entry).to_string()),
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Merges the layers of a run, a later layer over an earlier one for `model`,
+/// `max_tokens`, `reasoning`, `tools`, `policy`, `mcp` and the `[codemode]`
+/// table; `skip` lists are appended and de-duplicated in order. Providers and
+/// the sandbox come from the global file, and a profile's tables merge over
+/// them field by field.
 pub fn merge_all(layers: &Layers) -> Settings {
     let mut merged = Settings::default();
     for (layer, profile) in [
@@ -402,13 +528,18 @@ fn apply(merged: &mut Settings, settings: &Settings, profile: bool) {
     over(&mut merged.model, &settings.model);
     over(&mut merged.max_tokens, &settings.max_tokens);
     over(&mut merged.reasoning, &settings.reasoning);
-    over(&mut merged.policy, &settings.policy);
-    over(&mut merged.bash_reads, &settings.bash_reads);
-    for name in &settings.skip {
-        if !merged.skip.contains(name) {
-            merged.skip.push(name.clone());
-        }
+    over(&mut merged.codemode.wall_time, &settings.codemode.wall_time);
+    if let Some(list) = &settings.policy {
+        fold(merged.policy.get_or_insert_with(Vec::new), list, true);
     }
+    if let Some(list) = &settings.tools {
+        fold(merged.tools.get_or_insert_with(Vec::new), list, true);
+    }
+    if let Some(list) = &settings.mcp {
+        fold(merged.mcp.get_or_insert_with(Vec::new), list, true);
+    }
+    over(&mut merged.bash_reads, &settings.bash_reads);
+    fold(&mut merged.skip, &settings.skip, false);
     if profile {
         for (name, table) in &settings.providers {
             match merged.providers.get_mut(name) {
@@ -668,6 +799,66 @@ mod tests {
         assert_eq!(merged.model.as_deref(), Some("kimi"));
         assert_eq!(merged.max_tokens, Some(100));
         assert_eq!(merged.providers["fi"].wire.as_deref(), Some("openai-chat"));
+    }
+
+    fn named(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn list_edit_fold_and_resolve() {
+        let mut merged = Vec::new();
+        fold_list(&mut merged, &named(&["read", "grep"]), true).expect("folds");
+        assert_eq!(merged, ["read", "grep"]);
+        fold_list(&mut merged, &named(&["+write", "-read"]), true).expect("folds");
+        assert_eq!(merged, ["read", "grep", "+write", "-read"]);
+        assert_eq!(resolve_list(&merged, &["bash"]), ["grep", "write"]);
+        let error = fold_list(&mut merged, &named(&["edit", "+bash"]), true).unwrap_err();
+        assert!(error.contains("not both"), "{error}");
+        // Skip's plain names add to the list instead of replacing it.
+        let mut added = Vec::new();
+        fold_list(&mut added, &named(&["a", "b"]), false).expect("folds");
+        fold_list(&mut added, &named(&["b", "c"]), false).expect("folds");
+        assert_eq!(added, ["a", "b", "c"]);
+        // A later plain name comes after an earlier removal and wins.
+        let mut back = Vec::new();
+        fold_list(&mut back, &named(&["vendor"]), false).expect("folds");
+        fold_list(&mut back, &named(&["-vendor"]), false).expect("folds");
+        fold_list(&mut back, &named(&["vendor"]), false).expect("folds");
+        assert_eq!(resolve_list(&back, &[]), ["vendor"]);
+        // Without a plain part the base is the default one.
+        assert_eq!(resolve_list(&named(&["-x"]), &["x", "y"]), ["y"]);
+        assert_eq!(resolve_list(&[], &["x"]), ["x"]);
+        assert_eq!(resolve_list(&named(&["b", "a"]), &["x"]), ["a", "b"]);
+        // An empty plain layer selects nothing, and later edits build on that.
+        let mut cleared = Vec::new();
+        fold_list(&mut cleared, &[], true).expect("folds");
+        assert!(resolve_list(&cleared, &["x"]).is_empty());
+        fold_list(&mut cleared, &named(&["+y"]), true).expect("folds");
+        assert_eq!(resolve_list(&cleared, &["x"]), ["y"]);
+        assert_eq!(list_name("+write"), "write");
+        assert_eq!(list_name("-write"), "write");
+        assert_eq!(list_name("write"), "write");
+        assert!(is_edit("+write") && is_edit("-write") && !is_edit("write"));
+    }
+
+    #[test]
+    fn codemode_table_sets_the_wall_time() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let global = write(dir.path(), "g.toml", "[codemode]\nwall_time = 30\n");
+        assert_eq!(settings(Some(&global), None).codemode.wall_time, Some(30));
+        let repo = write(dir.path(), "r.toml", "[codemode]\nwall_time = 20\n");
+        let merged = settings(Some(&global), Some(&repo));
+        assert_eq!(merged.codemode.wall_time, Some(20));
+        assert_eq!(settings(None, None).codemode.wall_time, None);
+    }
+
+    #[test]
+    fn codemode_table_unknown_key_is_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let global = write(dir.path(), "g.toml", "[codemode]\nnope = 1\n");
+        let error = load_file(Some(&global), false).unwrap_err();
+        assert!(error.contains("nope"), "{error}");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 mod args;
 mod json;
 mod login;
+mod mcp;
 mod models;
 mod prompt;
 mod run;
@@ -20,10 +21,14 @@ fn main() -> std::process::ExitCode {
         return sandbox::helper(argv.into_iter().skip(1));
     }
     if let Some(command) = argv.first().and_then(|arg| arg.to_str())
-        && matches!(command, "login" | "logout")
+        && matches!(command, "login" | "logout" | "mcp")
     {
         let runtime = runtime();
-        let code = runtime.block_on(login::run(command, argv[1..].to_vec()));
+        let code = if command == "mcp" {
+            runtime.block_on(mcp::run(argv[1..].to_vec()))
+        } else {
+            runtime.block_on(login::run(command, argv[1..].to_vec()))
+        };
         // The pasted-URL reader holds a blocking stdin thread, and dropping a
         // runtime waits for it, so `login` would hang until Enter after a
         // browser login. Shut the runtime down without waiting instead.

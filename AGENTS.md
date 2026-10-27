@@ -18,6 +18,7 @@ cargo nextest run -p reagent-ai --features testing --test allocs   # heap blocks
 cargo nextest run -p reagent-tools --test allocs                   # heap blocks for edit, read, walk and effects
 cargo nextest run -p reagent-agent --test session_allocs           # heap blocks per session line and stuck turn
 bash bench/instructions.sh                                         # Linux: Callgrind instruction counts against the merge base
+bash bench/syscalls.sh   # Linux: syscalls of fixed scenarios against bench/syscall-budget.txt
 bash bench/size.sh   # size build against bench/size-budget.txt
 cargo run -q -p reagent -- --version
 ```
@@ -48,11 +49,12 @@ A feature that does not move 1 or 2 in a measured run does not ship as a default
 | Small helpers with no domain types: text cuts, number writing, path normalizing, borrowed JSON reading | `crates/util` (`reagent-util`) | no other reagent crate |
 | OS sandbox for one process and its children: Seatbelt on macOS, Landlock on Linux | `crates/sandbox` (`reagent-sandbox`) | no other reagent crate |
 | Config files, providers and models, permission rules and their shell lexer and glob | `crates/config` (`reagent-config`) | depends on util |
-| Message types, providers, SSE, `FakeProvider`, OAuth logins | `crates/ai` (`reagent-ai`) | `reagent-config` (the auth file) |
+| Shared OAuth (PKCE, device flow, JWT, loopback callback) and the HTTP client | `crates/oauth` (`reagent-oauth`) | depends on config |
+| Message types, providers, SSE, `FakeProvider`, OAuth logins | `crates/ai` (`reagent-ai`) | `reagent-config` (the auth file) and oauth |
 | Loop, events, session, context policy, `Tool` trait, the permission guard | `crates/agent` (`reagent-agent`) | depends on ai, config and util |
 | Native tools | `crates/tools` (`reagent-tools`) | depends on agent, config and util |
-| QuickJS plugins and `execute(code)` | `crates/script` (`reagent-script`) | depends on agent |
-| MCP client | `crates/mcp` (`reagent-mcp`) | depends on agent |
+| The `codemode` tool: a QuickJS script that calls the other tools | `crates/script` (`reagent-script`) | depends on agent, ai and tools |
+| MCP client and its OAuth login | `crates/mcp` (`reagent-mcp`) | depends on agent, ai, oauth and config |
 | Terminal UI and markdown | `crates/tui` (`reagent-tui`) | depends on agent |
 | Binary and flags | `crates/cli` (`reagent`) | depends on all |
 | Model-facing prompt templates | none: `prompts/` at the root | baked into `crates/agent` and `crates/cli` with `include_str!` |
@@ -72,7 +74,7 @@ Design decisions and their reasons: `docs/plans/architecture.md` (local only, ig
 - All I/O is async: `tokio::fs`, `tokio::process`, `tokio::net`, `tokio::time`. `clippy.toml` bans the `std` versions, in tests too. Heavy CPU work goes in `tokio::task::spawn_blocking`. The runtime is `current_thread`.
 - A new dependency needs `default-features = false` and only the features it uses. Add it with `cargo add -p <package> <dep> --no-default-features -F <features>`.
 - Claim a speed or size gain only with a measured number and the command that produced it.
-- A hot path runs per stream event, per request, per tool call or per line or file a tool touches. A change to one keeps its `allocs` test and `bench/instructions.sh` passing (2% on instructions and estimated cycles, 12% for `find`, `grep` and `capture`, which touch the file system or a child process). A new hot path adds a dhat case that fails on the old code, with the bound set near the measured value. Raise a bound only with the old and new number in the commit body.
+- A hot path runs per stream event, per request, per tool call or per line or file a tool touches. A change to one keeps its `allocs` test, `bench/instructions.sh` and `bench/syscalls.sh` passing (2% on instructions and estimated cycles, 12% for `find`, `grep` and `capture`, which touch the file system or a child process). A new hot path adds a dhat case that fails on the old code, with the bound set near the measured value. Raise a bound only with the old and new number in the commit body.
 - Every test in a dhat file takes the file's shared lock as its first line. dhat counts every thread, and `cargo test` runs tests in parallel threads, so another test's setup lands in the count.
 - No per-event syscall: batch output writes, and read the clock only when the value is used.
 - No stack array over 16 KB in an async function; put the buffer on the heap. Clippy's `large_futures`, `large_stack_arrays` and `large_enum_variant` fire on x86_64 Linux with sizes macOS does not show, so a change to an async function, a buffer or an enum runs clippy on Linux too.

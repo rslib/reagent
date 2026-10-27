@@ -46,7 +46,7 @@ fn root() -> PathBuf {
 
 /// This run's spill folder, made on its first spill: a run that spills nothing
 /// makes nothing.
-pub(crate) async fn folder() -> Result<&'static Path, String> {
+pub async fn folder() -> Result<&'static Path, String> {
     folder_in(&root(), &RUN).await
 }
 

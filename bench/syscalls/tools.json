@@ -1,0 +1,11 @@
+{
+  "replies": [
+    {"calls": [{"name": "read", "arguments": {"path": "a.txt"}}]},
+    {"calls": [{"name": "grep", "arguments": {"pattern": "beta", "path": "a.txt"}}]},
+    {"calls": [{"name": "find", "arguments": {"pattern": "*.txt"}}]},
+    {"calls": [{"name": "edit", "arguments": {"path": "b.txt", "old_string": "delta", "new_string": "delta edited"}}]},
+    {"calls": [{"name": "write", "arguments": {"path": "d.txt", "content": "written\n"}}]},
+    {"calls": [{"name": "read", "arguments": {"path": "a.txt"}}]},
+    {"text": "all done"}
+  ]
+}

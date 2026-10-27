@@ -1,0 +1,10 @@
+{
+  "replies": [
+    {"calls": [{"name": "bash", "arguments": {"command": "true"}}]},
+    {"calls": [{"name": "bash", "arguments": {"command": "true"}}]},
+    {"calls": [{"name": "bash", "arguments": {"command": "true"}}]},
+    {"calls": [{"name": "bash", "arguments": {"command": "true"}}]},
+    {"calls": [{"name": "bash", "arguments": {"command": "true"}}]},
+    {"text": "all done"}
+  ]
+}

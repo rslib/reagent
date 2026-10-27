@@ -1,0 +1,8 @@
+{
+  "replies": [
+    {"calls": [{"name": "mcp__demo__echo", "arguments": {"text": "one"}}]},
+    {"calls": [{"name": "mcp__demo__echo", "arguments": {"text": "two"}}]},
+    {"calls": [{"name": "mcp__demo__echo", "arguments": {"text": "three"}}]},
+    {"text": "all done"}
+  ]
+}

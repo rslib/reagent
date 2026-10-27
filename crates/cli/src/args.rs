@@ -1,10 +1,12 @@
 //! Command line argument parsing with `lexopt`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use reagent_ai::{Auth, Compat, CompatOverride, MaxTokensField, Preset, Route};
+use reagent_config::mcp::{McpConfig, McpDirect};
 use reagent_config::permissions::Rules;
-use reagent_config::{Layer, Layers, Model, Provider, Secret, Settings};
+use reagent_config::{Layer, Layers, McpServer, Model, Provider, Secret, Settings};
 use serde::Deserialize;
 use serde::de::IntoDeserializer;
 
@@ -39,6 +41,32 @@ const DEFAULT_CHAT_POLICIES: [&str; 3] = ["budget", "mask", "snapshot"];
 /// the whole file, and thinking counts toward the cap, so a low cap cuts the
 /// reply.
 const DEFAULT_MAX_TOKENS: u32 = 64_000;
+
+/// The tool names a `--tools` value may select.
+pub const TOOL_NAMES: [&str; 7] = ["bash", "edit", "find", "grep", "read", "write", "codemode"];
+
+/// Whether the folded `--tools` list writes a plain list at all, and whether
+/// it names `codemode`.
+fn codemode_in_tools(folded: &[String]) -> (bool, bool) {
+    let plain = folded.iter().any(|entry| !reagent_config::is_edit(entry));
+    let named = folded
+        .iter()
+        .any(|entry| reagent_config::list_name(entry) == reagent_script::codemode::NAME);
+    (plain, named)
+}
+
+/// The tools with no `--tools` flag. `codemode` joins them only when asked
+/// for: a script the model writes costs a turn more than the calls it saves.
+const DEFAULT_TOOLS: [&str; 6] = ["bash", "edit", "find", "grep", "read", "write"];
+
+/// What a run says when a tool list leaves `codemode` out and drops the servers
+/// whose tools all need one, naming them.
+fn mcp_without_codemode(dropped: &[&str]) -> String {
+    format!(
+        "reagent: MCP servers need codemode; they are off because the tool list leaves codemode out: {}",
+        dropped.join(", ")
+    )
+}
 
 /// The provider wire selected by `--provider`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,9 +177,17 @@ pub struct Args {
     pub reasoning: Option<String>,
     /// A hard deadline in seconds, if any.
     pub deadline: Option<u64>,
+    /// The `[codemode]` table, merged from the config files.
+    pub codemode: reagent_config::CodemodeSettings,
+    /// The tools the run offers, resolved and sorted.
+    pub tools: Vec<String>,
+    /// The MCP servers the run starts, picked and sorted by name.
+    pub mcp_servers: Vec<(String, McpServer)>,
+    /// Whether a run warns when many MCP tools go into the request directly.
+    pub warn_many_direct: bool,
     /// The working directory the tools run in.
     pub cwd: PathBuf,
-    /// The loop policies to enable, expanded and de-duplicated.
+    /// The loop policies to enable, resolved and sorted.
     pub policy: Vec<String>,
     /// Folder names from the config that searches leave out.
     pub skip: Vec<String>,
@@ -299,8 +335,13 @@ fn usage() -> &'static str {
         "      --cwd <dir>      the working directory for the tools (default: current dir)\n",
         "      --profile <name>  read <config dir>/profiles/<name>.toml over the global config;\n",
         "                       REAGENT_PROFILE names one too\n",
+        "  -t, --tools <list>   tools: bash, edit, find, grep, read, write, codemode;\n",
+        "                       +name adds, -name removes, plain names replace (default: all but codemode)\n",
+        "      --mcp <list>     MCP servers to start: +name adds, -name removes, plain names replace\n",
+        "      --no-mcp         start no MCP server\n",
         "      --policy <list>  loop policies: completion, stuck, budget, snapshot, mask, compact;\n",
-        "                       all = completion, budget, snapshot; none = off\n",
+        "                       all = completion, budget, snapshot; none = off;\n",
+        "                       +name adds, -name removes, plain names replace\n",
         "                       (default: budget and snapshot, plus mask on openai-chat)\n",
         "      --version        print the version and exit\n",
         "\n",
@@ -308,7 +349,8 @@ fn usage() -> &'static str {
         "  models [name] [--refresh]  list the models of a provider, or of all with a key\n",
         "  login <provider> [--as <name>] [--no-browser]  save a login for a provider;\n",
         "                       openrouter, chatgpt\n",
-        "  logout <provider>  drop a saved login\n"
+        "  logout <provider>  drop a saved login\n",
+        "  mcp add|remove|list|login|logout  manage MCP servers (see reagent mcp --help)\n"
     )
 }
 
@@ -369,26 +411,93 @@ fn parse_header(text: &str) -> Result<(String, String), String> {
     Ok((name.to_string(), value.to_string()))
 }
 
-/// Expands and validates a `--policy` comma list into sorted, de-duplicated
-/// policy names. `all` expands to [`ALL_POLICIES`] and `none`, valid only
-/// alone, to no policy. An unknown name is an error, which the binary reports
-/// by exiting 2.
-pub fn parse_policy(value: &str) -> Result<Vec<String>, String> {
-    if value.trim() == "none" {
-        return Ok(Vec::new());
+/// Splits a `--tools` or `--policy` comma list into its trimmed entries.
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// The edits a plain `none` layer becomes: every policy name removed.
+fn clear_policies() -> Vec<String> {
+    POLICY_NAMES.iter().map(|name| format!("-{name}")).collect()
+}
+
+/// Checks a `--tools` comma list, which exits 2 on an unknown name.
+fn tool_list(value: &str) -> Result<Vec<String>, String> {
+    let names = split_list(value);
+    reagent_config::check_list(&names)?;
+    for entry in &names {
+        let name = reagent_config::list_name(entry);
+        if !TOOL_NAMES.contains(&name) {
+            return Err(format!(
+                "unknown tool: {name}; tools: {}",
+                TOOL_NAMES.join(", ")
+            ));
+        }
     }
-    let mut names = Vec::new();
-    for part in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        match part {
-            "none" => return Err("none must be the only policy".to_string()),
-            "all" => names.extend(ALL_POLICIES.iter().map(ToString::to_string)),
-            name if POLICY_NAMES.contains(&name) => names.push(name.to_string()),
+    Ok(names)
+}
+
+/// Splits a `--mcp` comma list; an unknown name fails once the config is read.
+fn mcp_list(value: &str) -> Result<Vec<String>, String> {
+    let names = split_list(value);
+    reagent_config::check_list(&names)?;
+    Ok(names)
+}
+
+/// The servers `names` picks, sorted by name, or the error that names an
+/// unknown one beside the servers the config defines.
+fn pick_servers(
+    names: &[String],
+    servers: &BTreeMap<String, McpServer>,
+) -> Result<Vec<(String, McpServer)>, String> {
+    let mut picked = Vec::with_capacity(names.len());
+    for name in names {
+        let Some(server) = servers.get(name) else {
+            let defined: Vec<&str> = servers.keys().map(String::as_str).collect();
+            return Err(if defined.is_empty() {
+                format!("unknown server: {name}; no server is defined in mcp.toml")
+            } else {
+                format!("unknown server: {name}; servers: {}", defined.join(", "))
+            });
+        };
+        picked.push((name.clone(), server.clone()));
+    }
+    Ok(picked)
+}
+
+/// Checks a policy list, expanding `all` and spelling a plain `none` as the
+/// edits that clear the list. An unknown name is an error.
+fn expand_policy(names: &[String]) -> Result<Vec<String>, String> {
+    reagent_config::check_list(names)?;
+    if names.iter().any(|entry| reagent_config::is_edit(entry)) {
+        for entry in names {
+            let name = reagent_config::list_name(entry);
+            if !POLICY_NAMES.contains(&name) {
+                return Err(format!("unknown policy: {name}"));
+            }
+        }
+        return Ok(names.to_vec());
+    }
+    if names.len() > 1 && names.iter().any(|name| name == "none") {
+        return Err("none must be the only policy".to_string());
+    }
+    let mut expanded = Vec::with_capacity(names.len());
+    for name in names {
+        match name.as_str() {
+            "none" => return Ok(clear_policies()),
+            "all" => expanded.extend(ALL_POLICIES.iter().map(ToString::to_string)),
+            name if POLICY_NAMES.contains(&name) => expanded.push(name.to_string()),
             other => return Err(format!("unknown policy: {other}")),
         }
     }
-    names.sort();
-    names.dedup();
-    Ok(names)
+    expanded.sort();
+    expanded.dedup();
+    Ok(expanded)
 }
 
 /// Parses the process arguments, or returns an exit decision.
@@ -396,13 +505,13 @@ pub fn parse() -> Result<Outcome, String> {
     parse_from(lexopt::Parser::from_env(), &load_settings)
 }
 
-/// Replaces the policy names of `layer` with their expanded form, naming the
-/// file when one is wrong.
-fn expand_policies(layer: &mut Layer) -> Result<(), String> {
+/// Checks the policy and tool lists of `layer`, expanding `all` and `none`,
+/// and names the file when one is wrong.
+fn check_lists(layer: &mut Layer) -> Result<(), String> {
     let path = layer.path.display().to_string();
     let expand = |names: &mut Option<Vec<String>>| -> Result<(), String> {
         if let Some(list) = names {
-            *list = parse_policy(&list.join(",")).map_err(|error| format!("{path}: {error}"))?;
+            *list = expand_policy(list).map_err(|error| format!("{path}: {error}"))?;
         }
         Ok(())
     };
@@ -412,13 +521,23 @@ fn expand_policies(layer: &mut Layer) -> Result<(), String> {
             expand(&mut model.policy)?;
         }
     }
+    if let Some(list) = &layer.settings.tools {
+        tool_list(&list.join(",")).map_err(|error| format!("{path}: {error}"))?;
+    }
+    if let Some(list) = &layer.settings.mcp {
+        reagent_config::check_list(list).map_err(|error| format!("{path}: {error}"))?;
+    }
+    reagent_config::check_list(&layer.settings.skip).map_err(|error| format!("{path}: {error}"))?;
     Ok(())
 }
 
 /// Loads the config files for `cwd` and the profile `profile`, checks their
-/// policy names and merges them, and parses their permission rules.
-fn load_settings(cwd: &Path, profile: Option<&str>) -> Result<(Settings, Rules), String> {
-    settings_from(reagent_config::load_for(cwd, profile)?, cwd)
+/// lists, merges them, parses their permission rules and reads their servers.
+fn load_settings(cwd: &Path, profile: Option<&str>) -> Result<Loaded, String> {
+    let layers = reagent_config::load_for(cwd, profile)?;
+    let servers = reagent_config::load_mcp_for(profile)?;
+    let (settings, rules) = settings_from(layers, cwd, &servers.servers)?;
+    Ok((settings, rules, servers))
 }
 
 #[expect(
@@ -431,12 +550,19 @@ fn canonical(path: &Path) -> PathBuf {
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn settings_from(mut layers: Layers, cwd: &Path) -> Result<(Settings, Rules), String> {
+fn settings_from(
+    mut layers: Layers,
+    cwd: &Path,
+    servers: &BTreeMap<String, McpServer>,
+) -> Result<(Settings, Rules), String> {
     for layer in [&mut layers.global, &mut layers.profile, &mut layers.repo]
         .into_iter()
         .flatten()
     {
-        expand_policies(layer)?;
+        check_lists(layer)?;
+    }
+    if let Some(repo) = &mut layers.repo {
+        repo_mcp(repo, servers);
     }
     // The tools resolve paths from the real folder, so the rules must too,
     // or a symlinked --cwd would make every relative path rule miss.
@@ -444,6 +570,32 @@ fn settings_from(mut layers: Layers, cwd: &Path) -> Result<(Settings, Rules), St
     let home = std::env::var_os("HOME").map(|home| canonical(Path::new(&home)));
     let rules = Rules::from_layers(&layers.ordered(), &cwd, home.as_deref())?;
     Ok((reagent_config::merge_all(&layers), rules))
+}
+
+/// Cuts `repo`'s `mcp` list down to what a repo file may do: remove a server,
+/// or name one that is enabled. A server is something the user trusts by
+/// defining it in `mcp.toml`, and a cloned repo is not trusted.
+fn repo_mcp(repo: &mut Layer, servers: &BTreeMap<String, McpServer>) {
+    let Some(list) = &mut repo.settings.mcp else {
+        return;
+    };
+    let path = repo.path.clone();
+    list.retain(|entry| {
+        let name = reagent_config::list_name(entry);
+        let starts = !entry.starts_with('-') && servers.get(name).is_some_and(|s| !s.enabled);
+        if starts {
+            eprintln!("{}", repo_disabled(&path, name));
+        }
+        !starts
+    });
+}
+
+/// The line a run prints once for a repo file that asks for a disabled server.
+fn repo_disabled(path: &Path, name: &str) -> String {
+    format!(
+        "reagent: {} asks for MCP server {name}, which is disabled; enable it in mcp.toml or pass --mcp +{name}",
+        path.display()
+    )
 }
 
 /// The preset a name selects, whose fields a config table may override.
@@ -623,9 +775,12 @@ fn model_targets(settings: &Settings, name: Option<&str>) -> Result<Vec<Target>,
         .collect()
 }
 
-/// Reads the merged settings and the permission rules for a working folder
-/// and a profile.
-type LoadSettings<'a> = dyn Fn(&Path, Option<&str>) -> Result<(Settings, Rules), String> + 'a;
+/// The merged settings, the permission rules and the MCP servers a run reads.
+type Loaded = (Settings, Rules, McpConfig);
+
+/// Reads the merged settings, the permission rules and the MCP servers for a
+/// working folder and a profile.
+type LoadSettings<'a> = dyn Fn(&Path, Option<&str>) -> Result<Loaded, String> + 'a;
 
 /// Parses `args` (the arguments after the program name) into an outcome.
 /// `load` reads the settings for the working directory; a flag beats them.
@@ -641,7 +796,11 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
     let mut reasoning = None;
     let mut deadline = None;
     let mut cwd = None;
-    let mut policy: Option<Vec<String>> = None;
+    // Each `--tools`, `--policy` and `--mcp` value, in command-line order.
+    let mut tools: Vec<Vec<String>> = Vec::new();
+    let mut policy: Vec<Vec<String>> = Vec::new();
+    let mut mcp: Vec<Vec<String>> = Vec::new();
+    let mut no_mcp = false;
     let mut models: Option<Option<String>> = None;
     let mut refresh = false;
     let mut profile = None;
@@ -728,16 +887,29 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
                 let text = value.into_string().map_err(|_| bad("--deadline"))?;
                 deadline = Some(text.parse().map_err(|_| bad("--deadline"))?);
             }
+            lexopt::Arg::Short('t') | lexopt::Arg::Long("tools") => {
+                let value = parser
+                    .value()
+                    .map_err(|_| "missing value for --tools".to_string())?;
+                let text = value.into_string().map_err(|_| bad("--tools"))?;
+                tools.push(tool_list(&text).map_err(|error| format!("--tools: {error}"))?);
+            }
             lexopt::Arg::Long("policy") => {
                 let value = parser
                     .value()
                     .map_err(|_| "missing value for --policy".to_string())?;
                 let text = value.into_string().map_err(|_| bad("--policy"))?;
-                let names = policy.get_or_insert_with(Vec::new);
-                names.extend(parse_policy(&text)?);
-                names.sort();
-                names.dedup();
+                let names = split_list(&text);
+                policy.push(expand_policy(&names).map_err(|error| format!("--policy: {error}"))?);
             }
+            lexopt::Arg::Long("mcp") => {
+                let value = parser
+                    .value()
+                    .map_err(|_| "missing value for --mcp".to_string())?;
+                let text = value.into_string().map_err(|_| bad("--mcp"))?;
+                mcp.push(mcp_list(&text).map_err(|error| format!("--mcp: {error}"))?);
+            }
+            lexopt::Arg::Long("no-mcp") => no_mcp = true,
             lexopt::Arg::Long("cwd") => {
                 let value = parser
                     .value()
@@ -782,11 +954,14 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
             || max_tokens.is_some()
             || reasoning.is_some()
             || deadline.is_some()
-            || policy.is_some()
+            || !tools.is_empty()
+            || !policy.is_empty()
+            || !mcp.is_empty()
+            || no_mcp
         {
             return Err("the models command takes no run flags".into());
         }
-        let (settings, _) = load(
+        let (settings, _, _) = load(
             &cwd.unwrap_or_else(|| PathBuf::from(".")),
             profile.as_deref(),
         )?;
@@ -808,7 +983,7 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
         return Err("missing task; use -p <task>".into());
     };
     let cwd = cwd.unwrap_or_else(|| PathBuf::from("."));
-    let (settings, rules) = load(&cwd, profile.as_deref())?;
+    let (settings, rules, servers) = load(&cwd, profile.as_deref())?;
     check_provider_names(&settings)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let (sandbox, network, write) = resolve_sandbox(&settings.sandbox, home.as_deref())?;
@@ -866,17 +1041,74 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
     }
     config_header.extend(header);
     let header = config_header;
-    let policy = policy
-        .or(model_table.policy)
-        .or(settings.policy)
-        .unwrap_or_else(|| {
-            let names: &[&str] = if provider == Wire::OpenAiChat {
-                &DEFAULT_CHAT_POLICIES
-            } else {
-                &DEFAULT_POLICIES
-            };
-            names.iter().map(ToString::to_string).collect()
-        });
+    // The lists fold in layer order: the config files, each flag as written,
+    // and for `policy` the model's table before the flags.
+    let mut folded = settings.policy.clone().unwrap_or_default();
+    if let Some(list) = &model_table.policy {
+        reagent_config::fold_list(&mut folded, list, true)
+            .map_err(|error| format!("config: {error}"))?;
+    }
+    for list in &policy {
+        reagent_config::fold_list(&mut folded, list, true)
+            .map_err(|error| format!("--policy: {error}"))?;
+    }
+    let default: &[&str] = if provider == Wire::OpenAiChat {
+        &DEFAULT_CHAT_POLICIES
+    } else {
+        &DEFAULT_POLICIES
+    };
+    let policy = reagent_config::resolve_list(&folded, default);
+    let mut folded = settings.tools.clone().unwrap_or_default();
+    for list in &tools {
+        reagent_config::fold_list(&mut folded, list, true)
+            .map_err(|error| format!("--tools: {error}"))?;
+    }
+    let mut tools = reagent_config::resolve_list(&folded, &DEFAULT_TOOLS);
+    let (plain_tools, names_codemode) = codemode_in_tools(&folded);
+    // The servers fold the same way, with every enabled server as the base.
+    let mut folded = settings.mcp.clone().unwrap_or_default();
+    for list in &mcp {
+        reagent_config::fold_list(&mut folded, list, true)
+            .map_err(|error| format!("--mcp: {error}"))?;
+    }
+    let default: Vec<&str> = servers
+        .servers
+        .iter()
+        .filter(|(_, server)| server.enabled)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let mut mcp_servers = if no_mcp {
+        Vec::new()
+    } else {
+        pick_servers(
+            &reagent_config::resolve_list(&folded, &default),
+            &servers.servers,
+        )?
+    };
+    // A script reaches the tools that are not direct, so a picked server with
+    // one needs `codemode`. A server whose every tool is direct needs nothing.
+    if mcp_servers
+        .iter()
+        .any(|(_, server)| server.direct != McpDirect::All)
+    {
+        if !plain_tools && !names_codemode {
+            tools.push(reagent_script::codemode::NAME.to_string());
+            tools.sort();
+        } else if !tools
+            .iter()
+            .any(|name| name == reagent_script::codemode::NAME)
+        {
+            let dropped: Vec<&str> = mcp_servers
+                .iter()
+                .filter(|(_, server)| server.direct == McpDirect::None)
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if !dropped.is_empty() {
+                eprintln!("{}", mcp_without_codemode(&dropped));
+            }
+            mcp_servers.retain(|(_, server)| server.direct != McpDirect::None);
+        }
+    }
     // Editing old tool results breaks the reasoning the Anthropic and
     // Responses wires replay, so masking runs only on the chat wire.
     if policy.iter().any(|name| name == "mask") && provider != Wire::OpenAiChat {
@@ -927,9 +1159,13 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
                 .find(|text| !text.trim().is_empty())
         }),
         deadline,
+        codemode: settings.codemode,
+        tools,
+        mcp_servers,
+        warn_many_direct: servers.warn_many_direct,
         cwd,
         policy,
-        skip: settings.skip,
+        skip: reagent_config::resolve_list(&settings.skip, &[]),
         bash_reads: settings.bash_reads.unwrap_or(true),
         rules,
         context_window: model_table.context_window,
@@ -950,16 +1186,14 @@ pub fn help() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reagent_config::McpTransport;
 
     fn parse(args: &[&str]) -> Result<Outcome, String> {
         parse_with(args, Settings::default())
     }
 
     fn parse_with(args: &[&str], settings: Settings) -> Result<Outcome, String> {
-        let argv = args.iter().map(std::ffi::OsString::from);
-        parse_from(lexopt::Parser::from_args(argv), &|_, _| {
-            Ok((settings.clone(), Rules::none()))
-        })
+        parse_with_servers(args, settings, BTreeMap::new())
     }
 
     fn run_with(args: &[&str], settings: Settings) -> Args {
@@ -1319,6 +1553,444 @@ mod tests {
         assert!(parse(&["-p", "task", "--policy"]).is_err());
     }
 
+    /// The merged settings of the three config layers.
+    fn merged(global: Option<Layer>, profile: Option<Layer>, repo: Option<Layer>) -> Settings {
+        reagent_config::merge_all(&Layers {
+            global,
+            profile,
+            repo,
+        })
+    }
+
+    fn layer(path: &str, settings: Settings) -> Layer {
+        Layer {
+            path: PathBuf::from(path),
+            settings,
+        }
+    }
+
+    #[test]
+    fn list_edit_tools_add_and_remove() {
+        let args = run(&["-p", "task", "--tools", "+codemode,-write"]);
+        assert_eq!(
+            args.tools,
+            ["bash", "codemode", "edit", "find", "grep", "read"]
+        );
+    }
+
+    #[test]
+    fn list_edit_tools_plain_replaces() {
+        let args = run(&["-p", "task", "--tools", "read,grep"]);
+        assert_eq!(args.tools, ["grep", "read"]);
+        let args = run(&["-p", "task", "-t", "bash"]);
+        assert_eq!(args.tools, ["bash"]);
+    }
+
+    // The MCP tests below build their servers instead of reading `mcp.toml`.
+    fn server(enabled: bool) -> McpServer {
+        McpServer {
+            transport: McpTransport::Stdio {
+                command: "npx".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+                cwd: None,
+            },
+            timeout: std::time::Duration::from_secs(60),
+            enabled,
+            direct: McpDirect::None,
+            oauth: None,
+        }
+    }
+
+    /// The servers of a fake `mcp.toml`, by name and whether they are enabled.
+    fn defined(list: &[(&str, bool)]) -> BTreeMap<String, McpServer> {
+        list.iter()
+            .map(|(name, enabled)| ((*name).to_string(), server(*enabled)))
+            .collect()
+    }
+
+    fn parse_with_servers(
+        args: &[&str],
+        settings: Settings,
+        servers: BTreeMap<String, McpServer>,
+    ) -> Result<Outcome, String> {
+        let argv = args.iter().map(std::ffi::OsString::from);
+        parse_from(lexopt::Parser::from_args(argv), &|_, _| {
+            Ok((
+                settings.clone(),
+                Rules::none(),
+                McpConfig {
+                    servers: servers.clone(),
+                    warn_many_direct: true,
+                    settings: Default::default(),
+                },
+            ))
+        })
+    }
+
+    fn run_servers(
+        args: &[&str],
+        settings: Settings,
+        servers: BTreeMap<String, McpServer>,
+    ) -> Args {
+        match parse_with_servers(args, settings, servers) {
+            Ok(Outcome::Run(args)) => *args,
+            other => panic!("expected a run outcome for {args:?}, got {other:?}"),
+        }
+    }
+
+    fn picked(args: &Args) -> Vec<&str> {
+        args.mcp_servers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn mcp_config_default_picks_enabled() {
+        let servers = defined(&[("a", true), ("b", false)]);
+        let args = run_servers(&["-p", "task"], Settings::default(), servers);
+        assert_eq!(picked(&args), ["a"]);
+        assert!(args.mcp_servers[0].1.enabled, "the entry reaches the args");
+    }
+
+    #[test]
+    fn mcp_codemode_turns_on_with_a_server() {
+        let servers = defined(&[("gh", true)]);
+        let args = run_servers(&["-p", "task"], Settings::default(), servers);
+        assert_eq!(picked(&args), ["gh"]);
+        assert!(
+            args.tools.iter().any(|name| name == "codemode"),
+            "{:?}",
+            args.tools
+        );
+        // An edit layer that says nothing about codemode keeps it too.
+        let servers = defined(&[("gh", true)]);
+        let args = run_servers(
+            &["-p", "task", "--tools", "+find"],
+            Settings::default(),
+            servers,
+        );
+        assert!(args.tools.iter().any(|name| name == "codemode"));
+    }
+
+    #[test]
+    fn mcp_codemode_off_when_removed() {
+        let servers = defined(&[("gh", true)]);
+        let args = run_servers(
+            &["-p", "task", "--tools", "-codemode"],
+            Settings::default(),
+            servers,
+        );
+        assert!(args.mcp_servers.is_empty(), "{:?}", picked(&args));
+        assert!(!args.tools.iter().any(|name| name == "codemode"));
+        let servers = defined(&[("gh", true)]);
+        let args = run_servers(
+            &["-p", "task", "--tools", "read,grep"],
+            Settings::default(),
+            servers,
+        );
+        assert!(args.mcp_servers.is_empty(), "{:?}", picked(&args));
+        // A plain list that keeps codemode keeps the servers.
+        let servers = defined(&[("gh", true)]);
+        let args = run_servers(
+            &["-p", "task", "--tools", "codemode,read"],
+            Settings::default(),
+            servers,
+        );
+        assert_eq!(picked(&args), ["gh"]);
+    }
+
+    #[test]
+    fn mcp_direct_codemode_needed_for_rest() {
+        let mut servers = defined(&[("gh", true)]);
+        servers.get_mut("gh").expect("the server").direct =
+            McpDirect::Only(vec!["echo".to_string()]);
+        let args = run_servers(&["-p", "task"], Settings::default(), servers);
+        assert_eq!(picked(&args), ["gh"]);
+        assert!(
+            args.tools.iter().any(|name| name == "codemode"),
+            "{:?}",
+            args.tools
+        );
+    }
+
+    #[test]
+    fn mcp_config_repo_removes_one() {
+        let servers = defined(&[("gh", true), ("slack", true)]);
+        let settings = merged(
+            Some(layer("/g/config.toml", Settings::default())),
+            None,
+            Some(layer(
+                "/repo/.reagent/config.toml",
+                Settings {
+                    mcp: Some(vec!["-slack".into()]),
+                    ..Settings::default()
+                },
+            )),
+        );
+        let args = run_servers(&["-p", "task"], settings, servers);
+        assert_eq!(picked(&args), ["gh"]);
+    }
+
+    #[test]
+    fn mcp_config_repo_cannot_enable_a_disabled_server() {
+        let servers = defined(&[("dev", true), ("prod", false)]);
+        for list in [
+            vec!["+prod".to_string()],
+            vec!["prod".to_string()],
+            vec!["+prod".to_string(), "+dev".to_string()],
+        ] {
+            let settings = settings_of(
+                None,
+                Some(layer(
+                    "/repo/.reagent/config.toml",
+                    Settings {
+                        mcp: Some(list.clone()),
+                        ..Settings::default()
+                    },
+                )),
+                &servers,
+            );
+            let args = run_servers(&["-p", "task"], settings, servers.clone());
+            assert!(!picked(&args).contains(&"prod"), "{list:?}");
+        }
+        // The global file and the folder's list keep the full rules.
+        let settings = settings_of(
+            Some(layer(
+                "/g/config.toml",
+                Settings {
+                    mcp: Some(vec!["+prod".into()]),
+                    ..Settings::default()
+                },
+            )),
+            None,
+            &servers,
+        );
+        let args = run_servers(&["-p", "task"], settings, servers.clone());
+        assert!(picked(&args).contains(&"prod"), "{:?}", picked(&args));
+        let args = run_servers(
+            &["-p", "task", "--mcp", "+prod"],
+            Settings::default(),
+            servers,
+        );
+        assert!(picked(&args).contains(&"prod"), "{:?}", picked(&args));
+    }
+
+    #[test]
+    fn mcp_config_repo_message_names_the_file_the_server_and_the_flag() {
+        assert_eq!(
+            repo_disabled(Path::new("/repo/.reagent/config.toml"), "prod"),
+            concat!(
+                "reagent: /repo/.reagent/config.toml asks for MCP server prod, which is disabled; ",
+                "enable it in mcp.toml or pass --mcp +prod"
+            )
+        );
+    }
+
+    /// The settings the three files merge to, with the repo file's `mcp` list
+    /// cut down to what a repo file may start.
+    fn settings_of(
+        global: Option<Layer>,
+        repo: Option<Layer>,
+        servers: &BTreeMap<String, McpServer>,
+    ) -> Settings {
+        let layers = Layers {
+            global,
+            profile: None,
+            repo,
+        };
+        settings_from(layers, Path::new("/repo"), servers)
+            .expect("settings")
+            .0
+    }
+
+    #[test]
+    fn mcp_config_flag_adds_disabled() {
+        let servers = defined(&[("a", true), ("b", false)]);
+        let args = run_servers(&["-p", "task", "--mcp", "+b"], Settings::default(), servers);
+        assert_eq!(picked(&args), ["a", "b"]);
+        assert!(!args.mcp_servers[1].1.enabled);
+    }
+
+    #[test]
+    fn mcp_config_no_mcp() {
+        let servers = defined(&[("a", true)]);
+        let args = run_servers(
+            &["-p", "task", "--mcp", "+a", "--no-mcp"],
+            Settings::default(),
+            servers,
+        );
+        assert!(args.mcp_servers.is_empty(), "{:?}", picked(&args));
+    }
+
+    #[test]
+    fn mcp_config_unknown_name() {
+        let servers = defined(&[("a", true), ("b", false)]);
+        let error = parse_with_servers(
+            &["-p", "task", "--mcp", "+nope"],
+            Settings::default(),
+            servers,
+        )
+        .unwrap_err();
+        assert!(error.contains("nope"), "{error}");
+        assert!(error.contains("a, b"), "{error}");
+    }
+
+    #[test]
+    fn list_edit_mixed_list_is_an_error() {
+        let error = parse(&["-p", "task", "--tools", "read,+grep"]).unwrap_err();
+        assert!(error.contains("not both"), "{error}");
+        let error = parse(&["-p", "task", "--policy", "budget,+stuck"]).unwrap_err();
+        assert!(error.contains("not both"), "{error}");
+    }
+
+    #[test]
+    fn list_edit_unknown_tool_is_named() {
+        let error = parse(&["-p", "task", "--tools", "+nope"]).unwrap_err();
+        assert!(error.contains("nope"), "{error}");
+        for name in ["bash", "edit", "find", "grep", "read", "write", "codemode"] {
+            assert!(error.contains(name), "{error}");
+        }
+        let error = parse(&["-p", "task", "--policy", "+nope"]).unwrap_err();
+        assert!(error.contains("nope"), "{error}");
+        for word in ["all", "none"] {
+            for sign in ["+", "-"] {
+                assert!(
+                    parse(&["-p", "task", "--policy", &format!("{sign}{word}")]).is_err(),
+                    "{sign}{word}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn list_edit_policy_layers_stack() {
+        let settings = merged(
+            Some(layer(
+                "/g/config.toml",
+                Settings {
+                    policy: Some(vec!["+stuck".into()]),
+                    ..Settings::default()
+                },
+            )),
+            Some(layer(
+                "/g/profiles/p.toml",
+                Settings {
+                    policy: Some(vec!["-snapshot".into()]),
+                    ..Settings::default()
+                },
+            )),
+            None,
+        );
+        assert_eq!(
+            run_with(&["-p", "task"], settings).policy,
+            ["budget", "stuck"]
+        );
+    }
+
+    #[test]
+    fn list_edit_policy_flag_goes_last() {
+        let settings = Settings {
+            policy: Some(vec!["+stuck".into()]),
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "task", "--policy", "-stuck"], settings);
+        assert_eq!(args.policy, ["budget", "snapshot"]);
+    }
+
+    #[test]
+    fn list_edit_policy_plain_config_then_flag_edit() {
+        let settings = Settings {
+            policy: Some(vec!["completion".into()]),
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "task", "--policy", "+stuck"], settings);
+        assert_eq!(args.policy, ["completion", "stuck"]);
+    }
+
+    #[test]
+    fn list_edit_policy_chat_default_edit() {
+        let args = run(&[
+            "-p",
+            "task",
+            "--provider",
+            "openai-chat",
+            "--policy",
+            "-mask",
+        ]);
+        assert_eq!(args.policy, ["budget", "snapshot"]);
+    }
+
+    #[test]
+    fn list_edit_skip_removes() {
+        let settings = merged(
+            Some(layer(
+                "/g/config.toml",
+                Settings {
+                    skip: vec!["vendor".into()],
+                    ..Settings::default()
+                },
+            )),
+            None,
+            Some(layer(
+                "/w/.reagent/config.toml",
+                Settings {
+                    skip: vec!["-vendor".into()],
+                    ..Settings::default()
+                },
+            )),
+        );
+        assert!(run_with(&["-p", "task"], settings).skip.is_empty());
+    }
+
+    #[test]
+    fn list_edit_empty_list_selects_nothing() {
+        let empty = |path: &str| {
+            Some(layer(
+                path,
+                Settings {
+                    policy: Some(Vec::new()),
+                    tools: Some(Vec::new()),
+                    ..Settings::default()
+                },
+            ))
+        };
+        let args = run_with(&["-p", "task"], merged(empty("/g/config.toml"), None, None));
+        assert!(args.policy.is_empty(), "{:?}", args.policy);
+        assert!(args.tools.is_empty(), "{:?}", args.tools);
+        let edited = run_with(
+            &["-p", "task", "--tools", "+read"],
+            merged(empty("/g/config.toml"), None, None),
+        );
+        assert_eq!(edited.tools, ["read"]);
+    }
+
+    #[test]
+    fn codemode_table_wall_time() {
+        let settings = Settings {
+            codemode: reagent_config::CodemodeSettings {
+                wall_time: Some(30),
+            },
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "task"], settings.clone());
+        assert_eq!(
+            crate::run::codemode_wall(args.codemode.wall_time, args.deadline),
+            std::time::Duration::from_secs(30)
+        );
+        let args = run_with(&["-p", "task", "--deadline", "10"], settings);
+        assert_eq!(
+            crate::run::codemode_wall(args.codemode.wall_time, args.deadline),
+            std::time::Duration::from_secs(10)
+        );
+        let args = run_with(&["-p", "task"], Settings::default());
+        assert_eq!(
+            crate::run::codemode_wall(args.codemode.wall_time, args.deadline),
+            std::time::Duration::from_secs(600)
+        );
+    }
+
     #[test]
     fn the_default_provider_is_anthropic() {
         let args = run(&["-p", "task"]);
@@ -1493,7 +2165,7 @@ mod tests {
                 ..Settings::default()
             },
         };
-        let error = expand_policies(&mut layer).unwrap_err();
+        let error = check_lists(&mut layer).unwrap_err();
         assert!(
             error.starts_with("/home/u/.config/reagent/config.toml: "),
             "{error}"
@@ -1510,7 +2182,7 @@ mod tests {
                 ..Settings::default()
             },
         };
-        expand_policies(&mut layer).unwrap();
+        check_lists(&mut layer).unwrap();
         assert_eq!(
             layer.settings.policy,
             Some(vec![
@@ -1539,6 +2211,7 @@ mod tests {
                 ..Layers::default()
             },
             Path::new("/work"),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert!(!rules.is_open());
@@ -1558,6 +2231,7 @@ mod tests {
                 ..Layers::default()
             },
             Path::new("/work"),
+            &BTreeMap::new(),
         )
         .unwrap_err();
         assert!(error.starts_with("/g/config.toml"), "{error}");
@@ -1590,7 +2264,15 @@ mod tests {
                 lexopt::Parser::from_args(argv),
                 &|_: &Path, profile: Option<&str>| {
                     seen.borrow_mut().push(profile.map(str::to_string));
-                    Ok((Settings::default(), Rules::none()))
+                    Ok((
+                        Settings::default(),
+                        Rules::none(),
+                        McpConfig {
+                            servers: BTreeMap::new(),
+                            warn_many_direct: true,
+                            settings: Default::default(),
+                        },
+                    ))
                 },
             )
         };
@@ -1641,7 +2323,7 @@ mod tests {
             profile: Some(profile),
             repo: None,
         };
-        let (settings, _) = settings_from(layers, dir.path()).expect("settings");
+        let (settings, _) = settings_from(layers, dir.path(), &BTreeMap::new()).expect("settings");
         let args = run_with(&["-p", "task"], settings.clone());
         assert_eq!(args.model, "glm");
         assert_eq!(args.api_key_env.as_deref(), Some("WORK_KEY"));

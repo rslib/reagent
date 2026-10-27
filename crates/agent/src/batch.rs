@@ -91,8 +91,10 @@ pub async fn run_all_guarded_seen<'a>(
         .collect()
 }
 
-/// Runs one call, giving up with `None` when the token fires.
-fn run_one<'a>(
+/// Runs one call as a direct call does: the name and argument repair, the
+/// rules, the reroute, the type coercion and the run. `None` when the token
+/// fires.
+pub fn run_one<'a>(
     registry: &'a Registry,
     guard: Option<&'a Guard>,
     call: &'a ToolCall,

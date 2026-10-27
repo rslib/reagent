@@ -21,6 +21,9 @@ const MAX_RSS_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CPU_MICROS_PER_TURN: u64 = 7_500;
 /// Debug builds run far slower, so the CPU budget is loose there.
 const DEBUG_CPU_FACTOR: u64 = 10;
+/// A debug binary maps far more code: about 17.3 MB peak measured on Linux with
+/// codemode built in (16.3 MB before), so the debug budget is looser too.
+const MAX_DEBUG_RSS_BYTES: u64 = 24 * 1024 * 1024;
 
 /// Peak resident set size over the waited children, in bytes.
 ///
@@ -97,7 +100,12 @@ async fn a_long_scripted_run_stays_within_the_footprint_budget() {
     } else {
         MAX_CPU_MICROS_PER_TURN
     };
-    assert!(rss <= MAX_RSS_BYTES, "peak rss {rss} over {MAX_RSS_BYTES}");
+    let rss_budget = if cfg!(debug_assertions) {
+        MAX_DEBUG_RSS_BYTES
+    } else {
+        MAX_RSS_BYTES
+    };
+    assert!(rss <= rss_budget, "peak rss {rss} over {rss_budget}");
     assert!(
         cpu_per_turn <= cpu_budget,
         "cpu per turn {cpu_per_turn} us over {cpu_budget} us"

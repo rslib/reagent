@@ -12,8 +12,8 @@ use std::time::Duration;
 use reagent_config::Secret;
 use serde::Deserialize;
 
-use super::percent_encode;
-use super::session::Sleeper;
+use crate::Sleeper;
+use crate::percent_encode;
 
 /// The Radius gateway's endpoints and client.
 pub mod radius {

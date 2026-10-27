@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use reagent_agent::agent_loop::{Agent, AgentConfig};
@@ -22,13 +23,15 @@ use reagent_agent::policy::TurnPolicy;
 use reagent_agent::policy::budget::Budget;
 use reagent_agent::policy::completion::Completion;
 use reagent_agent::policy::stuck::Stuck;
-use reagent_agent::tool::Registry;
+use reagent_agent::tool::{Registry, Tool};
 use reagent_agent::workspace::Workspace;
 use reagent_ai::levels::{Level, Reasoning};
 use reagent_ai::oauth::session::{Sleeper, Wait};
 use reagent_ai::{Provider, StopReason, Text, Usage};
 use reagent_config::Secret;
+use reagent_config::mcp::McpDirect;
 use reagent_config::permissions::Rules;
+use reagent_script::codemode::{Codemode, ToolSource};
 use reagent_tools::bash::{Bash, Fallback, Launcher};
 use reagent_tools::edit::Edit;
 use reagent_tools::find::Find;
@@ -36,7 +39,7 @@ use reagent_tools::grep::Grep;
 use reagent_tools::read::Read;
 use reagent_tools::write::Write;
 
-use crate::args::{Args, SandboxMode};
+use crate::args::{Args, SandboxMode, TOOL_NAMES};
 use crate::prompt;
 
 /// The tools' working folder, fingerprinted for the completion policy, and
@@ -136,6 +139,47 @@ fn fire(slot: &AtomicU8, cause: Cause, token: &CancellationToken) {
         Ordering::SeqCst,
     );
     token.cancel();
+}
+
+/// Installs the handlers that cancel a run: Ctrl-C, and on unix also SIGTERM
+/// and SIGHUP, which a service manager or a closed terminal sends.
+fn signal_watchers(cancel: &CancellationToken, cause: &Arc<AtomicU8>) -> Vec<JoinHandle<()>> {
+    let mut watchers = Vec::new();
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        for kind in [
+            SignalKind::interrupt(),
+            SignalKind::terminate(),
+            SignalKind::hangup(),
+        ] {
+            let mut stream = match signal(kind) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    eprintln!("reagent: cannot listen for a signal: {error}");
+                    continue;
+                }
+            };
+            let token = cancel.clone();
+            let cause = Arc::clone(cause);
+            watchers.push(tokio::spawn(async move {
+                if stream.recv().await.is_some() {
+                    fire(&cause, Cause::CtrlC, &token);
+                }
+            }));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let token = cancel.clone();
+        let cause = Arc::clone(cause);
+        watchers.push(tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                fire(&cause, Cause::CtrlC, &token);
+            }
+        }));
+    }
+    watchers
 }
 
 /// Reads the whole task from standard input (`-p -`).
@@ -438,15 +482,44 @@ pub async fn run(mut args: Args) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let registry = tools(
+    let cancel = CancellationToken::new();
+    let cause = Arc::new(AtomicU8::new(Cause::None as u8));
+    // The handlers go in before the servers start, so a signal during the
+    // startup wait takes the same exit path as one during the run.
+    let mut timers = signal_watchers(&cancel, &cause);
+    let servers = start_servers(&args, &cancel).await;
+    if cancel.is_cancelled() {
+        stop_servers(servers).await;
+        return exit_code(
+            &TurnEndReason::Cancelled,
+            Cause::from_u8(cause.load(Ordering::SeqCst)),
+        );
+    }
+    let direct = direct_adapters(&args, servers.as_ref());
+    let codemode = chosen(&args.tools, reagent_script::codemode::NAME).then(|| CodemodeSetup {
+        rules: args.rules.clone(),
+        wall: codemode_wall(args.codemode.wall_time, args.deadline),
+        servers: servers.clone(),
+        direct: direct
+            .iter()
+            .map(|adapter| adapter.spec().name.clone())
+            .collect(),
+    });
+    let mut registry = tools(
         &cwd,
         &args.skip,
         archive.as_ref(),
         launcher,
         args.bash_reads,
+        &args.tools,
+        codemode,
     );
+    for adapter in direct {
+        registry.add(adapter);
+    }
     if let Err(message) = check_rule_tools(&args.rules, &registry) {
         eprintln!("reagent: {message}");
+        stop_servers(servers).await;
         return ExitCode::from(2);
     }
 
@@ -489,29 +562,18 @@ pub async fn run(mut args: Args) -> ExitCode {
             "compact" => compact_enabled = true,
             other => {
                 eprintln!("reagent: unknown policy: {other}");
+                stop_servers(servers).await;
                 return ExitCode::from(2);
             }
         }
     }
 
-    let cancel = CancellationToken::new();
-    let cause = Arc::new(AtomicU8::new(Cause::None as u8));
-    let mut timers = Vec::new();
     if let Some(seconds) = args.deadline {
         let token = cancel.clone();
         let cause = Arc::clone(&cause);
         timers.push(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(seconds)).await;
             fire(&cause, Cause::Deadline, &token);
-        }));
-    }
-    {
-        let token = cancel.clone();
-        let cause = Arc::clone(&cause);
-        timers.push(tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                fire(&cause, Cause::CtrlC, &token);
-            }
         }));
     }
 
@@ -560,6 +622,7 @@ pub async fn run(mut args: Args) -> ExitCode {
         .await
         .unwrap_or_else(|_| panic!("writer task failed"));
 
+    stop_servers(servers).await;
     exit_code(&reason, Cause::from_u8(cause.load(Ordering::SeqCst)))
 }
 
@@ -1261,11 +1324,16 @@ mod fake {
     }
 }
 
-/// Refuses a rule that names no tool of the run: a typo would make a deny
-/// silently do nothing.
+/// Refuses a rule that names no tool reagent has: a typo would make a deny
+/// silently do nothing. A tool that the run's list leaves out is still a tool.
 fn check_rule_tools(rules: &Rules, registry: &Registry) -> Result<(), String> {
     for (name, rule, file) in rules.tool_names() {
-        if registry.resolve(name).is_none() {
+        // A server's tool is a tool the run offers in a script, not directly.
+        let known = TOOL_NAMES
+            .iter()
+            .any(|tool| tool.eq_ignore_ascii_case(name))
+            || name.starts_with(reagent_mcp::EXPOSED_PREFIX);
+        if !known && registry.resolve(name).is_none() {
             let tools = registry.names().collect::<Vec<_>>().join(", ");
             return Err(format!(
                 "{file}: rule {rule} names no tool; the tools are: {tools}, plus Read, Edit and *"
@@ -1364,29 +1432,247 @@ fn probe_for(policy: &[String], cwd: &std::path::Path) -> Option<crate::snapshot
         .then(|| crate::snapshot::start(cwd))
 }
 
-/// The tools a headless run offers, all rooted at `cwd`.
+/// The longest one `codemode` script may run unless the `[codemode]` table
+/// says otherwise, and that unless `--deadline` is shorter.
+const CODEMODE_WALL: Duration = Duration::from_secs(10 * 60);
+
+/// What the `codemode` tool needs: the rules its script's calls are checked
+/// against, and the longest one script may run.
+struct CodemodeSetup {
+    rules: Rules,
+    wall: Duration,
+    /// The server set a script's late calls resolve through, when a run has one.
+    servers: Option<reagent_mcp::Servers>,
+    /// The exposed names the request offers directly, taken once so the
+    /// script and the request agree on them.
+    direct: Vec<String>,
+}
+
+/// The wall time a script gets: the table's cap, or the deadline when that is
+/// shorter. The deadline timer cancels the run's token too, which stops a
+/// running script.
+pub(crate) fn codemode_wall(wall: Option<u64>, deadline: Option<u64>) -> Duration {
+    let wall = wall.map_or(CODEMODE_WALL, Duration::from_secs);
+    deadline.map_or(wall, |seconds| Duration::from_secs(seconds).min(wall))
+}
+
+/// Adds the direct tools `selected` names to `registry`.
+fn direct_tools(
+    registry: &mut Registry,
+    cwd: &std::path::Path,
+    skip: &[String],
+    touched: reagent_tools::repair::Touched,
+    launcher: Option<Launcher>,
+    bash_reads: bool,
+    selected: &[String],
+) {
+    if chosen(selected, "read") {
+        registry.add(Read::new(cwd).with_touched(touched.clone()));
+    }
+    if chosen(selected, "write") {
+        registry.add(Write::new(cwd).with_touched(touched.clone()));
+    }
+    if chosen(selected, "edit") {
+        registry.add(Edit::new(cwd).with_touched(touched));
+    }
+    if chosen(selected, "bash") {
+        let bash = Bash::new(cwd).with_reads(bash_reads);
+        registry.add(match launcher {
+            Some(launcher) => bash.with_launcher(launcher),
+            None => bash,
+        });
+    }
+    if chosen(selected, "grep") {
+        registry.add(Grep::new(cwd).with_skip(skip.iter().cloned()));
+    }
+    if chosen(selected, "find") {
+        registry.add(Find::new(cwd).with_skip(skip.iter().cloned()));
+    }
+}
+
+/// Whether a resolved tool list holds `name`.
+fn chosen(selected: &[String], name: &str) -> bool {
+    selected.iter().any(|chosen| chosen == name)
+}
+
+/// How long a run waits for its MCP servers before it starts without them.
+const STARTUP_WAIT: Duration = Duration::from_secs(10);
+
+/// How many direct MCP tools a run adds before it warns once about the tokens.
+const MANY_DIRECT: usize = 75;
+
+/// The line a run prints when it adds `count` direct MCP tools, if it warns.
+fn many_direct_warning(count: usize, warn: bool) -> Option<String> {
+    (warn && count >= MANY_DIRECT).then(|| {
+        format!(
+            "reagent: {count} MCP tools are direct; each costs prompt tokens (set warn_many_direct = false in [settings] to hide this)"
+        )
+    })
+}
+
+/// The MCP tools the request offers directly, with a line for each name a
+/// server does not have and one when there are many.
+fn direct_adapters(
+    args: &Args,
+    servers: Option<&reagent_mcp::Servers>,
+) -> Vec<reagent_mcp::McpTool> {
+    let Some(servers) = servers else {
+        return Vec::new();
+    };
+    let known = servers.warnings().len();
+    let adapters = servers.direct_adapters();
+    for warning in &servers.warnings()[known..] {
+        eprintln!("reagent: {warning}");
+    }
+    if let Some(line) = many_direct_warning(adapters.len(), args.warn_many_direct) {
+        eprintln!("{line}");
+    }
+    adapters
+}
+
+/// Starts the run's MCP servers, waits for them, and prints what each one did.
+/// A signal during the wait ends it early.
+async fn start_servers(args: &Args, cancel: &CancellationToken) -> Option<reagent_mcp::Servers> {
+    if args.mcp_servers.is_empty() {
+        return None;
+    }
+    let auth_dir = reagent_config::auth::dir().ok();
+    let servers = reagent_mcp::Servers::start(&args.mcp_servers, auth_dir);
+    tokio::select! {
+        () = servers.wait_ready(STARTUP_WAIT) => {}
+        () = cancel.cancelled() => {}
+    }
+    for state in servers.snapshot() {
+        match &state.status {
+            reagent_mcp::ServerStatus::Ready(tools) => {
+                eprintln!("reagent: mcp {} ready ({} tools)", state.name, tools.len());
+            }
+            reagent_mcp::ServerStatus::Failed(reason) => {
+                eprintln!("reagent: mcp {} failed: {reason}", state.name);
+            }
+            reagent_mcp::ServerStatus::Starting => {
+                // A server still starting offers no direct tool this run.
+                match args
+                    .mcp_servers
+                    .iter()
+                    .find(|(name, _)| name == &state.name)
+                    .map(|(_, server)| &server.direct)
+                {
+                    Some(direct) if direct != &McpDirect::None => eprintln!(
+                        "reagent: mcp {} starting; its direct tools are left out of this run",
+                        state.name
+                    ),
+                    _ => eprintln!("reagent: mcp {} starting", state.name),
+                }
+            }
+        }
+    }
+    Some(servers)
+}
+
+/// Stops the servers a run started, when it started any.
+async fn stop_servers(servers: Option<reagent_mcp::Servers>) {
+    if let Some(servers) = servers {
+        servers.stop().await;
+    }
+}
+
+/// The run's servers, for a script call to a tool that is still starting.
+struct McpSource {
+    servers: reagent_mcp::Servers,
+}
+
+impl ToolSource for McpSource {
+    fn resolve<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Option<Result<Box<dyn Tool>, String>>> + Send + 'a>> {
+        Box::pin(async move {
+            match self.servers.tool(name).await {
+                Ok(tool) => Some(Ok(Box::new(tool) as Box<dyn Tool>)),
+                Err(reason) => Some(Err(reason)),
+            }
+        })
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.servers.names()
+    }
+
+    fn generation(&self) -> u64 {
+        self.servers.generation()
+    }
+
+    fn refresh(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.servers.refresh())
+    }
+}
+
+/// The tools a headless run offers, all rooted at `cwd`, as `selected` names
+/// them.
 fn tools(
     cwd: &std::path::Path,
     skip: &[String],
     archive: Option<&Arc<Archive>>,
     launcher: Option<Launcher>,
     bash_reads: bool,
+    selected: &[String],
+    codemode: Option<CodemodeSetup>,
 ) -> Registry {
     let mut registry = Registry::new();
-    // One list of touched files, so an edit can name the file a read found.
+    // One list of touched files, so an edit can name the file a read found,
+    // and a script's reads count as the run's own.
     let touched = reagent_tools::repair::Touched::default();
-    registry.add(Read::new(cwd).with_touched(touched.clone()));
-    registry.add(Write::new(cwd).with_touched(touched.clone()));
-    registry.add(Edit::new(cwd).with_touched(touched));
-    let bash = Bash::new(cwd).with_reads(bash_reads);
-    registry.add(match launcher {
-        Some(launcher) => bash.with_launcher(launcher),
-        None => bash,
+    // A script gets a registry of its own, so the outer one never offers a tool
+    // a copy of itself.
+    let script = codemode.map(|setup| {
+        let mut inner = Registry::new();
+        direct_tools(
+            &mut inner,
+            cwd,
+            skip,
+            touched.clone(),
+            launcher.clone(),
+            bash_reads,
+            selected,
+        );
+        // A server's tools are in the script's registry, hidden from the model,
+        // so its description names them only by signature. A direct tool is
+        // named as a callable one, since the request offers it itself.
+        let mut hidden = Vec::new();
+        if let Some(servers) = &setup.servers {
+            for adapter in servers.adapters() {
+                if !setup.direct.contains(&adapter.spec().name) {
+                    hidden.push(adapter.spec().name.clone());
+                }
+                inner.add(adapter);
+            }
+        }
+        let mut script = Codemode::new(Arc::new(inner))
+            .with_guard(Guard::new(setup.rules))
+            .with_wall_time(setup.wall)
+            .with_hidden(hidden);
+        if let Some(servers) = &setup.servers {
+            script = script.with_source(Arc::new(McpSource {
+                servers: servers.clone(),
+            }));
+        }
+        script
     });
-    registry.add(Grep::new(cwd).with_skip(skip.iter().cloned()));
-    registry.add(Find::new(cwd).with_skip(skip.iter().cloned()));
+    direct_tools(
+        &mut registry,
+        cwd,
+        skip,
+        touched,
+        launcher,
+        bash_reads,
+        selected,
+    );
     if let Some(archive) = archive {
         registry.add(Expand::new(Arc::clone(archive)));
+    }
+    if let Some(script) = script {
+        registry.add(script);
     }
     registry
 }
@@ -1829,7 +2115,15 @@ mod tests {
 
     #[test]
     fn tools_are_bash_edit_find_grep_read_and_write() {
-        let registry = tools(std::path::Path::new("."), &[], None, None, true);
+        let registry = tools(
+            std::path::Path::new("."),
+            &[],
+            None,
+            None,
+            true,
+            &default_tools(),
+            None,
+        );
         let names: Vec<&str> = registry.names().collect();
         assert_eq!(names, ["bash", "edit", "find", "grep", "read", "write"]);
     }
@@ -2125,6 +2419,32 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_for_a_tool_left_out_of_the_list_is_kept() {
+        let layer = reagent_config::Layer {
+            path: std::path::PathBuf::from("/c.toml"),
+            settings: reagent_config::Settings {
+                permissions: reagent_config::permissions::Lists {
+                    deny: vec!["Bash(git push:*)".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        let rules = Rules::from_layers(&[layer], std::path::Path::new("/w"), None).unwrap();
+        let selected = vec!["grep".to_string(), "read".to_string()];
+        let registry = tools(
+            std::path::Path::new("."),
+            &[],
+            None,
+            None,
+            true,
+            &selected,
+            None,
+        );
+        assert!(check_rule_tools(&rules, &registry).is_ok());
+    }
+
+    #[test]
     fn a_rule_for_an_unknown_tool_is_refused() {
         let layer = reagent_config::Layer {
             path: std::path::PathBuf::from("/c.toml"),
@@ -2137,7 +2457,15 @@ mod tests {
             },
         };
         let rules = Rules::from_layers(&[layer], std::path::Path::new("/w"), None).unwrap();
-        let registry = tools(std::path::Path::new("."), &[], None, None, true);
+        let registry = tools(
+            std::path::Path::new("."),
+            &[],
+            None,
+            None,
+            true,
+            &default_tools(),
+            None,
+        );
         let error = check_rule_tools(&rules, &registry).unwrap_err();
         assert!(error.contains("Bsh(git push:*)"), "{error}");
         let ok = reagent_config::Layer {
@@ -2157,7 +2485,15 @@ mod tests {
     #[test]
     fn compact_policy_offers_expand() {
         let archive = Archive::new();
-        let registry = tools(std::path::Path::new("."), &[], Some(&archive), None, true);
+        let registry = tools(
+            std::path::Path::new("."),
+            &[],
+            Some(&archive),
+            None,
+            true,
+            &default_tools(),
+            None,
+        );
         assert!(registry.names().any(|name| name == "expand"));
     }
 
@@ -2495,6 +2831,19 @@ mod tests {
     }
 
     #[test]
+    fn mcp_direct_many_warning() {
+        assert_eq!(many_direct_warning(MANY_DIRECT - 1, true), None);
+        assert_eq!(many_direct_warning(MANY_DIRECT, false), None);
+        assert_eq!(many_direct_warning(80, false), None);
+        assert_eq!(
+            many_direct_warning(80, true).as_deref(),
+            Some(
+                "reagent: 80 MCP tools are direct; each costs prompt tokens (set warn_many_direct = false in [settings] to hide this)"
+            )
+        );
+    }
+
+    #[test]
     fn reasoning_map_unknown_words_alone_send_the_asked_level() {
         let model = with_unknown(Reasoning::default(), &["deep", "wide"]);
         let mapped = map_reasoning("high", Some(&model));
@@ -2506,17 +2855,255 @@ mod tests {
     fn bash_reads_off_keeps_every_command_in_bash() {
         let cwd = std::path::Path::new(".");
         let args = r#"{"command":"cat Cargo.toml"}"#;
-        let on = tools(cwd, &[], None, None, true);
+        let on = tools(cwd, &[], None, None, true, &default_tools(), None);
         assert!(
             on.resolve("bash")
                 .and_then(|bash| bash.reroute(args))
                 .is_some()
         );
-        let off = tools(cwd, &[], None, None, false);
+        let off = tools(cwd, &[], None, None, false, &default_tools(), None);
         assert!(
             off.resolve("bash")
                 .and_then(|bash| bash.reroute(args))
                 .is_none()
+        );
+    }
+
+    /// The tools a run's list names, sorted as a resolved list is.
+    fn named(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    fn default_tools() -> Vec<String> {
+        named(&["bash", "edit", "find", "grep", "read", "write"])
+    }
+
+    /// The rules and wall time a run that lists `codemode` gives it.
+    fn codemode_setup() -> CodemodeSetup {
+        CodemodeSetup {
+            rules: Rules::none(),
+            wall: CODEMODE_WALL,
+            servers: None,
+            direct: Vec::new(),
+        }
+    }
+
+    /// A registry of the direct tools, built the way `tools` built one before
+    /// the `codemode` tool existed.
+    fn hand_built(cwd: &std::path::Path) -> Registry {
+        let mut registry = Registry::new();
+        let touched = reagent_tools::repair::Touched::default();
+        registry.add(Read::new(cwd).with_touched(touched.clone()));
+        registry.add(Write::new(cwd).with_touched(touched.clone()));
+        registry.add(Edit::new(cwd).with_touched(touched));
+        registry.add(Bash::new(cwd).with_reads(true));
+        registry.add(Grep::new(cwd).with_skip(std::iter::empty::<String>()));
+        registry.add(Find::new(cwd).with_skip(std::iter::empty::<String>()));
+        registry
+    }
+
+    #[test]
+    fn codemode_tools_off_by_default() {
+        let cwd = std::path::Path::new(".");
+        let registry = tools(cwd, &[], None, None, true, &default_tools(), None);
+        let names: Vec<&str> = registry.names().collect();
+        assert_eq!(names, ["bash", "edit", "find", "grep", "read", "write"]);
+        let before = hand_built(cwd);
+        assert_eq!(
+            serde_json::to_string(registry.specs()).unwrap(),
+            serde_json::to_string(before.specs()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn codemode_tools_on_runs_read() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        tokio::fs::write(tmp.path().join("a.txt"), "hello")
+            .await
+            .expect("write the file");
+        let selected = named(&["codemode", "read"]);
+        let registry = tools(
+            tmp.path(),
+            &[],
+            None,
+            None,
+            true,
+            &selected,
+            Some(codemode_setup()),
+        );
+        assert!(
+            registry
+                .specs()
+                .iter()
+                .any(|spec| spec.name == reagent_script::codemode::NAME)
+        );
+        let tool = registry
+            .get(reagent_script::codemode::NAME)
+            .expect("the codemode tool");
+        let args =
+            serde_json::json!({ "code": "return await tools.read({path: \"a.txt\"})" }).to_string();
+        let output = tool.run(&args, &CancellationToken::new()).await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("hello"), "{}", output.content);
+    }
+
+    /// A tool a server would expose, for the guard and the rule tests.
+    struct McpLike {
+        spec: reagent_ai::ToolSpec,
+    }
+
+    impl McpLike {
+        fn new(name: &str) -> Self {
+            Self {
+                spec: reagent_ai::ToolSpec {
+                    name: name.into(),
+                    description: "A server tool.".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            }
+        }
+    }
+
+    impl reagent_agent::tool::Tool for McpLike {
+        fn spec(&self) -> &reagent_ai::ToolSpec {
+            &self.spec
+        }
+
+        fn run<'a>(
+            &'a self,
+            _args: &'a str,
+            _cancel: &CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = reagent_agent::tool::ToolOutput> + Send + 'a>> {
+            Box::pin(async { reagent_agent::tool::ToolOutput::ok("deleted") })
+        }
+    }
+
+    /// The rules of one deny list.
+    fn deny_rule(rule: &str) -> Rules {
+        let layer = reagent_config::Layer {
+            path: std::path::PathBuf::from("/c.toml"),
+            settings: reagent_config::Settings {
+                permissions: reagent_config::permissions::Lists {
+                    deny: vec![rule.into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        Rules::from_layers(&[layer], std::path::Path::new("/w"), None).expect("the rules")
+    }
+
+    #[tokio::test]
+    async fn mcp_codemode_rule_names_mcp_tool() {
+        // A rule may name a server tool, which the run's registry never holds.
+        let rules = deny_rule("mcp__gh__delete_repo");
+        let registry = tools(
+            std::path::Path::new("."),
+            &[],
+            None,
+            None,
+            true,
+            &default_tools(),
+            None,
+        );
+        assert!(check_rule_tools(&rules, &registry).is_ok());
+
+        let mut inner = Registry::new();
+        inner.add(McpLike::new("mcp__gh__delete_repo"));
+        let codemode = Codemode::new(Arc::new(inner)).with_guard(Guard::new(rules));
+        let args = serde_json::json!({
+            "code": "await tools.mcp__gh__delete_repo({repo: \"x\"})"
+        })
+        .to_string();
+        let output = codemode.run(&args, &CancellationToken::new()).await;
+        assert!(output.is_error, "{}", output.content);
+        assert!(
+            output
+                .content
+                .contains("denied by rule mcp__gh__delete_repo"),
+            "{}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_codemode_no_server_same_specs() {
+        let cwd = std::path::Path::new(".");
+        // A run with no `mcp.toml` picks no server, so its request is the one
+        // that had no server support at all.
+        let servers = reagent_mcp::Servers::start(&[], None);
+        let plain = tools(cwd, &[], None, None, true, &default_tools(), None);
+        let started = tools(cwd, &[], None, None, true, &default_tools(), None);
+        assert_eq!(
+            serde_json::to_string(plain.specs()).unwrap(),
+            serde_json::to_string(started.specs()).unwrap()
+        );
+        let selected = named(&["codemode", "read"]);
+        let before = tools(
+            cwd,
+            &[],
+            None,
+            None,
+            true,
+            &selected,
+            Some(codemode_setup()),
+        );
+        let after = tools(
+            cwd,
+            &[],
+            None,
+            None,
+            true,
+            &selected,
+            Some(CodemodeSetup {
+                servers: Some(servers),
+                ..codemode_setup()
+            }),
+        );
+        let description = |registry: &Registry| {
+            registry
+                .get(reagent_script::codemode::NAME)
+                .expect("the codemode tool")
+                .spec()
+                .description
+                .clone()
+        };
+        assert_eq!(description(&before), description(&after));
+        assert!(
+            !description(&after).contains("mcp__"),
+            "no server tool reaches the description"
+        );
+    }
+
+    #[tokio::test]
+    async fn codemode_tools_follow_the_list() {
+        // The list `+codemode,-write` leaves `write` out of both the outer
+        // registry and the one a script's calls land in.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let selected = named(&["bash", "codemode", "edit", "find", "grep", "read"]);
+        let registry = tools(
+            tmp.path(),
+            &[],
+            None,
+            None,
+            true,
+            &selected,
+            Some(codemode_setup()),
+        );
+        assert!(registry.get("write").is_none());
+        let tool = registry
+            .get(reagent_script::codemode::NAME)
+            .expect("the codemode tool");
+        let args = serde_json::json!({
+            "code": "return await tools.write({path: \"a.txt\", content: \"x\"})"
+        })
+        .to_string();
+        let output = tool.run(&args, &CancellationToken::new()).await;
+        assert!(output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("unknown tool"),
+            "{}",
+            output.content
         );
     }
 }
