@@ -5,13 +5,15 @@ use std::fmt::Write as _;
 use std::io::{self, BufRead, BufReader, Read as _};
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use bytes::Bytes;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use reagent_agent::tool::{
     EffectClass, Effects, Identity, Object, Repaired, Seen, Tool, ToolOutput, parse_args,
 };
-use reagent_ai::{Text, ToolSpec};
+use reagent_ai::{Image, ImageType, Text, ToolSpec};
 
 use crate::blocking;
 use crate::repair::{Kind, Touched};
@@ -28,6 +30,9 @@ const DEFAULT_LIMIT: usize = 2000;
 /// The most bytes one read returns, so one large file does not fill the
 /// context of every later turn.
 const BYTE_CAP: usize = 32 * 1024;
+/// The largest image file a read prepares, in bytes: an image is held whole so
+/// `prepare` can take its buffer without a copy.
+const IMAGE_CAP: u64 = 64 * 1024 * 1024;
 
 /// Arguments for one `read` call.
 #[derive(Debug, Deserialize)]
@@ -89,6 +94,7 @@ impl Read {
             text: loaded.text,
             seen,
             object: loaded.object,
+            images: loaded.images,
         })
     }
 }
@@ -105,6 +111,12 @@ fn read_file(path: PathBuf, offset: u64, limit: usize) -> Result<Loaded, String>
     let size = metadata.len();
     let mut probe = [0_u8; BINARY_PROBE];
     let probe_len = file.read(&mut probe).map_err(failed)?;
+    // An image is not text and a model can take it: the whole file is read and
+    // prepared here, in the job that already opened it, with no extra copy of
+    // its bytes. `offset` and `limit` name lines, so they do not apply.
+    if reagent_image::sniff(&probe[..probe_len]).is_some() {
+        return read_image(path, file, metadata, &probe[..probe_len]);
+    }
     if probe[..probe_len].contains(&0) {
         return Err(format!(
             "{} is a binary file; read only text files",
@@ -158,6 +170,7 @@ fn read_file(path: PathBuf, offset: u64, limit: usize) -> Result<Loaded, String>
             text,
             shown: None,
             object: read_object(offset, offset.saturating_sub(1), None),
+            images: Vec::new(),
         });
     }
     let more = lines.has_more().map_err(failed)?;
@@ -177,17 +190,138 @@ fn read_file(path: PathBuf, offset: u64, limit: usize) -> Result<Loaded, String>
             cut: lines.cut,
         }),
         object,
+        images: Vec::new(),
     })
 }
 
+/// Reads and prepares one image in the job that already opened it. The file
+/// lands in one buffer that `prepare` takes as `Bytes`, so its bytes are not
+/// copied again until the base64 text, which is the one copy kept.
+#[expect(clippy::disallowed_types, reason = "runs inside spawn_blocking")]
+fn read_image(
+    path: PathBuf,
+    file: std::fs::File,
+    metadata: std::fs::Metadata,
+    probe: &[u8],
+) -> Result<Loaded, String> {
+    let (image, text) = prepare_file(&path, file, metadata.len(), probe)?;
+    let mut object = Object::new(serde_json::Map::new());
+    object.fields.insert("width".into(), image.width.into());
+    object.fields.insert("height".into(), image.height.into());
+    Ok(Loaded {
+        path,
+        metadata,
+        text,
+        shown: None,
+        object,
+        images: vec![image],
+    })
+}
+
+/// The image `path` holds, prepared for a model, with its note line, or
+/// `None` when the path is missing, is not a regular file or is not an image.
+///
+/// This is the file work of one `@path` word, for a caller that already runs
+/// in a blocking job.
+#[expect(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "runs inside spawn_blocking"
+)]
+pub fn image_file(path: &Path) -> Result<Option<(Image, String)>, String> {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(None);
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Ok(None);
+    };
+    // Only the start of the file is read to decide, so a large text file is
+    // not read whole to find out that it is not an image.
+    let mut probe = [0_u8; IMAGE_PROBE];
+    let Ok(probe_len) = file.read(&mut probe) else {
+        return Ok(None);
+    };
+    if reagent_image::sniff(&probe[..probe_len]).is_none() {
+        return Ok(None);
+    }
+    prepare_file(path, file, metadata.len(), &probe[..probe_len]).map(Some)
+}
+
+/// Bytes of a file's start that decide whether it is an image.
+const IMAGE_PROBE: usize = 64;
+
+/// Reads the rest of an image file after its `probe` and prepares it: the
+/// image as base64 and its note line, `[image WxH]` or the crate's note.
+#[expect(clippy::disallowed_types, reason = "runs inside spawn_blocking")]
+fn prepare_file(
+    path: &Path,
+    file: std::fs::File,
+    size: u64,
+    probe: &[u8],
+) -> Result<(Image, String), String> {
+    if size > IMAGE_CAP {
+        return Err(format!(
+            "{} is an image of {size} bytes; an image file is at most 64 MiB",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    bytes.extend_from_slice(probe);
+    // A file that grew after its size was read is still cut at the cap.
+    let left = (IMAGE_CAP + 1).saturating_sub(probe.len() as u64);
+    file.take(left)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > IMAGE_CAP {
+        return Err(format!(
+            "{} grew past 64 MiB while it was read",
+            path.display()
+        ));
+    }
+    let prepared = reagent_image::prepare(Bytes::from(bytes), &reagent_image::Limits::default())
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    // The one copy of the image kept is its base64 text; every turn and every
+    // wire write this same text.
+    let data: Text = base64::engine::general_purpose::STANDARD
+        .encode(&prepared.data)
+        .into();
+    let text = match prepared.note {
+        Some(note) => note,
+        None => format!("[image {}x{}]", prepared.width, prepared.height),
+    };
+    let image = Image {
+        media_type: image_type(prepared.format),
+        width: prepared.width,
+        height: prepared.height,
+        data,
+    };
+    Ok((image, text))
+}
+
+/// The model image type of a prepared format. `prepare` returns only the four
+/// formats a model takes; anything else is encoded as PNG or JPEG.
+fn image_type(format: reagent_image::Format) -> ImageType {
+    match format {
+        reagent_image::Format::Png => ImageType::Png,
+        reagent_image::Format::Gif => ImageType::Gif,
+        reagent_image::Format::Webp => ImageType::Webp,
+        _ => ImageType::Jpeg,
+    }
+}
+
 /// What the job of one read produced: the file it opened and the state it saw,
-/// the text for the model, the lines it showed, and the object a script reads.
+/// the text for the model, the lines it showed, the images it prepared, and the
+/// object a script reads.
 struct Loaded {
     path: PathBuf,
     metadata: std::fs::Metadata,
     text: String,
     shown: Option<Shown>,
     object: Object,
+    images: Vec<Image>,
 }
 
 /// The lines one read showed.
@@ -197,12 +331,13 @@ struct Shown {
     cut: bool,
 }
 
-/// What one read produced: the text for the model, the lines it showed, and
-/// the object a script reads in place of the text.
+/// What one read produced: the text for the model, the lines it showed, the
+/// images of an image file, and the object a script reads in place of the text.
 struct ReadOut {
     text: String,
     seen: Option<Seen>,
     object: Object,
+    images: Vec<Image>,
 }
 
 /// The object a script reads for the lines `start..=end`, with `next` when the
@@ -276,7 +411,9 @@ impl Tool for Read {
                 result = self.run_inner(&arguments) => match result {
                     Ok(out) => {
                         self.touched.note(&self.working_dir, Path::new(arguments.path.as_ref()));
-                        let output = ToolOutput::ok(out.text).with_object(out.object);
+                        let output = ToolOutput::ok(out.text)
+                            .with_object(out.object)
+                            .with_images(out.images);
                         match out.seen {
                             Some(seen) => output.with_seen(seen),
                             None => output,
@@ -440,7 +577,8 @@ pub fn spec() -> ToolSpec {
         description: concat!(
             "Read a text file. Each line is printed as `N<TAB>text`. ",
             "At most `limit` lines (default 2000) or 32 KB are shown; use `offset` to continue. ",
-            "Lines over 2000 bytes are cut."
+            "Lines over 2000 bytes are cut. ",
+            "Image files (PNG, JPEG, GIF, WebP, BMP, TIFF) come back as images."
         )
         .into(),
         input_schema: serde_json::json!({
@@ -685,6 +823,145 @@ mod tests {
             "line body not capped"
         );
         assert!(text.contains("[line cut; more]"), "{}", text);
+    }
+
+    /// The 64x48 PNG the image tests use, copied into this crate's fixtures so
+    /// a read is checked against the bytes on disk.
+    const SHOT: &[u8] = include_bytes!("../tests/fixtures/shot.png");
+
+    /// A 4000x3000 JPEG, encoded the way the image crate's tests make one.
+    fn big_jpeg() -> Vec<u8> {
+        let data: Vec<u8> = (0..3000u32)
+            .flat_map(|y| (0..4000u32).flat_map(move |x| [(x / 16) as u8, (y / 16) as u8, 90]))
+            .collect();
+        let mut out = Vec::new();
+        jpeg_encoder::Encoder::new(&mut out, 80)
+            .encode(&data, 4000, 3000, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+        out
+    }
+
+    /// The bytes the base64 text of `image` decodes to.
+    fn decoded(image: &reagent_ai::Image) -> Vec<u8> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(image.data.as_bytes())
+            .expect("the image data is base64")
+    }
+
+    #[tokio::test]
+    async fn an_image_comes_back_byte_for_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("shot.png"), SHOT)
+            .await
+            .unwrap();
+        let output = tool(&tmp)
+            .run(r#"{"path":"shot.png"}"#, &CancellationToken::new())
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(output.content.as_ref(), "[image 64x48]");
+        assert_eq!(output.images().len(), 1);
+        let image = &output.images()[0];
+        assert_eq!(image.media_type, reagent_ai::ImageType::Png);
+        assert_eq!((image.width, image.height), (64, 48));
+        assert_eq!(decoded(image), SHOT);
+        // An image has no lines, so there is no re-read note either.
+        assert!(output.seen.is_none());
+        assert!(output.object.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_large_image_comes_back_shrunk_with_its_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("big.jpg"), big_jpeg())
+            .await
+            .unwrap();
+        let output = tool(&tmp)
+            .run(r#"{"path":"big.jpg"}"#, &CancellationToken::new())
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(
+            output.content.as_ref(),
+            "[image 4000x3000 -> 2000x1500]",
+            "the crate's note names the change"
+        );
+        assert_eq!(output.images().len(), 1);
+        let image = &output.images()[0];
+        assert_eq!(image.media_type, reagent_ai::ImageType::Jpeg);
+        assert_eq!((image.width, image.height), (2000, 1500));
+    }
+
+    #[tokio::test]
+    async fn an_image_over_the_cap_is_refused_before_it_is_read() {
+        use tokio::io::AsyncWriteExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("huge.png");
+        // A sparse file: the PNG magic, then a length past the cap. A read of
+        // it would hold 64 MiB, so the size alone must refuse it.
+        {
+            let mut file = tokio::fs::File::create(&path).await.unwrap();
+            file.write_all(&SHOT[..8]).await.unwrap();
+            file.set_len(IMAGE_CAP + 1).await.unwrap();
+        }
+        let output = tool(&tmp)
+            .run(r#"{"path":"huge.png"}"#, &CancellationToken::new())
+            .await;
+        assert!(output.is_error, "{}", output.content);
+        let content = output.content.as_ref();
+        assert!(content.contains("67108865"), "{content}");
+        assert!(content.contains("64 MiB"), "{content}");
+        assert!(output.images().is_empty());
+    }
+
+    #[tokio::test]
+    async fn random_bytes_keep_the_binary_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = (0..4096).map(|i| (i * 37 % 256) as u8).collect();
+        tokio::fs::write(tmp.path().join("noise.dat"), &bytes)
+            .await
+            .unwrap();
+        let output = tool(&tmp)
+            .run(r#"{"path":"noise.dat"}"#, &CancellationToken::new())
+            .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("binary"), "{}", output.content);
+        assert!(output.images().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_text_file_that_starts_with_bm_reads_as_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            tmp.path().join("bmw.txt"),
+            "BMW service notes\noil change due\n",
+        )
+        .await
+        .unwrap();
+        let output = tool(&tmp)
+            .run(r#"{"path":"bmw.txt"}"#, &CancellationToken::new())
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("oil change due"),
+            "{}",
+            output.content
+        );
+        assert!(output.images().is_empty());
+    }
+
+    /// One image read is still one job: the open, the read and `prepare`.
+    #[tokio::test]
+    async fn one_hop_reads_an_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("shot.png"), SHOT)
+            .await
+            .unwrap();
+        crate::blocking::reset_hops();
+        let output = tool(&tmp)
+            .run(r#"{"path":"shot.png"}"#, &CancellationToken::new())
+            .await;
+        assert_eq!(output.content.as_ref(), "[image 64x48]");
+        assert_eq!(crate::blocking::hops(), 1);
     }
 
     #[tokio::test]

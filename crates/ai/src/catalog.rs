@@ -76,6 +76,12 @@ pub struct Entry {
     /// file written before this field has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
+    /// Whether the model takes images: `Some(true)` when the catalogue's input
+    /// list names `image`, `Some(false)` when it lists inputs without it, and
+    /// `None` when nothing lists an input list. A cache file written before
+    /// this field has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<bool>,
 }
 
 impl Entry {
@@ -356,6 +362,7 @@ mod tests {
                 price: None,
                 price_source: None,
                 reasoning: None,
+                images: None,
             }
         }
     }
@@ -417,6 +424,10 @@ mod tests {
             cache.models[0].reasoning, None,
             "an old cache names no reasoning levels"
         );
+        assert_eq!(
+            cache.models[0].images, None,
+            "an old cache says nothing about images"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -438,6 +449,7 @@ mod tests {
                 }),
                 price_source: Some(PriceSource::Provider),
                 reasoning: None,
+                images: Some(true),
             }],
         };
         assert_eq!(read(&dir, "fi"), None);
@@ -474,6 +486,7 @@ mod tests {
             price: None,
             price_source: None,
             reasoning,
+            images: None,
         }
     }
 

@@ -400,6 +400,7 @@ mod tests {
             price: None,
             price_source: None,
             reasoning,
+            images: None,
         }
     }
 

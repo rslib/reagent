@@ -93,6 +93,7 @@ mod tests {
                         call_id: "call_1".into(),
                         content: "ok".into(),
                         is_error: false,
+                        images: Vec::new(),
                     },
                 )
             })

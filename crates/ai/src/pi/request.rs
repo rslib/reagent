@@ -8,7 +8,8 @@ use serde_json::value::RawValue;
 
 use crate::Error;
 use crate::openai::{BodyParts, JsonStr};
-use crate::types::{AssistantMessage, Content, Message, StopReason, ToolResult, ToolSpec};
+use crate::request_images::NO_IMAGES;
+use crate::types::{AssistantMessage, Content, Image, Message, StopReason, ToolResult, ToolSpec};
 
 use super::stream::level_of;
 use super::{API, Replay, UPSTREAM};
@@ -28,7 +29,7 @@ impl MessageBody {
     ///
     /// `names` maps the call id of every tool call in the history to its tool
     /// name, which a tool result sends back. Thinking from another provider is
-    /// dropped, because its signature is not valid here.
+    /// dropped, because its signature is not valid here. Images are sent.
     ///
     /// `timestamp` is the fixed counter of the message's position, which the
     /// request builder hands over: the body cache is keyed on the position, so
@@ -39,11 +40,24 @@ impl MessageBody {
         names: &[(&str, &str)],
         timestamp: u64,
     ) -> Result<Self, Error> {
-        let mut out = Vec::with_capacity(estimate(message));
+        Self::with_images(message, provider, names, timestamp, true)
+    }
+
+    /// Serializes one message for the provider named `provider`, sending its
+    /// images only when `images` and writing the note of
+    /// [`crate::request_images::NO_IMAGES`] in their place when not.
+    pub fn with_images(
+        message: &Message,
+        provider: &str,
+        names: &[(&str, &str)],
+        timestamp: u64,
+        images: bool,
+    ) -> Result<Self, Error> {
+        let mut out = Vec::with_capacity(estimate(message, images));
         match message {
-            Message::User { content } => user(&text_of(content), &mut out),
+            Message::User { content } => user(content, images, &mut out),
             Message::Assistant(reply) => assistant(reply, provider, &mut out)?,
-            Message::ToolResult(result) => tool_result(result, &mut out, names),
+            Message::ToolResult(result) => tool_result(result, &mut out, names, images),
         }
         // The message object is closed; the timestamp takes the place of the
         // closing brace, so the body is whole.
@@ -200,23 +214,26 @@ const SLACK: usize = 512;
 ///
 /// A large tool result is most of a body, so a count within a few hundred
 /// bytes of it lets the writer fill one buffer and grow none.
-fn estimate(message: &Message) -> usize {
+fn estimate(message: &Message, images: bool) -> usize {
     let content = match message {
-        Message::User { content } => user_len(content),
+        Message::User { content } => user_len(content, images),
         Message::Assistant(reply) => reply.content.iter().map(content_len).sum(),
-        Message::ToolResult(result) => escaped_len(&result.content),
+        Message::ToolResult(result) => tool_result_len(result, images),
     };
     content + SLACK
 }
 
-/// The bytes of the text one user message carries: its text blocks and the
-/// newlines between them.
-fn user_len(content: &[Content]) -> usize {
+/// The bytes of the text one user message carries: its text blocks, the
+/// newlines between them, and its images or the note that replaces each one.
+fn user_len(content: &[Content], images: bool) -> usize {
     content
         .iter()
         .map(|content| match content {
             Content::Text { text } => escaped_len(text),
-            _ => 0,
+            Content::Image(image) => image_len(image, images),
+            // A user message holds no thinking and no tool call: nothing of
+            // those reaches the wire, and neither carries an image.
+            Content::Thinking { .. } | Content::RedactedThinking { .. } | Content::ToolCall(_) => 0,
         })
         .sum::<usize>()
         + content.len()
@@ -234,7 +251,30 @@ fn content_len(content: &Content) -> usize {
         Content::ToolCall(call) => {
             escaped_len(&call.arguments) + escaped_len(&call.id) + escaped_len(&call.name)
         }
+        // A reply holds no image, but the size estimate counts one, so no image
+        // is dropped without the bytes it takes being counted after all.
+        Content::Image(image) => escaped_len(&image.data),
     }
+}
+
+/// The bytes one image block takes, or the note that replaces it.
+fn image_len(image: &Image, images: bool) -> usize {
+    if images {
+        escaped_len(&image.data)
+    } else {
+        NO_IMAGES.len() + 1
+    }
+}
+
+/// The bytes a tool result takes: its text and its images, or the note that
+/// replaces each one.
+fn tool_result_len(result: &ToolResult, images: bool) -> usize {
+    escaped_len(&result.content)
+        + result
+            .images
+            .iter()
+            .map(|image| image_len(image, images))
+            .sum::<usize>()
 }
 
 /// The bytes a JSON string of `text` takes, its escapes included.
@@ -307,6 +347,14 @@ struct UserMessage<'a> {
     content: &'a str,
 }
 
+/// A user message whose content holds an image: the text blocks and the image
+/// blocks in order.
+#[derive(Serialize)]
+struct UserBlocks<'a> {
+    role: &'static str,
+    content: &'a [Block<'a>],
+}
+
 #[derive(Serialize)]
 struct AssistantBody<'a> {
     role: &'static str,
@@ -348,6 +396,24 @@ enum Block<'a> {
         #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
         thought_signature: Option<&'a str>,
     },
+    Image {
+        data: &'a str,
+        #[serde(rename = "mimeType")]
+        mime_type: &'static str,
+    },
+}
+
+/// The content of one tool result: the text block alone, which takes no buffer,
+/// when the result has no image, and the text block with an image block for
+/// each image when it has one.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ToolContent<'a> {
+    /// The text block of a result with no image, on the stack so it costs no
+    /// buffer.
+    Single([Block<'a>; 1]),
+    /// The text block and the images of a result that carries one.
+    Blocks(Vec<Block<'a>>),
 }
 
 #[derive(Serialize)]
@@ -357,16 +423,9 @@ struct ToolResultBody<'a> {
     tool_call_id: &'a str,
     #[serde(rename = "toolName")]
     tool_name: &'a str,
-    content: [ToolResultText<'a>; 1],
+    content: ToolContent<'a>,
     #[serde(rename = "isError")]
     is_error: bool,
-}
-
-#[derive(Serialize)]
-struct ToolResultText<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    text: &'a str,
 }
 
 #[derive(Serialize)]
@@ -395,11 +454,42 @@ struct CostBody {
     total: f64,
 }
 
-fn user(content: &str, out: &mut Vec<u8>) {
+/// Writes one user message: a string when it holds no image, and a list of
+/// text and image blocks when it does.
+fn user(content: &[Content], images: bool, out: &mut Vec<u8>) {
+    if images
+        && content
+            .iter()
+            .any(|content| matches!(content, Content::Image(_)))
+    {
+        let blocks: Vec<Block<'_>> = content
+            .iter()
+            .filter_map(|content| match content {
+                Content::Text { text } => Some(Block::Text {
+                    text,
+                    text_signature: None,
+                }),
+                Content::Image(image) => Some(image_block(image, images)),
+                // A user message holds no thinking and no tool call, and
+                // neither carries an image.
+                Content::Thinking { .. }
+                | Content::RedactedThinking { .. }
+                | Content::ToolCall(_) => None,
+            })
+            .collect();
+        write(
+            &UserBlocks {
+                role: "user",
+                content: &blocks,
+            },
+            out,
+        );
+        return;
+    }
     write(
         &UserMessage {
             role: "user",
-            content,
+            content: &text_of(content, images),
         },
         out,
     );
@@ -410,11 +500,16 @@ fn write(value: &impl Serialize, out: &mut Vec<u8>) {
     serde_json::to_writer(out, value).expect("a request part serializes");
 }
 
-/// The text one user message carries: the text blocks in order, one per line.
-fn text_of(content: &[Content]) -> Cow<'_, str> {
+/// The text one user message carries: the text blocks in order, one per line,
+/// and for every image the note that replaces it when the model takes none.
+fn text_of(content: &[Content], images: bool) -> Cow<'_, str> {
     let mut texts = content.iter().filter_map(|content| match content {
         Content::Text { text } => Some(&**text),
-        _ => None,
+        Content::Image(_) if !images => Some(NO_IMAGES),
+        // An image the model takes is written as an image block, and the other
+        // blocks of a user message carry no text.
+        Content::Image(_) => None,
+        Content::Thinking { .. } | Content::RedactedThinking { .. } | Content::ToolCall(_) => None,
     });
     let first = texts.next().unwrap_or("");
     match texts.next() {
@@ -473,6 +568,9 @@ fn assistant(reply: &AssistantMessage, provider: &str, out: &mut Vec<u8>) -> Res
                 arguments: arguments(&call.arguments),
                 thought_signature: replay.tool_signatures.get(&*call.id).map(JsonStr::as_str),
             },
+            // A model's reply holds no image, and the pi wire has no place for
+            // one in an assistant message.
+            Content::Image(_) => continue,
         };
         blocks.push(block);
     }
@@ -503,19 +601,44 @@ fn arguments(text: &str) -> &RawValue {
 /// The arguments of a call whose stored text is not JSON.
 const EMPTY_ARGUMENTS: &str = "{}";
 
-fn tool_result(result: &ToolResult, out: &mut Vec<u8>, names: &[(&str, &str)]) {
+/// The block one image writes: its base64 text with its media type, or the
+/// note that says it was not sent.
+fn image_block(image: &Image, images: bool) -> Block<'_> {
+    if images {
+        Block::Image {
+            data: &image.data,
+            mime_type: image.media_type.mime(),
+        }
+    } else {
+        Block::Text {
+            text: NO_IMAGES,
+            text_signature: None,
+        }
+    }
+}
+
+fn tool_result(result: &ToolResult, out: &mut Vec<u8>, names: &[(&str, &str)], images: bool) {
     let name = names
         .iter()
         .find(|(id, _)| *id == &*result.call_id)
         .map_or("", |(_, name)| *name);
+    let single = Block::Text {
+        text: &result.content,
+        text_signature: None,
+    };
+    let content = if result.images.is_empty() {
+        ToolContent::Single([single])
+    } else {
+        let mut blocks = Vec::with_capacity(result.images.len() + 1);
+        blocks.push(single);
+        blocks.extend(result.images.iter().map(|image| image_block(image, images)));
+        ToolContent::Blocks(blocks)
+    };
     let message = ToolResultBody {
         role: "toolResult",
         tool_call_id: &result.call_id,
         tool_name: name,
-        content: [ToolResultText {
-            kind: "text",
-            text: &result.content,
-        }],
+        content,
         is_error: result.is_error,
     };
     write(&message, out);
@@ -653,6 +776,126 @@ mod tests {
         })
     }
 
+    fn sample_image() -> crate::types::Image {
+        crate::types::Image {
+            media_type: crate::types::ImageType::Png,
+            width: 1,
+            height: 1,
+            data: "aGk=".into(),
+        }
+    }
+
+    fn user_with_image() -> Message {
+        Message::User {
+            content: vec![Content::text("look"), Content::Image(sample_image())],
+        }
+    }
+
+    fn result_with_image() -> Message {
+        Message::tool_result_with_images("call_1", "one frame", false, vec![sample_image()])
+    }
+
+    /// The body of `messages`, with images sent or replaced by the note.
+    fn body_of_images(builder: &RequestBuilder, messages: &[Message], images: bool) -> Bytes {
+        let names = tool_names(messages);
+        let bodies: Vec<MessageBody> = messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                MessageBody::with_images(message, PROVIDER, &names, index as u64 + 1, images)
+                    .expect("a message")
+            })
+            .collect();
+        builder.body(&bodies)
+    }
+
+    const IMAGE_BLOCK: &str = r#"{"type":"image","data":"aGk=","mimeType":"image/png"}"#;
+
+    #[test]
+    fn an_image_body_writes_the_image_blocks_the_wire_names() {
+        let messages = vec![user_with_image(), assistant(), result_with_image()];
+        let raw = body_of_images(&builder(Some("high")), &messages, true);
+        let body: serde_json::Value = serde_json::from_slice(&raw).expect("the body is JSON");
+        assert_eq!(
+            body["context"]["messages"][1],
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image", "data": "aGk=", "mimeType": "image/png"},
+                ],
+                "timestamp": 1,
+            }),
+            "{body}"
+        );
+        assert_eq!(
+            body["context"]["messages"][3],
+            json!({
+                "role": "toolResult",
+                "toolCallId": "call_1",
+                "toolName": "read",
+                "content": [
+                    {"type": "text", "text": "one frame"},
+                    {"type": "image", "data": "aGk=", "mimeType": "image/png"},
+                ],
+                "isError": false,
+                "timestamp": 3,
+            }),
+            "{body}"
+        );
+        assert_eq!(
+            std::str::from_utf8(&raw)
+                .unwrap()
+                .matches(IMAGE_BLOCK)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn takes_no_images_writes_the_note_in_place_of_each_image() {
+        let messages = vec![user_with_image(), assistant(), result_with_image()];
+        let raw = body_of_images(&builder(Some("high")), &messages, false);
+        let body = std::str::from_utf8(&raw).unwrap();
+        assert!(!body.contains("aGk="), "{body}");
+        assert_eq!(
+            body.matches("[image not sent: the model takes no images]")
+                .count(),
+            2,
+            "one note for each image: {body}"
+        );
+    }
+
+    #[test]
+    fn an_image_message_keeps_its_bytes_across_turns() {
+        let provider = crate::pi::PiMessages::new("", "http://localhost:1/v1");
+        let first: Vec<Message> = vec![Message::user("hello"), user_with_image()];
+        let mut second = first.clone();
+        second.push(result_with_image());
+        let system = Text::from(SYSTEM);
+        let key = Text::from("sess-1");
+        let tools = tools();
+        let mut request = Request {
+            model: MODEL,
+            max_tokens: 1024,
+            system: Some(&system),
+            tools: &tools,
+            messages: &first,
+            images: true,
+            reasoning: Some("high"),
+            cache_key: Some(&key),
+        };
+        let one = provider.request_body(&request).expect("the body builds");
+        request.messages = &second;
+        let two = provider.request_body(&request).expect("the body builds");
+        assert!(
+            two.starts_with(&one[..one.len() - 3]),
+            "the image message keeps its bytes:\n{}\n{}",
+            String::from_utf8_lossy(&one),
+            String::from_utf8_lossy(&two)
+        );
+    }
+
     #[test]
     fn pi_request_body_matches_the_wire() {
         let expected = json!({
@@ -754,6 +997,7 @@ mod tests {
             system: Some(&system),
             tools: &tools,
             messages: &first,
+            images: true,
             reasoning: Some("high"),
             cache_key: Some(&key),
         };

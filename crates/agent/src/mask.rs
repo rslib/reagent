@@ -73,7 +73,7 @@ impl Mask {
         let mut total = 0;
         for result in old_results(history) {
             if is_candidate(result) {
-                total += result.content.len();
+                total += size(result);
             }
         }
         if total < STEP_BYTES {
@@ -85,12 +85,15 @@ impl Mask {
                 break;
             }
             if is_candidate(result) {
-                total -= result.content.len();
+                total -= size(result);
                 let id = archive.id_of(&result.call_id);
                 if let Some(id) = id {
                     archive.keep(id, Text::clone(&result.content));
                 }
                 result.content = stub(id);
+                // A masked output sends none of its images again: they are
+                // most of its bytes. The archive keeps only the text.
+                result.images = Vec::new();
                 masked += 1;
             }
         }
@@ -116,8 +119,18 @@ fn old_results(history: &mut [Message]) -> impl Iterator<Item = &mut ToolResult>
         .skip(KEEP.max(newest_turn))
 }
 
+/// The bytes an output sends: its text and the base64 of its images.
+fn size(result: &ToolResult) -> usize {
+    result.content.len()
+        + result
+            .images
+            .iter()
+            .map(|image| image.data.len())
+            .sum::<usize>()
+}
+
 fn is_candidate(result: &ToolResult) -> bool {
-    result.content.len() >= MIN_BYTES && !is_stub(&result.content)
+    size(result) >= MIN_BYTES && !is_stub(&result.content)
 }
 
 #[cfg(test)]
@@ -147,6 +160,39 @@ mod tests {
     fn apply(messages: &mut [Message]) -> usize {
         let archive = numbered(messages);
         Mask.apply(messages, &archive)
+    }
+
+    #[test]
+    fn old_image_outputs_count_and_lose_their_images_when_masked() {
+        // 43 outputs of 20 bytes of text and a 4,980 byte image, 5,000 in
+        // all as in the text test: only the images make them count.
+        let image = reagent_ai::Image {
+            media_type: reagent_ai::ImageType::Png,
+            width: 1,
+            height: 1,
+            data: "A".repeat(4_980).into(),
+        };
+        let mut messages: Vec<Message> = (0..43)
+            .map(|index| {
+                Message::tool_result_with_images(
+                    format!("call_{index}"),
+                    "x".repeat(20),
+                    false,
+                    vec![image.clone()],
+                )
+            })
+            .collect();
+        let archive = numbered(&messages);
+        assert_eq!(Mask.apply(&mut messages, &archive), 20);
+        let Message::ToolResult(first) = &messages[0] else {
+            panic!("not a tool result");
+        };
+        assert!(is_stub(&first.content));
+        assert!(first.images.is_empty());
+        let Message::ToolResult(last) = &messages[42] else {
+            panic!("not a tool result");
+        };
+        assert_eq!(last.images.len(), 1);
     }
 
     fn numbered(messages: &[Message]) -> Archive {
@@ -365,6 +411,7 @@ mod loop_tests {
             reasoning: None,
             cache_key: None,
             max_turns: None,
+            images: true,
         };
         let (tx, _rx) = mpsc::channel(4096);
         let mut history = vec![Message::user("go")];

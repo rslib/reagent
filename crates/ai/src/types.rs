@@ -89,6 +89,49 @@ pub struct ToolCall {
     pub arguments: Text,
 }
 
+/// The image formats a model takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageType {
+    /// PNG.
+    Png,
+    /// JPEG.
+    Jpeg,
+    /// GIF.
+    Gif,
+    /// WebP.
+    Webp,
+}
+
+impl ImageType {
+    /// The media type every wire writes for this format.
+    pub fn mime(self) -> &'static str {
+        match self {
+            ImageType::Png => "image/png",
+            ImageType::Jpeg => "image/jpeg",
+            ImageType::Gif => "image/gif",
+            ImageType::Webp => "image/webp",
+        }
+    }
+}
+
+/// One image attached to a message.
+///
+/// `data` is the base64 text of the image bytes, in the standard alphabet with
+/// padding. It is written once, when the image is read, and every wire writes
+/// that text as it stands: an image is never encoded again and never copied.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Image {
+    /// The format of the image.
+    pub media_type: ImageType,
+    /// The width in pixels.
+    pub width: u32,
+    /// The height in pixels.
+    pub height: u32,
+    /// The image bytes as base64 text.
+    pub data: Text,
+}
+
 /// One block of a user or assistant message.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -113,6 +156,8 @@ pub enum Content {
     },
     /// A request to run a tool.
     ToolCall(ToolCall),
+    /// An image the user attached or a tool returned.
+    Image(Image),
 }
 
 impl Content {
@@ -140,6 +185,9 @@ pub struct ToolResult {
     /// Whether the tool failed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_error: bool,
+    /// The images the tool produced, in call order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<Image>,
 }
 
 /// One assistant reply plus the metadata needed to send it back.
@@ -221,10 +269,21 @@ impl Message {
 
     /// Builds the result of one tool call.
     pub fn tool_result(call_id: impl Into<Text>, content: impl Into<Text>, is_error: bool) -> Self {
+        Self::tool_result_with_images(call_id, content, is_error, Vec::new())
+    }
+
+    /// Builds the result of one tool call that produced images, in call order.
+    pub fn tool_result_with_images(
+        call_id: impl Into<Text>,
+        content: impl Into<Text>,
+        is_error: bool,
+        images: Vec<Image>,
+    ) -> Self {
         Message::ToolResult(ToolResult {
             call_id: call_id.into(),
             content: content.into(),
             is_error,
+            images,
         })
     }
 }
@@ -372,6 +431,55 @@ mod tests {
         let message = Message::tool_result("toolu_02", "ok", false);
         let json = serde_json::to_string(&message).unwrap();
         assert!(!json.contains("is_error"));
+        assert!(!json.contains("images"), "a result with no image: {json}");
+        let back: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, message);
+    }
+
+    fn sample_image(data: &str) -> Image {
+        Image {
+            media_type: ImageType::Png,
+            width: 2,
+            height: 3,
+            data: data.into(),
+        }
+    }
+
+    #[test]
+    fn an_image_block_keeps_its_bytes_and_mime_type() {
+        assert_eq!(ImageType::Png.mime(), "image/png");
+        assert_eq!(ImageType::Jpeg.mime(), "image/jpeg");
+        assert_eq!(ImageType::Gif.mime(), "image/gif");
+        assert_eq!(ImageType::Webp.mime(), "image/webp");
+        let content = Content::Image(sample_image("aGk="));
+        let json = serde_json::to_string(&content).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"image","media_type":"png","width":2,"height":3,"data":"aGk="}"#
+        );
+        let back: Content = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, content);
+    }
+
+    #[test]
+    fn a_tool_result_image_round_trips_and_shares_its_text() {
+        let message = Message::tool_result_with_images(
+            "call_01",
+            "the screenshot",
+            false,
+            vec![sample_image("aGk="), sample_image("bG8=")],
+        );
+        let clone = message.clone();
+        let (Message::ToolResult(result), Message::ToolResult(copy)) = (&message, &clone) else {
+            panic!("expected tool results");
+        };
+        assert_eq!(result.images.len(), 2);
+        assert!(
+            Arc::ptr_eq(&result.images[0].data, &copy.images[0].data),
+            "the image text is shared, not copied"
+        );
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains(r#""images":["#), "{json}");
         let back: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(back, message);
     }

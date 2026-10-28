@@ -599,6 +599,8 @@ pub async fn run(mut args: Args) -> ExitCode {
         reasoning: reasoning.and_then(|mapped| mapped.sent),
         cache_key: Some(Text::from("headless-v1")),
         max_turns: Some(MAX_TURNS),
+        // On until the catalog says the model takes no images.
+        images: cached.as_ref().and_then(|entry| entry.images) != Some(false),
     };
 
     // The loop policies.
@@ -726,7 +728,27 @@ pub async fn run(mut args: Args) -> ExitCode {
     }
     let mut asked = task.is_some();
     if let Some(text) = task {
-        history.push(reagent_ai::Message::user(text));
+        // The image files the task names by `@path` go with it: the text is
+        // kept as written, then one note line and one image per image. A file
+        // that is not an image adds nothing, and one that cannot be prepared
+        // stops the run before any request.
+        let attached = crate::attach::blocks(&cwd, &text).await;
+        let blocks = match attached {
+            Ok(blocks) => blocks,
+            Err(message) => {
+                eprintln!("reagent: {message}");
+                stop_servers(servers).await;
+                return ExitCode::from(1);
+            }
+        };
+        if blocks.is_empty() {
+            history.push(reagent_ai::Message::user(text));
+        } else {
+            let mut content = Vec::with_capacity(1 + blocks.len());
+            content.push(reagent_ai::Content::text(text));
+            content.extend(blocks);
+            history.push(reagent_ai::Message::user_content(content));
+        }
     }
     // A crash in the first request of a turn leaves its message with no reply,
     // and the continue asks for that reply.
@@ -2423,6 +2445,7 @@ mod tests {
             price: None,
             price_source: None,
             reasoning: None,
+            images: None,
         };
         let cache = reagent_ai::catalog::Cache {
             fetched_at: 1,
@@ -2462,6 +2485,7 @@ mod tests {
                 price: Some(price),
                 price_source: Some(reagent_ai::catalog::PriceSource::Provider),
                 reasoning: None,
+                images: None,
             }],
         };
         reagent_ai::catalog::write(&dir, "fi", &cache).expect("writes the cache");
@@ -2540,6 +2564,7 @@ mod tests {
             }),
             price_source: Some(reagent_ai::catalog::PriceSource::ModelsDev),
             reasoning: None,
+            images: None,
         };
         let config = reagent_config::ModelPrice {
             input: 1.0,
@@ -2572,6 +2597,7 @@ mod tests {
             }),
             price_source: Some(reagent_ai::catalog::PriceSource::ModelsDev),
             reasoning: None,
+            images: None,
         };
         let usage = Usage {
             input_tokens: 1000,

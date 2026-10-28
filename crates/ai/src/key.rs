@@ -153,6 +153,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: &[],
+            images: true,
             reasoning: None,
             cache_key: None,
         };

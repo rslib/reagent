@@ -277,8 +277,13 @@ async fn run_reroute(
 }
 
 fn result_message(call: &ToolCall, output: ToolOutput) -> Outcome {
-    // The message takes the content; `seen` moves out next to it.
-    let message = Message::tool_result(call.id.clone(), output.content, output.is_error);
+    // The message takes the content and the images; `seen` moves out next to it.
+    let message = Message::tool_result_with_images(
+        call.id.clone(),
+        output.content,
+        output.is_error,
+        output.images.map(|images| *images).unwrap_or_default(),
+    );
     (message, output.seen)
 }
 

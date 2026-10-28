@@ -1,5 +1,6 @@
 //! OpenAI-compatible Chat Completions provider.
 
+use std::borrow::Cow;
 use std::sync::Mutex;
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -14,7 +15,11 @@ use crate::http::ExtraHeaders;
 use crate::key::Credential;
 use crate::openai::{BodyCache, BodyParts, JsonStr};
 use crate::providers::{Compat, MaxTokensField, ReasoningField};
-use crate::types::{AssistantMessage, Content, Message, Reasoning, StopReason, Text, ToolSpec};
+use crate::request_images::{NO_IMAGES, data_url};
+use crate::types::{
+    AssistantMessage, Content, Image, Message, Reasoning, Role, StopReason, Text, ToolResult,
+    ToolSpec,
+};
 use crate::{Provider, Request, StreamEvent, Usage};
 
 /// The provider name recorded on assistant messages.
@@ -40,6 +45,8 @@ struct Head {
     system: Option<Text>,
     reasoning: Option<String>,
     tools: Vec<ToolSpec>,
+    /// Whether images are sent. A change rebuilds every message body.
+    images: bool,
     builder: RequestBuilder,
 }
 
@@ -113,6 +120,7 @@ impl OpenAiChat {
                 && cached.system.as_deref() == request.system.map(|system| &**system)
                 && cached.reasoning.as_deref() == request.reasoning
                 && cached.tools.as_slice() == request.tools
+                && cached.images == request.images
         });
         if !reuse {
             *head = Some(Head {
@@ -121,6 +129,7 @@ impl OpenAiChat {
                 system: request.system.cloned(),
                 reasoning: request.reasoning.map(str::to_string),
                 tools: request.tools.to_vec(),
+                images: request.images,
                 builder: RequestBuilder::with_compat(
                     request.model,
                     request.max_tokens,
@@ -134,8 +143,14 @@ impl OpenAiChat {
         let builder = &head.as_ref().expect("head is cached").builder;
 
         let mut bodies = self.bodies.lock().expect("body cache lock");
+        if !reuse {
+            // A body holds the images of its message or the note that replaces
+            // them, so a new head rebuilds all of them.
+            *bodies = BodyCache::default();
+        }
+        let images = request.images;
         bodies.align(request.messages, |message| {
-            MessageBody::new(message, PROVIDER)
+            MessageBody::with_images(message, PROVIDER, images)
         })?;
         Ok(builder.body_parts(bodies.bodies()))
     }
@@ -220,6 +235,11 @@ where
 #[derive(Debug, Clone)]
 pub struct MessageBody {
     bytes: Option<Bytes>,
+    /// The role of the message it was built from.
+    role: Role,
+    /// The image parts a tool result adds to the user message that follows the
+    /// tool messages of its turn, in call order. Empty when it has none.
+    images: Vec<Bytes>,
 }
 
 impl MessageBody {
@@ -228,31 +248,92 @@ impl MessageBody {
     /// Thinking from another provider is dropped. Tool arguments are passed
     /// through as the raw JSON string the model emitted; an empty argument
     /// string becomes an empty object. An assistant message with nothing kept
-    /// produces no body at all.
+    /// produces no body at all. Images are sent.
     pub fn new(message: &Message, provider: &str) -> Result<Self, Error> {
-        let bytes = match message {
-            Message::User { content } => Some(to_bytes(&UserOut {
-                role: "user",
-                content: content
-                    .iter()
-                    .filter_map(|content| match content {
-                        Content::Text { text } => Some(Part {
-                            kind: "text",
-                            text: text.as_ref(),
-                        }),
-                        _ => None,
-                    })
-                    .collect(),
-            })),
-            Message::Assistant(assistant) => assistant_message(assistant, provider),
-            Message::ToolResult(result) => Some(to_bytes(&ToolOut {
-                role: "tool",
-                tool_call_id: &result.call_id,
-                content: result.content.as_ref(),
-            })),
-        };
-        Ok(Self { bytes })
+        Self::with_images(message, provider, true)
     }
+
+    /// Serializes one message for the provider named `provider`, sending its
+    /// images only when `images` and writing the note of
+    /// [`crate::request_images::NO_IMAGES`] in their place when not.
+    pub fn with_images(message: &Message, provider: &str, images: bool) -> Result<Self, Error> {
+        let (bytes, parts) = match message {
+            Message::User { content } => (
+                Some(to_bytes(&UserOut {
+                    role: "user",
+                    content: user_parts(content, images),
+                })),
+                Vec::new(),
+            ),
+            Message::Assistant(assistant) => (assistant_message(assistant, provider), Vec::new()),
+            Message::ToolResult(result) => (
+                Some(to_bytes(&ToolOut {
+                    role: "tool",
+                    tool_call_id: &result.call_id,
+                    content: &tool_content(result, images),
+                })),
+                if images {
+                    image_parts(&result.images)
+                } else {
+                    Vec::new()
+                },
+            ),
+        };
+        Ok(Self {
+            bytes,
+            role: message.role(),
+            images: parts,
+        })
+    }
+}
+
+/// The content parts of one user message: its text, and each image as a
+/// `data:` URL, or the note that says why the image is not sent.
+fn user_parts(content: &[Content], images: bool) -> Vec<Part<'_>> {
+    content
+        .iter()
+        .filter_map(|content| match content {
+            Content::Text { text } => Some(Part::Text {
+                text: text.as_ref(),
+            }),
+            Content::Image(image) if images => Some(image_part(image)),
+            Content::Image(_) => Some(Part::Text { text: NO_IMAGES }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The image parts of `images`, in call order, which the user message after
+/// the tool messages of a turn writes.
+fn image_parts(images: &[Image]) -> Vec<Bytes> {
+    images
+        .iter()
+        .map(|image| to_bytes(&image_part(image)))
+        .collect()
+}
+
+fn image_part(image: &Image) -> Part<'_> {
+    Part::ImageUrl {
+        image_url: ImageUrl {
+            url: Cow::Owned(data_url(image)),
+        },
+    }
+}
+
+/// The text of one tool result: its text, and the note for every image the
+/// model takes none of, because the tool message itself writes text only.
+fn tool_content(result: &ToolResult, images: bool) -> Cow<'_, str> {
+    if images || result.images.is_empty() {
+        return Cow::Borrowed(result.content.as_ref());
+    }
+    let mut text =
+        String::with_capacity(result.content.len() + result.images.len() * (NO_IMAGES.len() + 1));
+    text.push_str(&result.content);
+    for _ in &result.images {
+        text.push('\n');
+        text.push_str(NO_IMAGES);
+    }
+    Cow::Owned(text)
 }
 
 /// Builds a Chat Completions body from a stable head and reusable messages.
@@ -405,8 +486,11 @@ impl RequestBuilder {
             .iter()
             .filter(|message| message.bytes.is_some())
             .count();
+        let images: usize = messages.iter().map(|message| message.images.len()).sum();
         let mut parts = BodyParts::with_capacity(
-            2 + usize::from(self.system.is_some()) + crate::openai::item_pieces(visible),
+            2 + usize::from(self.system.is_some())
+                + crate::openai::item_pieces(visible)
+                + image_message_pieces(images),
         );
         parts.push(self.head.clone());
         let mut first = match &self.system {
@@ -416,15 +500,51 @@ impl RequestBuilder {
             }
             None => true,
         };
-        for message in messages {
-            let Some(bytes) = &message.bytes else {
+        let mut index = 0;
+        while index < messages.len() {
+            if messages[index].role != Role::ToolResult {
+                if let Some(bytes) = &messages[index].bytes {
+                    if !first {
+                        parts.push_static(COMMA);
+                    }
+                    first = false;
+                    parts.push(bytes.clone());
+                }
+                index += 1;
                 continue;
-            };
+            }
+            // The tool messages of one turn, and then one user message with the
+            // images they carry, which the tool messages themselves cannot hold.
+            let start = index;
+            let mut carried = 0;
+            while index < messages.len() && messages[index].role == Role::ToolResult {
+                let message = &messages[index];
+                carried += message.images.len();
+                if let Some(bytes) = &message.bytes {
+                    if !first {
+                        parts.push_static(COMMA);
+                    }
+                    first = false;
+                    parts.push(bytes.clone());
+                }
+                index += 1;
+            }
+            if carried == 0 {
+                continue;
+            }
             if !first {
                 parts.push_static(COMMA);
             }
             first = false;
-            parts.push(bytes.clone());
+            parts.push_static(IMAGES_PREFIX);
+            for part in messages[start..index]
+                .iter()
+                .flat_map(|message| &message.images)
+            {
+                parts.push_static(COMMA);
+                parts.push(part.clone());
+            }
+            parts.push_static(IMAGES_END);
         }
         parts.push_static(END);
         debug_assert_eq!(
@@ -444,18 +564,56 @@ impl RequestBuilder {
             len += system.len();
             first = false;
         }
-        for message in messages {
-            if let Some(bytes) = &message.bytes {
-                len += bytes.len() + usize::from(!first);
-                first = false;
+        let mut index = 0;
+        while index < messages.len() {
+            if messages[index].role != Role::ToolResult {
+                if let Some(bytes) = &messages[index].bytes {
+                    len += bytes.len() + usize::from(!first);
+                    first = false;
+                }
+                index += 1;
+                continue;
+            }
+            let start = index;
+            let mut carried = 0;
+            while index < messages.len() && messages[index].role == Role::ToolResult {
+                let message = &messages[index];
+                carried += message.images.len();
+                if let Some(bytes) = &message.bytes {
+                    len += bytes.len() + usize::from(!first);
+                    first = false;
+                }
+                index += 1;
+            }
+            if carried == 0 {
+                continue;
+            }
+            len += IMAGES_PREFIX.len() + IMAGES_END.len() + usize::from(!first) + carried;
+            first = false;
+            for part in messages[start..index]
+                .iter()
+                .flat_map(|message| &message.images)
+            {
+                len += part.len();
             }
         }
         len
     }
 }
 
+/// The pieces a user message of tool-result images takes: the comma before it,
+/// the prefix that opens it, a comma before every image, and the bracket that
+/// closes it.
+fn image_message_pieces(images: usize) -> usize {
+    if images == 0 { 0 } else { 2 * images + 3 }
+}
+
 const COMMA: &[u8] = b",";
 const END: &[u8] = b"]}";
+/// The user message that carries the images of the tool results above it. It
+/// closes with [`IMAGES_END`], and its content starts with one text part.
+const IMAGES_PREFIX: &[u8] = b"{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Images from the tool results above:\"}";
+const IMAGES_END: &[u8] = b"]}";
 
 #[derive(Serialize)]
 struct ChatTool<'a> {
@@ -483,11 +641,18 @@ struct UserOut<'a> {
     content: Vec<Part<'a>>,
 }
 
+/// One content part of a user message: text, or an image as a `data:` URL.
 #[derive(Serialize)]
-struct Part<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    text: &'a str,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Part<'a> {
+    Text { text: &'a str },
+    ImageUrl { image_url: ImageUrl<'a> },
+}
+
+/// The `image_url` object of one image part.
+#[derive(Serialize)]
+struct ImageUrl<'a> {
+    url: Cow<'a, str>,
 }
 
 #[derive(Serialize)]
@@ -546,6 +711,9 @@ fn assistant_message(assistant: &AssistantMessage, provider: &str) -> Option<Byt
                 }
             }
             Content::RedactedThinking { .. } => {}
+            // A model's reply holds no image, and the wire has no place for
+            // one in an assistant message.
+            Content::Image(_) => {}
             Content::ToolCall(call) => tool_calls.push(ToolCallOut {
                 id: &call.id,
                 kind: "function",
@@ -1381,6 +1549,109 @@ mod tests {
             .expect("a usage event")
     }
 
+    fn sample_image() -> Image {
+        Image {
+            media_type: crate::types::ImageType::Png,
+            width: 1,
+            height: 1,
+            data: "aGk=".into(),
+        }
+    }
+
+    fn user_with_image() -> Message {
+        Message::User {
+            content: vec![Content::text("look"), Content::Image(sample_image())],
+        }
+    }
+
+    fn result_with_image() -> Message {
+        Message::tool_result_with_images("call_01", "one frame", false, vec![sample_image()])
+    }
+
+    /// The body of `messages`, with images sent or replaced by the note.
+    fn body_of_images(messages: &[Message], images: bool) -> Bytes {
+        let bodies: Vec<MessageBody> = messages
+            .iter()
+            .map(|message| MessageBody::with_images(message, PROVIDER, images).unwrap())
+            .collect();
+        golden_builder().body(&bodies)
+    }
+
+    const URL: &str = "data:image/png;base64,aGk=";
+    const IMAGE_PART: &str =
+        r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,aGk="}}"#;
+
+    #[test]
+    fn an_image_body_writes_the_user_image_and_one_user_message_for_the_tool_images() {
+        let body = body_of_images(
+            &[
+                Message::user("hello"),
+                user_with_image(),
+                result_with_image(),
+            ],
+            true,
+        );
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            body.contains(&format!(
+                r#"{{"role":"user","content":[{{"type":"text","text":"look"}},{IMAGE_PART}]}}"#
+            )),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"{"role":"tool","tool_call_id":"call_01","content":"one frame"}"#),
+            "a tool message stays text: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                r#"{{"role":"user","content":[{{"type":"text","text":"Images from the tool results above:"}},{IMAGE_PART}]}}"#
+            )),
+            "{body}"
+        );
+        assert_eq!(body.matches(URL).count(), 2, "{body}");
+    }
+
+    #[test]
+    fn takes_no_images_writes_the_note_and_no_image_message() {
+        let body = body_of_images(&[user_with_image(), result_with_image()], false);
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(!body.contains("aGk="), "{body}");
+        assert!(
+            !body.contains("Images from the tool results above"),
+            "no image user message: {body}"
+        );
+        assert!(
+            body.contains(r#""text":"[image not sent: the model takes no images]""#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r"one frame\n[image not sent: the model takes no images]"),
+            "the note goes in the tool message: {body}"
+        );
+    }
+
+    #[test]
+    fn an_image_message_keeps_its_bytes_across_turns() {
+        let provider = OpenAiChat::new("key", "http://localhost");
+        let history = [
+            Message::user("hello"),
+            user_with_image(),
+            result_with_image(),
+        ];
+        let first = provider
+            .request_body(&request_for(&history[..2]))
+            .expect("the body builds");
+        let second = provider
+            .request_body(&request_for(&history))
+            .expect("the body builds");
+        assert!(
+            second.starts_with(&first[..first.len() - 2]),
+            "the image message keeps its bytes:\n{}\n{}",
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&second)
+        );
+    }
+
     /// A request over `history` for the local test server.
     fn request_for(history: &[Message]) -> Request<'_> {
         Request {
@@ -1389,6 +1660,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: history,
+            images: true,
             reasoning: None,
             cache_key: None,
         }
@@ -1775,6 +2047,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: &history,
+            images: true,
             reasoning: None,
             cache_key: None,
         };
@@ -1803,6 +2076,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: &history,
+            images: true,
             reasoning: None,
             cache_key: None,
         };
@@ -2343,6 +2617,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: &history,
+            images: true,
             reasoning: None,
             cache_key: None,
         };
@@ -2407,6 +2682,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: &[],
+            images: true,
             reasoning: None,
             cache_key: None,
         };

@@ -56,6 +56,8 @@ struct Head {
     reasoning: Option<String>,
     session: Option<Text>,
     tools: Vec<ToolSpec>,
+    /// Whether images are sent. A change rebuilds every message body.
+    images: bool,
     builder: request::RequestBuilder,
 }
 
@@ -103,6 +105,7 @@ impl PiMessages {
                 && cached.reasoning.as_deref() == request.reasoning
                 && cached.session.as_deref() == request.cache_key.map(|key| &**key)
                 && cached.tools.as_slice() == request.tools
+                && cached.images == request.images
         });
         if !reuse {
             *head = Some(Head {
@@ -112,6 +115,7 @@ impl PiMessages {
                 reasoning: request.reasoning.map(str::to_string),
                 session: request.cache_key.cloned(),
                 tools: request.tools.to_vec(),
+                images: request.images,
                 builder: request::RequestBuilder::new(
                     request.model,
                     request.max_tokens,
@@ -125,9 +129,15 @@ impl PiMessages {
         let builder = &head.as_ref().expect("head is cached").builder;
 
         let names = request::tool_names(request.messages);
+        let images = request.images;
         let mut bodies = self.bodies.lock().expect("body cache lock");
+        if !reuse {
+            // A body holds the images of its message or the note that replaces
+            // them, so a new head rebuilds all of them.
+            *bodies = BodyCache::default();
+        }
         bodies.align_at(request.messages, |index, message| {
-            MessageBody::new(message, PROVIDER, &names, builder.timestamp(index))
+            MessageBody::with_images(message, PROVIDER, &names, builder.timestamp(index), images)
         })?;
         Ok(builder.body_parts(bodies.bodies()))
     }

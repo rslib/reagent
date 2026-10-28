@@ -31,6 +31,9 @@ enum Line<'a> {
         bytes: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<&'a str>,
+        /// The images the result carries, never their base64 text.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageLine<'a>>,
     },
     Usage {
         input: u64,
@@ -80,6 +83,16 @@ enum Line<'a> {
     },
 }
 
+/// One image of a tool result: what it is and how big, without its base64 text.
+#[derive(Serialize)]
+struct ImageLine<'a> {
+    media_type: &'a str,
+    width: u32,
+    height: u32,
+    /// The decoded byte count of the image.
+    bytes: usize,
+}
+
 /// Appends one agent event to `buf` as a JSON object and a newline.
 pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
     // The deltas of a streamed answer are the hot path of `--json`: their whole
@@ -109,11 +122,21 @@ pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
             is_error,
             bytes,
             error,
+            images,
         } => Line::ToolResult {
             id,
             is_error: *is_error,
             bytes: *bytes,
             error: error.as_deref(),
+            images: images
+                .iter()
+                .map(|image| ImageLine {
+                    media_type: image.media_type.mime(),
+                    width: image.width,
+                    height: image.height,
+                    bytes: decoded_len(image.data.as_ref()),
+                })
+                .collect(),
         },
         Event::Usage(usage) => Line::Usage {
             input: usage.input_tokens,
@@ -255,6 +278,13 @@ pub fn context_tokens(usage: &Usage) -> u64 {
     usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens
 }
 
+/// The byte count the base64 text of an image decodes to, without decoding it:
+/// four characters are three bytes, minus the padding.
+fn decoded_len(data: &str) -> usize {
+    let padding = data.bytes().rev().take_while(|byte| *byte == b'=').count();
+    (data.len() / 4 * 3).saturating_sub(padding)
+}
+
 fn turn_reason(reason: &TurnEndReason) -> &'static str {
     match reason {
         TurnEndReason::EndTurn => "end_turn",
@@ -332,6 +362,7 @@ mod tests {
                     is_error: true,
                     bytes: 1234,
                     error: Some("old_string not found in a.rs".into()),
+                    images: Vec::new(),
                 },
                 json!({ "type": "tool_result", "id": "c1", "is_error": true, "bytes": 1234, "error": "old_string not found in a.rs" }),
             ),
@@ -341,8 +372,26 @@ mod tests {
                     is_error: false,
                     bytes: 10,
                     error: None,
+                    images: Vec::new(),
                 },
                 json!({ "type": "tool_result", "id": "c2", "is_error": false, "bytes": 10 }),
+            ),
+            (
+                Event::ToolResult {
+                    id: "c3".into(),
+                    is_error: false,
+                    bytes: 12,
+                    error: None,
+                    images: vec![reagent_ai::Image {
+                        media_type: reagent_ai::ImageType::Png,
+                        width: 64,
+                        height: 48,
+                        data: "aGk=".into(),
+                    }],
+                },
+                // The line names the image and its decoded size, never its
+                // base64 text.
+                json!({ "type": "tool_result", "id": "c3", "is_error": false, "bytes": 12, "images": [{ "media_type": "image/png", "width": 64, "height": 48, "bytes": 2 }] }),
             ),
             (
                 Event::Usage(usage()),

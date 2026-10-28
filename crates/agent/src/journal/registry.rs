@@ -39,13 +39,30 @@ pub mod message {
     pub const RESULT: u32 = 14;
     /// Whether a tool result is a failure.
     pub const IS_ERROR: u32 = 15;
+    /// One image a tool result carries, in call order; repeated.
+    pub const IMAGE: u32 = 16;
+
+    /// Fields of one image inside [`IMAGE`].
+    ///
+    /// The numbers start at 32, above the fields of the message itself, so
+    /// this one flat table has no repeated pair.
+    pub mod image {
+        /// The image format: 1 png, 2 jpeg, 3 gif, 4 webp.
+        pub const MEDIA_TYPE: u32 = 44;
+        /// The width in pixels.
+        pub const WIDTH: u32 = 45;
+        /// The height in pixels.
+        pub const HEIGHT: u32 = 46;
+        /// The image bytes as base64 text.
+        pub const DATA: u32 = 47;
+    }
 
     /// Fields of one content block inside [`CONTENT`].
     ///
     /// The numbers start at 32, above the fields of the message itself, so
     /// this one flat table has no repeated pair.
     pub mod content {
-        /// The block kind: 1 text, 2 thinking, 3 redacted thinking, 4 tool call.
+        /// The block kind: 1 text, 2 thinking, 3 redacted thinking, 4 tool call, 5 image.
         pub const KIND: u32 = 32;
         /// The visible text of a text block.
         pub const TEXT: u32 = 33;
@@ -61,6 +78,14 @@ pub mod message {
         pub const NAME: u32 = 38;
         /// The JSON arguments of a tool call block.
         pub const ARGUMENTS: u32 = 39;
+        /// The image format of an image block: 1 png, 2 jpeg, 3 gif, 4 webp.
+        pub const MEDIA_TYPE: u32 = 40;
+        /// The width of an image block, in pixels.
+        pub const WIDTH: u32 = 41;
+        /// The height of an image block, in pixels.
+        pub const HEIGHT: u32 = 42;
+        /// The image bytes of an image block, as base64 text.
+        pub const IMAGE_DATA: u32 = 43;
     }
 }
 
@@ -170,6 +195,19 @@ pub const FIELDS: &[(u8, u32, &str)] = &[
     (kinds::MESSAGE, message::CALL_ID, "message.call_id"),
     (kinds::MESSAGE, message::RESULT, "message.result"),
     (kinds::MESSAGE, message::IS_ERROR, "message.is_error"),
+    (kinds::MESSAGE, message::IMAGE, "message.image"),
+    (
+        kinds::MESSAGE,
+        message::image::MEDIA_TYPE,
+        "message.image.media_type",
+    ),
+    (kinds::MESSAGE, message::image::WIDTH, "message.image.width"),
+    (
+        kinds::MESSAGE,
+        message::image::HEIGHT,
+        "message.image.height",
+    ),
+    (kinds::MESSAGE, message::image::DATA, "message.image.data"),
     (
         kinds::MESSAGE,
         message::content::KIND,
@@ -209,6 +247,26 @@ pub const FIELDS: &[(u8, u32, &str)] = &[
         kinds::MESSAGE,
         message::content::ARGUMENTS,
         "message.content.arguments",
+    ),
+    (
+        kinds::MESSAGE,
+        message::content::MEDIA_TYPE,
+        "message.content.media_type",
+    ),
+    (
+        kinds::MESSAGE,
+        message::content::WIDTH,
+        "message.content.width",
+    ),
+    (
+        kinds::MESSAGE,
+        message::content::HEIGHT,
+        "message.content.height",
+    ),
+    (
+        kinds::MESSAGE,
+        message::content::IMAGE_DATA,
+        "message.content.image_data",
     ),
     (kinds::CALL_START, call_start::CALL_ID, "call_start.call_id"),
     (
@@ -316,6 +374,11 @@ mod tests {
 16 13 message.call_id
 16 14 message.result
 16 15 message.is_error
+16 16 message.image
+16 44 message.image.media_type
+16 45 message.image.width
+16 46 message.image.height
+16 47 message.image.data
 16 32 message.content.kind
 16 33 message.content.text
 16 34 message.content.thinking
@@ -324,6 +387,10 @@ mod tests {
 16 37 message.content.call_id
 16 38 message.content.name
 16 39 message.content.arguments
+16 40 message.content.media_type
+16 41 message.content.width
+16 42 message.content.height
+16 43 message.content.image_data
 17 1 call_start.call_id
 17 2 call_start.tool_name
 17 3 call_start.effect

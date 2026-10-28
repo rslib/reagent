@@ -1,6 +1,7 @@
 //! The reagent binary: a headless coding agent.
 
 mod args;
+mod attach;
 mod gc;
 mod json;
 mod login;
@@ -13,9 +14,10 @@ mod session;
 mod snapshot;
 
 /// The estimated-token budget for the system prompt and tool specs: 1000,
-/// raised to 1024 for the edit tool's `line` argument.
+/// raised to 1024 for the edit tool's `line` argument and to 1040 for the
+/// `read` sentence on images.
 #[cfg(test)]
-const PROMPT_BUDGET: usize = 1024;
+const PROMPT_BUDGET: usize = 1040;
 
 fn main() -> std::process::ExitCode {
     let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();

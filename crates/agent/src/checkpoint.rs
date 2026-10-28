@@ -60,13 +60,22 @@ pub fn build(number: u32, messages: &[Message], archive: &Archive) -> Checkpoint
     let mut files: Vec<FileEntry> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
     let mut failure = None;
+    let mut images = 0;
 
     for message in messages {
         match message {
             Message::User { content } => {
                 for block in content {
-                    if let Content::Text { text: body } = block {
-                        let _ = write!(text, "\nUser: {body}");
+                    match block {
+                        Content::Text { text: body } => {
+                            let _ = write!(text, "\nUser: {body}");
+                        }
+                        // A summary is text, so an image is left out and
+                        // counted below: no image goes in silence.
+                        Content::Image(_) => images += 1,
+                        Content::Thinking { .. }
+                        | Content::RedactedThinking { .. }
+                        | Content::ToolCall(_) => {}
                     }
                 }
             }
@@ -104,11 +113,19 @@ pub fn build(number: u32, messages: &[Message], archive: &Archive) -> Checkpoint
                             }
                         }
                         Content::Thinking { .. } | Content::RedactedThinking { .. } => {}
+                        // A summary is text: an image is left out and counted
+                        // below, so none goes in silence.
+                        Content::Image(_) => images += 1,
                     }
                 }
             }
-            Message::ToolResult(_) => {}
+            Message::ToolResult(result) => images += result.images.len(),
         }
+    }
+
+    if images > 0 {
+        let noun = if images == 1 { "image" } else { "images" };
+        let _ = write!(text, "\n\n[{images} {noun} dropped from this summary]");
     }
 
     if !files.is_empty() {
@@ -268,6 +285,47 @@ mod tests {
 
     fn header() -> &'static str {
         HEADER.trim_end_matches('\n')
+    }
+
+    fn png(data: &str) -> reagent_ai::Image {
+        reagent_ai::Image {
+            media_type: reagent_ai::ImageType::Png,
+            width: 1,
+            height: 1,
+            data: data.into(),
+        }
+    }
+
+    #[test]
+    fn a_summary_counts_the_images_it_drops() {
+        let one = build(
+            1,
+            &[Message::User {
+                content: vec![Content::text("look"), Content::Image(png("AAAA"))],
+            }],
+            &Archive::default(),
+        );
+        assert!(
+            one.text.ends_with("[1 image dropped from this summary]"),
+            "{}",
+            one.text
+        );
+        assert!(!one.text.contains("AAAA"));
+        let three = build(
+            1,
+            &[
+                Message::User {
+                    content: vec![Content::Image(png("AAAA"))],
+                },
+                Message::tool_result_with_images("c", "ok", false, vec![png("BBBB"), png("CCCC")]),
+            ],
+            &Archive::default(),
+        );
+        assert!(
+            three.text.contains("[3 images dropped from this summary]"),
+            "{}",
+            three.text
+        );
     }
 
     #[test]

@@ -7,7 +7,9 @@
 use std::io;
 
 use bytes::Bytes;
-use reagent_ai::{AssistantMessage, Content, Message, StopReason, Text, ToolCall, Usage};
+use reagent_ai::{
+    AssistantMessage, Content, Image, ImageType, Message, StopReason, Text, ToolCall, Usage,
+};
 use reagent_store::{DecodeError, Decoder, Encoder, Value};
 
 use crate::journal::kinds;
@@ -30,6 +32,8 @@ const BLOCK_THINKING: u64 = 2;
 const BLOCK_REDACTED: u64 = 3;
 /// The content block byte of a tool call block.
 const BLOCK_TOOL_CALL: u64 = 4;
+/// The content block byte of an image block.
+const BLOCK_IMAGE: u64 = 5;
 
 /// One journal record, decoded.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,8 +130,22 @@ pub fn encode_message(out: &mut Vec<u8>, message: &Message) {
             encoder.str(message::CALL_ID, &result.call_id);
             encoder.str(message::RESULT, &result.content);
             encoder.bool(message::IS_ERROR, result.is_error);
+            for image in &result.images {
+                encoder.message(message::IMAGE, |inner| encode_image(inner, image));
+            }
         }
     }
+}
+
+/// Writes one image, inside a [`message::IMAGE`] field.
+fn encode_image(encoder: &mut Encoder<'_>, image: &Image) {
+    encoder.u64(
+        message::image::MEDIA_TYPE,
+        image_type_byte(image.media_type),
+    );
+    encoder.u64(message::image::WIDTH, u64::from(image.width));
+    encoder.u64(message::image::HEIGHT, u64::from(image.height));
+    encoder.str(message::image::DATA, &image.data);
 }
 
 /// Writes one content block, inside a [`message::CONTENT`] field.
@@ -156,6 +174,16 @@ fn encode_content(encoder: &mut Encoder<'_>, block: &Content) {
             encoder.str(message::content::CALL_ID, &call.id);
             encoder.str(message::content::NAME, &call.name);
             encoder.str(message::content::ARGUMENTS, &call.arguments);
+        }
+        Content::Image(image) => {
+            encoder.u64(message::content::KIND, BLOCK_IMAGE);
+            encoder.u64(
+                message::content::MEDIA_TYPE,
+                image_type_byte(image.media_type),
+            );
+            encoder.u64(message::content::WIDTH, u64::from(image.width));
+            encoder.u64(message::content::HEIGHT, u64::from(image.height));
+            encoder.str(message::content::IMAGE_DATA, &image.data);
         }
     }
 }
@@ -233,6 +261,7 @@ fn decode_message(payload: &Bytes) -> io::Result<Message> {
     let mut call_id = None;
     let mut result = None;
     let mut is_error = false;
+    let mut images = Vec::new();
     while let Some((field, value)) = next(&mut decoder)? {
         match field {
             message::ROLE => role = Some(varint_of(&value)?),
@@ -253,6 +282,10 @@ fn decode_message(payload: &Bytes) -> io::Result<Message> {
             message::CALL_ID => call_id = Some(text_of(&value)?),
             message::RESULT => result = Some(text_of(&value)?),
             message::IS_ERROR => is_error = varint_of(&value)? != 0,
+            message::IMAGE => {
+                let body = bytes_of(&value)?;
+                images.push(decode_image(&body)?);
+            }
             _ => {}
         }
     }
@@ -265,10 +298,11 @@ fn decode_message(payload: &Bytes) -> io::Result<Message> {
             reply.replay = replay;
             Ok(Message::assistant(reply))
         }
-        Some(ROLE_TOOL_RESULT) => Ok(Message::tool_result(
+        Some(ROLE_TOOL_RESULT) => Ok(Message::tool_result_with_images(
             or_empty(call_id),
             or_empty(result),
             is_error,
+            images,
         )),
         Some(other) => Err(invalid(format!("message has an unknown role {other}"))),
         None => Err(invalid("message has no role")),
@@ -285,6 +319,10 @@ fn decode_content(payload: &Bytes) -> io::Result<Content> {
     let mut call_id = None;
     let mut name = None;
     let mut arguments = None;
+    let mut media_type = None;
+    let mut width = None;
+    let mut height = None;
+    let mut image_data = None;
     while let Some((field, value)) = next(&mut decoder)? {
         match field {
             message::content::KIND => kind = Some(varint_of(&value)?),
@@ -295,6 +333,10 @@ fn decode_content(payload: &Bytes) -> io::Result<Content> {
             message::content::CALL_ID => call_id = Some(text_of(&value)?),
             message::content::NAME => name = Some(text_of(&value)?),
             message::content::ARGUMENTS => arguments = Some(text_of(&value)?),
+            message::content::MEDIA_TYPE => media_type = Some(varint_of(&value)?),
+            message::content::WIDTH => width = Some(varint_of(&value)?),
+            message::content::HEIGHT => height = Some(varint_of(&value)?),
+            message::content::IMAGE_DATA => image_data = Some(text_of(&value)?),
             _ => {}
         }
     }
@@ -314,11 +356,41 @@ fn decode_content(payload: &Bytes) -> io::Result<Content> {
             name: or_empty(name),
             arguments: or_empty(arguments),
         })),
+        Some(BLOCK_IMAGE) => Ok(Content::Image(Image {
+            media_type: image_type_of(media_type)?,
+            width: u32_of(width.unwrap_or(0))?,
+            height: u32_of(height.unwrap_or(0))?,
+            data: or_empty(image_data),
+        })),
         Some(other) => Err(invalid(format!(
             "message has an unknown content block {other}"
         ))),
         None => Err(invalid("message content block has no kind")),
     }
+}
+
+/// Reads one image, inside a [`message::IMAGE`] field.
+fn decode_image(payload: &Bytes) -> io::Result<Image> {
+    let mut decoder = Decoder::new(payload);
+    let mut media_type = None;
+    let mut width = None;
+    let mut height = None;
+    let mut data = None;
+    while let Some((field, value)) = next(&mut decoder)? {
+        match field {
+            message::image::MEDIA_TYPE => media_type = Some(varint_of(&value)?),
+            message::image::WIDTH => width = Some(varint_of(&value)?),
+            message::image::HEIGHT => height = Some(varint_of(&value)?),
+            message::image::DATA => data = Some(text_of(&value)?),
+            _ => {}
+        }
+    }
+    Ok(Image {
+        media_type: image_type_of(media_type)?,
+        width: u32_of(width.unwrap_or(0))?,
+        height: u32_of(height.unwrap_or(0))?,
+        data: or_empty(data),
+    })
 }
 
 fn decode_call_start(payload: &Bytes) -> io::Result<CallStart> {
@@ -425,6 +497,28 @@ fn decode_model(payload: &Bytes) -> io::Result<Model> {
     Ok(record)
 }
 
+/// The byte an image format is written as.
+fn image_type_byte(kind: ImageType) -> u64 {
+    match kind {
+        ImageType::Png => 1,
+        ImageType::Jpeg => 2,
+        ImageType::Gif => 3,
+        ImageType::Webp => 4,
+    }
+}
+
+/// The image format of a byte.
+fn image_type_of(value: Option<u64>) -> io::Result<ImageType> {
+    match value {
+        Some(1) => Ok(ImageType::Png),
+        Some(2) => Ok(ImageType::Jpeg),
+        Some(3) => Ok(ImageType::Gif),
+        Some(4) => Ok(ImageType::Webp),
+        Some(other) => Err(invalid(format!("unknown image media type {other}"))),
+        None => Err(invalid("image has no media type")),
+    }
+}
+
 /// The byte an effect class is written as.
 fn class_byte(class: EffectClass) -> u64 {
     match class {
@@ -521,4 +615,62 @@ fn string_of(value: &Value) -> io::Result<String> {
 
 fn u32_of(value: u64) -> io::Result<u32> {
     u32::try_from(value).map_err(|_| invalid("a count field was past u32"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::journal::kinds;
+
+    /// One image, with base64 text the journal stores as it stands.
+    fn image(data: &str) -> Image {
+        Image {
+            media_type: ImageType::Png,
+            width: 2,
+            height: 3,
+            data: data.into(),
+        }
+    }
+
+    /// One message through the encoder and back.
+    fn round_trip(message: &Message) -> Record {
+        let mut out = Vec::new();
+        encode_message(&mut out, message);
+        decode(kinds::MESSAGE, &Bytes::from(out)).expect("decode")
+    }
+
+    #[test]
+    fn a_user_image_and_a_tool_result_with_two_images_round_trip() {
+        let user =
+            Message::user_content(vec![Content::text("look"), Content::Image(image("aGk="))]);
+        assert_eq!(round_trip(&user), Record::Message(user));
+        let result = Message::tool_result_with_images(
+            "call_1",
+            "two frames",
+            false,
+            vec![image("aGk="), image("bG8=")],
+        );
+        assert_eq!(round_trip(&result), Record::Message(result));
+    }
+
+    #[test]
+    fn an_image_record_makes_one_text_for_each_image() {
+        let result = Message::tool_result_with_images(
+            "call_1",
+            "two frames",
+            false,
+            vec![image("aGk="), image("bG8=")],
+        );
+        let Record::Message(Message::ToolResult(decoded)) = round_trip(&result) else {
+            panic!("a tool result");
+        };
+        assert_eq!(decoded.images.len(), 2);
+        assert_eq!(decoded.images[1].data.as_ref(), "bG8=");
+        assert!(
+            !Arc::ptr_eq(&decoded.images[0].data, &decoded.images[1].data),
+            "one text for each image"
+        );
+    }
 }

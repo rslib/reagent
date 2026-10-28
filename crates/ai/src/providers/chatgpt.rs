@@ -57,6 +57,7 @@ impl Item {
             price: None,
             price_source: None,
             reasoning: None,
+            images: None,
         })
     }
 }

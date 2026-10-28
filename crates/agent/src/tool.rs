@@ -90,6 +90,9 @@ pub struct ToolOutput {
     pub seen: Option<Box<Seen>>,
     /// The object a script gets in place of the text; `None` for a text result.
     pub object: Option<Box<Object>>,
+    /// The images the tool produced, in call order; `None` for a text
+    /// result. Boxed so a result stays one pointer larger than text alone.
+    pub images: Option<Box<Vec<reagent_ai::Image>>>,
 }
 
 /// What a script gets in place of a result's text.
@@ -137,6 +140,7 @@ impl ToolOutput {
             is_error: false,
             seen: None,
             object: None,
+            images: None,
         }
     }
 
@@ -147,7 +151,20 @@ impl ToolOutput {
             is_error: true,
             seen: None,
             object: None,
+            images: None,
         }
+    }
+
+    /// Attaches the images this result produced, in call order.
+    #[must_use]
+    pub fn with_images(mut self, images: Vec<reagent_ai::Image>) -> Self {
+        self.images = (!images.is_empty()).then(|| Box::new(images));
+        self
+    }
+
+    /// The images this result produced, in call order.
+    pub fn images(&self) -> &[reagent_ai::Image] {
+        self.images.as_deref().map_or(&[], Vec::as_slice)
     }
 
     /// Records the lines this result showed, so the loop can note a re-read.

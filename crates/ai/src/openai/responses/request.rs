@@ -1,17 +1,27 @@
 //! Builds OpenAI Responses request bodies.
 
+use std::borrow::Cow;
+
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::Serialize;
 
 use crate::Error;
 use crate::openai::{BodyParts, item_pieces};
 use crate::providers::{Compat, MaxTokensField};
-use crate::types::{AssistantMessage, Content, Message, Reasoning, ToolSpec};
+use crate::request_images::{NO_IMAGES, data_url};
+use crate::types::{
+    AssistantMessage, Content, Image, Message, Reasoning, Role, ToolResult, ToolSpec,
+};
 
 /// One message serialized in Responses wire form, reusable across requests.
 #[derive(Debug, Clone)]
 pub struct MessageBody {
     items: Vec<Bytes>,
+    /// The role of the message it was built from.
+    role: Role,
+    /// The image parts a tool result adds to the user message that follows the
+    /// tool outputs of its turn, in call order. Empty when it has none.
+    images: Vec<Bytes>,
 }
 
 impl MessageBody {
@@ -19,17 +29,35 @@ impl MessageBody {
     ///
     /// Thinking blocks from another provider are dropped. Tool arguments are
     /// passed through as the raw JSON string the model emitted; an empty
-    /// argument string becomes an empty object.
+    /// argument string becomes an empty object. Images are sent.
     pub fn new(message: &Message, provider: &str) -> Result<Self, Error> {
-        let items = match message {
-            Message::User { content } => user_items(content),
-            Message::Assistant(assistant) => assistant_items(assistant, provider),
-            Message::ToolResult(result) => vec![to_bytes(&InputItem::FunctionCallOutput {
-                call_id: &result.call_id,
-                output: result.content.as_ref(),
-            })],
+        Self::with_images(message, provider, true)
+    }
+
+    /// Serializes one message for the provider named `provider`, sending its
+    /// images only when `images` and writing the note of
+    /// [`crate::request_images::NO_IMAGES`] in their place when not.
+    pub fn with_images(message: &Message, provider: &str, images: bool) -> Result<Self, Error> {
+        let (items, parts) = match message {
+            Message::User { content } => (user_items(content, images), Vec::new()),
+            Message::Assistant(assistant) => (assistant_items(assistant, provider), Vec::new()),
+            Message::ToolResult(result) => (
+                vec![to_bytes(&InputItem::FunctionCallOutput {
+                    call_id: &result.call_id,
+                    output: &tool_output(result, images),
+                })],
+                if images {
+                    image_parts(&result.images)
+                } else {
+                    Vec::new()
+                },
+            ),
         };
-        Ok(Self { items })
+        Ok(Self {
+            items,
+            role: message.role(),
+            images: parts,
+        })
     }
 }
 
@@ -144,17 +172,44 @@ impl RequestBuilder {
     /// message's items, none of them copied.
     pub fn body_parts(&self, messages: &[MessageBody]) -> BodyParts {
         let items: usize = messages.iter().map(|message| message.items.len()).sum();
-        let mut parts = BodyParts::with_capacity(2 + item_pieces(items));
+        let images: usize = messages.iter().map(|message| message.images.len()).sum();
+        let mut parts =
+            BodyParts::with_capacity(2 + item_pieces(items) + image_message_pieces(images));
         parts.push(self.head.clone());
         let mut first = true;
-        for message in messages {
-            for item in &message.items {
-                if !first {
-                    parts.push_static(COMMA);
-                }
-                first = false;
-                parts.push(item.clone());
+        let mut index = 0;
+        while index < messages.len() {
+            if messages[index].role != Role::ToolResult {
+                push_items(&mut parts, &messages[index].items, &mut first);
+                index += 1;
+                continue;
             }
+            // The tool outputs of one turn, and then one user message with the
+            // images they carry, which a function call output cannot hold.
+            let start = index;
+            let mut carried = 0;
+            while index < messages.len() && messages[index].role == Role::ToolResult {
+                let message = &messages[index];
+                carried += message.images.len();
+                push_items(&mut parts, &message.items, &mut first);
+                index += 1;
+            }
+            if carried == 0 {
+                continue;
+            }
+            if !first {
+                parts.push_static(COMMA);
+            }
+            first = false;
+            parts.push_static(IMAGES_PREFIX);
+            for part in messages[start..index]
+                .iter()
+                .flat_map(|message| &message.images)
+            {
+                parts.push_static(COMMA);
+                parts.push(part.clone());
+            }
+            parts.push_static(IMAGES_END);
         }
         parts.push_static(END);
         debug_assert_eq!(
@@ -170,18 +225,73 @@ impl RequestBuilder {
     fn body_len(&self, messages: &[MessageBody]) -> usize {
         let mut len = self.head.len() + END.len();
         let mut first = true;
-        for message in messages {
-            for item in &message.items {
-                len += item.len() + usize::from(!first);
-                first = false;
+        let mut index = 0;
+        while index < messages.len() {
+            if messages[index].role != Role::ToolResult {
+                len += items_len(&messages[index].items, &mut first);
+                index += 1;
+                continue;
+            }
+            let start = index;
+            let mut carried = 0;
+            while index < messages.len() && messages[index].role == Role::ToolResult {
+                let message = &messages[index];
+                carried += message.images.len();
+                len += items_len(&message.items, &mut first);
+                index += 1;
+            }
+            if carried == 0 {
+                continue;
+            }
+            len += IMAGES_PREFIX.len() + IMAGES_END.len() + usize::from(!first) + carried;
+            first = false;
+            for part in messages[start..index]
+                .iter()
+                .flat_map(|message| &message.images)
+            {
+                len += part.len();
             }
         }
         len
     }
 }
 
+/// Appends `items` as pieces, with the comma before every item but the first
+/// of the body.
+fn push_items(parts: &mut BodyParts, items: &[Bytes], first: &mut bool) {
+    for item in items {
+        if !*first {
+            parts.push_static(COMMA);
+        }
+        *first = false;
+        parts.push(item.clone());
+    }
+}
+
+/// The length of `items` written with a comma before every one but the first
+/// of the body, and whether `first` stays first.
+fn items_len(items: &[Bytes], first: &mut bool) -> usize {
+    let mut len = 0;
+    for item in items {
+        len += item.len() + usize::from(!*first);
+        *first = false;
+    }
+    len
+}
+
+/// The pieces a user message of tool-result images takes: the comma before it,
+/// the prefix that opens it, a comma before every image, and the bracket that
+/// closes it.
+fn image_message_pieces(images: usize) -> usize {
+    if images == 0 { 0 } else { 2 * images + 3 }
+}
+
 const COMMA: &[u8] = b",";
 const END: &[u8] = b"]}";
+/// The user message that carries the images of the tool outputs above it. It
+/// closes with [`IMAGES_END`], and its content starts with one text part.
+const IMAGES_PREFIX: &[u8] = b"{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Images from the tool results above:\"}";
+const IMAGES_END: &[u8] = b"]}";
 
 #[derive(Serialize)]
 struct FunctionTool<'a> {
@@ -221,15 +331,18 @@ enum InputItem<'a> {
 enum Part<'a> {
     InputText { text: &'a str },
     OutputText { text: &'a str },
+    InputImage { image_url: Cow<'a, str> },
 }
 
-fn user_items(content: &[Content]) -> Vec<Bytes> {
+fn user_items(content: &[Content], images: bool) -> Vec<Bytes> {
     let parts: Vec<Part<'_>> = content
         .iter()
         .filter_map(|content| match content {
             Content::Text { text } => Some(Part::InputText {
                 text: text.as_ref(),
             }),
+            Content::Image(image) if images => Some(image_part(image)),
+            Content::Image(_) => Some(Part::InputText { text: NO_IMAGES }),
             _ => None,
         })
         .collect();
@@ -241,6 +354,37 @@ fn user_items(content: &[Content]) -> Vec<Bytes> {
             content: parts,
         })]
     }
+}
+
+/// The image parts of `images`, in call order, which the user message after
+/// the tool outputs of a turn writes.
+fn image_parts(images: &[Image]) -> Vec<Bytes> {
+    images
+        .iter()
+        .map(|image| to_bytes(&image_part(image)))
+        .collect()
+}
+
+fn image_part(image: &Image) -> Part<'_> {
+    Part::InputImage {
+        image_url: Cow::Owned(data_url(image)),
+    }
+}
+
+/// The output text of one tool result: its text, and the note for every image
+/// the model takes none of, because the output item itself writes text only.
+fn tool_output(result: &ToolResult, images: bool) -> Cow<'_, str> {
+    if images || result.images.is_empty() {
+        return Cow::Borrowed(result.content.as_ref());
+    }
+    let mut text =
+        String::with_capacity(result.content.len() + result.images.len() * (NO_IMAGES.len() + 1));
+    text.push_str(&result.content);
+    for _ in &result.images {
+        text.push('\n');
+        text.push_str(NO_IMAGES);
+    }
+    Cow::Owned(text)
 }
 
 fn assistant_items(assistant: &AssistantMessage, provider: &str) -> Vec<Bytes> {
@@ -265,6 +409,9 @@ fn assistant_items(assistant: &AssistantMessage, provider: &str) -> Vec<Bytes> {
             Content::RedactedThinking { .. } => {
                 flush_assistant_text(&mut items, &mut text, &mut pending_reasoning)
             }
+            // A model's reply holds no image, and the wire has no place for
+            // one in an assistant item.
+            Content::Image(_) => {}
             Content::ToolCall(call) => {
                 flush_assistant_text(&mut items, &mut text, &mut pending_reasoning);
                 commit_reasoning(&mut items, &mut pending_reasoning);
@@ -378,6 +525,127 @@ mod tests {
             .map(|message| MessageBody::new(message, PROVIDER).unwrap())
             .collect();
         golden_builder().body(&bodies)
+    }
+
+    fn sample_image() -> Image {
+        Image {
+            media_type: crate::types::ImageType::Png,
+            width: 1,
+            height: 1,
+            data: "aGk=".into(),
+        }
+    }
+
+    fn user_with_image() -> Message {
+        Message::User {
+            content: vec![Content::text("look"), Content::Image(sample_image())],
+        }
+    }
+
+    fn result_with_image() -> Message {
+        Message::tool_result_with_images("call_01", "one frame", false, vec![sample_image()])
+    }
+
+    /// The body of `messages`, with images sent or replaced by the note.
+    fn body_of_images(messages: &[Message], images: bool) -> Bytes {
+        let bodies: Vec<MessageBody> = messages
+            .iter()
+            .map(|message| MessageBody::with_images(message, PROVIDER, images).unwrap())
+            .collect();
+        golden_builder().body(&bodies)
+    }
+
+    const URL: &str = "data:image/png;base64,aGk=";
+    const IMAGE_PART: &str = r#"{"type":"input_image","image_url":"data:image/png;base64,aGk="}"#;
+
+    #[test]
+    fn an_image_body_writes_the_input_image_and_one_message_for_the_tool_images() {
+        let body = body_of_images(
+            &[
+                Message::user("hello"),
+                user_with_image(),
+                result_with_image(),
+            ],
+            true,
+        );
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            body.contains(&format!(
+                r#"{{"type":"message","role":"user","content":[{{"type":"input_text","text":"look"}},{IMAGE_PART}]}}"#
+            )),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                r#"{"type":"function_call_output","call_id":"call_01","output":"one frame"}"#
+            ),
+            "a function call output stays text: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                r#"{{"type":"message","role":"user","content":[{{"type":"input_text","text":"Images from the tool results above:"}},{IMAGE_PART}]}}"#
+            )),
+            "{body}"
+        );
+        assert_eq!(body.matches(URL).count(), 2, "{body}");
+    }
+
+    #[test]
+    fn takes_no_images_writes_the_note_and_no_image_message() {
+        let body = body_of_images(&[user_with_image(), result_with_image()], false);
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(!body.contains("aGk="), "{body}");
+        assert!(
+            !body.contains("Images from the tool results above"),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#""text":"[image not sent: the model takes no images]""#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r"one frame\n[image not sent: the model takes no images]"),
+            "the note goes in the output item: {body}"
+        );
+    }
+
+    #[test]
+    fn an_image_message_keeps_its_bytes_across_turns() {
+        let provider = crate::openai::responses::OpenAiResponses::new("key", "http://localhost");
+        let mut history = vec![Message::user("hello"), user_with_image()];
+        let first = {
+            let request = Request {
+                model: "gpt-5",
+                max_tokens: 128,
+                system: None,
+                tools: &[],
+                messages: &history,
+                images: true,
+                reasoning: None,
+                cache_key: None,
+            };
+            provider.request_body(&request).expect("the body builds")
+        };
+        history.push(result_with_image());
+        let second = {
+            let request = Request {
+                model: "gpt-5",
+                max_tokens: 128,
+                system: None,
+                tools: &[],
+                messages: &history,
+                images: true,
+                reasoning: None,
+                cache_key: None,
+            };
+            provider.request_body(&request).expect("the body builds")
+        };
+        assert!(
+            second.starts_with(&first[..first.len() - 2]),
+            "the image message keeps its bytes:\n{}\n{}",
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&second)
+        );
     }
 
     #[test]
@@ -779,6 +1047,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: &history,
+            images: true,
             reasoning: None,
             cache_key: None,
         };

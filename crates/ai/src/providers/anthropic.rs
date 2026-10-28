@@ -41,6 +41,7 @@ impl<'a> From<Item<'a>> for Entry {
             price: None,
             price_source: None,
             reasoning: shaped::<Capabilities>(item.capabilities).and_then(Capabilities::reasoning),
+            images: None,
         }
     }
 }

@@ -66,6 +66,25 @@ struct Limit {
     output: Option<u64>,
 }
 
+/// The `modalities` object of one catalogue model: the inputs it takes.
+#[derive(Debug, Default, Deserialize)]
+struct Modalities {
+    /// The input kinds the model takes, which holds `image` for a model that
+    /// takes images.
+    #[serde(default)]
+    input: Option<Vec<String>>,
+}
+
+impl Modalities {
+    /// Whether the model takes images: `Some(true)` when the input list names
+    /// `image`, `Some(false)` when it lists inputs without it, and `None` when
+    /// it lists no input list.
+    fn images(&self) -> Option<bool> {
+        let input = self.input.as_ref()?;
+        Some(input.iter().any(|kind| kind == "image"))
+    }
+}
+
 /// One catalogue model, with only the fields reagent reads. Every other field
 /// is ignored.
 #[derive(Debug, Default, Deserialize)]
@@ -74,6 +93,9 @@ struct Model {
     cost: Option<Cost>,
     #[serde(default)]
     limit: Option<Limit>,
+    /// The input kinds the catalogue lists for it.
+    #[serde(default)]
+    modalities: Option<Modalities>,
     /// The reasoning levels and the toggle the catalogue lists for it.
     #[serde(default)]
     reasoning_options: Vec<ReasoningOption>,
@@ -94,6 +116,7 @@ impl Model {
             price_source: price.map(|_| PriceSource::ModelsDev),
             price,
             reasoning: reasoning(self.reasoning_options),
+            images: self.modalities.as_ref().and_then(Modalities::images),
         }
     }
 }
@@ -399,6 +422,7 @@ mod tests {
         "reasoning": true,
         "reasoning_options": [{"type": "toggle"}],
         "limit": {"context": 1048576, "output": 393216},
+        "modalities": {"input": ["text", "image"], "output": ["text"]},
         "cost": {"input": 0.15, "output": 0.6, "reasoning": 0.6, "cache_read": 0.003},
         "canonical_model_id": "deepseek/deepseek-v4.1-flash-1017"
        },
@@ -500,6 +524,26 @@ mod tests {
         );
         assert_eq!(reasoning.off, Some(true), "a none value turns thinking off");
         assert_eq!(reasoning.default, None);
+    }
+
+    #[test]
+    fn image_input_models_dev_reads_the_input_list() {
+        // An input list that names `image` lets the model take images.
+        let found = extract(SAMPLE.as_bytes(), &["deepseek"]).expect("parses");
+        let flash = found[0]
+            .1
+            .iter()
+            .find(|entry| entry.id == "deepseek-flash")
+            .expect("the flash model");
+        assert_eq!(flash.images, Some(true));
+        // An input list without it says the model takes none.
+        let body = br#"{"fi":{"models":{"m":{"id":"m","modalities":{"input":["text"]}}}}}"#;
+        let found = extract(body, &["fi"]).expect("parses");
+        assert_eq!(found[0].1[0].images, Some(false));
+        // A model with no input list says nothing about images.
+        let body = br#"{"fi":{"models":{"m":{"id":"m"}}}}"#;
+        let found = extract(body, &["fi"]).expect("parses");
+        assert_eq!(found[0].1[0].images, None);
     }
 
     #[test]

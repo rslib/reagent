@@ -118,6 +118,8 @@ struct Head {
     reasoning: Option<String>,
     cache_key: Option<Text>,
     tools: Vec<ToolSpec>,
+    /// Whether images are sent. A change rebuilds every message body.
+    images: bool,
     builder: RequestBuilder,
 }
 
@@ -169,6 +171,7 @@ impl OpenAiResponses {
                 && cached.reasoning.as_deref() == request.reasoning
                 && cached.cache_key.as_deref() == request.cache_key.map(|key| &**key)
                 && cached.tools.as_slice() == request.tools
+                && cached.images == request.images
         });
         if !reuse {
             *head = Some(Head {
@@ -178,6 +181,7 @@ impl OpenAiResponses {
                 reasoning: request.reasoning.map(str::to_string),
                 cache_key: request.cache_key.cloned(),
                 tools: request.tools.to_vec(),
+                images: request.images,
                 builder: RequestBuilder::with_compat(
                     request.model,
                     request.max_tokens,
@@ -192,8 +196,14 @@ impl OpenAiResponses {
         let builder = &head.as_ref().expect("head is cached").builder;
 
         let mut bodies = self.bodies.lock().expect("body cache lock");
+        if !reuse {
+            // A body holds the images of its message or the note that replaces
+            // them, so a new head rebuilds all of them.
+            *bodies = BodyCache::default();
+        }
+        let images = request.images;
         bodies.align(request.messages, |message| {
-            MessageBody::new(message, PROVIDER)
+            MessageBody::with_images(message, PROVIDER, images)
         })?;
         Ok(builder.body_parts(bodies.bodies()))
     }
@@ -312,6 +322,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: &[],
+            images: true,
             reasoning: None,
             cache_key: None,
         };
@@ -386,6 +397,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: &[],
+            images: true,
             reasoning: None,
             cache_key: None,
         };
@@ -413,6 +425,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: &history,
+            images: true,
             reasoning: None,
             cache_key: None,
         };

@@ -129,6 +129,7 @@ fn agent_tool_turns(setup: Run) -> usize {
         mut history,
     } = setup;
     let config = AgentConfig {
+        images: true,
         model: "fake-model".into(),
         max_tokens: 128,
         system: None,

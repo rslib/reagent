@@ -6,7 +6,10 @@ use serde_json::value::RawValue;
 
 use crate::Error;
 use crate::openai::BodyParts;
-use crate::types::{AssistantMessage, Content, Message, Reasoning, Role, ToolResult, ToolSpec};
+use crate::request_images::NO_IMAGES;
+use crate::types::{
+    AssistantMessage, Content, Image, Message, Reasoning, Role, ToolResult, ToolSpec,
+};
 
 /// One message serialized in Anthropic wire form, reusable across requests.
 #[derive(Debug, Clone)]
@@ -20,20 +23,32 @@ impl MessageBody {
     ///
     /// Thinking blocks from another provider are dropped, because their
     /// signature is not valid here. An empty argument string for a tool call
-    /// becomes an empty object; malformed arguments are an error.
+    /// becomes an empty object; malformed arguments are an error. Images are
+    /// sent.
     pub fn new(message: &Message, provider: &str) -> Result<Self, Error> {
+        Self::with_images(message, provider, true)
+    }
+
+    /// Serializes one message for the provider named `provider`, sending its
+    /// images only when `images` and writing the note of
+    /// [`crate::request_images::NO_IMAGES`] in their place when not.
+    pub fn with_images(message: &Message, provider: &str, images: bool) -> Result<Self, Error> {
         let (role, blocks) = match message {
             Message::User { content } => (
                 Role::User,
                 content
                     .iter()
-                    .map(serialize_content)
+                    .map(|content| serialize_content(content, images))
                     .collect::<Result<Vec<_>, _>>()?,
             ),
-            Message::Assistant(assistant) => {
-                (Role::Assistant, serialize_assistant(assistant, provider)?)
-            }
-            Message::ToolResult(result) => (Role::ToolResult, vec![serialize_tool_result(result)]),
+            Message::Assistant(assistant) => (
+                Role::Assistant,
+                serialize_assistant(assistant, provider, images)?,
+            ),
+            Message::ToolResult(result) => (
+                Role::ToolResult,
+                vec![serialize_tool_result(result, images)],
+            ),
         };
         Ok(Self { role, blocks })
     }
@@ -49,13 +64,35 @@ impl MessageBody {
 /// Each cached body is keyed on the message it was built from, so a compacted
 /// history, an edited message or a second session on the same provider cannot
 /// reuse stale bytes.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BodyCache {
     messages: Vec<Message>,
     bodies: Vec<MessageBody>,
+    /// Whether images are sent. A change rebuilds every body.
+    images: bool,
+}
+
+impl Default for BodyCache {
+    fn default() -> Self {
+        Self {
+            messages: Vec::new(),
+            bodies: Vec::new(),
+            images: true,
+        }
+    }
 }
 
 impl BodyCache {
+    /// Sets whether images are sent. The bodies are rebuilt when it changes,
+    /// because they hold the images or the note that replaces them.
+    pub fn set_images(&mut self, images: bool) {
+        if self.images != images {
+            self.images = images;
+            self.messages.clear();
+            self.bodies.clear();
+        }
+    }
+
     /// Rebuilds the bodies whose message changed and reuses the rest.
     pub fn align(&mut self, messages: &[Message], provider: &str) -> Result<(), Error> {
         self.messages.truncate(messages.len());
@@ -66,7 +103,8 @@ impl BodyCache {
             }
             self.messages.truncate(index);
             self.bodies.truncate(index);
-            self.bodies.push(MessageBody::new(message, provider)?);
+            self.bodies
+                .push(MessageBody::with_images(message, provider, self.images)?);
             self.messages.push(message.clone());
         }
         Ok(())
@@ -360,10 +398,34 @@ enum Block<'a> {
     },
     ToolResult {
         tool_use_id: &'a str,
-        content: &'a str,
+        content: ToolContent<'a>,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+    Image {
+        source: ImageSource<'a>,
+    },
+}
+
+/// The content of one tool result: the text alone when the result has no image,
+/// which is the bytes the wire wrote before images existed, and the text block
+/// followed by an image block for each image when it has one.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ToolContent<'a> {
+    /// The text of a result with no image.
+    Text(&'a str),
+    /// The text block and the images of a result that carries one.
+    Blocks(Vec<Block<'a>>),
+}
+
+/// The `source` of an image block: base64 text with its media type.
+#[derive(Serialize)]
+struct ImageSource<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: &'static str,
+    data: &'a str,
 }
 
 #[derive(Serialize)]
@@ -375,11 +437,12 @@ struct Tool<'a> {
     cache_control: Option<CacheControl>,
 }
 
-fn serialize_content(content: &Content) -> Result<Bytes, Error> {
+fn serialize_content(content: &Content, images: bool) -> Result<Bytes, Error> {
     let block = match content {
         Content::Text { text } => Block::Text {
             text: text.as_ref(),
         },
+        Content::Image(image) => image_block(image, images),
         Content::Thinking {
             thinking,
             signature,
@@ -408,20 +471,50 @@ fn serialize_content(content: &Content) -> Result<Bytes, Error> {
     Ok(to_bytes(&block))
 }
 
-fn serialize_assistant(assistant: &AssistantMessage, provider: &str) -> Result<Vec<Bytes>, Error> {
+fn serialize_assistant(
+    assistant: &AssistantMessage,
+    provider: &str,
+    images: bool,
+) -> Result<Vec<Bytes>, Error> {
     let keep_thinking = assistant.provider.as_ref() == provider;
     assistant
         .content
         .iter()
         .filter(|content| keep_thinking || !content.is_thinking())
-        .map(serialize_content)
+        .map(|content| serialize_content(content, images))
         .collect()
 }
 
-fn serialize_tool_result(result: &ToolResult) -> Bytes {
+/// The block one image writes: the image itself, or the note that says it was
+/// not sent, so no image is dropped in silence.
+fn image_block(image: &Image, images: bool) -> Block<'_> {
+    if images {
+        Block::Image {
+            source: ImageSource {
+                kind: "base64",
+                media_type: image.media_type.mime(),
+                data: &image.data,
+            },
+        }
+    } else {
+        Block::Text { text: NO_IMAGES }
+    }
+}
+
+fn serialize_tool_result(result: &ToolResult, images: bool) -> Bytes {
+    let content = if result.images.is_empty() {
+        ToolContent::Text(result.content.as_ref())
+    } else {
+        let mut blocks = Vec::with_capacity(result.images.len() + 1);
+        blocks.push(Block::Text {
+            text: result.content.as_ref(),
+        });
+        blocks.extend(result.images.iter().map(|image| image_block(image, images)));
+        ToolContent::Blocks(blocks)
+    };
     to_bytes(&Block::ToolResult {
         tool_use_id: &result.call_id,
-        content: result.content.as_ref(),
+        content,
         is_error: result.is_error.then_some(true),
     })
 }
@@ -518,9 +611,100 @@ mod tests {
             system: None,
             tools: &[],
             messages,
+            images: true,
             reasoning: None,
             cache_key: None,
         }
+    }
+
+    fn sample_image() -> Image {
+        Image {
+            media_type: crate::types::ImageType::Png,
+            width: 1,
+            height: 1,
+            data: "aGk=".into(),
+        }
+    }
+
+    fn user_with_image() -> Message {
+        Message::User {
+            content: vec![Content::text("look"), Content::Image(sample_image())],
+        }
+    }
+
+    fn result_with_image() -> Message {
+        Message::tool_result_with_images("toolu_01", "one frame", false, vec![sample_image()])
+    }
+
+    /// The body of `messages`, with images sent or replaced by the note.
+    fn body_of_images(messages: &[Message], images: bool) -> Bytes {
+        let bodies: Vec<MessageBody> = messages
+            .iter()
+            .map(|message| MessageBody::with_images(message, PROVIDER, images).unwrap())
+            .collect();
+        golden_builder().body(&bodies)
+    }
+
+    const IMAGE_BLOCK: &str =
+        r#"{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGk="}}"#;
+
+    #[test]
+    fn an_image_body_writes_the_image_block_in_a_user_message_and_in_a_tool_result() {
+        let body = body_of_images(&[user_with_image(), result_with_image()], true);
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            body.contains(&format!(r#"{{"type":"text","text":"look"}},{IMAGE_BLOCK}"#)),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                r#"{{"type":"tool_result","tool_use_id":"toolu_01","content":[{{"type":"text","text":"one frame"}},{IMAGE_BLOCK}]"#
+            )),
+            "{body}"
+        );
+        assert_eq!(body.matches(IMAGE_BLOCK).count(), 2, "{body}");
+    }
+
+    #[test]
+    fn takes_no_images_writes_the_note_in_place_of_each_image() {
+        let body = body_of_images(&[user_with_image(), result_with_image()], false);
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !body.contains("aGk="),
+            "no base64 reaches a model that takes no images: {body}"
+        );
+        assert_eq!(
+            body.matches("[image not sent: the model takes no images]")
+                .count(),
+            2,
+            "one note for each image: {body}"
+        );
+    }
+
+    #[test]
+    fn an_image_message_keeps_its_bytes_across_turns() {
+        let provider = Anthropic::new("key", "http://localhost");
+        let history = [
+            Message::user("hello"),
+            user_with_image(),
+            golden_assistant(),
+        ];
+        let first = provider
+            .request_body(&request("claude-sonnet-4-5", &history[..2]))
+            .expect("the body builds");
+        let mut longer = history.to_vec();
+        longer.push(result_with_image());
+        let second = provider
+            .request_body(&request("claude-sonnet-4-5", &longer))
+            .expect("the body builds");
+        let strip = |body: &[u8]| {
+            String::from_utf8_lossy(body).replace(r#","cache_control":{"type":"ephemeral"}"#, "")
+        };
+        let (first, second) = (strip(&first), strip(&second));
+        assert!(
+            second.starts_with(&first[..first.len() - 2]),
+            "the image message keeps its bytes:\n{first}\n{second}"
+        );
     }
 
     #[test]

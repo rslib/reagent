@@ -33,7 +33,9 @@ reagent-sandbox.workspace = true
 reagent-oauth.workspace = true
 
 [dev-dependencies]
+base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 gungraun = "0.20.0"
+png = { version = "0.18", default-features = false }
 nix = { version = "0.31.3", default-features = false, features = ["resource"] }
 tempfile = { version = "3.27.0", default-features = false }
 tokio = { version = "1.53.3", default-features = false, features = ["rt", "macros", "process", "io-std", "io-util", "time", "sync"] }

@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use reagent_ai::{
-    AssistantMessage, Content, Error, Message, Provider, Request, StopReason, StreamEvent, Text,
-    ToolCall, ToolResult, Usage,
+    AssistantMessage, Content, Error, Image, Message, Provider, Request, StopReason, StreamEvent,
+    Text, ToolCall, ToolResult, Usage,
 };
 
 use crate::archive::Archive;
@@ -79,6 +79,9 @@ pub struct AgentConfig {
     pub cache_key: Option<Text>,
     /// The maximum number of provider calls, after which the run stops.
     pub max_turns: Option<u32>,
+    /// Whether the model takes images, so a request sends them. It is on for
+    /// a model that nothing says takes none.
+    pub images: bool,
 }
 
 /// Drives one provider through a conversation until the model calls no tool
@@ -404,10 +407,10 @@ impl<'a> Agent<'a> {
             run_all_guarded_seen(&calls, self.registry, self.guard.as_ref(), &self.token).await;
         // Every result reaches history before any event is sent, so a cancel
         // or a closed receiver cannot leave a call unanswered.
-        let mut facts: Vec<(usize, Option<Text>)> = Vec::with_capacity(results.len());
+        let mut facts: Vec<(usize, Option<Text>, Vec<Image>)> = Vec::with_capacity(results.len());
         let mut failure = None;
         for (result, _seen) in results {
-            facts.push((tool_bytes(&result), tool_error(&result)));
+            facts.push((tool_bytes(&result), tool_error(&result), images(&result)));
             if let Some(error) = record_result(result, history, journal) {
                 failure.get_or_insert(error);
             }
@@ -420,12 +423,13 @@ impl<'a> Agent<'a> {
             emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
             return TurnEndReason::Error;
         }
-        for (call, (bytes, error)) in calls.iter().zip(facts) {
+        for (call, (bytes, error, images)) in calls.iter().zip(facts) {
             let event = Event::ToolResult {
                 id: call.id.clone(),
                 is_error: error.is_some(),
                 bytes,
                 error,
+                images,
             };
             if emit(events, &self.token, event).await {
                 return TurnEndReason::Cancelled;
@@ -747,7 +751,8 @@ impl<'a> Agent<'a> {
                 // cancel or a closed receiver cannot leave a call unanswered.
                 // The results move into history, so only their event fields
                 // are kept here; nothing is cloned.
-                let mut facts: Vec<(usize, Option<Text>)> = Vec::with_capacity(results.len());
+                let mut facts: Vec<(usize, Option<Text>, Vec<Image>)> =
+                    Vec::with_capacity(results.len());
                 let mut failure = None;
                 for (at, (result, seen)) in results.into_iter().enumerate() {
                     // A note says how the agent itself read the call, so a
@@ -769,7 +774,7 @@ impl<'a> Agent<'a> {
                         }
                         _ => result,
                     };
-                    facts.push((tool_bytes(&result), tool_error(&result)));
+                    facts.push((tool_bytes(&result), tool_error(&result), images(&result)));
                     if let Some(error) = record_result(result, history, journal) {
                         failure.get_or_insert(error);
                     }
@@ -777,12 +782,13 @@ impl<'a> Agent<'a> {
                 if let Some(error) = failure {
                     return TurnOutcome::Error(error);
                 }
-                for (call, (bytes, error)) in calls.iter().zip(facts) {
+                for (call, (bytes, error, images)) in calls.iter().zip(facts) {
                     let event = Event::ToolResult {
                         id: call.id.clone(),
                         is_error: error.is_some(),
                         bytes,
                         error,
+                        images,
                     };
                     if emit(events, &self.token, event).await {
                         return TurnOutcome::Cancelled;
@@ -966,6 +972,7 @@ impl<'a> Agent<'a> {
             system: self.config.system.as_ref(),
             tools: self.registry.specs(),
             messages: history,
+            images: self.config.images,
             reasoning: self.config.reasoning.as_deref(),
             cache_key: self.config.cache_key.as_ref(),
         }
@@ -1535,6 +1542,15 @@ fn tool_bytes(message: &Message) -> usize {
     }
 }
 
+/// The images of a result, shared with the message: a clone of the base64 text
+/// is an `Arc` clone, and a result without images does not allocate.
+fn images(message: &Message) -> Vec<Image> {
+    match message {
+        Message::ToolResult(result) => result.images.clone(),
+        _ => Vec::new(),
+    }
+}
+
 /// A thinking block being assembled, which may carry only a signature.
 #[derive(Default)]
 struct OpenThinking {
@@ -1972,6 +1988,7 @@ mod tests {
             reasoning: None,
             cache_key: None,
             max_turns: None,
+            images: true,
         }
     }
 
@@ -4250,5 +4267,169 @@ mod tests {
 
         assert_eq!(thinkings_in(&history), vec!["why"]);
         assert_eq!(texts_in(&history), vec!["x</think>\ny"]);
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use futures_util::future::BoxFuture;
+    use futures_util::stream::BoxStream;
+    use reagent_ai::fake::FakeProvider;
+    use reagent_ai::{Image, ImageType, Role, ToolSpec};
+    use serde_json::json;
+
+    use crate::tool::{Tool, ToolOutput};
+
+    /// A read-only tool that returns one image with its text.
+    struct Picture {
+        spec: ToolSpec,
+    }
+
+    impl Tool for Picture {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn read_only(&self) -> bool {
+            true
+        }
+
+        fn run<'a>(
+            &'a self,
+            _args: &'a str,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, ToolOutput> {
+            Box::pin(async move {
+                ToolOutput::ok("one image").with_images(vec![Image {
+                    media_type: ImageType::Png,
+                    width: 1,
+                    height: 1,
+                    data: "aGk=".into(),
+                }])
+            })
+        }
+    }
+
+    /// A provider that keeps the messages of every request it is asked for.
+    struct Recorder {
+        inner: FakeProvider,
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl Provider for Recorder {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn stream(&self, request: &Request<'_>) -> BoxStream<'static, Result<StreamEvent, Error>> {
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .push(request.messages.to_vec());
+            self.inner.stream(request)
+        }
+    }
+
+    fn registry() -> Registry {
+        let mut registry = Registry::new();
+        registry.add(Picture {
+            spec: ToolSpec {
+                name: "picture".into(),
+                description: "One image.".into(),
+                input_schema: json!({"type": "object"}),
+            },
+        });
+        registry
+    }
+
+    fn config() -> AgentConfig {
+        AgentConfig {
+            model: "fake-model".into(),
+            max_tokens: 128,
+            system: None,
+            reasoning: None,
+            cache_key: None,
+            max_turns: None,
+            images: true,
+        }
+    }
+
+    fn picture_reply() -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolCallStart {
+                id: Text::from("call_1"),
+                name: Text::from("picture"),
+            },
+            StreamEvent::ToolCallDelta {
+                id: Text::from("call_1"),
+                partial_json: Text::from("{}"),
+            },
+            StreamEvent::ToolCallEnd {
+                id: Text::from("call_1"),
+            },
+            StreamEvent::Stop(StopReason::ToolUse),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_tool_image_reaches_the_next_request() {
+        let provider = FakeProvider::new(vec![picture_reply(), {
+            vec![
+                StreamEvent::TextDelta(Text::from("done")),
+                StreamEvent::Stop(StopReason::EndTurn),
+            ]
+        }]);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = Recorder {
+            inner: provider,
+            requests: Arc::clone(&requests),
+        };
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("go")];
+        Agent::new(&provider, &registry(), config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2, "two turns, two requests");
+        let result = requests[1]
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .expect("the picture result is in the second request");
+        assert_eq!(result.content.as_ref(), "one image");
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(result.images[0].data.as_ref(), "aGk=");
+        assert_eq!(result.images[0].media_type, ImageType::Png);
+        assert!(
+            requests[1]
+                .iter()
+                .any(|message| message.role() == Role::ToolResult),
+            "the result keeps its role"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_that_takes_no_images_asks_for_none() {
+        let provider = FakeProvider::new(vec![vec![
+            StreamEvent::TextDelta(Text::from("done")),
+            StreamEvent::Stop(StopReason::EndTurn),
+        ]]);
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("go")];
+        let config = AgentConfig {
+            images: false,
+            ..config()
+        };
+        Agent::new(&provider, &registry(), config, CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert!(!provider.seen()[0].images, "the request sends no image");
     }
 }

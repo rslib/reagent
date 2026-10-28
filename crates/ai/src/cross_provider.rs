@@ -53,6 +53,7 @@ mod tests {
             system: None,
             tools: &[],
             messages,
+            images: true,
             reasoning,
             cache_key: None,
         }
@@ -269,6 +270,157 @@ mod tests {
             Some("low"),
             "a level keeps adaptive thinking"
         );
+    }
+
+    #[test]
+    fn an_image_reaches_every_wire() {
+        use crate::types::{Image, ImageType};
+
+        let history = vec![
+            Message::user("hello"),
+            Message::User {
+                content: vec![
+                    Content::text("look"),
+                    Content::Image(Image {
+                        media_type: ImageType::Png,
+                        width: 1,
+                        height: 1,
+                        data: "aGk=".into(),
+                    }),
+                ],
+            },
+        ];
+        let request = request(None, &history);
+        for (wire, body) in [
+            (
+                "anthropic",
+                Anthropic::new("key", "http://localhost")
+                    .request_body(&request)
+                    .unwrap(),
+            ),
+            (
+                "responses",
+                OpenAiResponses::new("key", "http://localhost")
+                    .request_body(&request)
+                    .unwrap(),
+            ),
+            (
+                "chat",
+                OpenAiChat::new("key", "http://localhost")
+                    .request_body(&request)
+                    .unwrap(),
+            ),
+        ] {
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(body.contains("aGk="), "{wire}: {body}");
+        }
+    }
+
+    /// A body builder that keeps its provider's caches between calls.
+    type Build = Box<dyn Fn(&Request<'_>) -> bytes::Bytes>;
+
+    /// One provider of each wire, as a body builder.
+    fn every_wire() -> Vec<(&'static str, Build)> {
+        let anthropic = Anthropic::new("key", "http://localhost");
+        let responses = OpenAiResponses::new("key", "http://localhost");
+        let chat = OpenAiChat::new("key", "http://localhost");
+        let pi = crate::pi::PiMessages::new("key", "http://localhost");
+        vec![
+            (
+                "anthropic",
+                Box::new(move |request| anthropic.request_body(request).unwrap()),
+            ),
+            (
+                "responses",
+                Box::new(move |request| responses.request_body(request).unwrap()),
+            ),
+            (
+                "chat",
+                Box::new(move |request| chat.request_body(request).unwrap()),
+            ),
+            (
+                "pi",
+                Box::new(move |request| pi.request_body(request).unwrap()),
+            ),
+        ]
+    }
+
+    fn png(data: &str) -> crate::types::Image {
+        crate::types::Image {
+            media_type: crate::types::ImageType::Png,
+            width: 1,
+            height: 1,
+            data: data.into(),
+        }
+    }
+
+    fn call(id: &str) -> Content {
+        Content::ToolCall(ToolCall {
+            id: id.into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        })
+    }
+
+    #[test]
+    fn turning_images_off_rebuilds_the_cached_image_bodies_on_every_wire() {
+        let history = vec![
+            Message::User {
+                content: vec![Content::text("look"), Content::Image(png("aGk="))],
+            },
+            assistant("m", vec![call("call_1")]),
+            Message::tool_result_with_images("call_1", "ok", false, vec![png("Ynll")]),
+        ];
+        for (wire, body) in every_wire() {
+            let on = body(&request(None, &history));
+            let on = std::str::from_utf8(&on).unwrap();
+            assert!(on.contains("aGk=") && on.contains("Ynll"), "{wire}: {on}");
+            let off = Request {
+                images: false,
+                ..request(None, &history)
+            };
+            let off = body(&off);
+            let off = std::str::from_utf8(&off).unwrap();
+            assert!(
+                !off.contains("aGk=") && !off.contains("Ynll"),
+                "{wire}: {off}"
+            );
+            assert!(
+                off.contains("[image not sent: the model takes no images]"),
+                "{wire}: {off}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_result_images_keep_their_bytes_and_order_on_the_next_turn_on_every_wire() {
+        let mut history = vec![
+            Message::user("hello"),
+            assistant("m", vec![call("call_1"), call("call_2")]),
+            Message::tool_result_with_images("call_1", "one", false, vec![png("Zmlyc3Q=")]),
+            Message::tool_result_with_images("call_2", "two", false, vec![png("c2Vjb25k")]),
+        ];
+        for (wire, body) in every_wire() {
+            let first = body(&request(None, &history));
+            let first = std::str::from_utf8(&first).unwrap().to_owned();
+            history.push(assistant("m", vec![Content::text("seen")]));
+            history.push(Message::user("next"));
+            let second = body(&request(None, &history));
+            let second = std::str::from_utf8(&second).unwrap();
+            history.truncate(4);
+            // The images sit between the tool results and the next turn, in
+            // call order, with the same bytes as on the turn they came back.
+            let one = second.find("Zmlyc3Q=").expect("first image");
+            let two = second.find("c2Vjb25k").expect("second image");
+            let next = second.find("\"next\"").expect("next user text");
+            assert!(one < two && two < next, "{wire}: {second}");
+            let start = first.find("hello").unwrap();
+            let end = first.rfind("c2Vjb25k").unwrap();
+            assert!(
+                second.contains(&first[start..end]),
+                "{wire}: the first turn's messages changed\n{first}\n{second}"
+            );
+        }
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub struct SeenRequest {
     pub model: String,
     /// How many messages the request carried.
     pub messages: usize,
+    /// Whether the request asked the wire to send images.
+    pub images: bool,
     /// The reasoning text the request carried, if any.
     pub reasoning: Option<String>,
 }
@@ -83,6 +85,7 @@ impl Provider for FakeProvider {
         self.seen.lock().expect("seen lock").push(SeenRequest {
             model: request.model.to_string(),
             messages: request.messages.len(),
+            images: request.images,
             reasoning: request.reasoning.map(str::to_string),
         });
         let reply = self
@@ -143,6 +146,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: history,
+            images: true,
             reasoning: Some("low"),
             cache_key: None,
         }
@@ -191,11 +195,13 @@ mod tests {
                 SeenRequest {
                     model: "fake-model".into(),
                     messages: 2,
+                    images: true,
                     reasoning: Some("low".into()),
                 },
                 SeenRequest {
                     model: "fake-model".into(),
                     messages: 2,
+                    images: true,
                     reasoning: Some("low".into()),
                 },
             ]

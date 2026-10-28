@@ -136,6 +136,7 @@ fn session(turns: usize, masked: bool, profiled: bool) -> Measured {
         reasoning: None,
         cache_key: None,
         max_turns: None,
+        images: true,
     };
     let (tx, mut rx) = mpsc::channel(256);
     let mut history = vec![Message::user("go")];

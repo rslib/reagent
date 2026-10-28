@@ -21,6 +21,7 @@ reagent-script = { path = "crates/script" }
 reagent-mcp = { path = "crates/mcp" }
 reagent-tui = { path = "crates/tui" }
 reagent-store = { path = "crates/store" }
+reagent-image = { path = "crates/image" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

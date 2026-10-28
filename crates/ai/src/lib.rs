@@ -12,6 +12,7 @@ pub mod oauth;
 pub mod openai;
 pub mod pi;
 pub mod providers;
+mod request_images;
 pub mod sse;
 pub mod types;
 
@@ -22,8 +23,8 @@ pub use providers::{
 };
 
 pub use types::{
-    AssistantMessage, Content, Message, Reasoning, Role, StopReason, Text, ToolCall, ToolResult,
-    ToolSpec, Usage,
+    AssistantMessage, Content, Image, ImageType, Message, Reasoning, Role, StopReason, Text,
+    ToolCall, ToolResult, ToolSpec, Usage,
 };
 
 use futures_util::stream::BoxStream;
@@ -194,6 +195,10 @@ pub struct Request<'a> {
     pub tools: &'a [ToolSpec],
     /// The conversation so far, oldest first.
     pub messages: &'a [Message],
+    /// Whether the model takes images, so the wires send them. When it is
+    /// false, each wire writes `[image not sent: the model takes no images]` in
+    /// their place.
+    pub images: bool,
     /// How much reasoning the provider may spend, in its own words: a level
     /// text or a token budget. See [`Reasoning::parse`].
     pub reasoning: Option<&'a str>,

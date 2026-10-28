@@ -54,6 +54,9 @@ pub enum Event {
         /// The output text of a failed call, shared with history; `None`
         /// when the call succeeded.
         error: Option<Text>,
+        /// The images the result carries, shared with history; empty for the
+        /// text results that are almost every call, which allocates nothing.
+        images: Vec<reagent_ai::Image>,
     },
     /// Running token counts for this turn.
     Usage(Usage),

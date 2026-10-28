@@ -204,7 +204,14 @@ fn size(message: &Message) -> usize {
     match message {
         Message::User { content } => content.iter().map(content_size).sum(),
         Message::Assistant(reply) => reply.content.iter().map(content_size).sum(),
-        Message::ToolResult(result) => result.content.len(),
+        Message::ToolResult(result) => {
+            result.content.len()
+                + result
+                    .images
+                    .iter()
+                    .map(|image| image.data.len())
+                    .sum::<usize>()
+        }
     }
 }
 
@@ -214,6 +221,7 @@ fn content_size(content: &Content) -> usize {
         Content::Thinking { thinking, .. } => thinking.len(),
         Content::RedactedThinking { data } => data.len(),
         Content::ToolCall(call) => call.name.len() + call.arguments.len(),
+        Content::Image(image) => image.data.len(),
     }
 }
 

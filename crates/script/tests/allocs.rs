@@ -46,11 +46,12 @@ fn blocks(body: impl FnOnce()) -> u64 {
 }
 
 /// The most bytes one tool result may take: the text's pointer pair, the error
-/// flag, and the two boxed extras, which keep every other result small.
-const TOOL_OUTPUT_BYTES: usize = 40;
+/// flag, and the three boxed extras, which keep every other result small.
+const TOOL_OUTPUT_BYTES: usize = 48;
 
-/// A result is a pointer pair, a flag and two options of a box: the `object` a
-/// script reads in place of the text took the last pointer, not a third one.
+/// A result is a pointer pair, a flag and three options of a box: the `object`
+/// a script reads in place of the text took the last pointer, and the images of
+/// the result take one more.
 #[test]
 fn tool_output_grows_by_one_pointer() {
     let _serial = serial();

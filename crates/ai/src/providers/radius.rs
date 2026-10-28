@@ -64,6 +64,7 @@ impl Item {
             price_source: price.map(|_| PriceSource::Provider),
             price,
             reasoning: None,
+            images: None,
         })
     }
 }

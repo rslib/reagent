@@ -272,6 +272,7 @@ mod tests {
             call_id: id.into(),
             content: content.into(),
             is_error: false,
+            images: Vec::new(),
         }
     }
 
@@ -280,6 +281,7 @@ mod tests {
             call_id: id.into(),
             content: content.into(),
             is_error: true,
+            images: Vec::new(),
         }
     }
 

@@ -41,7 +41,7 @@ BENCH_TARGET=instructions
 # The cli package is `reagent` and lives in crates/cli; the base-package loop
 # below maps that name. Its bench needs the package's `testing` feature, which
 # this tree's runs and a base that has the bench get.
-PACKAGES=(-p reagent-ai -p reagent-tools -p reagent-config -p reagent-agent -p reagent)
+PACKAGES=(-p reagent-ai -p reagent-tools -p reagent-config -p reagent-agent -p reagent-image -p reagent)
 # The one feature the benches need: the cli package's scripted fake provider.
 BENCH_FEATURES=reagent/testing
 

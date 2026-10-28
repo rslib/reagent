@@ -49,11 +49,12 @@ A feature that does not move 1 or 2 in a measured run does not ship as a default
 | Small helpers with no domain types: text cuts, number writing, path normalizing, borrowed JSON reading | `crates/util` (`reagent-util`) | no other reagent crate |
 | OS sandbox for one process and its children: Seatbelt on macOS, Landlock on Linux | `crates/sandbox` (`reagent-sandbox`) | no other reagent crate |
 | Durable append-only session log: frames, fields, CRC, part writer and reader, recovery, fork pointers, zstd stream, session list. No message types | `crates/store` (`reagent-store`) | no other reagent crate |
+| Images for models: format sniffing, decoders, EXIF orientation, resize, PNG and JPEG encode, limits. No file system; AVIF only on macOS (ImageIO in `src/imageio.rs`, the crate's one `unsafe` module) | `crates/image` (`reagent-image`) | no other reagent crate |
 | Config files, providers and models, permission rules and their shell lexer and glob | `crates/config` (`reagent-config`) | depends on util |
 | Shared OAuth (PKCE, device flow, JWT, loopback callback) and the HTTP client | `crates/oauth` (`reagent-oauth`) | depends on config |
 | Message types, providers, SSE, `FakeProvider`, OAuth logins | `crates/ai` (`reagent-ai`) | `reagent-config` (the auth file) and oauth |
 | Loop, events, session journal, context policy, `Tool` trait, the permission guard | `crates/agent` (`reagent-agent`) | depends on ai, config, store and util |
-| Native tools | `crates/tools` (`reagent-tools`) | depends on agent, config and util |
+| Native tools; `read` returns images through `reagent-image` | `crates/tools` (`reagent-tools`) | depends on agent, ai, config, image and util |
 | The `codemode` tool: a QuickJS script that calls the other tools | `crates/script` (`reagent-script`) | depends on agent, ai and tools |
 | MCP client and its OAuth login | `crates/mcp` (`reagent-mcp`) | depends on agent, ai, oauth and config |
 | Terminal UI and markdown | `crates/tui` (`reagent-tui`) | depends on agent |

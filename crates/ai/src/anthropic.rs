@@ -99,6 +99,7 @@ impl Anthropic {
         let builder = &head.as_ref().expect("head is cached").builder;
 
         let mut bodies = self.bodies.lock().expect("body cache lock");
+        bodies.set_images(request.images);
         bodies.align(request.messages, self.name())?;
         Ok(builder.body_parts(bodies.bodies()))
     }
@@ -228,6 +229,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: &[],
+            images: true,
             reasoning: None,
             cache_key: None,
         };
@@ -256,6 +258,7 @@ mod tests {
             system: None,
             tools: &[],
             messages: &history,
+            images: true,
             reasoning: None,
             cache_key: None,
         };

@@ -38,6 +38,7 @@ impl From<Item> for Entry {
             price_source: price.map(|_| PriceSource::Provider),
             price,
             reasoning: None,
+            images: None,
         }
     }
 }

@@ -58,6 +58,7 @@ impl<'a> From<Item<'a>> for Entry {
             price,
             reasoning: shaped::<SyntheticEfforts>(item.reasoning_parameters)
                 .and_then(SyntheticEfforts::reasoning),
+            images: None,
         }
     }
 }

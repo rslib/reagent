@@ -207,6 +207,7 @@ fn perf_stuck_write_turn_does_not_copy_the_content() {
             call_id: "c".into(),
             content: Text::from("ok"),
             is_error: false,
+            images: Vec::new(),
         },
     )];
     let assistant = AssistantMessage::new("fake", "m", vec![Content::text("x")]);

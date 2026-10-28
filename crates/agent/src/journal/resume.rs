@@ -267,7 +267,9 @@ mod tests {
     use std::path::Path;
 
     use bytes::Bytes;
-    use reagent_ai::{AssistantMessage, Content, StopReason, Text, ToolCall, Usage};
+    use reagent_ai::{
+        AssistantMessage, Content, Image, ImageType, StopReason, Text, ToolCall, Usage,
+    };
     use reagent_store::Header;
 
     use crate::journal::Journal;
@@ -290,6 +292,16 @@ mod tests {
     fn load_now(dir: &Path) -> Resumed {
         let session = Session::open(dir).expect("open the session");
         load(&session).expect("load the run")
+    }
+
+    /// One image, with base64 text the journal stores as it stands.
+    fn image(data: &str) -> Image {
+        Image {
+            media_type: ImageType::Png,
+            width: 2,
+            height: 3,
+            data: data.into(),
+        }
     }
 
     /// An assistant message that calls `calls`, in order.
@@ -497,6 +509,72 @@ mod tests {
 
         let resumed = load_now(dir.path());
         assert_eq!(resumed.history, [a1, a2, b1]);
+    }
+
+    #[tokio::test]
+    async fn a_resume_gives_back_the_images_it_wrote() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = journal(dir.path());
+        let user =
+            Message::user_content(vec![Content::text("look"), Content::Image(image("aGk="))]);
+        let reply = call_reply(&[("c1", "read")]);
+        let result = Message::tool_result_with_images(
+            "c1",
+            "two frames",
+            false,
+            vec![image("aGk="), image("bG8=")],
+        );
+        journal.message(&user).expect("append");
+        journal.message(&reply).expect("append");
+        journal.message(&result).expect("append");
+        journal.turn_end(1, Usage::default()).expect("turn end");
+        journal.commit().expect("commit");
+        journal.close().expect("close");
+
+        let resumed = load_now(dir.path());
+        assert_eq!(
+            resumed.history,
+            [user, reply, result],
+            "the images come back byte for byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fork_keeps_the_images_of_the_parent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut parent = journal(dir.path());
+        let a1 = Message::user_content(vec![Content::text("a1"), Content::Image(image("aGk="))]);
+        let a2 = Message::tool_result_with_images("c1", "a2", false, vec![image("bG8=")]);
+        parent.message(&a1).expect("append");
+        parent.message(&a2).expect("append");
+        parent.commit().expect("commit");
+        parent.close().expect("close");
+
+        let session = Session::open(dir.path()).expect("open the parent");
+        let last = session
+            .records()
+            .filter_map(Result::ok)
+            .map(|record| record.seq)
+            .max()
+            .expect("a record");
+        let fork = session.fork_point(last + 1);
+        let created = session.header().created_ms + 1;
+        let session_id = session.header().session_id.clone();
+        drop(session);
+
+        let header = Header::new(session_id, created, Some(fork), Bytes::new());
+        let mut child = Journal::create(dir.path(), header).expect("create the child");
+        let b1 = Message::user("b1");
+        child.message(&b1).expect("append");
+        child.commit().expect("commit");
+        child.close().expect("close");
+
+        let resumed = load_now(dir.path());
+        assert_eq!(
+            resumed.history,
+            [a1, a2, b1],
+            "the images of the parent reach the fork"
+        );
     }
 
     #[tokio::test]

@@ -36,6 +36,7 @@ fn config() -> AgentConfig {
         reasoning: None,
         cache_key: None,
         max_turns: None,
+        images: true,
     }
 }
 
