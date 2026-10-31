@@ -26,7 +26,7 @@ TARGET=x86_64-unknown-linux-musl
 
 cd "$ROOT"
 rustup target add "$TARGET" >/dev/null
-cargo zigbuild --profile min -p reagent --target "$TARGET"
+cargo zigbuild --profile min -p reagent --no-default-features --target "$TARGET"
 
 TARGET_DIR="$(cargo metadata --format-version 1 --no-deps |
   python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"

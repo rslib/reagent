@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
-# The footprint gate: builds the `min` profile binary and checks its size
-# against bench/size-budget.txt.
+# The footprint gate: builds the `min` profile binary twice and checks each
+# against bench/size-budget.txt: without the TUI (`--no-default-features`, the
+# eval container and Harbor build) against the `<os>-<arch>` line, and with
+# the default features (the TUI) against the `<os>-<arch>-tui` line.
 #
 # Usage:
 #   bench/size.sh              build, then check this platform's budget
@@ -54,17 +56,23 @@ binary_size() {
     wc -c <"$binary" | tr -d ' '
 }
 
-# Builds the min profile binary the budget is about.
+# Builds the min profile binary: without the TUI by default, with it when the
+# first argument is `tui`.
 build() {
-    say "building the min profile binary"
-    cargo build --profile min -p reagent
+    if [[ ${1:-} == tui ]]; then
+        say "building the min profile binary with the TUI"
+        cargo build --profile min -p reagent
+    else
+        say "building the min profile binary without the TUI"
+        cargo build --profile min -p reagent --no-default-features
+    fi
 }
 
 # Compares the binary with the budget for this platform in `file`.
 # Returns 0 within budget, 1 over, 2 when the platform has no line.
 check() {
     local budget key size percent
-    key=$(platform)
+    key=$(platform)${2:+-$2}
     size=$(binary_size)
     budget=$(budget_for "$1" "$key")
     if [[ -z $budget ]]; then
@@ -111,7 +119,13 @@ case ${1:-} in
         say "usage: bench/size.sh [--self-test]"
         exit 2
     }
+    headless=0
     build
-    check "$BUDGET_FILE"
+    check "$BUDGET_FILE" || headless=$?
+    full=0
+    build tui
+    check "$BUDGET_FILE" tui || full=$?
+    # The worse of the two: 2 (no line) over 1 (over budget) over 0.
+    exit $((headless > full ? headless : full))
     ;;
 esac

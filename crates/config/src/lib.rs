@@ -4,6 +4,7 @@ pub mod auth;
 pub mod glob;
 pub mod mcp;
 pub mod permissions;
+pub mod saved;
 pub mod shell;
 
 use std::collections::BTreeMap;
@@ -248,13 +249,15 @@ pub struct Layers {
     pub profile: Option<Layer>,
     /// The repo `.reagent/config.toml`.
     pub repo: Option<Layer>,
+    /// The allow rules saved for this project; see [`saved`].
+    pub saved: Option<Layer>,
 }
 
 impl Layers {
-    /// The layers in precedence order: the global file, the profile, then the
-    /// repo file.
+    /// The layers in precedence order: the global file, the profile, the repo
+    /// file, then the saved rules of the project.
     pub fn ordered(&self) -> Vec<Layer> {
-        [&self.global, &self.profile, &self.repo]
+        [&self.global, &self.profile, &self.repo, &self.saved]
             .into_iter()
             .flatten()
             .cloned()
@@ -400,13 +403,30 @@ fn load_file(path: Option<&Path>, repo: bool) -> Result<Option<Layer>, String> {
 }
 
 /// Loads the global file, the file of the profile `profile` when the run
-/// names one, and the repo file for `cwd`.
+/// names one, the repo file for `cwd`, and the rules saved for its project.
+///
+/// There is no saved layer when the state folder has no path (no `HOME` and
+/// no `XDG_STATE_HOME`), which is not an error.
 pub fn load_for(cwd: &Path, profile: Option<&str>) -> Result<Layers, String> {
+    load_for_state(cwd, profile, auth::dir().ok().as_deref())
+}
+
+/// [`load_for`] with the state folder named, so a test needs no environment.
+fn load_for_state(
+    cwd: &Path,
+    profile: Option<&str>,
+    state: Option<&Path>,
+) -> Result<Layers, String> {
     let repo = repo_root(cwd).map(|root| root.join(".reagent").join("config.toml"));
+    let saved = state
+        .map(|state| saved::load(&saved::path(state, cwd)))
+        .transpose()?
+        .flatten();
     Ok(Layers {
         global: load_file(global_path().as_deref(), false)?,
         profile: profile.map(load_profile).transpose()?,
         repo: load_file(repo.as_deref(), true)?,
+        saved,
     })
 }
 
@@ -656,7 +676,58 @@ mod tests {
             global: load_file(global, false).expect("loads"),
             profile: None,
             repo: load_file(repo, true).expect("loads"),
+            saved: None,
         })
+    }
+
+    #[expect(clippy::disallowed_methods, reason = "test setup on a temp dir")]
+    fn folder(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::create_dir_all(&path).expect("makes the folder");
+        path
+    }
+
+    #[test]
+    fn saved_layer_comes_last_and_allows_its_rule() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = dir.path().join("state");
+        let work = folder(dir.path(), "work");
+        let file = saved::path(&state, &work);
+        assert!(saved::add(&file, "Bash(cargo test:*)").expect("adds"));
+        let layers = load_for_state(&work, None, Some(&state)).expect("loads");
+        assert_eq!(
+            layers.saved.as_ref().map(|layer| layer.path.clone()),
+            Some(file.clone())
+        );
+        let ordered = layers.ordered();
+        assert_eq!(ordered.last().map(|layer| &layer.path), Some(&file));
+        let layer = layers.saved.expect("a saved layer");
+        let rules =
+            permissions::Rules::from_layers(&[layer], &work, Some(dir.path())).expect("rules");
+        let decision = rules.decide(&permissions::Call {
+            tool: "bash",
+            main_arg: Some("command"),
+            value: Some("cargo test -p b"),
+            reads: &[],
+            writes: &[],
+        });
+        assert_eq!(decision.kind, permissions::Kind::Allow);
+        assert_eq!(
+            decision.reason,
+            permissions::Reason::Rule {
+                rule: "Bash(cargo test:*)".into(),
+                file: file.display().to_string().into(),
+            }
+        );
+    }
+
+    #[test]
+    fn saved_layer_is_absent_without_a_state_folder() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let work = folder(dir.path(), "work");
+        let layers = load_for_state(&work, None, None).expect("loads");
+        assert!(layers.saved.is_none());
+        assert!(layers.ordered().iter().all(|layer| layer.path != work));
     }
 
     #[test]
@@ -672,6 +743,7 @@ mod tests {
             global: load_file(Some(&global), false).expect("loads"),
             profile: load_file(Some(&profile), false).expect("loads"),
             repo: None,
+            saved: None,
         });
         assert_eq!(merged.sandbox.mode.as_deref(), Some("on"));
         assert_eq!(merged.sandbox.write, vec!["~/.cache"]);
@@ -964,6 +1036,7 @@ mod tests {
             global: load_file(Some(&global), false).expect("loads"),
             profile: load_file(Some(&profile), false).expect("loads"),
             repo: None,
+            saved: None,
         });
         assert_eq!(merged.session.keep_days(), 7);
         assert_eq!(merged.session.max_mb(), 0, "0 turns the cap off");
@@ -1167,6 +1240,7 @@ mod tests {
                 .expect("loads")
                 .flatten(),
             repo: load_file(repo, true).expect("loads"),
+            saved: None,
         };
         merge_all(&layers)
     }

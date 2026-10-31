@@ -174,6 +174,8 @@ pub struct Args {
     pub provider_given: bool,
     /// Print one JSON object per event.
     pub json: bool,
+    /// Serve the session as a worker instead of running it once.
+    pub worker: bool,
     /// The provider model id.
     pub model: String,
     /// The provider wire to use.
@@ -531,8 +533,17 @@ fn expand_policy(names: &[String]) -> Result<Vec<String>, String> {
 }
 
 /// Parses the process arguments, or returns an exit decision.
-pub fn parse() -> Result<Outcome, String> {
-    parse_from(lexopt::Parser::from_env(), &load_settings)
+pub fn parse(argv: Vec<std::ffi::OsString>, worker: bool) -> Result<Outcome, String> {
+    parse_from(lexopt::Parser::from_args(argv), &load_settings, worker)
+}
+
+/// Takes the leading `worker` word, which makes the run a session worker.
+pub fn worker_word(argv: &mut Vec<std::ffi::OsString>) -> bool {
+    if argv.first().and_then(|word| word.to_str()) != Some("worker") {
+        return false;
+    }
+    argv.remove(0);
+    true
 }
 
 /// Parses the process arguments again with `model` named.
@@ -544,10 +555,10 @@ pub fn parse() -> Result<Outcome, String> {
 /// provider or profile of their own. It reads the config files, so call it
 /// inside `spawn_blocking`.
 pub fn reparse(model: &str) -> Result<Outcome, String> {
-    let argv = std::env::args_os()
-        .skip(1)
-        .chain(["--model".into(), model.into()]);
-    parse_from(lexopt::Parser::from_args(argv), &load_settings)
+    let mut argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let worker = worker_word(&mut argv);
+    let argv = argv.into_iter().chain(["--model".into(), model.into()]);
+    parse_from(lexopt::Parser::from_args(argv), &load_settings, worker)
 }
 
 /// Checks the policy and tool lists of `layer`, expanding `all` and `none`,
@@ -624,6 +635,16 @@ fn settings_from(
     let cwd = canonical(cwd);
     let home = std::env::var_os("HOME").map(|home| canonical(Path::new(&home)));
     let rules = Rules::from_layers(&layers.ordered(), &cwd, home.as_deref())?;
+    // A saved rule is an approval a client gave in an earlier session, so it
+    // answers the ask rule that asked for it, as an approval of this session
+    // does; as a plain allow rule every ask rule would win over it. A deny
+    // rule still wins over both.
+    if let Some(saved) = &layers.saved {
+        let file = saved.path.display().to_string();
+        for rule in &saved.settings.permissions.allow {
+            rules.add_saved_allow(rule, &file);
+        }
+    }
     Ok((reagent_config::merge_all(&layers), rules))
 }
 
@@ -695,7 +716,7 @@ pub fn check_account_name(name: &str) -> Result<(), String> {
 
 /// The profile a run reads: the flag, else `REAGENT_PROFILE` when it is set
 /// and not empty.
-fn profile_from(flag: Option<String>, env: Option<String>) -> Option<String> {
+pub(crate) fn profile_from(flag: Option<String>, env: Option<String>) -> Option<String> {
     flag.or_else(|| env.filter(|name| !name.is_empty()))
 }
 
@@ -882,7 +903,11 @@ fn fork_ref(text: &str) -> Result<(String, Option<u64>), String> {
 
 /// Parses `args` (the arguments after the program name) into an outcome.
 /// `load` reads the settings for the working directory; a flag beats them.
-fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome, String> {
+fn parse_from(
+    mut parser: lexopt::Parser,
+    load: &LoadSettings,
+    worker: bool,
+) -> Result<Outcome, String> {
     let mut task: Option<TaskSource> = None;
     let mut sessions = Sessions::New;
     let mut model_given = false;
@@ -1077,6 +1102,15 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
         check_profile_name(name)?;
     }
 
+    // A worker speaks the client protocol on stdout and needs a journal to
+    // catch a client up from, so neither flag means anything for one.
+    if worker && json {
+        return Err("--json is not for a worker: it writes the client protocol".into());
+    }
+    if worker && matches!(sessions, Sessions::None) {
+        return Err("--no-session is not for a worker: it needs a journal".into());
+    }
+
     if let Some(name) = models {
         if task.is_some()
             || json
@@ -1110,9 +1144,10 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
     if refresh {
         return Err("--refresh needs the models command".into());
     }
-    // Only a continue or a resume may run with no message: the run answers
-    // the calls its ledger left open.
-    let open = matches!(sessions, Sessions::Continue | Sessions::Resume(_));
+    // Only a continue, a resume or a worker may run with no message: the run
+    // answers the calls its ledger left open, and a worker takes the ones its
+    // clients send.
+    let open = matches!(sessions, Sessions::Continue | Sessions::Resume(_)) || worker;
     if task.is_none() {
         if json {
             return Err("the --json flag needs a task; use -p <task>".into());
@@ -1275,6 +1310,7 @@ fn parse_from(mut parser: lexopt::Parser, load: &LoadSettings) -> Result<Outcome
         model_given,
         provider_given,
         json,
+        worker,
         model: model_id,
         provider,
         profile,
@@ -1702,6 +1738,7 @@ mod tests {
             global,
             profile,
             repo,
+            saved: None,
         })
     }
 
@@ -1758,17 +1795,21 @@ mod tests {
         servers: BTreeMap<String, McpServer>,
     ) -> Result<Outcome, String> {
         let argv = args.iter().map(std::ffi::OsString::from);
-        parse_from(lexopt::Parser::from_args(argv), &|_, _| {
-            Ok((
-                settings.clone(),
-                Rules::none(),
-                McpConfig {
-                    servers: servers.clone(),
-                    warn_many_direct: true,
-                    settings: Default::default(),
-                },
-            ))
-        })
+        parse_from(
+            lexopt::Parser::from_args(argv),
+            &|_, _| {
+                Ok((
+                    settings.clone(),
+                    Rules::none(),
+                    McpConfig {
+                        servers: servers.clone(),
+                        warn_many_direct: true,
+                        settings: Default::default(),
+                    },
+                ))
+            },
+            false,
+        )
     }
 
     fn run_servers(
@@ -1942,6 +1983,7 @@ mod tests {
             global,
             profile: None,
             repo,
+            saved: None,
         };
         settings_from(layers, Path::new("/repo"), servers)
             .expect("settings")
@@ -2417,6 +2459,7 @@ mod tests {
                         },
                     ))
                 },
+                false,
             )
         };
         let models = parse(&["models", "--profile", "work"]).expect("parses");
@@ -2465,6 +2508,7 @@ mod tests {
             global: Some(global),
             profile: Some(profile),
             repo: None,
+            saved: None,
         };
         let (settings, _) = settings_from(layers, dir.path(), &BTreeMap::new()).expect("settings");
         let args = run_with(&["-p", "task"], settings.clone());
@@ -2478,7 +2522,11 @@ mod tests {
     #[test]
     fn a_config_error_ends_the_parse() {
         let argv = ["-p", "task"].iter().map(std::ffi::OsString::from);
-        let error = parse_from(lexopt::Parser::from_args(argv), &|_, _| Err("bad".into()));
+        let error = parse_from(
+            lexopt::Parser::from_args(argv),
+            &|_, _| Err("bad".into()),
+            false,
+        );
         assert_eq!(error.unwrap_err(), "bad");
     }
 

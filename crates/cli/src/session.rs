@@ -148,6 +148,9 @@ pub struct Ask<'a> {
     pub model: &'a str,
     /// The task text, which titles a new session.
     pub title: &'a str,
+    /// Whether the session is served by a worker, which may resume a session
+    /// with nothing to continue.
+    pub worker: bool,
 }
 
 /// Runs the `session` command: `ls`, `cat <ref>`, `rm <ref>` or `gc`.
@@ -415,8 +418,9 @@ fn resume_into(folder: &Path, dir: &Path, ask: &Ask<'_>) -> Result<Option<Plan>,
     let session = Session::open(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     let (resumed, seq) =
         resume::load_tail(&session).map_err(|error| format!("{}: {error}", dir.display()))?;
-    // A run with no open turn and no message has nothing to do.
-    if !resumed.open_turn && ask.title.is_empty() {
+    // A run with no open turn and no message has nothing to do, unless it is
+    // a worker that serves the session to its clients.
+    if !resumed.open_turn && ask.title.is_empty() && !ask.worker {
         return Err("nothing to continue; give a message with -p".into());
     }
     let parent = Meta::decode(&session.header().meta);

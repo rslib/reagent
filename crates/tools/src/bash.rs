@@ -182,6 +182,33 @@ impl Bash {
         }
     }
 
+    /// Runs one command contained: the same launcher without `--network`, and
+    /// no fallback. `None` when no launcher can hold the call, so the batch
+    /// asks a person instead of running it outside the sandbox.
+    async fn contain_inner(
+        &self,
+        args: &Args<'_>,
+        cancel: &CancellationToken,
+    ) -> Option<ToolOutput> {
+        let launcher = self
+            .launcher
+            .as_ref()
+            .filter(|_| !self.disabled.load(Ordering::Relaxed))?;
+        let launcher = Launcher {
+            args: without_network(&launcher.args),
+            ..launcher.clone()
+        };
+        let timeout_ms = args
+            .timeout_ms
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .clamp(1, MAX_TIMEOUT_MS);
+        let ran = self
+            .execute(Some(&launcher), args, timeout_ms, cancel)
+            .await;
+        // A launcher that cannot start leaves the call unrun, for a person.
+        ran.unavailable.is_none().then_some(ran.output)
+    }
+
     async fn execute(
         &self,
         launcher: Option<&Launcher>,
@@ -736,6 +763,30 @@ impl Tool for Bash {
             self.run_inner(&arguments, cancel).await
         })
     }
+
+    fn can_contain(&self) -> bool {
+        self.launcher.is_some() && !self.disabled.load(Ordering::Relaxed)
+    }
+
+    fn run_contained<'a>(
+        &'a self,
+        args: &'a str,
+        cancel: &'a CancellationToken,
+    ) -> futures_util::future::BoxFuture<'a, Option<ToolOutput>> {
+        Box::pin(async move {
+            let arguments = parse_args::<Args<'a>>(args).ok()?;
+            self.contain_inner(&arguments, cancel).await
+        })
+    }
+}
+
+/// The launcher arguments with `--network` dropped: a contained call is the
+/// one that never reaches the network.
+fn without_network(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| arg.as_str() != "--network")
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -1237,6 +1288,61 @@ mod tests {
         assert_eq!(
             output.content.as_ref(),
             "launched --flag\ninner\nexit code: 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn contained_mode_drops_the_network_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut launcher = fake_launcher(
+            &tmp,
+            // Records the launcher's own flags, up to `--`, and runs nothing.
+            "args=\nwhile [ \"$1\" != -- ]; do args=\"$args $1\"; shift; done\necho \"args:$args\"",
+            Fallback::Required,
+        )
+        .await;
+        launcher.args = vec!["--sandbox".into(), "--network".into(), "--read-only".into()];
+        let bash = tool(&tmp).with_launcher(launcher);
+        assert!(bash.can_contain());
+        let output = bash
+            .run_contained(
+                r#"{"command":"rm -rf target/debug"}"#,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("the launcher starts");
+        assert!(!output.is_error, "{}", output.content);
+        // The launcher saw the other flags, and no `--network`.
+        assert_eq!(
+            output.content.as_ref(),
+            "args: --sandbox --read-only\nexit code: 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn contained_mode_reports_a_launcher_that_cannot_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No launcher at all, then one that reports it cannot start: neither
+        // runs the call outside the sandbox.
+        let plain = tool(&tmp);
+        assert!(!plain.can_contain());
+        assert!(
+            plain
+                .run_contained(r#"{"command":"echo one"}"#, &CancellationToken::new())
+                .await
+                .is_none()
+        );
+        let bash =
+            tool(&tmp).with_launcher(fake_launcher(&tmp, UNAVAILABLE_SCRIPT, Fallback::Auto).await);
+        assert!(
+            bash.run_contained(r#"{"command":"echo one"}"#, &CancellationToken::new())
+                .await
+                .is_none(),
+            "no fallback: the call waits for a person"
+        );
+        assert!(
+            !bash.disabled.load(Ordering::Relaxed),
+            "a contained run never falls back"
         );
     }
 

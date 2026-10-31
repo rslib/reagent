@@ -407,17 +407,19 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::disallowed_methods, reason = "the test removes its folder")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test writes one file into a temp folder"
+    )]
     fn usage_cost_old_cache_without_price_loads() {
-        let dir = std::env::temp_dir().join(format!("reagent-catalog-old-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("creates the folder");
+        let temp = tempfile::tempdir().expect("makes a temp folder");
+        let dir = temp.path();
         std::fs::write(
-            path(&dir, "fi"),
+            path(dir, "fi"),
             br#"{"fetched_at":1,"models":[{"id":"m","context_window":8000,"max_output":null}]}"#,
         )
         .expect("writes an old cache");
-        let cache = read(&dir, "fi").expect("an old cache loads");
+        let cache = read(dir, "fi").expect("an old cache loads");
         assert_eq!(cache.models[0].price, None);
         assert_eq!(cache.models[0].context_window, Some(8000));
         assert_eq!(
@@ -428,13 +430,12 @@ mod tests {
             cache.models[0].images, None,
             "an old cache says nothing about images"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    #[expect(clippy::disallowed_methods, reason = "the test removes its folder")]
     fn catalog_cache_round_trips() {
-        let dir = std::env::temp_dir().join(format!("reagent-catalog-{}", std::process::id()));
+        let temp = tempfile::tempdir().expect("makes a temp folder");
+        let dir = temp.path();
         let cache = Cache {
             fetched_at: 1_700_000_000,
             models: vec![Entry {
@@ -452,10 +453,9 @@ mod tests {
                 images: Some(true),
             }],
         };
-        assert_eq!(read(&dir, "fi"), None);
-        write(&dir, "fi", &cache).expect("writes");
-        assert_eq!(read(&dir, "fi"), Some(cache));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read(dir, "fi"), None);
+        write(dir, "fi", &cache).expect("writes");
+        assert_eq!(read(dir, "fi"), Some(cache));
     }
 
     #[test]
@@ -515,11 +515,13 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::disallowed_methods, reason = "the test removes its folder")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test reads one file back from a temp folder"
+    )]
     fn reasoning_levels_the_cache_writes_the_level_names() {
-        let dir =
-            std::env::temp_dir().join(format!("reagent-catalog-reason-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = tempfile::tempdir().expect("makes a temp folder");
+        let dir = temp.path();
         let cache = Cache {
             fetched_at: 1,
             models: vec![bare(
@@ -532,15 +534,14 @@ mod tests {
                 }),
             )],
         };
-        write(&dir, "fi", &cache).expect("writes");
-        let text = std::fs::read_to_string(path(&dir, "fi")).expect("reads the cache text");
+        write(dir, "fi", &cache).expect("writes");
+        let text = std::fs::read_to_string(path(dir, "fi")).expect("reads the cache text");
         assert!(
             text.contains(
                 r#""reasoning":{"levels":["low","high"],"off":false,"mandatory":true,"default":"high"}"#
             ),
             "{text}"
         );
-        assert_eq!(read(&dir, "fi"), Some(cache));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read(dir, "fi"), Some(cache));
     }
 }

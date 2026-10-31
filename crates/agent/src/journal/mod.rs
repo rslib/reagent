@@ -12,7 +12,7 @@ use bytes::Bytes;
 use reagent_ai::{Message, Usage};
 use reagent_store::{Header, Writer};
 
-use crate::journal::record::TurnEnd;
+use crate::journal::record::{Approval, ApprovalKind, Settings, TurnEnd};
 use crate::journal::state::State;
 use crate::tool::EffectClass;
 
@@ -40,6 +40,10 @@ pub struct Journal {
     /// History messages a parent part already holds: a resumed run writes
     /// only the messages after them and no base at its start.
     recorded: Option<usize>,
+    /// The number of the record this journal appended last: the part numbers
+    /// its records from 1, and a part that continues another starts after the
+    /// last record of the chain it forks from.
+    records: u64,
 }
 
 impl Journal {
@@ -47,10 +51,12 @@ impl Journal {
     ///
     /// Writing blocks on the file, so a caller runs this in `spawn_blocking`.
     pub fn create(dir: &Path, header: Header) -> io::Result<Self> {
+        let records = header.fork.map_or(0, |fork| fork.seq);
         Ok(Self {
             writer: Writer::create(dir, header)?,
             scratch: Vec::new(),
             recorded: None,
+            records,
         })
     }
 
@@ -107,6 +113,42 @@ impl Journal {
         self.append(kinds::MODEL, false)
     }
 
+    /// Appends the wait of a call for a client's answer, or the answer it got.
+    ///
+    /// The wait is on the disk before the call asks, so a resume knows a call
+    /// without an answer never ran, whatever its call start says.
+    pub fn approval(&mut self, id: &str, kind: ApprovalKind) -> io::Result<()> {
+        self.scratch.clear();
+        record::encode_approval(
+            &mut self.scratch,
+            &Approval {
+                id: id.to_owned(),
+                kind,
+            },
+        );
+        self.append(kinds::APPROVAL, false)
+    }
+
+    /// Appends a change of the reasoning level, the permission mode, or both.
+    /// A change of the model is a [`Journal::model`] record.
+    pub fn settings(&mut self, level: Option<&str>, mode: Option<&str>) -> io::Result<()> {
+        self.scratch.clear();
+        record::encode_settings(
+            &mut self.scratch,
+            &Settings {
+                level: level.map(str::to_owned),
+                mode: mode.map(str::to_owned),
+            },
+        );
+        self.append(kinds::SETTINGS, false)
+    }
+
+    /// The number of the record this journal appended last, or of the last
+    /// record of the chain it continues before its first append.
+    pub fn record(&self) -> u64 {
+        self.records
+    }
+
     /// The bytes the encoder buffer keeps for the next record.
     pub fn buffered_bytes(&self) -> usize {
         self.scratch.capacity()
@@ -139,6 +181,8 @@ impl Journal {
         if self.scratch.capacity() > MAX_BUFFER {
             self.scratch = Vec::new();
         }
-        self.writer.append(kind, payload, base)
+        self.writer.append(kind, payload, base)?;
+        self.records += 1;
+        Ok(())
     }
 }

@@ -18,15 +18,13 @@ fn bin() -> &'static str {
     BIN
 }
 
-/// Runs `reagent` with the given arguments and returns its output.
+/// Runs `reagent` with the given arguments and returns its output. The state
+/// folder is a `state` folder in `tmp`, which the test deletes at its end.
 async fn run(tmp: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin())
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.join("state"))
         .env_remove("REAGENT_PROFILE")
         .args(args)
         .current_dir(tmp)
@@ -92,17 +90,15 @@ const SLOW_SCRIPT: &str = r#"{"replies": [{"calls": [
     {"name": "bash", "arguments": {"command": "sleep 30"}}
 ]}]}"#;
 
-/// Runs `reagent --provider fake:<f> -p -` with `input` piped to its stdin.
-async fn run_with_stdin(fake: &str, input: &[u8]) -> std::process::Output {
+/// Runs `reagent --provider fake:<f> -p -` with `input` piped to its stdin,
+/// and the state folder a `state` folder in `tmp`.
+async fn run_with_stdin(tmp: &Path, fake: &str, input: &[u8]) -> std::process::Output {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
     let mut child = Command::new(bin())
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.join("state"))
         .args(["--provider", fake, "-p", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -124,7 +120,7 @@ async fn run_with_stdin(fake: &str, input: &[u8]) -> std::process::Output {
 async fn a_dash_task_reads_the_task_from_stdin() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let fake = script(tmp.path(), r#"{"replies": [{"text": "from stdin"}]}"#).await;
-    let output = run_with_stdin(&fake, b"write the file\n").await;
+    let output = run_with_stdin(tmp.path(), &fake, b"write the file\n").await;
     assert!(
         output.status.success(),
         "exit {} stderr {}",
@@ -138,7 +134,7 @@ async fn a_dash_task_reads_the_task_from_stdin() {
 async fn an_empty_stdin_task_exits_2() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let fake = script(tmp.path(), r#"{"replies": [{"text": "x"}]}"#).await;
-    let output = run_with_stdin(&fake, b"").await;
+    let output = run_with_stdin(tmp.path(), &fake, b"").await;
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -151,7 +147,7 @@ async fn an_empty_stdin_task_exits_2() {
 async fn a_non_utf8_stdin_task_exits_2() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let fake = script(tmp.path(), r#"{"replies": [{"text": "x"}]}"#).await;
-    let output = run_with_stdin(&fake, &[0xff, 0xfe, 0x00]).await;
+    let output = run_with_stdin(tmp.path(), &fake, &[0xff, 0xfe, 0x00]).await;
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -193,10 +189,7 @@ async fn a_missing_key_exits_2() {
     let output = Command::new(bin())
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
         .args(["-p", "hi"])
         .current_dir(tmp.path())
         .env_remove("ANTHROPIC_API_KEY")
@@ -231,10 +224,7 @@ async fn ctrl_c_exits_130() {
     let child = Command::new(bin())
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
         .args(["--provider", &fake, "-p", "hi"])
         .current_dir(tmp.path())
         .stdout(std::process::Stdio::null())
@@ -329,10 +319,7 @@ async fn start_line_names_the_profile_a_run_reads() {
     let fake = script(tmp.path(), r#"{"replies": [{"text": "ok"}]}"#).await;
     let output = Command::new(bin())
         .env("XDG_CONFIG_HOME", tmp.path().join("config"))
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
         .env("HOME", tmp.path())
         .env_remove("REAGENT_PROFILE")
         .args(["--provider", &fake, "--profile", "work", "-p", "hi"])
@@ -399,10 +386,7 @@ async fn start_line_names_the_env_var_and_never_the_key() {
     let output = Command::new(bin())
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
         .env("XDG_CACHE_HOME", tmp.path().join("cache"))
         .env("HOME", tmp.path())
         .env("PRINT_START_KEY", KEY)
@@ -459,10 +443,7 @@ async fn a_retried_turn_prints_only_the_text_of_the_last_attempt() {
     let output = Command::new(BIN)
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
         .args(["--provider", &script_arg, "-p", "hi"])
         .current_dir(tmp.path())
         .env("ANTHROPIC_API_KEY", "sk-ant-test")

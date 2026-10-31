@@ -1,6 +1,7 @@
 //! Tests of the records the loop writes: their order, the sync before a
 //! side-effect call runs, the commit after a result and the base after a
-//! compaction.
+//! compaction, the wait and the answer of a call that asks a client, a
+//! settings change, the commit events and what a resume makes of them.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -8,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use reagent_ai::fake::FakeProvider;
-use reagent_ai::{AssistantMessage, Content, Message, StopReason, StreamEvent, Text, ToolSpec};
+use reagent_ai::{
+    AssistantMessage, Content, Message, StopReason, StreamEvent, Text, ToolCall, ToolSpec,
+};
+use reagent_config::permissions::PermissionMode;
 use reagent_store::{Header, Session};
 use serde::Deserialize;
 use serde_json::json;
@@ -17,10 +21,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{Agent, AgentConfig};
 use crate::compact::Compact;
-use crate::event::Event;
+use crate::event::{Event, TurnEndReason};
 use crate::journal::Journal;
-use crate::journal::record::{self, Record};
-use crate::tool::{Registry, Tool, ToolOutput};
+use crate::journal::record::{self, ApprovalKind, Aside, Record};
+use crate::journal::resume::{self, PendingCall};
+use crate::live::{self, Command, SendMode, Settings};
+use crate::tool::{EffectClass, Registry, Tool, ToolOutput};
 
 /// How often a test asks whether the writer thread wrote its line.
 const VISIBLE_POLLS: usize = 500;
@@ -463,5 +469,742 @@ async fn a_resumed_run_writes_no_base_and_no_copy() {
     assert!(
         child < 8 * 1024,
         "the child part holds no copy: {child} bytes"
+    );
+}
+
+/// A tool that may change the world and counts how often it ran.
+struct Poke {
+    spec: ToolSpec,
+    runs: Arc<Mutex<usize>>,
+}
+
+impl Tool for Poke {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn run<'a>(
+        &'a self,
+        _args: &'a str,
+        _cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            *self.runs.lock().expect("the runs lock") += 1;
+            ToolOutput::ok("poked")
+        })
+    }
+}
+
+/// A registry whose only tool writes to the world and counts its runs.
+fn poke_registry(runs: &Arc<Mutex<usize>>) -> Registry {
+    let mut registry = Registry::new();
+    registry.add(Poke {
+        spec: ToolSpec {
+            name: "poke".into(),
+            description: "Changes the world.".into(),
+            input_schema: json!({"type": "object"}),
+        },
+        runs: Arc::clone(runs),
+    });
+    registry
+}
+
+/// A tool that may change the world and never finishes, so a test can look at
+/// the journal while it runs.
+struct Hanging {
+    spec: ToolSpec,
+    started: Arc<tokio::sync::Notify>,
+}
+
+impl Tool for Hanging {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn run<'a>(
+        &'a self,
+        _args: &'a str,
+        _cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, ToolOutput> {
+        Box::pin(async move {
+            self.started.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+/// A guard that asks a client about every call.
+fn asking_guard() -> crate::guard::Guard {
+    let layer = reagent_config::Layer {
+        path: PathBuf::from("/c/config.toml"),
+        settings: reagent_config::Settings {
+            permissions: reagent_config::permissions::Lists {
+                default: Some("ask".into()),
+                ..Default::default()
+            },
+            ..reagent_config::Settings::default()
+        },
+    };
+    let rules = reagent_config::permissions::Rules::from_layers(&[layer], Path::new("/work"), None)
+        .expect("the rules build");
+    crate::guard::Guard::new(rules)
+}
+
+/// One assistant reply that calls one tool, as the model sent it.
+fn call_reply(id: &str, name: &str, args: &str) -> Message {
+    let call = Content::ToolCall(ToolCall {
+        id: Text::from(id),
+        name: Text::from(name),
+        arguments: Text::from(args),
+    });
+    let mut reply = AssistantMessage::new("fake", "fake-model", vec![call]);
+    reply.stop_reason = Some(StopReason::ToolUse);
+    Message::assistant(reply)
+}
+
+/// The approval records of `dir`, in order: the call id and the kind.
+fn approvals(dir: &Path) -> Vec<(String, ApprovalKind)> {
+    let Ok(session) = Session::open(dir) else {
+        return Vec::new();
+    };
+    session
+        .records()
+        .filter_map(Result::ok)
+        .filter_map(
+            |record| match record::decode_aside(record.kind, &record.payload) {
+                Ok(Some(Aside::Approval(approval))) => Some((approval.id, approval.kind)),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+/// The calls whose results are on the disk, in the order they were written.
+fn result_ids(dir: &Path) -> Vec<String> {
+    read_records(dir)
+        .iter()
+        .filter_map(|record| match record {
+            Record::Message(Message::ToolResult(result)) => Some(result.call_id.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The record each commit named, in order.
+fn commits(events: &[Event]) -> Vec<u64> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Committed { record } => Some(*record),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_result_is_on_the_disk_before_the_batch_ends() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let mut registry = Registry::new();
+    registry.add(Probe::new(
+        "peek",
+        true,
+        dir.path(),
+        &Arc::new(Mutex::new(Vec::new())),
+    ));
+    registry.add(Hanging {
+        spec: ToolSpec {
+            name: "hang".into(),
+            description: "Never finishes.".into(),
+            input_schema: json!({"type": "object"}),
+        },
+        started: Arc::clone(&started),
+    });
+    // A read and a call that writes: the read runs first, then the write.
+    let provider = FakeProvider::new(vec![tool_replies(&[
+        ("call_1", "peek", r#"{"id":"call_1"}"#),
+        ("call_2", "hang", "{}"),
+    ])]);
+    let (tx, _rx) = mpsc::channel(64);
+    let mut history = vec![Message::user("hello")];
+    let mut journal = journal(dir.path());
+    let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new());
+    {
+        let run = agent.run(&mut history, Some(&mut journal), &tx);
+        tokio::pin!(run);
+        tokio::select! {
+            () = started.notified() => {}
+            () = &mut run => panic!("the run ended before the call that writes started"),
+        }
+        // The loop takes the note of the read while its next call waits, so the
+        // read's result is committed while the write still runs.
+        let mut seen = Vec::new();
+        for _ in 0..VISIBLE_POLLS {
+            seen = result_ids(dir.path());
+            if !seen.is_empty() {
+                break;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(VISIBLE_WAIT) => {}
+                () = &mut run => panic!("the run ended while the call that writes ran"),
+            }
+        }
+        assert_eq!(
+            seen,
+            ["call_1"],
+            "the read is committed while the write runs"
+        );
+    }
+    // The process dies with the write still running: the read's result stays.
+    drop(agent);
+    journal.close().expect("close the journal");
+    assert_eq!(result_ids(dir.path()), ["call_1"]);
+}
+
+#[tokio::test]
+async fn commit_events_rise_and_are_one_per_commit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let provider = FakeProvider::new(vec![text_reply("done")]);
+    let registry = Registry::new();
+    let (tx, mut inbox) = live::channel();
+    let (events, mut rx) = mpsc::channel(64);
+    let mut history = Vec::new();
+    let mut journal = journal(dir.path());
+    let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new());
+
+    let session = live::run_live(
+        &mut agent,
+        &mut history,
+        Some(&mut journal),
+        &events,
+        &mut inbox,
+    );
+    let client = async {
+        tx.send(Command::Send {
+            client: 1,
+            text: Text::from("hello"),
+            mode: SendMode::Steer,
+        })
+        .await
+        .expect("the session is open");
+        drop(tx);
+        let mut seen = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let end = matches!(event, Event::RunEnd(_));
+            seen.push(event);
+            if end {
+                break;
+            }
+        }
+        seen
+    };
+    let (_, seen) = tokio::join!(session, client);
+    journal.close().expect("close the journal");
+
+    // The start of the run (a base and the history) is one commit, and the end
+    // of the turn (its message and its turn end) is the other.
+    let named = commits(&seen);
+    assert_eq!(named.len(), 2, "one event per commit: {seen:?}");
+    assert!(
+        named.windows(2).all(|pair| pair[0] < pair[1]),
+        "a commit never names a smaller record: {named:?}"
+    );
+    let held = read_records(dir.path()).len() as u64;
+    assert_eq!(
+        named.last().copied(),
+        Some(held),
+        "the last event names the last record of the part"
+    );
+}
+
+#[tokio::test]
+async fn a_run_without_an_inbox_sends_no_commit_event() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut registry = Registry::new();
+    registry.add(Probe::new(
+        "peek",
+        true,
+        dir.path(),
+        &Arc::new(Mutex::new(Vec::new())),
+    ));
+    let provider = FakeProvider::new(vec![
+        tool_replies(&[("call_1", "peek", r#"{"id":"call_1"}"#)]),
+        text_reply("done"),
+    ]);
+    let (tx, mut rx) = mpsc::channel(64);
+    let mut history = vec![Message::user("hello")];
+    let mut journal = journal(dir.path());
+
+    Agent::new(&provider, &registry, config(), CancellationToken::new())
+        .run(&mut history, Some(&mut journal), &tx)
+        .await;
+    drop(tx);
+    journal.close().expect("close the journal");
+    let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+
+    assert!(
+        commits(&events).is_empty(),
+        "a headless run names no record: {events:?}"
+    );
+    // The records are there all the same: only the events are held back.
+    assert!(read_records(dir.path()).len() > 1);
+}
+
+#[tokio::test]
+async fn a_set_of_the_level_and_the_mode_is_in_the_journal_and_a_resume() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let provider = FakeProvider::new(vec![text_reply("done")]);
+    let registry = Registry::new();
+    let (tx, mut inbox) = live::channel();
+    let (events, mut rx) = mpsc::channel(64);
+    let mut history = Vec::new();
+    let mut journal = journal(dir.path());
+    let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new())
+        .with_guard(asking_guard());
+
+    let session = live::run_live(
+        &mut agent,
+        &mut history,
+        Some(&mut journal),
+        &events,
+        &mut inbox,
+    );
+    let client = async {
+        tx.send(Command::Set {
+            client: 1,
+            settings: Settings {
+                level: Some(Text::from("high")),
+                mode: Some(PermissionMode::AcceptEdits),
+                ..Settings::default()
+            },
+        })
+        .await
+        .expect("the session is open");
+        tx.send(Command::Send {
+            client: 1,
+            text: Text::from("hello"),
+            mode: SendMode::Steer,
+        })
+        .await
+        .expect("the session is open");
+        drop(tx);
+        while let Some(event) = rx.recv().await {
+            if matches!(event, Event::RunEnd(_)) {
+                break;
+            }
+        }
+    };
+    tokio::join!(session, client);
+    journal.close().expect("close the journal");
+
+    let parent = Session::open(dir.path()).expect("open the session");
+    let resumed = resume::load(&parent).expect("resume");
+    drop(parent);
+    assert_eq!(
+        resumed.level.as_deref(),
+        Some("high"),
+        "a resume carries the level"
+    );
+    assert_eq!(
+        resumed.mode,
+        Some(PermissionMode::AcceptEdits),
+        "a resume carries the mode"
+    );
+    // The model keeps its own record, which this change did not touch.
+    assert_eq!(resumed.model, "fake-model");
+}
+
+#[tokio::test]
+async fn a_resume_of_a_waiting_approval_asks_the_same_question() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let runs = Arc::new(Mutex::new(0usize));
+    let registry = poke_registry(&runs);
+    let provider = FakeProvider::new(vec![tool_replies(&[("call_1", "poke", "{}")])]);
+    let (tx, mut inbox) = live::channel();
+    let (events, mut rx) = mpsc::channel(64);
+    let mut history = Vec::new();
+    let mut journal = journal(dir.path());
+    let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new())
+        .with_guard(asking_guard());
+    tx.send(Command::Send {
+        client: 1,
+        text: Text::from("hello"),
+        mode: SendMode::Steer,
+    })
+    .await
+    .expect("the session is open");
+
+    // The call waits for a client, and the process dies before any answer.
+    {
+        let run = agent.run_with_inbox(&mut history, Some(&mut journal), &events, &mut inbox);
+        tokio::pin!(run);
+        loop {
+            tokio::select! {
+                event = rx.recv() => match event {
+                    Some(Event::ApprovalRequest(request)) => {
+                        assert_eq!(request.tool.as_ref(), "poke");
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("the events ended before the call asked"),
+                },
+                () = &mut run => panic!("the run ended before the call asked"),
+            }
+        }
+    }
+    assert_eq!(
+        *runs.lock().expect("the runs lock"),
+        0,
+        "the call never ran"
+    );
+    assert_eq!(
+        approvals(dir.path()),
+        [("call_1".to_owned(), ApprovalKind::Wait)],
+        "the wait is on the disk with no answer"
+    );
+
+    // A resume finds the call pending: its last approval record is a wait.
+    let parent = Session::open(dir.path()).expect("open the session");
+    let resumed = resume::load(&parent).expect("resume");
+    drop(parent);
+    assert_eq!(
+        resumed.pending,
+        [PendingCall {
+            id: "call_1".into(),
+            name: "poke".into(),
+            class: Some(EffectClass::LocalReversible),
+        }]
+    );
+    assert!(
+        !resumed
+            .history
+            .iter()
+            .any(|message| matches!(message, Message::ToolResult(_))),
+        "a call that never ran gets no interrupted result"
+    );
+
+    // The rerun in a live session asks the same question, and the call does
+    // not run before an answer arrives; the answer reaches the disk before the
+    // call runs.
+    let (events, mut rx) = mpsc::channel(64);
+    let (tx, mut inbox) = live::channel();
+    let provider = FakeProvider::new(Vec::new());
+    let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new())
+        .with_guard(asking_guard());
+    let mut history = resumed.history.clone();
+    let mut open = Some(&mut journal);
+    let reason = {
+        let run = agent.run_pending_with_inbox(
+            &mut history,
+            &mut open,
+            &events,
+            &resumed.pending,
+            &mut inbox,
+        );
+        tokio::pin!(run);
+        loop {
+            tokio::select! {
+                event = rx.recv() => match event {
+                    Some(Event::ApprovalRequest(request)) => {
+                        assert_eq!(request.tool.as_ref(), "poke", "the same question");
+                        assert_eq!(
+                            *runs.lock().expect("the runs lock"),
+                            0,
+                            "no answer came, so the call still has not run"
+                        );
+                        tx.send(Command::Approve {
+                            client: 1,
+                            id: request.id,
+                            answer: crate::guard::Answer::Once,
+                        })
+                        .await
+                        .expect("the session is open");
+                    }
+                    Some(_) => {}
+                    None => panic!("the events ended before the rerun ended"),
+                },
+                reason = &mut run => break reason,
+            }
+        }
+    };
+    assert_eq!(reason, TurnEndReason::EndTurn);
+    assert_eq!(*runs.lock().expect("the runs lock"), 1, "the answer ran it");
+    journal.close().expect("close the journal");
+    assert_eq!(
+        approvals(dir.path()),
+        [
+            ("call_1".to_owned(), ApprovalKind::Wait),
+            ("call_1".to_owned(), ApprovalKind::Wait),
+            ("call_1".to_owned(), ApprovalKind::Run),
+        ],
+        "the second ask and its answer are on the disk"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_edit_does_not_run_again_and_its_result_says_so() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let runs = Arc::new(Mutex::new(0usize));
+    let registry = poke_registry(&runs);
+    let (tx, _rx) = mpsc::channel(64);
+    let mut journal = journal(dir.path());
+    let user = Message::user("hello");
+    let reply = call_reply("call_1", "poke", "{}");
+    journal.message(&user).expect("append");
+    journal.message(&reply).expect("append");
+    journal
+        .call_start("call_1", "poke", EffectClass::LocalReversible)
+        .expect("call start");
+    journal.commit().expect("commit");
+    journal.close().expect("close the journal");
+
+    let parent = Session::open(dir.path()).expect("open the session");
+    let resumed = resume::load(&parent).expect("resume");
+    drop(parent);
+    assert!(
+        resumed.pending.is_empty(),
+        "a call that may have run is never rerun"
+    );
+
+    // The next request carries the interrupted result and runs nothing.
+    let provider = FakeProvider::new(vec![text_reply("done")]);
+    let mut history = resumed.history.clone();
+    Agent::new(&provider, &registry, config(), CancellationToken::new())
+        .run(&mut history, None, &tx)
+        .await;
+
+    let result = history
+        .iter()
+        .find_map(|message| match message {
+            Message::ToolResult(result) => Some(result.clone()),
+            _ => None,
+        })
+        .expect("the interrupted result");
+    assert_eq!(result.call_id.as_ref(), "call_1");
+    assert!(result.is_error);
+    assert!(
+        result.content.starts_with("interrupted"),
+        "{}",
+        result.content
+    );
+    assert_eq!(
+        *runs.lock().expect("the runs lock"),
+        0,
+        "the edit did not run again"
+    );
+    assert_eq!(
+        provider.seen()[0].messages,
+        3,
+        "the request carries the interrupted result"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_read_runs_again_and_its_result_reaches_the_next_request() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut registry = Registry::new();
+    registry.add(Probe::new(
+        "peek",
+        true,
+        dir.path(),
+        &Arc::new(Mutex::new(Vec::new())),
+    ));
+    let (tx, _rx) = mpsc::channel(64);
+    let mut journal = journal(dir.path());
+    let reply = call_reply("call_1", "peek", r#"{"id":"call_1"}"#);
+    journal.message(&Message::user("hello")).expect("append");
+    journal.message(&reply).expect("append");
+    journal.commit().expect("commit");
+    journal.close().expect("close the journal");
+
+    // A read writes no call start, so a resume cannot tell whether it ran: it
+    // runs again.
+    let parent = Session::open(dir.path()).expect("open the session");
+    let resumed = resume::load(&parent).expect("resume");
+    drop(parent);
+    assert_eq!(
+        resumed.pending,
+        [PendingCall {
+            id: "call_1".into(),
+            name: "peek".into(),
+            class: None,
+        }]
+    );
+
+    let mut history = resumed.history.clone();
+    let provider = FakeProvider::new(Vec::new());
+    let mut open = None;
+    let reason = Agent::new(&provider, &registry, config(), CancellationToken::new())
+        .run_pending(&mut history, &mut open, &tx, &resumed.pending)
+        .await;
+    assert_eq!(reason, TurnEndReason::EndTurn);
+    assert_eq!(
+        history.last(),
+        Some(&Message::tool_result("call_1", "ran call_1", false)),
+        "the rerun answered the call"
+    );
+
+    // The next request carries that result.
+    let provider = FakeProvider::new(vec![text_reply("done")]);
+    Agent::new(&provider, &registry, config(), CancellationToken::new())
+        .run(&mut history, None, &tx)
+        .await;
+    assert_eq!(provider.seen()[0].messages, 3);
+}
+
+#[tokio::test]
+async fn a_set_level_and_mode_survive_a_compaction_base_on_resume() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let archive = tempfile::tempdir().expect("archive dir");
+    let provider = FakeProvider::new(vec![text_reply("done")]);
+    let registry = Registry::new();
+    let (tx, mut inbox) = live::channel();
+    let (events, mut rx) = mpsc::channel(64);
+    // A history the compaction can shorten, as in `a_base_after_compaction`.
+    let mut history = vec![
+        Message::user("hello"),
+        Message::assistant(AssistantMessage::new(
+            "fake",
+            "fake-model",
+            vec![Content::text("hi")],
+        )),
+        Message::user("again"),
+        Message::assistant(AssistantMessage::new(
+            "fake",
+            "fake-model",
+            vec![Content::text("x".repeat(100_000))],
+        )),
+        Message::tool_result("call_0", "ok", false),
+    ];
+    let mut journal = journal(dir.path());
+    let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new())
+        .with_guard(asking_guard())
+        .with_compact(Compact::with_budget(0, archive.path()));
+
+    let session = live::run_live(
+        &mut agent,
+        &mut history,
+        Some(&mut journal),
+        &events,
+        &mut inbox,
+    );
+    let client = async {
+        tx.send(Command::Set {
+            client: 1,
+            settings: Settings {
+                level: Some(Text::from("high")),
+                mode: Some(PermissionMode::AcceptEdits),
+                ..Settings::default()
+            },
+        })
+        .await
+        .expect("the session is open");
+        tx.send(Command::Send {
+            client: 1,
+            text: Text::from("go"),
+            mode: SendMode::Steer,
+        })
+        .await
+        .expect("the session is open");
+        drop(tx);
+        let mut compacted = false;
+        while let Some(event) = rx.recv().await {
+            compacted |= matches!(event, Event::Compacted { .. });
+            if matches!(event, Event::RunEnd(_)) {
+                break;
+            }
+        }
+        compacted
+    };
+    let ((), compacted) = tokio::join!(session, client);
+    journal.close().expect("close the journal");
+    assert!(compacted, "the run compacted");
+
+    // A resume reads from the compaction's base, so the settings follow it.
+    let parent = Session::open(dir.path()).expect("open the session");
+    let resumed = resume::load(&parent).expect("resume");
+    drop(parent);
+    assert_eq!(
+        resumed.state.compaction, 1,
+        "the resume starts at the compaction"
+    );
+    assert_eq!(resumed.level.as_deref(), Some("high"));
+    assert_eq!(resumed.mode, Some(PermissionMode::AcceptEdits));
+}
+
+#[tokio::test]
+async fn a_tool_result_commit_event_comes_before_its_result_event() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut registry = Registry::new();
+    registry.add(Probe::new(
+        "peek",
+        true,
+        dir.path(),
+        &Arc::new(Mutex::new(Vec::new())),
+    ));
+    let provider = FakeProvider::new(vec![
+        tool_replies(&[("call_1", "peek", r#"{"id":"call_1"}"#)]),
+        text_reply("done"),
+    ]);
+    let (tx, mut inbox) = live::channel();
+    let (events, mut rx) = mpsc::channel(64);
+    let mut history = Vec::new();
+    let mut journal = journal(dir.path());
+    let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new());
+
+    let session = live::run_live(
+        &mut agent,
+        &mut history,
+        Some(&mut journal),
+        &events,
+        &mut inbox,
+    );
+    let client = async {
+        tx.send(Command::Send {
+            client: 1,
+            text: Text::from("hello"),
+            mode: SendMode::Steer,
+        })
+        .await
+        .expect("the session is open");
+        drop(tx);
+        let mut seen = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let end = matches!(event, Event::RunEnd(_));
+            seen.push(event);
+            if end {
+                break;
+            }
+        }
+        seen
+    };
+    let (_, seen) = tokio::join!(session, client);
+    journal.close().expect("close the journal");
+
+    let named = commits(&seen);
+    assert!(
+        named.windows(2).all(|pair| pair[0] < pair[1]),
+        "a commit never names a smaller record: {named:?}"
+    );
+    // The result is committed, and named, while the batch still runs, before
+    // the loop sends its result event.
+    let result_at = seen
+        .iter()
+        .position(|event| matches!(event, Event::ToolResult { .. }))
+        .expect("a result event");
+    let ready_at = seen
+        .iter()
+        .position(|event| matches!(event, Event::ToolCallReady { .. }))
+        .expect("a call event");
+    assert!(
+        seen[ready_at..result_at]
+            .iter()
+            .any(|event| matches!(event, Event::Committed { .. })),
+        "{seen:?}"
+    );
+    assert_eq!(
+        named.last().copied(),
+        Some(read_records(dir.path()).len() as u64),
+        "the last event names the last record of the part"
     );
 }

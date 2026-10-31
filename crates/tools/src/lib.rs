@@ -30,8 +30,6 @@ fn resolve(working_dir: &Path, path: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use reagent_agent::tool::{EffectClass, Tool as _};
 
     use crate::bash::Bash;
@@ -43,12 +41,14 @@ mod tests {
 
     #[test]
     fn tool_effect_classes() {
-        let dir = Path::new("/tmp/reagent-effect-class");
-        assert_eq!(Read::new(dir).effect(), EffectClass::Read);
-        assert_eq!(Grep::new(dir).effect(), EffectClass::Read);
-        assert_eq!(Find::new(dir).effect(), EffectClass::Read);
-        assert_eq!(Edit::new(dir).effect(), EffectClass::LocalReversible);
-        assert_eq!(Write::new(dir).effect(), EffectClass::LocalReversible);
-        assert_eq!(Bash::new(dir).effect(), EffectClass::LocalReversible);
+        // A path inside a temp folder that the test never makes.
+        let temp = tempfile::tempdir().expect("makes a temp folder");
+        let dir = temp.path().join("absent");
+        assert_eq!(Read::new(&dir).effect(), EffectClass::Read);
+        assert_eq!(Grep::new(&dir).effect(), EffectClass::Read);
+        assert_eq!(Find::new(&dir).effect(), EffectClass::Read);
+        assert_eq!(Edit::new(&dir).effect(), EffectClass::LocalReversible);
+        assert_eq!(Write::new(&dir).effect(), EffectClass::LocalReversible);
+        assert_eq!(Bash::new(&dir).effect(), EffectClass::LocalReversible);
     }
 }

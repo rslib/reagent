@@ -36,6 +36,11 @@ LIMIT_PCT=2
 # directory reads and pipe read sizes vary between runs of the same code, so
 # their counts move by up to about 10%; the other benches repeat exactly.
 NOISY_LIMIT_PCT=12
+# A rise under this many instructions or estimated cycles never counts, whatever
+# its percentage: on the smallest benches one cache line moved by an unrelated
+# change in code layout is a few percent (orientation_six: 395 instructions, the
+# same in both, and 1282 against 1316 estimated cycles, one more simulated miss).
+MIN_RISE=100
 BASELINE=base
 BENCH_TARGET=instructions
 # The cli package is `reagent` and lives in crates/cli; the base-package loop
@@ -120,10 +125,11 @@ pct_change() {
     }'
 }
 
-# Whether `new` rose more than `limit` percent over `old`.
+# Whether `new` rose more than `limit` percent over `old`, and by at least
+# MIN_RISE.
 over_limit() {
-    awk -v n="$1" -v o="$2" -v l="$3" 'BEGIN {
-        exit !(o > 0 && (n - o) / o * 100 > l)
+    awk -v n="$1" -v o="$2" -v l="$3" -v m="$MIN_RISE" 'BEGIN {
+        exit !(o > 0 && (n - o) / o * 100 > l && n - o >= m)
     }'
 }
 
@@ -285,7 +291,7 @@ gate() {
 
     new_log=$tmp/new.out
     new_err=$tmp/new.err
-    say "running the benches of this tree against baseline \"$BASELINE\", limit ${LIMIT_PCT}% on Ir and Estimated Cycles"
+    say "running the benches of this tree against baseline \"$BASELINE\", limit ${LIMIT_PCT}% on Ir and Estimated Cycles, rises under ${MIN_RISE} ignored"
     set +e
     run_benches "--baseline=$BASELINE" >"$new_log" 2>"$new_err"
     rc=$?

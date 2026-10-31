@@ -551,9 +551,9 @@ mod tests {
         assert!(extract(b"nope", &["fi"]).is_err());
     }
 
-    /// A temp folder for the catalogue cache.
-    fn temp_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("reagent-models-dev-{tag}-{}", std::process::id()))
+    /// A temp folder for the catalogue cache, removed when it drops.
+    fn folder() -> tempfile::TempDir {
+        tempfile::tempdir().expect("makes a temp folder")
     }
 
     /// Answers every request with `body`, and counts them.
@@ -583,12 +583,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[expect(clippy::disallowed_methods, reason = "the test removes its folder")]
     async fn models_dev_a_fresh_cache_makes_no_request() {
-        let dir = temp_dir("fresh");
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = folder();
+        let dir = temp.path();
         let (url, count) = serve(SAMPLE_BODY).await;
-        let found = load(&dir, &["deepseek"], 1_000, &url)
+        let found = load(dir, &["deepseek"], 1_000, &url)
             .await
             .expect("the first load fetches");
         assert_eq!(
@@ -597,7 +596,7 @@ mod tests {
         );
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
         // The cache written a moment ago still counts as fresh at that time.
-        let again = load(&dir, &["deepseek"], 1_000 + FRESH_SECS - 1, &url)
+        let again = load(dir, &["deepseek"], 1_000 + FRESH_SECS - 1, &url)
             .await
             .expect("the cache loads");
         assert_eq!(again, found);
@@ -606,35 +605,31 @@ mod tests {
             1,
             "the fresh cache is used, not the network"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    #[expect(clippy::disallowed_methods, reason = "the test removes its folder")]
     async fn models_dev_a_stale_cache_is_refetched() {
-        let dir = temp_dir("stale");
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = folder();
+        let dir = temp.path();
         let (url, count) = serve(SAMPLE_BODY).await;
-        load(&dir, &["deepseek"], 1_000, &url)
+        load(dir, &["deepseek"], 1_000, &url)
             .await
             .expect("the first load fetches");
-        load(&dir, &["deepseek"], 1_000 + FRESH_SECS, &url)
+        load(dir, &["deepseek"], 1_000 + FRESH_SECS, &url)
             .await
             .expect("a stale cache is refetched");
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
         // A fresh cache that lacks an id is refetched too.
-        load(&dir, &["deepseek", "openai"], 2_000, &url)
+        load(dir, &["deepseek", "openai"], 2_000, &url)
             .await
             .expect("a missing id refetches");
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    #[expect(clippy::disallowed_methods, reason = "the test removes its folder")]
     async fn models_dev_a_fetch_error_without_a_cache_is_an_error() {
-        let dir = temp_dir("error");
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = folder();
+        let dir = temp.path();
         // A port that nothing listens on: the fetch fails to connect.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -642,17 +637,17 @@ mod tests {
         let address = listener.local_addr().expect("the bound address");
         drop(listener);
         let url = format!("http://{address}/api.json");
-        let error = load(&dir, &["deepseek"], 1_000, &url)
+        let error = load(dir, &["deepseek"], 1_000, &url)
             .await
             .expect_err("a fetch error without a cache is the error");
         assert!(!error.is_empty());
         // With a stale cache the error is not returned.
         let (url, _count) = serve(SAMPLE_BODY).await;
-        load(&dir, &["deepseek"], 1_000, &url)
+        load(dir, &["deepseek"], 1_000, &url)
             .await
             .expect("the first load fetches");
         let stale = load(
-            &dir,
+            dir,
             &["deepseek"],
             1_000 + FRESH_SECS,
             "http://127.0.0.1:1/api.json",
@@ -660,47 +655,42 @@ mod tests {
         .await
         .expect("a stale cache answers a failed fetch");
         assert_eq!(stale["deepseek"][0].id, "deepseek-flash");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    #[expect(clippy::disallowed_methods, reason = "the test removes its folder")]
     async fn models_dev_the_cache_holds_only_the_ids_asked_for() {
-        let dir = temp_dir("only");
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = folder();
+        let dir = temp.path();
         let (url, _count) = serve(SAMPLE_BODY).await;
-        load(&dir, &["openai", "nope"], 1_000, &url)
+        load(dir, &["openai", "nope"], 1_000, &url)
             .await
             .expect("the load fetches");
-        let cache = read(&dir).expect("the cache is written");
+        let cache = read(dir).expect("the cache is written");
         assert_eq!(cache.fetched_at, 1_000);
         assert!(cache.providers.contains_key("openai"));
         assert_eq!(cache.providers.get("nope"), Some(&Vec::new()));
         assert!(!cache.providers.contains_key("deepseek"));
-        assert_eq!(path(&dir), dir.join("models.dev.json"));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(path(dir), dir.join("models.dev.json"));
     }
 
     #[tokio::test]
-    #[expect(clippy::disallowed_methods, reason = "the test removes its folder")]
     async fn models_dev_a_second_provider_keeps_the_first_in_the_cache() {
-        let dir = temp_dir("merge");
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = folder();
+        let dir = temp.path();
         let (url, count) = serve(SAMPLE_BODY).await;
-        load(&dir, &["deepseek"], 1_000, &url)
+        load(dir, &["deepseek"], 1_000, &url)
             .await
             .expect("the first load fetches");
-        load(&dir, &["openai"], 1_500, &url)
+        load(dir, &["openai"], 1_500, &url)
             .await
             .expect("a new id fetches");
-        let cache = read(&dir).expect("the cache is written");
+        let cache = read(dir).expect("the cache is written");
         assert!(cache.providers.contains_key("deepseek"));
         assert!(cache.providers.contains_key("openai"));
-        load(&dir, &["deepseek"], 1_600, &url)
+        load(dir, &["deepseek"], 1_600, &url)
             .await
             .expect("the merged cache answers");
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The sample as a reply body a fake server can serve.

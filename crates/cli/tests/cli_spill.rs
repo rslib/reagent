@@ -12,15 +12,12 @@ use tokio::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_reagent");
 
 /// Runs `reagent` with `$TMPDIR` set to `tmp`, which makes the spill root its
-/// own.
+/// own, and with the state folder a `state` folder in `tmp`.
 async fn run(tmp: &Path, args: &[&str]) -> std::process::Output {
     Command::new(BIN)
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.join("state"))
         .env_remove("REAGENT_PROFILE")
         .env("TMPDIR", tmp)
         .args(args)

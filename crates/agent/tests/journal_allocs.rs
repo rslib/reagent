@@ -47,6 +47,9 @@ const BLOCKS_PER_DECODED_TURN: f64 = 8.0;
 /// The bytes of the tool result the buffer test appends.
 const HUGE_RESULT: usize = 4 * 1024 * 1024;
 
+/// How many turns the stuck-policy case measures; it keeps the smallest count.
+const SAMPLES: usize = 5;
+
 /// The most blocks one stuck-policy turn may allocate: the counter table and
 /// little else. Parsing the arguments into a `Value` cost 11 before the fix.
 const BLOCKS_PER_TURN: u64 = 4;
@@ -219,28 +222,33 @@ fn perf_stuck_write_turn_does_not_copy_the_content() {
         tools: &calls,
         changed_files: None,
     };
-    let mut policy = Stuck::default();
+    // dhat counts every thread, and a thread an earlier test left can still
+    // allocate after it let go of the lock: the smallest of several turns,
+    // each with a fresh policy, is the turn's own count. A copy of the 1 MB
+    // content shows in every one of them.
+    let (blocks, bytes) = (0..SAMPLES)
+        .map(|_| {
+            let mut policy = Stuck::default();
+            // Testing mode keeps dhat from writing dhat-heap.json on drop.
+            let profiler = Profiler::builder().testing().build();
+            let decision = policy.after_turn(&view);
+            let stats = HeapStats::get();
+            drop(profiler);
+            assert_eq!(decision, Decision::Continue);
+            (stats.total_blocks, stats.total_bytes)
+        })
+        .fold((u64::MAX, u64::MAX), |(blocks, bytes), (b, n)| {
+            (blocks.min(b), bytes.min(n))
+        });
 
-    // Testing mode keeps dhat from writing dhat-heap.json on drop.
-    let profiler = Profiler::builder().testing().build();
-    let decision = policy.after_turn(&view);
-    let stats = HeapStats::get();
-    drop(profiler);
-
-    eprintln!(
-        "stuck write turn: {} blocks, {} bytes",
-        stats.total_blocks, stats.total_bytes
-    );
-    assert_eq!(decision, Decision::Continue);
+    eprintln!("stuck write turn: {blocks} blocks, {bytes} bytes");
     assert!(
-        stats.total_blocks <= BLOCKS_PER_TURN,
-        "{} blocks for one write turn, over {BLOCKS_PER_TURN}",
-        stats.total_blocks
+        blocks <= BLOCKS_PER_TURN,
+        "{blocks} blocks for one write turn, over {BLOCKS_PER_TURN}"
     );
     assert!(
-        stats.total_bytes < BYTES_PER_TURN,
-        "{} bytes for one write turn, over {BYTES_PER_TURN}: the 1 MB content was copied",
-        stats.total_bytes
+        bytes < BYTES_PER_TURN,
+        "{bytes} bytes for one write turn, over {BYTES_PER_TURN}: the 1 MB content was copied"
     );
 }
 

@@ -5,6 +5,7 @@
 //! line and headers and answers with a short canned SSE reply. No real API is
 //! called, and no key value is ever printed.
 
+use std::path::Path;
 use std::process::Output;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -89,16 +90,14 @@ const RESPONSES_REPLY: &str = concat!(
     "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
 );
 
-/// Runs the binary with `args`, `env` set and both default key vars removed.
-async fn run(args: &[&str], env: &[(&str, &str)]) -> Output {
+/// Runs the binary with `args`, `env` set, both default key vars removed and
+/// the state folder `state`, which the test deletes at its end.
+async fn run(state: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut command = Command::new(BIN);
     command.args(args);
     // The user's real config must not change the test.
     command.env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config");
-    command.env(
-        "XDG_STATE_HOME",
-        std::env::temp_dir().join("reagent-test-state"),
-    );
+    command.env("XDG_STATE_HOME", state);
     command.env_remove("ANTHROPIC_API_KEY");
     command.env_remove("OPENAI_API_KEY");
     for (name, value) in env {
@@ -127,7 +126,9 @@ fn assert_key_hidden(output: &Output, key: &str) {
 #[tokio::test]
 async fn provider_select_anthropic_posts_to_messages() {
     let (base, recorded) = serve(ANTHROPIC_REPLY).await;
+    let state = tempfile::tempdir().expect("state dir");
     let output = run(
+        state.path(),
         &[
             "--provider",
             "anthropic",
@@ -153,7 +154,9 @@ async fn provider_select_anthropic_posts_to_messages() {
 #[tokio::test]
 async fn provider_select_openai_chat_posts_to_chat_completions() {
     let (base, recorded) = serve(CHAT_REPLY).await;
+    let state = tempfile::tempdir().expect("state dir");
     let output = run(
+        state.path(),
         &[
             "--provider",
             "openai-chat",
@@ -181,7 +184,9 @@ async fn provider_select_openai_chat_posts_to_chat_completions() {
 #[tokio::test]
 async fn provider_select_openai_responses_posts_to_responses() {
     let (base, recorded) = serve(RESPONSES_REPLY).await;
+    let state = tempfile::tempdir().expect("state dir");
     let output = run(
+        state.path(),
         &[
             "--provider",
             "openai-responses",
@@ -209,7 +214,9 @@ async fn provider_select_openai_responses_posts_to_responses() {
 #[tokio::test]
 async fn provider_select_the_key_env_can_be_chosen() {
     let (base, recorded) = serve(ANTHROPIC_REPLY).await;
+    let state = tempfile::tempdir().expect("state dir");
     let output = run(
+        state.path(),
         &[
             "--provider",
             "anthropic",
@@ -231,7 +238,9 @@ async fn provider_select_the_key_env_can_be_chosen() {
 
 #[tokio::test]
 async fn provider_select_a_missing_key_exits_2_with_the_variable_name() {
+    let state = tempfile::tempdir().expect("state dir");
     let output = run(
+        state.path(),
         &[
             "--provider",
             "openai-responses",
@@ -252,7 +261,9 @@ async fn provider_select_a_missing_key_exits_2_with_the_variable_name() {
 
 #[tokio::test]
 async fn provider_select_a_named_missing_key_exits_2_with_its_name() {
+    let state = tempfile::tempdir().expect("state dir");
     let output = run(
+        state.path(),
         &[
             "--provider",
             "anthropic",
@@ -275,7 +286,9 @@ async fn provider_select_a_named_missing_key_exits_2_with_its_name() {
 
 #[tokio::test]
 async fn provider_select_an_empty_key_var_exits_2() {
+    let state = tempfile::tempdir().expect("state dir");
     let output = run(
+        state.path(),
         &[
             "--provider",
             "openai-chat",

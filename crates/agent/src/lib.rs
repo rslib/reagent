@@ -10,6 +10,7 @@ pub mod event;
 pub mod guard;
 pub mod journal;
 pub mod leak;
+pub mod live;
 pub mod mask;
 pub mod policy;
 pub mod repair;

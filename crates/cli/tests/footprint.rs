@@ -62,10 +62,7 @@ async fn a_long_scripted_run_stays_within_the_footprint_budget() {
     let output = Command::new(BIN)
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
         .args(["-p", "task", "--json", "--provider"])
         .arg(format!("fake:{}", script.display()))
         .arg("--cwd")

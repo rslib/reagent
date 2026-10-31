@@ -10,10 +10,11 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 
 use reagent_ai::{Content, Message, Text};
+use reagent_config::permissions::PermissionMode;
 use reagent_store::Session;
 
 use crate::journal::Journal;
-use crate::journal::record::{self, Record};
+use crate::journal::record::{self, ApprovalKind, Aside, Record};
 use crate::journal::state::State;
 use crate::tool::EffectClass;
 
@@ -43,6 +44,10 @@ pub struct Resumed {
     pub pending: Vec<PendingCall>,
     /// Whether the last turn has no `TURN_END`.
     pub open_turn: bool,
+    /// The reasoning level the run last moved to, when a settings record says.
+    pub level: Option<Text>,
+    /// The permission mode the run last moved to, when a settings record says.
+    pub mode: Option<PermissionMode>,
 }
 
 /// A tool call a resumed run has to run again.
@@ -105,18 +110,43 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
         recorded: 0,
         pending: Vec::new(),
         open_turn: false,
+        level: None,
+        mode: None,
     };
     // The class of each call that started, in the order it started.
     let mut started: Vec<(String, String, EffectClass)> = Vec::new();
     let mut answered: HashSet<Text> = HashSet::new();
+    // The kind of the last approval record of each call.
+    let mut approvals: HashMap<String, ApprovalKind> = HashMap::new();
     // The tool calls of the last assistant message, in the order sent.
     let mut last_calls: Vec<(Text, Text)> = Vec::new();
+    // The results that follow the last assistant message. A batch commits each
+    // result as it returns, so they may be out of call order.
+    let mut trailing: Vec<Message> = Vec::new();
     // The provider and model of the last assistant reply, for a log with no base.
     let mut last_provider: Option<Text> = None;
     let mut last_model: Option<Text> = None;
     for record in session.records_from(from) {
         let record = record?;
         last = record.seq;
+        // An approval or a settings change is not part of the replayed history;
+        // it decides what the history means.
+        if let Some(aside) = record::decode_aside(record.kind, &record.payload)? {
+            match aside {
+                Aside::Approval(approval) => {
+                    approvals.insert(approval.id, approval.kind);
+                }
+                Aside::Settings(change) => {
+                    if let Some(level) = change.level {
+                        resumed.level = Some(Text::from(level));
+                    }
+                    if let Some(mode) = change.mode {
+                        resumed.mode = mode.parse().ok();
+                    }
+                }
+            }
+            continue;
+        }
         let decoded = record::decode(record.kind, &record.payload)?;
         // The turn a fork stops at ends the read, and the last record read is
         // the turn end the new part forks at.
@@ -124,6 +154,11 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
             (Record::TurnEnd(end), Some(turn)) => end.turn == turn,
             _ => false,
         };
+        // A record that is not a tool result ends the results of the reply
+        // before it, which are in call order from here on.
+        if !matches!(decoded, Record::Message(Message::ToolResult(_))) {
+            ordered(&mut resumed.history, &mut trailing, &last_calls);
+        }
         match decoded {
             Record::Message(message) => {
                 match &message {
@@ -134,6 +169,9 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
                     }
                     Message::ToolResult(result) => {
                         answered.insert(result.call_id.clone());
+                        trailing.push(message);
+                        resumed.open_turn = true;
+                        continue;
                     }
                     Message::User { .. } => {}
                 }
@@ -155,7 +193,10 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
                 resumed.history.clear();
                 started.clear();
                 answered.clear();
+                approvals.clear();
                 last_calls.clear();
+                resumed.level = None;
+                resumed.mode = None;
             }
             Record::Model(change) => {
                 resumed.state.provider = change.provider;
@@ -168,6 +209,7 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
             break;
         }
     }
+    ordered(&mut resumed.history, &mut trailing, &last_calls);
     if let Some(turn) = until
         && !stopped
     {
@@ -178,7 +220,7 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
     }
     // Everything read so far is on the disk; what `settle` adds is not.
     resumed.recorded = resumed.history.len();
-    settle(&mut resumed, &started, &answered, &last_calls);
+    settle(&mut resumed, &started, &answered, &approvals, &last_calls);
     if resumed.state.provider.is_empty()
         && let Some(provider) = last_provider
     {
@@ -194,11 +236,35 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
     Ok((resumed, last))
 }
 
+/// Puts the tool results of the last assistant message in the order of its
+/// calls and appends them to the history.
+///
+/// The log may hold the results of one reply in the order they finished; the
+/// history the model saw is in the order the reply asked for the calls.
+fn ordered(history: &mut Vec<Message>, trailing: &mut Vec<Message>, last_calls: &[(Text, Text)]) {
+    if trailing.is_empty() {
+        return;
+    }
+    let mut results = std::mem::take(trailing);
+    for (id, _) in last_calls {
+        let Some(at) = results.iter().position(
+            |message| matches!(message, Message::ToolResult(result) if result.call_id == *id),
+        ) else {
+            continue;
+        };
+        history.push(results.remove(at));
+    }
+    // A result no call of the reply names, which a log cut in an odd place
+    // leaves behind, keeps its place after the ones that do.
+    history.append(&mut results);
+}
+
 /// Applies the crash rule to the calls without a result.
 fn settle(
     resumed: &mut Resumed,
     started: &[(String, String, EffectClass)],
     answered: &HashSet<Text>,
+    approvals: &HashMap<String, ApprovalKind>,
     last_calls: &[(Text, Text)],
 ) {
     let classes: HashMap<&str, EffectClass> = started
@@ -212,7 +278,13 @@ fn settle(
         if answered.contains(id) || !seen.insert(id.clone()) {
             continue;
         }
-        settle_one(resumed, id, name, classes.get(&**id).copied());
+        settle_one(
+            resumed,
+            id,
+            name,
+            classes.get(&**id).copied(),
+            approvals.get(&**id).copied(),
+        );
     }
 }
 
@@ -230,24 +302,32 @@ fn unasked(
 }
 
 /// Applies the crash rule to one call without a result.
-fn settle_one(resumed: &mut Resumed, id: &str, name: &str, class: Option<EffectClass>) {
-    match class {
+fn settle_one(
+    resumed: &mut Resumed,
+    id: &str,
+    name: &str,
+    class: Option<EffectClass>,
+    approval: Option<ApprovalKind>,
+) {
+    // A call whose last approval record is a wait or a refusal never ran: the
+    // call is pending, so the guard asks again after the resume.
+    let rerun = match (class, approval) {
+        (_, Some(ApprovalKind::Wait | ApprovalKind::Refused)) | (None, _) => true,
         // A read changes nothing, so it runs again.
-        Some(EffectClass::Read) => resumed.pending.push(PendingCall {
-            id: id.to_owned(),
-            name: name.to_owned(),
-            class,
-        }),
+        (Some(EffectClass::Read), _) => true,
         // A side effect may have happened: report it instead of repeating it.
-        Some(_) => resumed
-            .history
-            .push(Message::tool_result(id, INTERRUPTED, true)),
-        // The call never started, so it is safe to run now.
-        None => resumed.pending.push(PendingCall {
+        (Some(_), _) => false,
+    };
+    if rerun {
+        resumed.pending.push(PendingCall {
             id: id.to_owned(),
             name: name.to_owned(),
             class,
-        }),
+        });
+    } else {
+        resumed
+            .history
+            .push(Message::tool_result(id, INTERRUPTED, true));
     }
 }
 
@@ -276,7 +356,6 @@ mod tests {
     use crate::journal::state::State;
 
     use super::*;
-
     /// Opens a journal over `dir`, as a run does.
     fn journal(dir: &Path) -> Journal {
         let header = Header::new(
@@ -443,6 +522,143 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn tool_results_resume_in_call_order() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = journal(dir.path());
+        let user = Message::user("hello");
+        let reply = call_reply(&[("c1", "read"), ("c2", "read"), ("c3", "read")]);
+        let first = Message::tool_result("c1", "one", false);
+        let second = Message::tool_result("c2", "two", false);
+        let third = Message::tool_result("c3", "three", false);
+        journal.message(&user).expect("append");
+        journal.message(&reply).expect("append");
+        // The batch of one reply commits each result as it comes back, so the
+        // log holds them in the order the calls finished.
+        journal.message(&third).expect("append");
+        journal.message(&first).expect("append");
+        journal.message(&second).expect("append");
+        journal.turn_end(1, Usage::default()).expect("turn end");
+        journal.commit().expect("commit");
+        journal.close().expect("close");
+
+        let resumed = load_now(dir.path());
+        assert_eq!(
+            resumed.history,
+            [user, reply, first, second, third],
+            "a resume gives the order the model saw"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_that_waited_for_an_answer_never_ran() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = journal(dir.path());
+        let user = Message::user("hello");
+        let reply = call_reply(&[("c1", "bash")]);
+        journal.message(&user).expect("append");
+        journal.message(&reply).expect("append");
+        journal
+            .call_start("c1", "bash", EffectClass::LocalReversible)
+            .expect("call start");
+        // The call waits for a client, and no answer came before the crash.
+        journal
+            .approval("c1", ApprovalKind::Wait)
+            .expect("approval wait");
+        journal.commit().expect("commit");
+        journal.close().expect("close");
+
+        let resumed = load_now(dir.path());
+        assert_eq!(resumed.history, [user, reply], "no interrupted result");
+        assert_eq!(
+            resumed.pending,
+            [PendingCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                class: Some(EffectClass::LocalReversible),
+            }],
+            "the rerun asks the same question again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_refused_before_its_result_never_ran() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = journal(dir.path());
+        let user = Message::user("hello");
+        let reply = call_reply(&[("c1", "bash")]);
+        journal.message(&user).expect("append");
+        journal.message(&reply).expect("append");
+        journal
+            .call_start("c1", "bash", EffectClass::LocalReversible)
+            .expect("call start");
+        journal
+            .approval("c1", ApprovalKind::Wait)
+            .expect("approval wait");
+        // The client refused, and the process died before the refusal result.
+        journal
+            .approval("c1", ApprovalKind::Refused)
+            .expect("approval answer");
+        journal.commit().expect("commit");
+        journal.close().expect("close");
+
+        let resumed = load_now(dir.path());
+        assert_eq!(resumed.history, [user, reply], "no interrupted result");
+        assert_eq!(resumed.pending.len(), 1, "the guard asks again");
+    }
+
+    #[tokio::test]
+    async fn a_call_answered_to_run_is_a_started_call() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = journal(dir.path());
+        let user = Message::user("hello");
+        let reply = call_reply(&[("c1", "bash")]);
+        journal.message(&user).expect("append");
+        journal.message(&reply).expect("append");
+        journal
+            .call_start("c1", "bash", EffectClass::LocalReversible)
+            .expect("call start");
+        journal
+            .approval("c1", ApprovalKind::Wait)
+            .expect("approval wait");
+        journal
+            .approval("c1", ApprovalKind::Run)
+            .expect("approval answer");
+        journal.commit().expect("commit");
+        journal.close().expect("close");
+
+        let resumed = load_now(dir.path());
+        assert_eq!(
+            resumed.history,
+            [user, reply, Message::tool_result("c1", INTERRUPTED, true)],
+            "an answer to run and no result: it may have run"
+        );
+        assert!(resumed.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn settings_records_give_the_last_level_and_mode() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = journal(dir.path());
+        journal.base(&State::new("p", "m", 0)).expect("base");
+        journal
+            .settings(Some("high"), Some("accept-edits"))
+            .expect("settings");
+        journal.settings(Some("low"), None).expect("settings");
+        journal.model("p", "m2").expect("model");
+        journal.commit().expect("commit");
+        journal.close().expect("close");
+
+        let resumed = load_now(dir.path());
+        assert_eq!(resumed.level.as_deref(), Some("low"), "the last level wins");
+        assert_eq!(
+            resumed.mode,
+            Some(PermissionMode::AcceptEdits),
+            "a change that sets no mode keeps the mode"
+        );
+        assert_eq!(resumed.model, "m2", "the model has its own record");
     }
 
     #[tokio::test]

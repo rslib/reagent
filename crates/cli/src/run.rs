@@ -506,6 +506,15 @@ pub async fn run(mut args: Args) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // A worker takes its session before it names it: the lock, the socket and
+    // the entry a client reads are all there before the ready line goes out.
+    let mut worker = match crate::worker::start(&args, plan.as_ref(), &cwd).await {
+        Ok(worker) => worker,
+        Err(message) => {
+            eprintln!("reagent: {message}");
+            return ExitCode::from(1);
+        }
+    };
     // The environment block starts here, before the provider is built, so its
     // git runs overlap the provider setup. It is awaited below, just before the
     // first message is built.
@@ -548,6 +557,9 @@ pub async fn run(mut args: Args) -> ExitCode {
     // The handlers go in before the servers start, so a signal during the
     // startup wait takes the same exit path as one during the run.
     let mut timers = signal_watchers(&cancel, &cause);
+    if let Some(worker) = worker.as_mut() {
+        worker.stop_on(cancel.clone());
+    }
     let servers = start_servers(&args, &cancel).await;
     if cancel.is_cancelled() {
         stop_servers(servers).await;
@@ -663,8 +675,23 @@ pub async fn run(mut args: Args) -> ExitCode {
         agent = agent.with_workspace(&folder);
     }
     let (tx, rx) = mpsc::channel::<Event>(256);
-    let out = Out::new();
-    let writer = tokio::spawn(drain(rx, out, args.json, billing, args.context_window));
+    let session_id = plan.as_ref().map(|plan| plan.id.clone());
+    // A worker's events go to its own tasks; a run prints them through
+    // `drain`.
+    let writer = match worker.as_mut() {
+        Some(worker) => {
+            worker.watch(rx);
+            None
+        }
+        None => Some(tokio::spawn(drain(
+            rx,
+            Out::new(),
+            args.json,
+            session_id,
+            billing,
+            args.context_window,
+        ))),
+    };
 
     if let Some(probe) = probe
         && let Some(text) = task.take()
@@ -707,7 +734,21 @@ pub async fn run(mut args: Args) -> ExitCode {
         }
     }
     let mut pending_reason = TurnEndReason::EndTurn;
-    if let Some((journal, _)) = journal.as_mut() {
+    // A worker starts serving before the first run, so a client can follow the
+    // calls a resumed session left open.
+    if let Some(worker) = worker.as_mut() {
+        let record = journal.as_ref().map_or(0, |(journal, _)| journal.record());
+        worker.begin(record);
+    }
+    if let Some(worker) = worker.as_mut() {
+        if let Some((journal, _)) = journal.as_mut() {
+            // A live session answers a call the rules send to a person from its
+            // clients, and a cancel stops it.
+            pending_reason = worker
+                .pending(&mut agent, &mut history, &mut Some(journal), &tx, &pending)
+                .await;
+        }
+    } else if let Some((journal, _)) = journal.as_mut() {
         pending_reason = agent
             .run_pending(&mut history, &mut Some(journal), &tx, &pending)
             .await;
@@ -732,29 +773,45 @@ pub async fn run(mut args: Args) -> ExitCode {
         // kept as written, then one note line and one image per image. A file
         // that is not an image adds nothing, and one that cannot be prepared
         // stops the run before any request.
-        let attached = crate::attach::blocks(&cwd, &text).await;
-        let blocks = match attached {
-            Ok(blocks) => blocks,
-            Err(message) => {
-                eprintln!("reagent: {message}");
-                stop_servers(servers).await;
-                return ExitCode::from(1);
-            }
-        };
-        if blocks.is_empty() {
-            history.push(reagent_ai::Message::user(text));
+        if let Some(worker) = worker.as_mut() {
+            // A worker's task is its own message, as if a client had sent it.
+            worker.task(text).await;
         } else {
-            let mut content = Vec::with_capacity(1 + blocks.len());
-            content.push(reagent_ai::Content::text(text));
-            content.extend(blocks);
-            history.push(reagent_ai::Message::user_content(content));
+            let attached = crate::attach::blocks(&cwd, &text).await;
+            let blocks = match attached {
+                Ok(blocks) => blocks,
+                Err(message) => {
+                    eprintln!("reagent: {message}");
+                    stop_servers(servers).await;
+                    return ExitCode::from(1);
+                }
+            };
+            if blocks.is_empty() {
+                history.push(reagent_ai::Message::user(text));
+            } else {
+                let mut content = Vec::with_capacity(1 + blocks.len());
+                content.push(reagent_ai::Content::text(text));
+                content.extend(blocks);
+                history.push(reagent_ai::Message::user_content(content));
+            }
         }
     }
     // A crash in the first request of a turn leaves its message with no reply,
     // and the continue asks for that reply.
     asked = asked
         || resumed.is_none_or(|resumed| resumed.open_turn || history.len() > resumed.recorded);
-    if !matches!(pending_reason, TurnEndReason::Error)
+    if let Some(worker) = worker.as_mut() {
+        // The worker's session runs from its inbox until its last client
+        // leaves; the task it was given is already queued there.
+        worker
+            .serve(
+                &mut agent,
+                &mut history,
+                journal.as_mut().map(|(journal, _)| &mut *journal),
+                &tx,
+            )
+            .await;
+    } else if !matches!(pending_reason, TurnEndReason::Error)
         && (asked || !pending.is_empty() || resumed.is_none())
     {
         agent
@@ -778,9 +835,14 @@ pub async fn run(mut args: Args) -> ExitCode {
         timer.abort();
     }
     // The writer task never panics; a join error would mean a runtime bug.
-    let mut reason = writer
-        .await
-        .unwrap_or_else(|_| panic!("writer task failed"));
+    let mut reason = match (writer, worker.as_mut()) {
+        (Some(writer), _) => writer
+            .await
+            .unwrap_or_else(|_| panic!("writer task failed")),
+        // A worker's writer is its tracker, which ends with the channel.
+        (None, Some(worker)) => worker.reason().await,
+        (None, None) => pending_reason,
+    };
     // A run whose pending calls failed ends with that reason: the exit code and
     // the list entry say the run did not finish.
     if matches!(pending_reason, TurnEndReason::Error) {
@@ -820,6 +882,11 @@ pub async fn run(mut args: Args) -> ExitCode {
             Err(_) => eprintln!("reagent: warning: the session sweep failed"),
         }
     }
+    // A worker stops because its last client left, so its exit code says it
+    // stopped rather than how its last run ended.
+    if worker.is_some() {
+        return ExitCode::SUCCESS;
+    }
     exit_code(&reason, Cause::from_u8(cause.load(Ordering::SeqCst)))
 }
 
@@ -841,6 +908,7 @@ async fn stored_model(
     let provider = args.provider_name.clone().unwrap_or_default();
     let model = args.model.clone();
     let title = title.to_owned();
+    let worker = args.worker;
     let stored = tokio::task::spawn_blocking(move || {
         let ask = crate::session::Ask {
             sessions: &sessions,
@@ -849,6 +917,7 @@ async fn stored_model(
             provider: &provider,
             model: &model,
             title: &title,
+            worker,
         };
         crate::session::stored(&ask)
     })
@@ -886,6 +955,7 @@ async fn plan_session(
     let provider = args.provider_name.clone().unwrap_or_default();
     let model = args.model.clone();
     let title = title.to_owned();
+    let worker = args.worker;
     tokio::task::spawn_blocking(move || {
         let ask = crate::session::Ask {
             sessions: &sessions,
@@ -894,6 +964,7 @@ async fn plan_session(
             provider: &provider,
             model: &model,
             title: &title,
+            worker,
         };
         crate::session::plan(&ask)
     })
@@ -941,14 +1012,16 @@ const EVENT_BATCH: usize = 64;
 
 /// Consumes the agent's event channel, prints it and returns how the run ended.
 ///
-/// Owns stdout: in plain mode only the final answer is printed; in JSON mode
-/// every event is one line and a summary follows the run end. `billing` fills
-/// the cost of a usage the provider did not price, and `context_window` is the
-/// window the end line reports.
+/// Owns stdout: in plain mode only the final answer is printed; in JSON mode a
+/// start line comes first, every event is one line and a summary follows the
+/// run end. `session` is the session the run writes, named by the start line.
+/// `billing` fills the cost of a usage the provider did not price, and
+/// `context_window` is the window the end line reports.
 async fn drain<W: AsyncWrite + Unpin>(
     rx: mpsc::Receiver<Event>,
     mut out: Out<W>,
     json: bool,
+    session: Option<String>,
     billing: Option<Billing>,
     context_window: Option<u64>,
 ) -> TurnEndReason {
@@ -963,6 +1036,9 @@ async fn drain<W: AsyncWrite + Unpin>(
 
     let mut rx = rx;
     let mut buf = Vec::with_capacity(512);
+    // Whether the start line has gone into a batch; it is written once, with
+    // the first batch, so it costs no extra write.
+    let mut started = false;
     // The events one receive takes. A reply sends one event right after
     // another, so in JSON mode they share one write and one flush instead of
     // taking one per event; the ready events after a batch join it, so a write
@@ -973,6 +1049,10 @@ async fn drain<W: AsyncWrite + Unpin>(
     'run: while rx.recv_many(&mut batch, EVENT_BATCH).await > 0 {
         if json {
             buf.clear();
+            if !started {
+                crate::json::write_start(&mut buf, session.as_deref());
+                started = true;
+            }
         }
         loop {
             for event in batch.drain(..) {
@@ -1024,6 +1104,9 @@ async fn drain<W: AsyncWrite + Unpin>(
 
     if json {
         buf.clear();
+        if !started {
+            crate::json::write_start(&mut buf, session.as_deref());
+        }
         crate::json::write_summary(
             &mut buf,
             &total,
@@ -2435,9 +2518,9 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::disallowed_methods, reason = "the test removes its folder")]
     fn the_context_window_comes_from_the_models_cache() {
-        let dir = std::env::temp_dir().join(format!("reagent-run-models-{}", std::process::id()));
+        let temp = tempfile::tempdir().expect("makes a temp folder");
+        let dir = temp.path();
         let entry = |id: &str, window| reagent_ai::catalog::Entry {
             id: id.into(),
             context_window: window,
@@ -2451,9 +2534,9 @@ mod tests {
             fetched_at: 1,
             models: vec![entry("m", Some(128_000)), entry("n", None)],
         };
-        reagent_ai::catalog::write(&dir, "fi", &cache).expect("writes the cache");
+        reagent_ai::catalog::write(dir, "fi", &cache).expect("writes the cache");
         let window =
-            |name, model| cached_entry(&dir, name, model).and_then(|entry| entry.context_window);
+            |name, model| cached_entry(dir, name, model).and_then(|entry| entry.context_window);
         let window_of = window(Some("fi"), "m");
         assert_eq!(window_of, Some(128_000));
         assert_eq!(compact_budget(window_of), 96_000);
@@ -2461,15 +2544,14 @@ mod tests {
         assert_eq!(window(Some("fi"), "x"), None);
         assert_eq!(window(Some("other"), "m"), None);
         assert_eq!(window(None, "m"), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    #[expect(clippy::disallowed_methods, reason = "the test removes its folder")]
     fn usage_cost_from_cached_price() {
         use reagent_ai::catalog::{Cache, Entry, Price};
 
-        let dir = std::env::temp_dir().join(format!("reagent-run-price-{}", std::process::id()));
+        let temp = tempfile::tempdir().expect("makes a temp folder");
+        let dir = temp.path();
         let price = Price {
             input: 0.000_001,
             output: 0.000_002,
@@ -2488,8 +2570,8 @@ mod tests {
                 images: None,
             }],
         };
-        reagent_ai::catalog::write(&dir, "fi", &cache).expect("writes the cache");
-        let entry = cached_entry(&dir, Some("fi"), "m").expect("the entry");
+        reagent_ai::catalog::write(dir, "fi", &cache).expect("writes the cache");
+        let entry = cached_entry(dir, Some("fi"), "m").expect("the entry");
         assert_eq!(entry.context_window, Some(128_000));
         let price = entry.price.expect("the cached price");
 
@@ -2523,7 +2605,6 @@ mod tests {
         };
         let cost = usage.cost.expect("a filled cost");
         assert!((cost - 0.002).abs() < 1e-12, "{cost}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2852,7 +2933,7 @@ mod tests {
                 .expect("the channel takes the event");
         }
         drop(tx);
-        drain(rx, Out::with_writer(sink.clone()), json, None, None).await;
+        drain(rx, Out::with_writer(sink.clone()), json, None, None, None).await;
     }
 
     #[tokio::test]
@@ -2861,6 +2942,7 @@ mod tests {
         let sink = Sink::default();
         let (tx, rx) = mpsc::channel(1024);
         let mut expected = Vec::new();
+        crate::json::write_start(&mut expected, None);
         for _ in 0..1000 {
             let event = Event::TextDelta(Text::from(text.as_str()));
             crate::json::write_event(&mut expected, &event);
@@ -2880,7 +2962,7 @@ mod tests {
             None,
         );
 
-        let reason = drain(rx, Out::with_writer(sink.clone()), true, None, None).await;
+        let reason = drain(rx, Out::with_writer(sink.clone()), true, None, None, None).await;
         assert_eq!(reason, TurnEndReason::EndTurn);
         assert_eq!(
             sink.bytes.borrow().as_slice(),
@@ -2893,11 +2975,14 @@ mod tests {
             .iter()
             .filter(|byte| **byte == b'\n')
             .count();
-        assert_eq!(lines, 1002, "1000 events plus the run end and the summary");
+        assert_eq!(
+            lines, 1003,
+            "the start line, 1000 events and the run end and the summary"
+        );
         let flushes = sink.flushes.get();
         assert_eq!(flushes, sink.writes.get(), "one flush per write");
-        // One write and one flush per 8 KiB batch: ten for these 1002 lines,
-        // against one each (1002) before the batch.
+        // One write and one flush per 8 KiB batch: ten for these 1003 lines,
+        // against one each (1003) before the batch.
         assert!(flushes <= 16, "1000 events cost {flushes} flushes");
     }
 

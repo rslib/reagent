@@ -27,6 +27,7 @@ dhat = { version = "0.3.3", default-features = false }
 divan = { version = "0.1.21", default-features = false }
 gungraun = "0.20.0"
 reagent-oauth = { workspace = true, features = ["testing"] }
+tempfile = { version = "3.27.0", default-features = false }
 tokio = { version = "1.53.3", default-features = false, features = ["rt", "macros", "net", "io-util", "sync", "time"] }
 
 [[bench]]

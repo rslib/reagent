@@ -12,17 +12,19 @@ use reagent_ai::{
 };
 
 use crate::archive::Archive;
-use crate::batch::run_all_guarded_seen;
+use crate::batch::{Note, Outcome, run_all_noted};
 use crate::compact::Compact;
 use crate::event::{Event, TurnEndReason};
-use crate::guard::Guard;
+use crate::guard::{Answer, Guard};
 use crate::journal::Journal;
+use crate::journal::record::ApprovalKind;
 use crate::journal::resume::PendingCall;
 use crate::journal::state::State;
+use crate::live::{ClientId, Command, Inbox, SendMode, Settings};
 use crate::mask::Mask;
 use crate::policy::{PolicyRun, TurnPolicy, TurnView};
 use crate::reread::Ledger;
-use crate::tool::{EffectClass, Registry};
+use crate::tool::{EffectClass, Identity, Registry};
 use crate::workspace::Workspace;
 
 /// Renames a tool call whose id an earlier call already used, so each call
@@ -108,6 +110,15 @@ pub struct Agent<'a> {
     /// The number this run gives its first turn: a run that continues a
     /// session numbers its turns after the ones the session already has.
     first_turn: u64,
+    /// Whether this run answers the clients of a live session. Only a live run
+    /// names the record it commits and records a call that waits for them.
+    live: bool,
+    /// The settings changes the run applied and the journal has not recorded
+    /// yet: a change made while no journal is open waits for the next request.
+    unrecorded: Vec<Settings>,
+    /// Whether a client changed the level or the mode: a base then records
+    /// them again, since a resume reads from the last base.
+    changed_settings: bool,
 }
 
 impl<'a> Agent<'a> {
@@ -136,6 +147,9 @@ impl<'a> Agent<'a> {
             compactions: 0,
             completed: 0,
             first_turn: 1,
+            live: false,
+            unrecorded: Vec::new(),
+            changed_settings: false,
             config,
         }
     }
@@ -168,6 +182,9 @@ impl<'a> Agent<'a> {
             compactions: 0,
             completed: 0,
             first_turn: 1,
+            live: false,
+            unrecorded: Vec::new(),
+            changed_settings: false,
             config,
         }
     }
@@ -238,12 +255,55 @@ impl<'a> Agent<'a> {
     pub async fn run(
         &mut self,
         history: &mut Vec<Message>,
+        journal: Option<&mut Journal>,
+        events: &mpsc::Sender<Event>,
+    ) {
+        self.run_inner(history, journal, events, None).await;
+    }
+
+    /// Runs the conversation as [`Agent::run`] does, and takes the commands of
+    /// a live session at each boundary of the run: a steer message joins the
+    /// conversation after the tool results and before the next request, a
+    /// queued message waits for the next run, a cancel ends the turn and a set
+    /// changes the next request.
+    ///
+    /// The commands are read without waiting, so a run makes no extra wakeup
+    /// and adds no timer. The run gets a token of its own, a child of the
+    /// session's, so a cancel stops the turn and not the session.
+    pub async fn run_with_inbox(
+        &mut self,
+        history: &mut Vec<Message>,
+        journal: Option<&mut Journal>,
+        events: &mpsc::Sender<Event>,
+        inbox: &mut Inbox,
+    ) {
+        let run = self.token.child_token();
+        let session = std::mem::replace(&mut self.token, run);
+        // The clients of the session answer the calls the rules send to a
+        // person; a run without an inbox keeps refusing them.
+        if let Some(guard) = self.guard.as_mut() {
+            guard.listen(events.clone());
+        }
+        self.run_inner(history, journal, events, Some(inbox)).await;
+        if let Some(guard) = self.guard.as_mut() {
+            guard.hush();
+        }
+        self.token = session;
+    }
+
+    async fn run_inner(
+        &mut self,
+        history: &mut Vec<Message>,
         mut journal: Option<&mut Journal>,
         events: &mpsc::Sender<Event>,
+        mut inbox: Option<&mut Inbox>,
     ) {
         let started = std::time::Instant::now();
         let mut turns: u32 = 0;
         let mut max_tokens_streak: u32 = 0;
+        // A run with an inbox answers the clients of a live session: only it
+        // names the record it commits and records a call that waits.
+        self.live = inbox.is_some();
         self.fingerprint = match self.workspace {
             Some(workspace) if !self.policies.is_empty() => workspace.fingerprint().await,
             _ => None,
@@ -262,7 +322,22 @@ impl<'a> Agent<'a> {
             emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
             return;
         }
+        committed(&journal, self.live, events, &self.token).await;
         let mut run_reason = loop {
+            // A command of a live session is taken here, before the request.
+            if let Some(inbox) = inbox.as_deref_mut() {
+                if self.take_commands(inbox, events).await {
+                    break TurnEndReason::Cancelled;
+                }
+                if let Some(error) = self
+                    .flush(history, &mut journal, inbox, events)
+                    .await
+                    .error()
+                {
+                    emit(events, &self.token, Event::Error(error)).await;
+                    break TurnEndReason::Error;
+                }
+            }
             if self.config.max_turns.is_some_and(|cap| turns >= cap) {
                 break TurnEndReason::MaxTurns;
             }
@@ -292,6 +367,7 @@ impl<'a> Agent<'a> {
                     emit(events, &self.token, Event::Error(error)).await;
                     break TurnEndReason::Error;
                 }
+                committed(&journal, self.live, events, &self.token).await;
                 if closed {
                     break TurnEndReason::Cancelled;
                 }
@@ -302,14 +378,35 @@ impl<'a> Agent<'a> {
                 archive.flush().await;
             }
             let before = history.len();
-            let mut outcome = self.run_turn(history, &mut journal, events).await;
+            let mut outcome = self
+                .run_turn(history, &mut journal, events, inbox.as_deref_mut())
+                .await;
+            // The commands that arrived during the turn are taken now, but a
+            // steer text joins the conversation only after the turn is recorded
+            // and its policies ran, so they see the turn exactly as without it.
+            let mut steer_waits = false;
+            if let Some(inbox) = inbox.as_deref_mut() {
+                if self.take_commands(inbox, events).await
+                    && !matches!(outcome, TurnOutcome::Error(_))
+                {
+                    outcome = TurnOutcome::Cancelled;
+                }
+                steer_waits = inbox.has_pending();
+            }
             // Every turn end records the turn and syncs it, whatever ended it.
             let usage = turn_usage(&history[before..]);
-            if let Some(journal) = journal.as_mut()
-                && let Err(error) = end_turn(journal, self.turn_number(turns), usage).await
-                && !matches!(outcome, TurnOutcome::Error(_))
-            {
-                outcome = TurnOutcome::Error(journal_error(&error));
+            if let Some(journal) = journal.as_mut() {
+                match end_turn(journal, self.turn_number(turns), usage).await {
+                    Ok(()) => {}
+                    Err(error) if !matches!(outcome, TurnOutcome::Error(_)) => {
+                        outcome = TurnOutcome::Error(journal_error(&error));
+                    }
+                    Err(_) => {}
+                }
+            }
+            // Only a turn end that reached the disk is named to the clients.
+            if !matches!(outcome, TurnOutcome::Error(_)) {
+                committed(&journal, self.live, events, &self.token).await;
             }
             match outcome {
                 TurnOutcome::Stopped(StopReason::MaxTokens)
@@ -324,15 +421,32 @@ impl<'a> Agent<'a> {
                 _ => {}
             }
 
-            let (turn_reason, run_end) = self
+            let (turn_reason, mut run_end) = self
                 .after_turn(outcome, turns, started, history, &mut journal, events)
                 .await;
+            // A steer text that arrived while the model wrote a reply with no
+            // tool call keeps the run going: the reply, then the text, then the
+            // next request.
+            if steer_waits && run_end == Some(TurnEndReason::EndTurn) {
+                run_end = None;
+            }
             let closed = emit(events, &self.token, Event::TurnEnd(turn_reason)).await;
             if let Some(reason) = run_end {
                 break reason;
             }
             if closed {
                 break TurnEndReason::Cancelled;
+            }
+            // The steer texts land after the tool results and any policy
+            // message, before the next request.
+            if let Some(inbox) = inbox.as_deref_mut()
+                && let Some(error) = self
+                    .flush(history, &mut journal, inbox, events)
+                    .await
+                    .error()
+            {
+                emit(events, &self.token, Event::Error(error)).await;
+                break TurnEndReason::Error;
             }
         };
 
@@ -341,6 +455,282 @@ impl<'a> Agent<'a> {
         }
         self.completed = turns;
         emit(events, &self.token, Event::RunEnd(run_reason)).await;
+    }
+
+    /// Adds the steer texts the inbox holds to the conversation, and applies
+    /// the settings a stream held.
+    ///
+    /// A steer message lands after the tool results that are already in
+    /// history, before the next request. When the journal cannot hold a
+    /// message, that message and the ones after it stay in the inbox, and the
+    /// caller ends the run with the error.
+    pub(crate) async fn flush(
+        &mut self,
+        history: &mut Vec<Message>,
+        journal: &mut Option<&mut Journal>,
+        inbox: &mut Inbox,
+        events: &mpsc::Sender<Event>,
+    ) -> Drained {
+        let mut drained = Drained::default();
+        let mut pending = inbox.take_pending().into_iter();
+        while let Some((client, text)) = pending.next() {
+            if let Err(error) = record(Message::user(text.clone()), history, journal) {
+                inbox.restore((client, text), pending);
+                drained.error = Some(error);
+                break;
+            }
+            drained.steered = true;
+        }
+        self.apply_held(inbox, events).await;
+        // A settings change reaches the journal before the request it applies
+        // to, so a resume applies the values the model saw.
+        let mut wrote = false;
+        let mut changes = std::mem::take(&mut self.unrecorded).into_iter();
+        while let Some(settings) = changes.next() {
+            let Some(journal) = journal.as_mut() else {
+                break;
+            };
+            match write_settings(journal, self.provider_name.as_ref(), &settings) {
+                Ok(()) => wrote = true,
+                Err(error) => {
+                    self.unrecorded.push(settings);
+                    self.unrecorded.extend(changes);
+                    drained.error = Some(journal_error(&error));
+                    return drained;
+                }
+            }
+        }
+        if wrote {
+            committed(journal, self.live, events, &self.token).await;
+        }
+        drained
+    }
+
+    /// Takes every command a live session holds, without waiting on the inbox:
+    /// a message waits for the next boundary or run, and a set waits for the
+    /// next request. Returns whether a client cancelled; the commands after a
+    /// cancel stay in the inbox.
+    pub(crate) async fn take_commands(
+        &mut self,
+        inbox: &mut Inbox,
+        events: &mpsc::Sender<Event>,
+    ) -> bool {
+        while let Some(command) = inbox.ready() {
+            match command {
+                Command::Send { client, text, mode } => {
+                    self.accept(client, text, mode, inbox, events).await;
+                }
+                Command::Cancel { .. } => {
+                    inbox.clear_waiting();
+                    self.token.cancel();
+                    return true;
+                }
+                Command::Set { settings, .. } => inbox.hold(settings),
+                Command::Approve { client, id, answer } => {
+                    self.approve(client, id, answer, events).await;
+                }
+            }
+        }
+        false
+    }
+
+    /// Waits for `work` while it takes the commands a client sends meanwhile,
+    /// so a cancel reaches a running tool batch or a retry wait at once.
+    ///
+    /// With no inbox this is `work` alone, as in a headless run.
+    async fn watched<F: std::future::Future>(
+        &self,
+        work: F,
+        inbox: Option<&mut Inbox>,
+        events: &mpsc::Sender<Event>,
+    ) -> F::Output {
+        let Some(inbox) = inbox else {
+            return work.await;
+        };
+        let mut work = std::pin::pin!(work);
+        loop {
+            tokio::select! {
+                output = &mut work => return output,
+                command = inbox.next() => self.take_stream(command, inbox, events).await,
+            }
+        }
+    }
+
+    /// [`Agent::watched`] with the notes of a tool batch: each note is recorded
+    /// as it arrives, while the other calls still run.
+    async fn watched_noted<F: std::future::Future>(
+        &self,
+        work: F,
+        inbox: Option<&mut Inbox>,
+        events: &mpsc::Sender<Event>,
+        notes: &mut mpsc::UnboundedReceiver<Note>,
+        results: &mut Results<'_, '_, '_>,
+    ) -> F::Output {
+        let mut work = std::pin::pin!(work);
+        match inbox {
+            // A headless run has no command to take, but each result still
+            // reaches the journal as it comes back.
+            None => loop {
+                tokio::select! {
+                    output = &mut work => return output,
+                    note = notes.recv() => match note {
+                        Some(note) => results.note(note).await,
+                        // The batch never drops its sender before it ends.
+                        None => return work.await,
+                    },
+                }
+            },
+            Some(inbox) => loop {
+                tokio::select! {
+                    output = &mut work => return output,
+                    note = notes.recv() => match note {
+                        Some(note) => results.note(note).await,
+                        None => return work.await,
+                    },
+                    command = inbox.next() => self.take_stream(command, inbox, events).await,
+                }
+            },
+        }
+    }
+
+    /// Applies one command of a live session while no run is open.
+    pub(crate) async fn idle(
+        &mut self,
+        command: Command,
+        inbox: &mut Inbox,
+        events: &mpsc::Sender<Event>,
+    ) {
+        match command {
+            Command::Send { client, text, mode } => {
+                self.accept(client, text, mode, inbox, events).await;
+            }
+            Command::Set { settings, .. } => self.set(settings, events).await,
+            Command::Approve { client, id, answer } => {
+                self.approve(client, id, answer, events).await;
+            }
+            // Nothing is running to stop; the session stays open, and what
+            // waited for a run is dropped as a cancel during a run drops it.
+            Command::Cancel { .. } => inbox.clear_waiting(),
+        }
+    }
+
+    /// Accepts one message of a live session: every client sees it, and it
+    /// waits for the next boundary (a steer) or for the next run (a queue).
+    ///
+    /// The text is shared with the conversation and with the event, never
+    /// copied.
+    pub(crate) async fn accept(
+        &self,
+        client: ClientId,
+        text: Text,
+        mode: SendMode,
+        inbox: &mut Inbox,
+        events: &mpsc::Sender<Event>,
+    ) {
+        let event = Event::UserMessage {
+            client,
+            mode,
+            text: text.clone(),
+        };
+        // A closed channel ends the run at its next event, as it always has.
+        let _ = emit(events, &self.token, event).await;
+        match mode {
+            SendMode::Steer => inbox.steer(client, text),
+            SendMode::Queue => inbox.queue(client, text),
+        }
+    }
+
+    /// Applies the settings a stream held, before the next request.
+    pub(crate) async fn apply_held(&mut self, inbox: &mut Inbox, events: &mpsc::Sender<Event>) {
+        for settings in inbox.take_held() {
+            self.set(settings, events).await;
+        }
+    }
+
+    /// Applies settings to the next request: the model, the reasoning level and
+    /// the permission mode. A request that is already in flight keeps the values
+    /// it was sent with.
+    ///
+    /// The change waits for the next [`Agent::flush`], which writes it to the
+    /// journal: no journal is open here when a session applies a setting while
+    /// no run is running.
+    async fn set(&mut self, settings: Settings, events: &mpsc::Sender<Event>) {
+        let mut recorded = Settings::default();
+        if let Some(model) = &settings.model {
+            self.model = model.clone();
+            self.config.model = model.to_string();
+            recorded.model = Some(model.clone());
+        }
+        if let Some(level) = &settings.level {
+            self.config.reasoning = Some(level.to_string());
+            recorded.level = Some(level.clone());
+        }
+        if let Some(mode) = settings.mode {
+            let applied = match self.guard.as_mut() {
+                Some(guard) => match guard.set_mode(mode) {
+                    Ok(()) => true,
+                    Err(message) => {
+                        emit(events, &self.token, Event::Error(Text::from(message))).await;
+                        false
+                    }
+                },
+                // A mode no guard holds changes nothing.
+                None => false,
+            };
+            if applied {
+                recorded.mode = Some(mode);
+            }
+        }
+        if recorded.level.is_some() || recorded.mode.is_some() {
+            self.changed_settings = true;
+        }
+        if recorded.model.is_some() || recorded.level.is_some() || recorded.mode.is_some() {
+            self.unrecorded.push(recorded);
+        }
+    }
+
+    /// Handles one command of a live session that arrived while the model
+    /// streamed its reply.
+    ///
+    /// Only a cancel acts at once: a message and a setting wait for the next
+    /// boundary, because the request in flight and the history it reads cannot
+    /// change under it.
+    async fn take_stream(&self, command: Command, inbox: &mut Inbox, events: &mpsc::Sender<Event>) {
+        match command {
+            Command::Send { client, text, mode } => {
+                self.accept(client, text, mode, inbox, events).await;
+            }
+            Command::Cancel { .. } => {
+                inbox.clear_waiting();
+                self.token.cancel();
+            }
+            Command::Set { settings, .. } => inbox.hold(settings),
+            Command::Approve { client, id, answer } => {
+                self.approve(client, id, answer, events).await;
+            }
+        }
+    }
+
+    /// Routes a client's answer to the call that waits for it.
+    ///
+    /// A request that no call waits for any more, one answered twice or one
+    /// answered from a session that listens to none, is reported to every
+    /// client with its id, so nobody believes the call ran.
+    async fn approve(
+        &self,
+        client: ClientId,
+        id: u64,
+        answer: Answer,
+        events: &mpsc::Sender<Event>,
+    ) {
+        let routed = match &self.guard {
+            Some(guard) => guard.answer(client, id, answer, &self.token).await,
+            None => false,
+        };
+        if !routed {
+            let message = format!("approval {id} is already resolved");
+            emit(events, &self.token, Event::Error(Text::from(message))).await;
+        }
     }
 
     /// The turns the last [`Agent::run`] made.
@@ -374,6 +764,46 @@ impl<'a> Agent<'a> {
         events: &mpsc::Sender<Event>,
         pending: &[PendingCall],
     ) -> TurnEndReason {
+        self.live = false;
+        self.run_pending_inner(history, journal, events, pending, None)
+            .await
+    }
+
+    /// Runs the pending calls as [`Agent::run_pending`] does, in a live
+    /// session: a call the rules send to a person asks the clients again, the
+    /// wait and the answer reach the journal, and a cancel stops the calls.
+    pub async fn run_pending_with_inbox(
+        &mut self,
+        history: &mut Vec<Message>,
+        journal: &mut Option<&mut Journal>,
+        events: &mpsc::Sender<Event>,
+        pending: &[PendingCall],
+        inbox: &mut Inbox,
+    ) -> TurnEndReason {
+        let run = self.token.child_token();
+        let session = std::mem::replace(&mut self.token, run);
+        if let Some(guard) = self.guard.as_mut() {
+            guard.listen(events.clone());
+        }
+        self.live = true;
+        let reason = self
+            .run_pending_inner(history, journal, events, pending, Some(inbox))
+            .await;
+        if let Some(guard) = self.guard.as_mut() {
+            guard.hush();
+        }
+        self.token = session;
+        reason
+    }
+
+    async fn run_pending_inner(
+        &mut self,
+        history: &mut Vec<Message>,
+        journal: &mut Option<&mut Journal>,
+        events: &mpsc::Sender<Event>,
+        pending: &[PendingCall],
+        inbox: Option<&mut Inbox>,
+    ) -> TurnEndReason {
         if pending.is_empty() {
             return TurnEndReason::EndTurn;
         }
@@ -403,18 +833,54 @@ impl<'a> Agent<'a> {
             emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
             return TurnEndReason::Error;
         }
-        let results =
-            run_all_guarded_seen(&calls, self.registry, self.guard.as_ref(), &self.token).await;
+        // Each result reaches the journal as it comes back, and a call that
+        // asks records its wait and its answer, exactly as in a turn.
+        let mut ledger = std::mem::take(&mut self.ledger);
+        let (notes, mut progress) = mpsc::unbounded_channel();
+        let batch = run_all_noted(
+            &calls,
+            self.registry,
+            self.guard.as_ref(),
+            &self.token,
+            &notes,
+            self.live,
+        );
+        let mut results = Results {
+            calls: &calls,
+            repaired: &[],
+            history,
+            registry: self.registry,
+            token: &self.token,
+            live: self.live,
+            events,
+            ledger: &mut ledger,
+            journal: &mut *journal,
+            written: None,
+            slots: calls.iter().map(|_| None).collect(),
+            facts: calls.iter().map(|_| None).collect(),
+            failure: None,
+        };
+        self.watched_noted(batch, inbox, events, &mut progress, &mut results)
+            .await;
+        while let Ok(note) = progress.try_recv() {
+            results.note(note).await;
+        }
+        let Results {
+            slots,
+            facts,
+            failure,
+            ..
+        } = results;
+        self.ledger = ledger;
         // Every result reaches history before any event is sent, so a cancel
         // or a closed receiver cannot leave a call unanswered.
-        let mut facts: Vec<(usize, Option<Text>, Vec<Image>)> = Vec::with_capacity(results.len());
-        let mut failure = None;
-        for (result, _seen) in results {
-            facts.push((tool_bytes(&result), tool_error(&result), images(&result)));
-            if let Some(error) = record_result(result, history, journal) {
-                failure.get_or_insert(error);
-            }
+        for result in slots {
+            history.push(result.expect("the batch answers every call"));
         }
+        let facts: Vec<(usize, Option<Text>, Vec<Image>)> = facts
+            .into_iter()
+            .map(|fact| fact.expect("the batch answers every call"))
+            .collect();
         mark_recorded(journal, history.len());
         if let Some(error) = failure {
             emit(events, &self.token, Event::Error(error)).await;
@@ -599,6 +1065,7 @@ impl<'a> Agent<'a> {
         history: &mut Vec<Message>,
         journal: &mut Option<&mut Journal>,
         events: &mpsc::Sender<Event>,
+        mut inbox: Option<&mut Inbox>,
     ) -> TurnOutcome {
         let mut assembler = Assembler::new();
         // How many retries already ran, capped at [`crate::retry::MAX_RETRIES`].
@@ -610,7 +1077,9 @@ impl<'a> Agent<'a> {
             // and, on the last allowed attempt, ends the turn.
             let mut stop_error: Option<Error> = None;
             loop {
-                let outcome = self.consume_stream(history, events, &mut assembler).await;
+                let outcome = self
+                    .consume_stream(history, events, &mut assembler, inbox.as_deref_mut())
+                    .await;
                 match outcome {
                     ConsumeOutcome::Cancelled | ConsumeOutcome::Finished => break,
                     ConsumeOutcome::StreamError(error) => {
@@ -630,8 +1099,9 @@ impl<'a> Agent<'a> {
                         if emit(events, &self.token, event).await {
                             return TurnOutcome::Cancelled;
                         }
+                        let wait = tokio::time::sleep(delay);
                         tokio::select! {
-                            () = tokio::time::sleep(delay) => {}
+                            () = self.watched(wait, inbox.as_deref_mut(), events) => {}
                             () = self.token.cancelled() => return TurnOutcome::Cancelled,
                         }
                         assembler = Assembler::new();
@@ -670,8 +1140,9 @@ impl<'a> Agent<'a> {
                 if emit(events, &self.token, event).await {
                     return TurnOutcome::Cancelled;
                 }
+                let wait = tokio::time::sleep(delay);
                 tokio::select! {
-                    () = tokio::time::sleep(delay) => {}
+                    () = self.watched(wait, inbox.as_deref_mut(), events) => {}
                     () = self.token.cancelled() => return TurnOutcome::Cancelled,
                 }
                 assembler = Assembler::new();
@@ -722,67 +1193,78 @@ impl<'a> Agent<'a> {
                 }
                 // A call that may change the world is on the disk, synced,
                 // before it runs.
-                if let Err(error) = note_calls(&calls, self.registry, journal).await {
-                    // No tool ran: each call still gets an answer in history,
-                    // so a later request never carries a call without one.
-                    for call in &calls {
-                        let message = Message::tool_result(call.id.clone(), error.clone(), true);
-                        let _ = record_result(message, history, journal);
+                match note_calls(&calls, self.registry, journal).await {
+                    Ok(true) => {
+                        committed(journal, self.live, events, &self.token).await;
                     }
-                    return TurnOutcome::Error(error);
+                    Ok(false) => {}
+                    Err(error) => {
+                        // No tool ran: each call still gets an answer in
+                        // history, so a later request never carries a call
+                        // without one.
+                        for call in &calls {
+                            let message =
+                                Message::tool_result(call.id.clone(), error.clone(), true);
+                            let _ = record_result(message, history, journal);
+                        }
+                        return TurnOutcome::Error(error);
+                    }
                 }
-                let results =
-                    run_all_guarded_seen(&calls, self.registry, self.guard.as_ref(), &self.token)
-                        .await;
-                // A file the reply writes loses its earlier reads, and a read
-                // of a file the reply writes is not recorded, so neither can
-                // answer a later read. A reply with nothing to drop and no read
-                // to skip resolves no tool and parses no argument, which is
-                // every turn that writes nothing.
-                let written = if self
-                    .ledger
-                    .needs_writes(results.iter().any(|(_, seen)| seen.is_some()))
-                {
-                    self.ledger.forget_writes(&calls, self.registry).await
-                } else {
-                    Vec::new()
+                // Each result is recorded and committed as it comes back, so a
+                // crash in the middle of the batch keeps what already ran.
+                // History keeps the model's call order, so the results wait in
+                // the batch's places until the whole batch is in.
+                let mut ledger = std::mem::take(&mut self.ledger);
+                let (notes, mut progress) = mpsc::unbounded_channel();
+                let batch = run_all_noted(
+                    &calls,
+                    self.registry,
+                    self.guard.as_ref(),
+                    &self.token,
+                    &notes,
+                    self.live,
+                );
+                let mut results = Results {
+                    calls: &calls,
+                    repaired: &repaired,
+                    history,
+                    registry: self.registry,
+                    token: &self.token,
+                    live: self.live,
+                    events,
+                    ledger: &mut ledger,
+                    journal: &mut *journal,
+                    written: None,
+                    slots: calls.iter().map(|_| None).collect(),
+                    facts: calls.iter().map(|_| None).collect(),
+                    failure: None,
                 };
+                self.watched_noted(batch, inbox, events, &mut progress, &mut results)
+                    .await;
+                // The batch answered every call before it ended, so the notes
+                // it left are the ones the select did not take.
+                while let Ok(note) = progress.try_recv() {
+                    results.note(note).await;
+                }
+                let Results {
+                    slots,
+                    facts,
+                    failure,
+                    ..
+                } = results;
+                self.ledger = ledger;
                 // Every result reaches history before any event is sent, so a
                 // cancel or a closed receiver cannot leave a call unanswered.
                 // The results move into history, so only their event fields
                 // are kept here; nothing is cloned.
-                let mut facts: Vec<(usize, Option<Text>, Vec<Image>)> =
-                    Vec::with_capacity(results.len());
-                let mut failure = None;
-                for (at, (result, seen)) in results.into_iter().enumerate() {
-                    // A note says how the agent itself read the call, so a
-                    // weak model stops sending the same shape. Only a result
-                    // with such a note is touched.
-                    let result = match calls
-                        .get(at)
-                        .and_then(|call| agent_note(call, at, &repaired))
-                    {
-                        Some(note) => with_note(result, note),
-                        None => result,
-                    };
-                    // A re-read of lines the run already holds keeps its
-                    // content and gains the note, before it reaches either the
-                    // journal or the model.
-                    let result = match seen {
-                        Some(seen) if !written.contains(&seen.key) => {
-                            self.ledger.apply(result, *seen, history.as_slice())
-                        }
-                        _ => result,
-                    };
-                    facts.push((tool_bytes(&result), tool_error(&result), images(&result)));
-                    if let Some(error) = record_result(result, history, journal) {
-                        failure.get_or_insert(error);
-                    }
+                for result in slots {
+                    history.push(result.expect("the batch answers every call"));
                 }
                 if let Some(error) = failure {
                     return TurnOutcome::Error(error);
                 }
-                for (call, (bytes, error, images)) in calls.iter().zip(facts) {
+                for (call, fact) in calls.iter().zip(facts) {
+                    let (bytes, error, images) = fact.expect("the batch answers every call");
                     let event = Event::ToolResult {
                         id: call.id.clone(),
                         is_error: error.is_some(),
@@ -904,11 +1386,16 @@ impl<'a> Agent<'a> {
     ///
     /// Nothing is pushed to history here; a reply is recorded only after the
     /// whole turn ends, so a caller may retry a failed stream safely.
+    ///
+    /// With a live inbox, a command that arrives before the next item is taken
+    /// at once: a cancel ends the turn here, and a message or a setting waits
+    /// for the next boundary, since the request in flight cannot change.
     async fn consume_stream(
         &self,
         history: &[Message],
         events: &mpsc::Sender<Event>,
         assembler: &mut Assembler,
+        mut inbox: Option<&mut Inbox>,
     ) -> ConsumeOutcome {
         let request = self.request(history);
         let mut stream = self.provider.stream(&request);
@@ -919,9 +1406,16 @@ impl<'a> Agent<'a> {
         // Grown on use: a tool turn has a few events, a long answer fills it.
         let mut raw: Vec<(StreamEvent, Option<Event>)> = Vec::new();
         loop {
-            let item = tokio::select! {
-                item = stream.next() => item,
-                () = self.token.cancelled() => return ConsumeOutcome::Cancelled,
+            let Some(step) = step(&mut stream, &self.token, inbox.as_deref_mut()).await else {
+                return ConsumeOutcome::Cancelled;
+            };
+            let item = match step {
+                Step::Item(item) => item,
+                Step::Command(command) => {
+                    let inbox = inbox.as_deref_mut().expect("an inbox carried the command");
+                    self.take_stream(command, inbox, events).await;
+                    continue;
+                }
             };
             let Some(item) = item else {
                 return ConsumeOutcome::Finished;
@@ -977,6 +1471,194 @@ impl<'a> Agent<'a> {
             cache_key: self.config.cache_key.as_ref(),
         }
     }
+}
+
+/// The event fields of one tool result: its size, its error text and its
+/// images.
+type Fact = (usize, Option<Text>, Vec<Image>);
+
+/// What the loop does with each note of a tool batch as it arrives: the note
+/// for the agent's own repair, the re-read ledger, the journal record and its
+/// commit.
+///
+/// History keeps the model's call order, so a result waits in its slot until
+/// the batch ends; the journal gets it as it comes.
+struct Results<'a, 'b, 'c> {
+    /// The reply's calls, in call order.
+    calls: &'a [ToolCall],
+    /// The places among the calls whose arguments the agent repaired.
+    repaired: &'a [usize],
+    /// The history the notes about re-reads are checked against.
+    history: &'a [Message],
+    /// The registry, to find what a call writes.
+    registry: &'a Registry,
+    /// The token of the run, for the event that names a commit.
+    token: &'a CancellationToken,
+    /// Whether the run answers the clients of a live session.
+    live: bool,
+    /// The channel the clients of a live session read.
+    events: &'a mpsc::Sender<Event>,
+    /// The re-read ledger, taken out of the loop while the batch runs.
+    ledger: &'b mut Ledger,
+    /// The journal, when the run keeps one.
+    journal: &'b mut Option<&'c mut Journal>,
+    /// The paths this reply wrote, once a re-read needed them.
+    written: Option<Vec<Identity>>,
+    /// The result of each call, by its place among the calls.
+    slots: Vec<Option<Message>>,
+    /// The event fields of each result, by its place among the calls.
+    facts: Vec<Option<Fact>>,
+    /// The first journal error, which ends the turn.
+    failure: Option<Text>,
+}
+
+impl Results<'_, '_, '_> {
+    /// Takes one note of the batch.
+    async fn note(&mut self, note: Note) {
+        match note {
+            Note::Done(at, outcome) => self.done(at, outcome).await,
+            Note::Wait { at, done } => {
+                self.approval(at, ApprovalKind::Wait).await;
+                let _ = done.send(());
+            }
+            Note::Answer { at, run, done } => {
+                let kind = if run {
+                    ApprovalKind::Run
+                } else {
+                    ApprovalKind::Refused
+                };
+                self.approval(at, kind).await;
+                let _ = done.send(());
+            }
+        }
+    }
+
+    /// Records one result: the note of the agent's own repair, the re-read
+    /// note, then the journal and its commit, so a crash in the middle of the
+    /// batch keeps what already ran.
+    async fn done(&mut self, at: usize, (result, seen): Outcome) {
+        // A note says how the agent itself read the call, so a weak model
+        // stops sending the same shape. Only a result with such a note is
+        // touched.
+        let result = match self
+            .calls
+            .get(at)
+            .and_then(|call| agent_note(call, at, self.repaired))
+        {
+            Some(note) => with_note(result, note),
+            None => result,
+        };
+        // A file the reply writes loses its earlier reads, and a read of a
+        // file the reply writes is not recorded, so neither can answer a later
+        // read. A reply with nothing to drop and no read to skip resolves no
+        // tool and parses no argument, which is every turn that writes nothing.
+        // The set is resolved once, at the first result that needs it.
+        if self.written.is_none() && self.ledger.needs_writes(seen.is_some()) {
+            self.written = Some(self.ledger.forget_writes(self.calls, self.registry).await);
+        }
+        // A re-read of lines the run already holds keeps its content and gains
+        // the note, before it reaches either the journal or the model.
+        let result = match seen {
+            Some(seen)
+                if !self
+                    .written
+                    .as_ref()
+                    .is_some_and(|written| written.contains(&seen.key)) =>
+            {
+                self.ledger.apply(result, *seen, self.history)
+            }
+            _ => result,
+        };
+        self.facts[at] = Some((tool_bytes(&result), tool_error(&result), images(&result)));
+        let mut wrote = false;
+        if let Some(journal) = self.journal.as_mut() {
+            match journal.message(&result).and_then(|()| journal.commit()) {
+                Ok(()) => wrote = true,
+                Err(error) => {
+                    self.failure.get_or_insert(journal_error(&error));
+                }
+            }
+        }
+        self.slots[at] = Some(result);
+        if wrote {
+            committed(self.journal, self.live, self.events, self.token).await;
+        }
+    }
+
+    /// Records a call that waits for a client, or the answer it got, so a
+    /// resume knows a call without an answer never ran.
+    async fn approval(&mut self, at: usize, kind: ApprovalKind) {
+        let Some(call) = self.calls.get(at) else {
+            return;
+        };
+        let mut wrote = false;
+        if let Some(journal) = self.journal.as_mut() {
+            // An approval is rare and waits for a person, so it is synced: the
+            // call asks or runs only once the record is on the disk.
+            let written = match journal.approval(&call.id, kind) {
+                Ok(()) => journal.sync().await,
+                Err(error) => Err(error),
+            };
+            match written {
+                Ok(()) => wrote = true,
+                Err(error) => {
+                    self.failure.get_or_insert(journal_error(&error));
+                }
+            }
+        }
+        if wrote {
+            committed(self.journal, self.live, self.events, self.token).await;
+        }
+    }
+}
+
+/// Writes one settings change and commits it: the model in its own record,
+/// the level and the mode in a settings record.
+fn write_settings(
+    journal: &mut Journal,
+    provider: &str,
+    settings: &Settings,
+) -> std::io::Result<()> {
+    let mut wrote = false;
+    if let Some(model) = &settings.model {
+        journal.model(provider, model)?;
+        wrote = true;
+    }
+    if settings.level.is_some() || settings.mode.is_some() {
+        let mode = settings.mode.map(|mode| mode.as_str());
+        journal.settings(settings.level.as_deref(), mode)?;
+        wrote = true;
+    }
+    if wrote {
+        journal.commit()?;
+    }
+    Ok(())
+}
+
+/// Tells the clients of a live session the number of the record the journal
+/// committed last, so a client can resume its view from it.
+///
+/// A run with no inbox, and a run with no journal, sends nothing.
+async fn committed(
+    journal: &Option<&mut Journal>,
+    live: bool,
+    events: &mpsc::Sender<Event>,
+    token: &CancellationToken,
+) -> bool {
+    if !live {
+        return false;
+    }
+    let Some(journal) = journal.as_ref() else {
+        return false;
+    };
+    emit(
+        events,
+        token,
+        Event::Committed {
+            record: journal.record(),
+        },
+    )
+    .await
 }
 
 /// Appends `message` to the journal, then to history. A journal error leaves
@@ -1038,6 +1720,12 @@ fn write_base(
         agent.compactions,
     );
     journal.base(&state)?;
+    // A resume reads from this base, so the level and the mode a client set
+    // follow it; a run nobody changed writes the same records as before.
+    if agent.changed_settings {
+        let mode = agent.guard.as_ref().map(|guard| guard.mode().as_str());
+        journal.settings(agent.config.reasoning.as_deref(), mode)?;
+    }
     for message in history {
         journal.message(message)?;
     }
@@ -1082,9 +1770,9 @@ async fn note_calls(
     calls: &[ToolCall],
     registry: &Registry,
     journal: &mut Option<&mut Journal>,
-) -> Result<(), Text> {
+) -> Result<bool, Text> {
     let Some(journal) = journal.as_mut() else {
-        return Ok(());
+        return Ok(false);
     };
     let mut wrote = false;
     for call in calls {
@@ -1105,7 +1793,7 @@ async fn note_calls(
             .await
             .map_err(|error| journal_error(&error))?;
     }
-    Ok(())
+    Ok(wrote)
 }
 
 /// Writes the end of a turn and waits until it is on the disk.
@@ -1193,6 +1881,22 @@ enum ConsumeOutcome {
     StreamError(Error),
 }
 
+/// What adding a live session's steer texts did.
+#[derive(Default)]
+pub(crate) struct Drained {
+    /// A user message joined the conversation.
+    pub steered: bool,
+    /// The journal could not hold a message.
+    pub error: Option<Text>,
+}
+
+impl Drained {
+    /// The journal error that ends the run, if any.
+    pub fn error(self) -> Option<Text> {
+        self.error
+    }
+}
+
 /// The outcome of one turn inside [`Agent::run`].
 enum TurnOutcome {
     /// A tool call was run; another provider call may follow.
@@ -1211,13 +1915,49 @@ enum TurnOutcome {
 
 /// Sends one event, waiting on the cancellation token; a closed receiver
 /// counts as a cancel. Returns true when the run should stop as a cancel.
-async fn emit(events: &mpsc::Sender<Event>, token: &CancellationToken, event: Event) -> bool {
+pub(crate) async fn emit(
+    events: &mpsc::Sender<Event>,
+    token: &CancellationToken,
+    event: Event,
+) -> bool {
     // Send first: after a cancel, an event with room in the channel is still
     // delivered, and only a full channel gives way to the token.
     tokio::select! {
         biased;
         result = events.send(event) => result.is_err(),
         () = token.cancelled() => true,
+    }
+}
+
+/// What [`step`] took from a stream: an item or a command.
+enum Step {
+    /// The next item of the stream, or its end.
+    Item(Option<Result<StreamEvent, Error>>),
+    /// A command of a live session arrived first.
+    Command(Command),
+}
+
+/// The next item of `stream`, the next command of a live session, or `None`
+/// when the run was cancelled first.
+///
+/// With no inbox a headless `-p` run polls only the stream and the token, as it
+/// always has. A closed inbox never returns, so a stream that is still running
+/// is not polled in a spin.
+async fn step(
+    stream: &mut futures_util::stream::BoxStream<'static, Result<StreamEvent, Error>>,
+    token: &CancellationToken,
+    inbox: Option<&mut Inbox>,
+) -> Option<Step> {
+    match inbox {
+        None => tokio::select! {
+            item = stream.next() => Some(Step::Item(item)),
+            () = token.cancelled() => None,
+        },
+        Some(inbox) => tokio::select! {
+            item = stream.next() => Some(Step::Item(item)),
+            () = token.cancelled() => None,
+            command = inbox.next() => Some(Step::Command(command)),
+        },
     }
 }
 

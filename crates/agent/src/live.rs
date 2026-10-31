@@ -1,0 +1,1272 @@
+//! A live session: many clients steer, queue, cancel and set one running agent.
+//!
+//! A client sends [`Command`]s on a bounded channel. The session drains them
+//! only at the boundaries of a run (after a tool batch, before a request) with
+//! a non-blocking read, so a run makes no extra wakeup and adds no timer; it
+//! waits on the channel only while no run is open.
+
+use std::collections::VecDeque;
+
+use tokio::sync::mpsc;
+
+use reagent_ai::{Message, Text};
+use reagent_config::permissions::PermissionMode;
+
+use crate::agent_loop::Agent;
+use crate::event::Event;
+use crate::guard::Answer;
+use crate::journal::Journal;
+
+/// The id a caller gives itself, so the events and the journal name it.
+pub type ClientId = u32;
+
+/// How a sent message joins the run that is in progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendMode {
+    /// Added after the current tool calls and before the next request.
+    Steer,
+    /// Held until the run ends; it starts the next run.
+    Queue,
+}
+
+/// What a client asks the session to change for the next request.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Settings {
+    /// The provider model id, when the client changes it.
+    pub model: Option<Text>,
+    /// The reasoning level text, when the client changes it.
+    pub level: Option<Text>,
+    /// The permission mode to switch to; the mode stays when it is `None`.
+    pub mode: Option<PermissionMode>,
+}
+
+/// One request of one client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Command {
+    /// A message: it steers the run or waits for the next one.
+    Send {
+        /// The client that sent it.
+        client: ClientId,
+        /// The text of the message.
+        text: Text,
+        /// How it joins the session.
+        mode: SendMode,
+    },
+    /// Stop the current turn; the session stays open for the next message.
+    Cancel {
+        /// The client that asked.
+        client: ClientId,
+    },
+    /// Change the model, the level or the mode for the next request.
+    Set {
+        /// The client that asked.
+        client: ClientId,
+        /// The values to change; each is left alone when it is `None`.
+        settings: Settings,
+    },
+    /// Answer a call that waits for approval: run it once, allow its rule for
+    /// this session, save the rule, refuse it or skip it.
+    Approve {
+        /// The client that answered.
+        client: ClientId,
+        /// The id of the request, as [`Event::ApprovalRequest`] reported it.
+        id: u64,
+        /// The answer.
+        answer: Answer,
+    },
+}
+
+/// How many commands may be in flight before a client waits.
+pub const COMMANDS: usize = 64;
+
+/// The side a client sends its commands on.
+pub type Sender = mpsc::Sender<Command>;
+
+/// The commands of one session, its steer list and its queue.
+#[derive(Debug)]
+pub struct Inbox {
+    commands: mpsc::Receiver<Command>,
+    /// Steer texts taken from the channel that no request has carried yet.
+    pending: Vec<(ClientId, Text)>,
+    /// Messages that start a run once the current one ends, oldest first.
+    queue: VecDeque<(ClientId, Text)>,
+    /// Settings taken during a stream, applied before the next request.
+    held: Vec<Settings>,
+}
+
+/// Creates the command channel of one session.
+pub fn channel() -> (Sender, Inbox) {
+    let (sender, commands) = mpsc::channel(COMMANDS);
+    let inbox = Inbox {
+        commands,
+        pending: Vec::new(),
+        queue: VecDeque::new(),
+        held: Vec::new(),
+    };
+    (sender, inbox)
+}
+
+impl Inbox {
+    /// Waits for the next command, or `None` when every sender is dropped.
+    ///
+    /// Only an idle session waits here: a run never does.
+    pub(crate) async fn wait(&mut self) -> Option<Command> {
+        self.commands.recv().await
+    }
+
+    /// Waits for the next command inside a run.
+    ///
+    /// Once every sender is dropped it waits forever, so a stream that is
+    /// still running is never polled in a spin.
+    pub(crate) async fn next(&mut self) -> Command {
+        match self.commands.recv().await {
+            Some(command) => command,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// The next command that is ready now, without waiting for one.
+    pub(crate) fn ready(&mut self) -> Option<Command> {
+        self.commands.try_recv().ok()
+    }
+
+    /// Adds a steer text, which lands before the next request.
+    pub(crate) fn steer(&mut self, client: ClientId, text: Text) {
+        self.pending.push((client, text));
+    }
+
+    /// Adds a message for the next run.
+    pub(crate) fn queue(&mut self, client: ClientId, text: Text) {
+        self.queue.push_back((client, text));
+    }
+
+    /// Holds settings a stream took, for the next boundary.
+    pub(crate) fn hold(&mut self, settings: Settings) {
+        self.held.push(settings);
+    }
+
+    /// The steer texts waiting for a boundary, oldest first.
+    pub(crate) fn take_pending(&mut self) -> Vec<(ClientId, Text)> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Puts back steer texts that could not join the conversation, in order,
+    /// ahead of any that arrived since.
+    pub(crate) fn restore(
+        &mut self,
+        first: (ClientId, Text),
+        rest: impl Iterator<Item = (ClientId, Text)>,
+    ) {
+        let newer = std::mem::take(&mut self.pending);
+        self.pending.push(first);
+        self.pending.extend(rest);
+        self.pending.extend(newer);
+    }
+
+    /// Whether a steer text waits for the next boundary.
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Drops the steer texts and the queued messages: a cancel stops the work a
+    /// client asked for, and a client that wants it again sends it again.
+    pub(crate) fn clear_waiting(&mut self) {
+        self.pending.clear();
+        self.queue.clear();
+    }
+
+    /// The settings waiting for a boundary, oldest first.
+    pub(crate) fn take_held(&mut self) -> std::vec::Drain<'_, Settings> {
+        self.held.drain(..)
+    }
+
+    /// The oldest message waiting for a run.
+    pub(crate) fn pop(&mut self) -> Option<(ClientId, Text)> {
+        self.queue.pop_front()
+    }
+
+    /// Whether a message starts the next run right away.
+    fn started(&self) -> bool {
+        !self.pending.is_empty() || !self.queue.is_empty()
+    }
+}
+
+/// Runs the session until the inbox's sender side is dropped and nothing is
+/// queued: one run per user message, and a message that arrives while the
+/// session waits starts the next run.
+///
+/// A run ends on its own or on a [`Command::Cancel`]; the session stays open
+/// after either, and a message that a client sent while the run was open
+/// starts the next one.
+pub async fn run_live(
+    agent: &mut Agent<'_>,
+    history: &mut Vec<Message>,
+    mut journal: Option<&mut Journal>,
+    events: &mpsc::Sender<Event>,
+    inbox: &mut Inbox,
+) {
+    loop {
+        while !inbox.started() {
+            // Nothing to run: wait on the channel, with no request in flight
+            // and no timer, until a client sends something.
+            let Some(command) = inbox.wait().await else {
+                return;
+            };
+            agent.idle(command, inbox, events).await;
+        }
+        // A run starts with the steer texts taken while the session waited, or
+        // else the oldest queued message. They go to history only: the run
+        // writes them to the journal with the rest of what it has not written.
+        let mut start = inbox.take_pending();
+        if start.is_empty()
+            && let Some(first) = inbox.pop()
+        {
+            start.push(first);
+        }
+        history.extend(start.into_iter().map(|(_, text)| Message::user(text)));
+        agent.apply_held(inbox, events).await;
+        agent
+            .run_with_inbox(history, journal.as_deref_mut(), events, inbox)
+            .await;
+        // The run wrote every message it holds, so the next run writes only
+        // what comes after them.
+        if let Some(journal) = journal.as_deref_mut() {
+            crate::journal::resume::mark_recorded(journal, history.len());
+        }
+        // A cancel that arrived after the run ended has nothing to stop; it
+        // must not stop the next run before its first request.
+        while let Some(command) = inbox.ready() {
+            agent.idle(command, inbox, events).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use futures_util::future::BoxFuture;
+    use futures_util::stream::{self, BoxStream};
+    use reagent_ai::fake::{FakeProvider, SeenRequest};
+    use reagent_ai::{Content, Error, Provider, Request, Role, StopReason, StreamEvent, ToolSpec};
+    use tokio::sync::Notify;
+    use tokio::sync::mpsc::Receiver;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::agent_loop::AgentConfig;
+    use crate::event::TurnEndReason;
+    use crate::tool::{Registry, Tool, ToolOutput};
+
+    /// One message of a request, as a test reads it back.
+    type SeenMessage = (Role, String);
+
+    /// A provider that plays a [`FakeProvider`]'s replies, records the messages
+    /// of every request and sends scripted commands into the session when a
+    /// request opens.
+    struct Script {
+        fake: FakeProvider,
+        /// The commands to send when request `n` opens, oldest first.
+        plan: Mutex<VecDeque<Vec<Command>>>,
+        /// The messages of every request, oldest first.
+        requests: Mutex<Vec<Vec<SeenMessage>>>,
+        /// The session's commands; dropped by [`Script::close`] to end it.
+        sender: Mutex<Option<Sender>>,
+        /// Set once when a request opens, so a test can wait for it.
+        opened: Notify,
+    }
+
+    impl Script {
+        /// Plays `replies` and sends `plan[n]` when request `n` opens.
+        fn new(replies: Vec<Vec<StreamEvent>>, plan: Vec<Vec<Command>>, sender: Sender) -> Self {
+            Self {
+                fake: FakeProvider::new(replies),
+                plan: Mutex::new(plan.into()),
+                requests: Mutex::new(Vec::new()),
+                sender: Mutex::new(Some(sender)),
+                opened: Notify::new(),
+            }
+        }
+
+        /// Every request the provider saw, as its messages in order.
+        fn requests(&self) -> Vec<Vec<SeenMessage>> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+
+        /// The requests the fake provider recorded, with their model and level.
+        fn seen(&self) -> Vec<SeenRequest> {
+            self.fake.seen()
+        }
+
+        /// Drops the session's sender, so an idle session returns.
+        fn close(&self) {
+            self.sender.lock().expect("sender lock").take();
+        }
+    }
+
+    impl Provider for Script {
+        fn name(&self) -> &'static str {
+            "script"
+        }
+
+        fn stream(&self, request: &Request<'_>) -> BoxStream<'static, Result<StreamEvent, Error>> {
+            self.requests.lock().expect("requests lock").push(
+                request
+                    .messages
+                    .iter()
+                    .map(|message| (message.role(), text_of(message)))
+                    .collect(),
+            );
+            for command in self
+                .plan
+                .lock()
+                .expect("plan lock")
+                .pop_front()
+                .unwrap_or_default()
+            {
+                let sender = self.sender.lock().expect("sender lock");
+                if let Some(sender) = sender.as_ref() {
+                    let _ = sender.try_send(command);
+                }
+            }
+            self.opened.notify_one();
+            self.fake.stream(request)
+        }
+    }
+
+    /// The visible text of `message`, or the tool text of a call and a result,
+    /// so a test names a request without its own copy of the types.
+    fn text_of(message: &Message) -> String {
+        match message {
+            Message::User { content } => texts(content),
+            Message::Assistant(assistant) => texts(&assistant.content),
+            Message::ToolResult(result) => result.content.to_string(),
+        }
+    }
+
+    fn texts(content: &[Content]) -> String {
+        content
+            .iter()
+            .filter_map(|content| match content {
+                Content::Text { text } => Some(&**text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// A read-only tool that answers `hi`.
+    struct Echo {
+        spec: ToolSpec,
+    }
+
+    impl Tool for Echo {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn read_only(&self) -> bool {
+            true
+        }
+
+        fn run<'a>(
+            &'a self,
+            _args: &'a str,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, ToolOutput> {
+            Box::pin(async { ToolOutput::ok("hi") })
+        }
+    }
+
+    fn registry() -> Registry {
+        let mut registry = Registry::new();
+        registry.add(Echo {
+            spec: ToolSpec {
+                name: "echo".into(),
+                description: "Echo.".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        });
+        registry
+    }
+
+    fn config() -> AgentConfig {
+        AgentConfig {
+            model: "fake-model".into(),
+            max_tokens: 128,
+            system: None,
+            reasoning: None,
+            cache_key: None,
+            max_turns: None,
+            images: true,
+        }
+    }
+
+    fn text_reply(text: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::TextDelta(Text::from(text)),
+            StreamEvent::Stop(StopReason::EndTurn),
+        ]
+    }
+
+    fn tool_reply(call_id: &str, name: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolCallStart {
+                id: Text::from(call_id),
+                name: Text::from(name),
+            },
+            StreamEvent::ToolCallDelta {
+                id: Text::from(call_id),
+                partial_json: Text::from("{}"),
+            },
+            StreamEvent::ToolCallEnd {
+                id: Text::from(call_id),
+            },
+            StreamEvent::Stop(StopReason::ToolUse),
+        ]
+    }
+
+    fn send(client: ClientId, text: &str, mode: SendMode) -> Command {
+        Command::Send {
+            client,
+            text: Text::from(text),
+            mode,
+        }
+    }
+
+    /// The events `rx` holds now, without waiting.
+    fn taken(rx: &mut Receiver<Event>) -> Vec<Event> {
+        let mut drained = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            drained.push(event);
+        }
+        drained
+    }
+
+    /// Waits for one event that `done` accepts, so a test needs no spin.
+    async fn until(rx: &mut Receiver<Event>, done: impl Fn(&Event) -> bool) {
+        while let Some(event) = rx.recv().await {
+            if done(&event) {
+                return;
+            }
+        }
+        panic!("the events ended before the one the test waited for");
+    }
+
+    #[tokio::test]
+    async fn a_steer_message_lands_after_the_tool_result() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![tool_reply("call_1", "echo"), text_reply("done")],
+            vec![vec![send(7, "use cargo nextest", SendMode::Steer)]],
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            until(&mut rx, |event| matches!(event, Event::RunEnd(_))).await;
+            script.close();
+            drop(tx);
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        tokio::join!(session, driver);
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2, "two requests: {requests:?}");
+        assert_eq!(
+            requests[1],
+            vec![
+                (Role::User, "hello".to_string()),
+                (Role::Assistant, String::new()),
+                (Role::ToolResult, "hi".to_string()),
+                (Role::User, "use cargo nextest".to_string()),
+            ],
+            "the steer message follows the tool result"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_steer_while_the_model_streams_keeps_the_run_going() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![text_reply("first"), text_reply("second")],
+            vec![vec![
+                send(7, "say more", SendMode::Steer),
+                Command::Set {
+                    client: 7,
+                    settings: Settings {
+                        model: Some(Text::from("other-model")),
+                        ..Settings::default()
+                    },
+                },
+            ]],
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            until(&mut rx, |event| matches!(event, Event::RunEnd(_))).await;
+            script.close();
+            drop(tx);
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        tokio::join!(session, driver);
+
+        let requests = script.requests();
+        assert_eq!(requests.len(), 2, "the run went on: {requests:?}");
+        assert_eq!(
+            requests[1],
+            vec![
+                (Role::User, "hello".to_string()),
+                (Role::Assistant, "first".to_string()),
+                (Role::User, "say more".to_string()),
+            ],
+            "the reply, then the steer message"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_queued_messages_start_two_later_runs_in_order() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![
+                text_reply("first"),
+                text_reply("second"),
+                text_reply("third"),
+            ],
+            vec![vec![
+                send(2, "add a test", SendMode::Queue),
+                send(3, "run clippy", SendMode::Queue),
+            ]],
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            // Three runs end with three end-turn run ends.
+            for _ in 0..3 {
+                until(&mut rx, |event| matches!(event, Event::RunEnd(_))).await;
+            }
+            script.close();
+            drop(tx);
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        tokio::join!(session, driver);
+
+        let roles: Vec<(Role, String)> = history
+            .iter()
+            .map(|message| (message.role(), text_of(message)))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                (Role::User, "hello".to_string()),
+                (Role::Assistant, "first".to_string()),
+                (Role::User, "add a test".to_string()),
+                (Role::Assistant, "second".to_string()),
+                (Role::User, "run clippy".to_string()),
+                (Role::Assistant, "third".to_string()),
+            ],
+            "each queued message starts its own run, in order"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_session_makes_no_request() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(vec![], vec![], tx.clone());
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert!(
+                script.seen().is_empty(),
+                "a session with no message makes no request"
+            );
+            script.close();
+            drop(tx);
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        tokio::join!(session, driver);
+
+        assert!(history.is_empty(), "no message, no conversation");
+        assert!(taken(&mut rx).is_empty(), "no event, no request");
+    }
+
+    /// A provider whose first reply never ends, and whose later replies say
+    /// `done`.
+    struct Endless {
+        requests: Mutex<usize>,
+        opened: Notify,
+    }
+
+    impl Provider for Endless {
+        fn name(&self) -> &'static str {
+            "endless"
+        }
+
+        fn stream(&self, _request: &Request<'_>) -> BoxStream<'static, Result<StreamEvent, Error>> {
+            let first = {
+                let mut requests = self.requests.lock().expect("requests lock");
+                *requests += 1;
+                *requests == 1
+            };
+            self.opened.notify_one();
+            if first {
+                Box::pin(stream::pending::<Result<StreamEvent, Error>>())
+            } else {
+                Box::pin(stream::iter(text_reply("done").into_iter().map(Ok)))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancel_ends_the_turn_and_the_session_stays_open() {
+        let (tx, mut inbox) = channel();
+        let provider = Endless {
+            requests: Mutex::new(0),
+            opened: Notify::new(),
+        };
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            provider.opened.notified().await;
+            tx.send(Command::Cancel { client: 1 })
+                .await
+                .expect("the cancel reaches the session");
+            until(&mut rx, |event| {
+                matches!(event, Event::RunEnd(TurnEndReason::Cancelled))
+            })
+            .await;
+            // The session is still open: a later message starts a new run.
+            tx.send(send(2, "again", SendMode::Steer))
+                .await
+                .expect("the cancel keeps the session open");
+            until(&mut rx, |event| {
+                matches!(event, Event::RunEnd(TurnEndReason::EndTurn))
+            })
+            .await;
+            drop(tx);
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(session, driver);
+        })
+        .await
+        .expect("the turn ends as cancelled within a second");
+
+        let roles: Vec<(Role, String)> = history
+            .iter()
+            .map(|message| (message.role(), text_of(message)))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                (Role::User, "hello".to_string()),
+                (Role::User, "again".to_string()),
+                (Role::Assistant, "done".to_string()),
+            ],
+            "the cancelled turn keeps no partial reply"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_set_level_applies_from_the_next_request() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![tool_reply("call_1", "echo"), text_reply("done")],
+            vec![vec![Command::Set {
+                client: 3,
+                settings: Settings {
+                    level: Some(Text::from("high")),
+                    ..Settings::default()
+                },
+            }]],
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let config = AgentConfig {
+            reasoning: Some("medium".into()),
+            ..config()
+        };
+        let mut agent = Agent::new(&script, &registry, config, CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            until(&mut rx, |event| matches!(event, Event::RunEnd(_))).await;
+            script.close();
+            drop(tx);
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        tokio::join!(session, driver);
+
+        let seen = script.seen();
+        assert_eq!(seen.len(), 2, "two requests");
+        assert_eq!(
+            seen[0].reasoning.as_deref(),
+            Some("medium"),
+            "the request in flight keeps the old level"
+        );
+        assert_eq!(
+            seen[1].reasoning.as_deref(),
+            Some("high"),
+            "the next request uses the new level"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_message_event_names_the_sending_client_once() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![text_reply("done"), text_reply("ok")],
+            vec![vec![send(7, "use cargo nextest", SendMode::Steer)]],
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            let mut sent = Vec::new();
+            while let Some(event) = rx.recv().await {
+                let end = matches!(event, Event::RunEnd(_));
+                sent.push(event);
+                if end {
+                    break;
+                }
+            }
+            script.close();
+            drop(tx);
+            sent
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        let (_, seen) = tokio::join!(session, driver);
+
+        let sent: Vec<(ClientId, SendMode, String)> = seen
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::UserMessage { client, mode, text } => Some((client, mode, text.to_string())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                (1, SendMode::Steer, "hello".to_string()),
+                (7, SendMode::Steer, "use cargo nextest".to_string()),
+            ],
+            "one event per accepted message, naming the client that sent it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_without_an_inbox_is_unchanged() {
+        let provider = FakeProvider::new(vec![tool_reply("call_1", "echo"), text_reply("done")]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(256);
+        let mut history = vec![Message::user("hello")];
+
+        let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new());
+        agent.run(&mut history, None, &tx).await;
+
+        let roles: Vec<Role> = history.iter().map(Message::role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                Role::User,
+                Role::Assistant,
+                Role::ToolResult,
+                Role::Assistant
+            ]
+        );
+        let seen = provider.seen();
+        assert_eq!(seen.len(), 2, "two requests, as before the inbox existed");
+        assert_eq!(seen[0].messages, 1);
+        assert_eq!(seen[1].messages, 3);
+        assert_eq!(
+            taken(&mut rx),
+            vec![
+                Event::TurnStart,
+                Event::ToolStart {
+                    id: Text::from("call_1"),
+                    name: Text::from("echo"),
+                },
+                Event::ToolCallReady {
+                    id: Text::from("call_1"),
+                    name: Text::from("echo"),
+                    arguments: Text::from("{}"),
+                },
+                Event::ToolResult {
+                    id: Text::from("call_1"),
+                    is_error: false,
+                    bytes: 2,
+                    error: None,
+                    images: Vec::new(),
+                },
+                Event::TurnEnd(TurnEndReason::EndTurn),
+                Event::TurnStart,
+                Event::TextDelta(Text::from("done")),
+                Event::TurnEnd(TurnEndReason::EndTurn),
+                Event::RunEnd(TurnEndReason::EndTurn),
+            ],
+            "the headless events, in order"
+        );
+    }
+
+    /// A tool that runs until the run is cancelled, and says when it started.
+    struct Slow {
+        spec: ToolSpec,
+        started: std::sync::Arc<Notify>,
+    }
+
+    impl Tool for Slow {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn run<'a>(
+            &'a self,
+            _args: &'a str,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, ToolOutput> {
+            Box::pin(async {
+                self.started.notify_one();
+                std::future::pending().await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancel_reaches_a_running_tool_at_once() {
+        let (tx, mut inbox) = channel();
+        let started = std::sync::Arc::new(Notify::new());
+        let mut registry = Registry::new();
+        registry.add(Slow {
+            spec: ToolSpec {
+                name: "slow".into(),
+                description: "Slow.".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            started: started.clone(),
+        });
+        let script = Script::new(vec![tool_reply("c1", "slow")], Vec::new(), tx.clone());
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "build it", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            started.notified().await;
+            tx.send(Command::Cancel { client: 1 })
+                .await
+                .expect("the cancel reaches the session");
+            until(&mut rx, |event| {
+                matches!(event, Event::RunEnd(TurnEndReason::Cancelled))
+            })
+            .await;
+            drop(tx);
+            script.close();
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(session, driver);
+        })
+        .await
+        .expect("a cancel during a tool call ends the turn within a second");
+        assert!(
+            matches!(history.last(), Some(Message::ToolResult(_))),
+            "the cancelled call still has its answer: {history:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_between_runs_does_not_stop_the_next_run() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![text_reply("done"), text_reply("ok")],
+            Vec::new(),
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            until(&mut rx, |event| matches!(event, Event::RunEnd(_))).await;
+            // The cancel arrives after the run it meant to stop has ended.
+            tx.send(Command::Cancel { client: 1 })
+                .await
+                .expect("the session is open");
+            tx.send(send(1, "again", SendMode::Queue))
+                .await
+                .expect("the session is open");
+            let mut ends = Vec::new();
+            while let Some(event) = rx.recv().await {
+                if let Event::RunEnd(reason) = event {
+                    ends.push(reason);
+                    break;
+                }
+            }
+            drop(tx);
+            script.close();
+            ends
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        let ((), ends) = tokio::join!(session, driver);
+        assert_eq!(
+            ends,
+            vec![TurnEndReason::EndTurn],
+            "the next run is not cancelled"
+        );
+        assert_eq!(script.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_live_session_writes_each_message_to_the_journal_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let header = reagent_store::Header::new(
+            "session".into(),
+            reagent_store::paths::now_ms(),
+            None,
+            bytes::Bytes::new(),
+        );
+        let mut journal = Journal::create(dir.path(), header).expect("create the journal");
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![text_reply("done"), text_reply("ok")],
+            vec![vec![send(1, "again", SendMode::Queue)]],
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            let mut ends = 0;
+            while let Some(event) = rx.recv().await {
+                if matches!(event, Event::RunEnd(_)) {
+                    ends += 1;
+                    if ends == 2 {
+                        break;
+                    }
+                }
+            }
+            drop(tx);
+            script.close();
+        };
+        let session = run_live(
+            &mut agent,
+            &mut history,
+            Some(&mut journal),
+            &events,
+            &mut inbox,
+        );
+        tokio::join!(session, driver);
+        journal.close().expect("close the journal");
+
+        let session = reagent_store::Session::open(dir.path()).expect("open the session");
+        let resumed = crate::journal::resume::load(&session).expect("load the session");
+        let roles: Vec<(Role, String)> = resumed
+            .history
+            .iter()
+            .map(|message| (message.role(), text_of(message)))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                (Role::User, "hello".to_string()),
+                (Role::Assistant, "done".to_string()),
+                (Role::User, "again".to_string()),
+                (Role::Assistant, "ok".to_string()),
+            ],
+            "each message is in the journal once, in order"
+        );
+        // A resume starts at the last base, so it hides a duplicate: count the
+        // records on the disk instead.
+        let records: Vec<crate::journal::record::Record> = session
+            .records()
+            .map(|record| {
+                let record = record.expect("read a record");
+                crate::journal::record::decode(record.kind, &record.payload).expect("decode")
+            })
+            .collect();
+        let bases = records
+            .iter()
+            .filter(|record| matches!(record, crate::journal::record::Record::Base(_)))
+            .count();
+        let messages = records
+            .iter()
+            .filter(|record| matches!(record, crate::journal::record::Record::Message(_)))
+            .count();
+        assert_eq!((bases, messages), (1, 4), "one base and four messages");
+    }
+
+    /// A guard that asks a client about every call.
+    fn asking_guard() -> crate::guard::Guard {
+        let layer = reagent_config::Layer {
+            path: std::path::PathBuf::from("/c/config.toml"),
+            settings: reagent_config::Settings {
+                permissions: reagent_config::permissions::Lists {
+                    default: Some("ask".into()),
+                    ..Default::default()
+                },
+                ..reagent_config::Settings::default()
+            },
+        };
+        let rules = reagent_config::permissions::Rules::from_layers(
+            &[layer],
+            std::path::Path::new("/work"),
+            None,
+        )
+        .expect("the rules build");
+        crate::guard::Guard::new(rules)
+    }
+
+    /// What the driver does when an approval request arrives.
+    #[derive(Clone, Debug)]
+    enum React {
+        /// Send this answer.
+        Answer(Answer),
+        /// Cancel the run.
+        Cancel,
+    }
+
+    /// Sends the reactions of `next` for each approval request, and returns
+    /// every event up to the first one `done` accepts.
+    async fn drive(
+        rx: &mut Receiver<Event>,
+        tx: &Sender,
+        mut next: impl FnMut(u64) -> Vec<React>,
+        done: impl Fn(&Event) -> bool,
+    ) -> Vec<Event> {
+        let mut seen = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let finished = done(&event);
+            if let Event::ApprovalRequest(request) = &event {
+                let id = request.id;
+                for react in next(id) {
+                    let command = match react {
+                        React::Answer(answer) => Command::Approve {
+                            client: 7,
+                            id,
+                            answer,
+                        },
+                        React::Cancel => Command::Cancel { client: 7 },
+                    };
+                    tx.send(command).await.expect("the session is open");
+                }
+            }
+            seen.push(event);
+            if finished {
+                return seen;
+            }
+        }
+        panic!("the events ended before the one the test waited for");
+    }
+
+    fn resolved(message: &str) -> impl Fn(&Event) -> bool + use<> {
+        let message = message.to_string();
+        move |event| matches!(event, Event::Error(error) if error.as_ref() == message)
+    }
+
+    #[tokio::test]
+    async fn the_first_approval_answer_wins_and_a_second_names_the_resolved_id() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![tool_reply("call_1", "echo"), text_reply("done")],
+            vec![],
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new())
+            .with_guard(asking_guard());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            // Two answers to one request: the second has no call to reach.
+            let seen = drive(
+                &mut rx,
+                &tx,
+                |_| vec![React::Answer(Answer::Once), React::Answer(Answer::Once)],
+                resolved("approval 0 is already resolved"),
+            )
+            .await;
+            script.close();
+            drop(tx);
+            seen
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        let (_, seen) = tokio::join!(session, driver);
+
+        let requests = seen
+            .iter()
+            .filter(|event| matches!(event, Event::ApprovalRequest(_)))
+            .count();
+        assert_eq!(requests, 1, "one request, answered twice: {seen:?}");
+        assert!(
+            history.iter().any(
+                |message| matches!(message, Message::ToolResult(result) if result.content.as_ref() == "hi")
+            ),
+            "the first answer ran the call"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_set_to_bypass_mode_that_is_not_enabled_is_refused_and_the_mode_stays() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![tool_reply("call_1", "echo"), text_reply("done")],
+            vec![],
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new())
+            .with_guard(asking_guard());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(Command::Set {
+                client: 2,
+                settings: Settings {
+                    mode: Some(reagent_config::permissions::PermissionMode::Bypass),
+                    ..Settings::default()
+                },
+            })
+            .await
+            .expect("the session is open");
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            let seen = drive(
+                &mut rx,
+                &tx,
+                |_| vec![React::Answer(Answer::Once)],
+                |event| matches!(event, Event::RunEnd(_)),
+            )
+            .await;
+            script.close();
+            drop(tx);
+            seen
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        let (_, seen) = tokio::join!(session, driver);
+
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                Event::Error(error) if error.contains("`bypass` is not enabled")
+            )),
+            "{seen:?}"
+        );
+        // The mode stayed the default, so the call still asked.
+        assert_eq!(
+            seen.iter()
+                .filter(|event| matches!(event, Event::ApprovalRequest(_)))
+                .count(),
+            1,
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_while_waiting_for_an_approval_ends_the_run_as_cancelled() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![tool_reply("call_1", "echo"), text_reply("done")],
+            vec![],
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new())
+            .with_guard(asking_guard());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            let seen = drive(
+                &mut rx,
+                &tx,
+                |_| vec![React::Cancel],
+                |event| matches!(event, Event::RunEnd(TurnEndReason::Cancelled)),
+            )
+            .await;
+            script.close();
+            drop(tx);
+            seen
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        let (_, seen) = tokio::join!(session, driver);
+
+        assert!(
+            seen.iter()
+                .any(|event| matches!(event, Event::RunEnd(TurnEndReason::Cancelled))),
+            "{seen:?}"
+        );
+        assert!(
+            history.iter().any(
+                |message| matches!(message, Message::ToolResult(result) if result.content.as_ref() == "cancelled")
+            ),
+            "the call did not run: {history:?}"
+        );
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "the cancelled turn made no second request"
+        );
+    }
+}

@@ -29,11 +29,19 @@ pub const INBOX: u8 = RECORD_FIRST + 6;
 /// A timer the run waits on; unused for now.
 pub const TIMER: u8 = RECORD_FIRST + 7;
 
-/// A permission decision the run waits on; unused for now.
+/// A call that waits for a client's answer, or the answer it got: the call id
+/// and the wait or answer kind.
+///
+/// The wait is on the disk before the call asks, so a resume knows a call that
+/// never got an answer never ran, whatever its `CALL_START` says.
 pub const APPROVAL: u8 = RECORD_FIRST + 8;
 
 /// The task a subagent belongs to; unused for now.
 pub const OWNER: u8 = RECORD_FIRST + 9;
+
+/// A change of the reasoning level or the permission mode. A change of the
+/// model is a [`MODEL`] record.
+pub const SETTINGS: u8 = RECORD_FIRST + 10;
 
 #[cfg(test)]
 mod tests {
@@ -41,7 +49,9 @@ mod tests {
     use reagent_ai::{AssistantMessage, Content, Message, StopReason, ToolCall, Usage};
     use reagent_store::Encoder;
 
-    use crate::journal::record::{self, CallStart, Model, Record, TurnEnd};
+    use crate::journal::record::{
+        self, Approval, ApprovalKind, CallStart, Model, Record, Settings, TurnEnd,
+    };
     use crate::journal::state::{LedgerEntry, State};
     use crate::tool::EffectClass;
 
@@ -250,6 +260,48 @@ mod tests {
     }
 
     #[test]
+    fn an_approval_wait_and_answer_round_trip() {
+        for kind in [ApprovalKind::Wait, ApprovalKind::Run, ApprovalKind::Refused] {
+            let approval = Approval {
+                id: "call_1".into(),
+                kind,
+            };
+            let mut out = Vec::new();
+            record::encode_approval(&mut out, &approval);
+            let payload = Bytes::from(out);
+            let decoded = record::decode_aside(APPROVAL, &payload).expect("decode");
+            assert_eq!(decoded, Some(record::Aside::Approval(approval)), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_settings_change_round_trips() {
+        let every = Settings {
+            level: Some("high".into()),
+            mode: Some("accept-edits".into()),
+        };
+        let level_only = Settings {
+            level: Some("low".into()),
+            mode: None,
+        };
+        let mode_only = Settings {
+            level: None,
+            mode: Some("bypass".into()),
+        };
+        for settings in [every, level_only, mode_only] {
+            let mut out = Vec::new();
+            record::encode_settings(&mut out, &settings);
+            let payload = Bytes::from(out);
+            let decoded = record::decode_aside(SETTINGS, &payload).expect("decode");
+            assert_eq!(
+                decoded,
+                Some(record::Aside::Settings(settings.clone())),
+                "{settings:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_kinds_are_defined_once() {
         let kinds = [
             MESSAGE,
@@ -262,6 +314,7 @@ mod tests {
             TIMER,
             APPROVAL,
             OWNER,
+            SETTINGS,
         ];
         for (at, kind) in kinds.iter().enumerate() {
             assert_eq!(*kind, RECORD_FIRST + at as u8);

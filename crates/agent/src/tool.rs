@@ -297,6 +297,27 @@ pub trait Tool: Send + Sync {
     /// Runs one call. `cancel` fires when the caller asks the loop to stop.
     fn run<'a>(&'a self, args: &'a str, cancel: &'a CancellationToken)
     -> BoxFuture<'a, ToolOutput>;
+
+    /// Whether the tool can run a call contained: `bash` can, with a launcher.
+    /// A tool that cannot makes the batch ask a client instead.
+    fn can_contain(&self) -> bool {
+        false
+    }
+
+    /// Runs one call contained, with no network, for [`PermissionMode::Auto`].
+    ///
+    /// The default, and a tool that cannot start its sandbox for this call,
+    /// returns `None`, and the batch asks a client instead. No fallback: a
+    /// contained call that the sandbox cannot hold never runs plainly.
+    ///
+    /// [`PermissionMode::Auto`]: reagent_config::permissions::PermissionMode::Auto
+    fn run_contained<'a>(
+        &'a self,
+        _args: &'a str,
+        _cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Option<ToolOutput>> {
+        Box::pin(async { None })
+    }
 }
 
 /// What [`Tool::repair`] made of a call.

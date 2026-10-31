@@ -4,11 +4,21 @@
 # line and exits 2 on a platform with no line.
 #
 # Each budget is the measured size plus 5%, rounded up to a multiple of 4096.
-# darwin-arm64: measured 5818192 bytes on 2026-10-28 (images: the image crate
-# with its decoders and encoders, read images and @path; 5038864 before),
-# budget 6111232.
-darwin-arm64 6111232
-# linux-x86_64: measured 7158280 bytes on 2026-10-28 (dftu-gate, Debian 13;
-# images: the image crate with its decoders and encoders, read images and
-# @path; 6199368 before), budget 7520256.
-linux-x86_64 7520256
+# darwin-arm64: measured 5154976 bytes on 2026-10-30 (min profile at
+# opt-level "z" with "s" for the CPU-heavy crates; 6050480 before, with the
+# worker, the protocol and saved rules), budget 5414912.
+darwin-arm64 5414912
+# linux-x86_64: measured 7123048 bytes on 2026-10-30 (dftu-gate, Debian 13;
+# min profile at opt-level "z" with "s" for the CPU-heavy crates; 7442456
+# before, with the worker, the protocol and saved rules), budget 7479296.
+linux-x86_64 7479296
+#
+# The full build with the TUI (default features), checked by the same script
+# against the `-tui` lines; the lines above are the build without it.
+# darwin-arm64-tui: measured 5520448 bytes on 2026-10-30 (TUI change 1: screen,
+# streaming markdown with pulldown-cmark, editor, worker client; 5155056
+# without the TUI), budget 5799936.
+darwin-arm64-tui 5799936
+# linux-x86_64-tui: measured 7708072 bytes on 2026-10-30 (dftu-gate; 7130568
+# without the TUI), budget 8093696.
+linux-x86_64-tui 8093696

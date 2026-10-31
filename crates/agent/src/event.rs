@@ -2,6 +2,9 @@
 
 use reagent_ai::{StopReason, Text, Usage};
 
+use crate::guard::Answer;
+use crate::live::{ClientId, SendMode};
+
 /// Why a turn, or the whole run, ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TurnEndReason {
@@ -81,6 +84,21 @@ pub enum Event {
         /// The error that caused the retry.
         error: Text,
     },
+    /// A client sent a message to a live session, sent once per accepted
+    /// message so every client sees the messages of the others.
+    UserMessage {
+        /// The client that sent the message.
+        client: ClientId,
+        /// How the message joined the session: a steer or a queue.
+        mode: SendMode,
+        /// The text the client sent, shared with the conversation.
+        text: Text,
+    },
+    /// A journal record was committed.
+    Committed {
+        /// The number of the record, so a client can resume its view from it.
+        record: u64,
+    },
     /// Older turns were replaced by a checkpoint before the next request.
     Compacted {
         /// The prompt size, in tokens, that triggered it.
@@ -90,4 +108,48 @@ pub enum Event {
         /// The size of the checkpoint, in bytes.
         bytes: u32,
     },
+    /// A tool call waits for a client's approval before it runs. Boxed, since
+    /// it is rare and would make every event larger.
+    ApprovalRequest(Box<ApprovalRequest>),
+    /// A client answered an approval request.
+    ApprovalResolved {
+        /// The id of the request.
+        id: u64,
+        /// The client that answered.
+        client: ClientId,
+        /// What it answered.
+        answer: Answer,
+    },
+    /// A client's answer saves a rule to the config.
+    RuleToSave {
+        /// The rule to write into the `allow` list.
+        rule: Text,
+    },
+}
+
+/// What [`Event::ApprovalRequest`] shows a client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    /// The id of the request, which the answer names.
+    pub id: u64,
+    /// The tool the call names.
+    pub tool: Text,
+    /// One line that shows the call.
+    pub call: Text,
+    /// The rule that asked, or `default` when no rule matched.
+    pub rule: Text,
+    /// The rule a save would write, when a save is possible.
+    pub save: Option<Text>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_event_stays_the_size_of_a_tool_result() {
+        // Every event takes one channel slot of this size, streamed deltas
+        // too; `ToolResult` sets it, and a rare event is boxed to stay under.
+        assert!(size_of::<Event>() <= 72, "{} bytes", size_of::<Event>());
+    }
 }

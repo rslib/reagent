@@ -7,11 +7,13 @@ mod json;
 mod login;
 mod mcp;
 mod models;
+mod permissions;
 mod prompt;
 mod run;
 mod sandbox;
 mod session;
 mod snapshot;
+mod worker;
 
 /// The estimated-token budget for the system prompt and tool specs: 1000,
 /// raised to 1024 for the edit tool's `line` argument and to 1040 for the
@@ -20,16 +22,20 @@ mod snapshot;
 const PROMPT_BUDGET: usize = 1040;
 
 fn main() -> std::process::ExitCode {
-    let argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let mut argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if argv.first().is_some_and(|arg| *arg == "--sandbox-exec") {
         return sandbox::helper(argv.into_iter().skip(1));
     }
     if let Some(command) = argv.first().and_then(|arg| arg.to_str())
-        && matches!(command, "login" | "logout" | "mcp" | "session")
+        && matches!(
+            command,
+            "login" | "logout" | "mcp" | "permissions" | "session"
+        )
     {
         let runtime = runtime();
         let code = match command {
             "mcp" => runtime.block_on(mcp::run(argv[1..].to_vec())),
+            "permissions" => runtime.block_on(permissions::run(argv[1..].to_vec())),
             "session" => runtime.block_on(session::command(argv[1..].to_vec())),
             _ => runtime.block_on(login::run(command, argv[1..].to_vec())),
         };
@@ -39,7 +45,10 @@ fn main() -> std::process::ExitCode {
         runtime.shutdown_background();
         return code;
     }
-    let outcome = match args::parse() {
+    // `worker` runs the same path as `-p`, with a flag that makes it serve the
+    // session instead of running it once.
+    let worker = args::worker_word(&mut argv);
+    let outcome = match args::parse(argv, worker) {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!("reagent: {error}");

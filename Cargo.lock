@@ -1173,6 +1173,7 @@ dependencies = [
  "reagent-config",
  "reagent-mcp",
  "reagent-oauth",
+ "reagent-protocol",
  "reagent-sandbox",
  "reagent-script",
  "reagent-store",
@@ -1221,6 +1222,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -1287,6 +1289,18 @@ dependencies = [
  "serde_json",
  "tokio",
  "webpki-root-certs",
+]
+
+[[package]]
+name = "reagent-protocol"
+version = "0.0.0"
+dependencies = [
+ "dhat",
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

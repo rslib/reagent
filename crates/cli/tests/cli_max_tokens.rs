@@ -23,10 +23,7 @@ async fn run(tmp: &Path, script: &str) -> std::process::Output {
     Command::new(BIN)
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.join("state"))
         .args(["--json", "--provider", &provider, "-p", "hi"])
         .current_dir(tmp)
         .env("ANTHROPIC_API_KEY", "test-key")

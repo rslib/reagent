@@ -21,6 +21,7 @@ reagent-script = { path = "crates/script" }
 reagent-mcp = { path = "crates/mcp" }
 reagent-tui = { path = "crates/tui" }
 reagent-store = { path = "crates/store" }
+reagent-protocol = { path = "crates/protocol" }
 reagent-image = { path = "crates/image" }
 
 [workspace.lints.rust]
@@ -56,5 +57,54 @@ debug = "line-tables-only"
 # Size-first build for footprint measurements and the eval container.
 [profile.min]
 inherits = "release"
-opt-level = "s"
+opt-level = "z"
 panic = "abort"
+
+# The crates that do heavy CPU work keep "s": "z" for them doubled the CPU of a
+# 4000x3000 JPEG read (96 to 193 ms) and slowed a grep by half on macOS, while
+# this split kept both and the binary still lost 895 KB (6,050,480 to
+# 5,154,976 bytes).
+[profile.min.package.crc32c]
+opt-level = "s"
+[profile.min.package.crc32fast]
+opt-level = "s"
+[profile.min.package.fdeflate]
+opt-level = "s"
+[profile.min.package.gif]
+opt-level = "s"
+[profile.min.package.heic-decoder]
+opt-level = "s"
+[profile.min.package.image-webp]
+opt-level = "s"
+[profile.min.package.jpeg-encoder]
+opt-level = "s"
+[profile.min.package.memchr]
+opt-level = "s"
+[profile.min.package.miniz_oxide]
+opt-level = "s"
+[profile.min.package.png]
+opt-level = "s"
+[profile.min.package.reagent-image]
+opt-level = "s"
+[profile.min.package.reagent-tools]
+opt-level = "s"
+[profile.min.package.regex-lite]
+opt-level = "s"
+[profile.min.package.serde_json]
+opt-level = "s"
+[profile.min.package.simd-adler32]
+opt-level = "s"
+[profile.min.package.tiff]
+opt-level = "s"
+[profile.min.package.weezl]
+opt-level = "s"
+[profile.min.package.zstd]
+opt-level = "s"
+[profile.min.package.zstd-safe]
+opt-level = "s"
+[profile.min.package.zstd-sys]
+opt-level = "s"
+[profile.min.package.zune-core]
+opt-level = "s"
+[profile.min.package.zune-jpeg]
+opt-level = "s"

@@ -114,13 +114,18 @@ async fn make(root: &Path) -> Result<Run, String> {
             Err(error) => return Err(error.to_string()),
         }
     }
+    // A run killed with SIGKILL never reaches `cleanup`, so the first spill of
+    // the next run sweeps what it left. This folder is locked by now, so the
+    // sweep keeps it.
+    let swept = root.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || sweep(&swept)).await;
     Ok(Run {
         folder,
         _lock: file,
     })
 }
 
-// The sweep runs after the runtime has stopped, when nothing else runs: one
+// At exit the sweep runs after the runtime has stopped, when nothing else runs: one
 // blocking call per entry costs less than a hop to tokio's blocking pool.
 #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 fn cleanup_in(root: &Path, own: Option<&Run>) {
@@ -245,6 +250,46 @@ mod tests {
         assert!(
             !fs::try_exists(&dead).await.unwrap(),
             "a dead run's folder stays"
+        );
+    }
+
+    /// A run killed with SIGKILL never cleans up, so the next run's first spill
+    /// sweeps what it left, not only a normal exit.
+    #[tokio::test]
+    async fn the_first_spill_sweeps_a_dead_run_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dead = folder(tmp.path(), "run-1-0", Some(Duration::from_secs(120))).await;
+        let cell = OnceCell::new();
+        let own = folder_in(tmp.path(), &cell).await.unwrap();
+        assert!(
+            !fs::try_exists(&dead).await.unwrap(),
+            "a dead run's folder stays after the first spill"
+        );
+        assert!(
+            fs::try_exists(own).await.unwrap(),
+            "the new run's folder is there"
+        );
+    }
+
+    /// The sweep at the first spill keeps the folder of a run that is live.
+    #[tokio::test]
+    async fn the_first_spill_keeps_a_live_run_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = folder(tmp.path(), "run-1-0", Some(Duration::from_secs(120))).await;
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .open(live.join(LOCK))
+            .await
+            .unwrap()
+            .into_std()
+            .await;
+        lock.try_lock().unwrap();
+        let cell = OnceCell::new();
+        folder_in(tmp.path(), &cell).await.unwrap();
+        assert!(
+            fs::try_exists(&live).await.unwrap(),
+            "a live run's folder is deleted by another run's first spill"
         );
     }
 

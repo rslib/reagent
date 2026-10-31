@@ -157,7 +157,13 @@ fn path_rules(count: usize) -> Rules {
     Rules::from_layers(&[layer], Path::new("/work"), Some(Path::new("/home/u"))).expect("the rules")
 }
 
-/// The blocks one `decide` of a call that reads [`READS`] allocates.
+/// How many times a comparison measures one `decide`. dhat counts the blocks
+/// of every thread in the process, so one sample can carry a few blocks that
+/// are not the call's; the smallest of several is the call's own count.
+const SAMPLES: usize = 5;
+
+/// The blocks one `decide` of a call that reads [`READS`] allocates: the
+/// smallest count of [`SAMPLES`] measures.
 fn blocks_per_read(rules: &Rules, reads: &[PathBuf]) -> u64 {
     let call = Call {
         tool: "read",
@@ -166,12 +172,17 @@ fn blocks_per_read(rules: &Rules, reads: &[PathBuf]) -> u64 {
         reads,
         writes: &[],
     };
-    let profiler = Profiler::builder().testing().build();
-    let kind = rules.decide(&call).kind;
-    let stats = HeapStats::get();
-    drop(profiler);
-    assert_eq!(kind, Kind::Allow);
-    stats.total_blocks
+    (0..SAMPLES)
+        .map(|_| {
+            let profiler = Profiler::builder().testing().build();
+            let kind = rules.decide(&call).kind;
+            let stats = HeapStats::get();
+            drop(profiler);
+            assert_eq!(kind, Kind::Allow);
+            stats.total_blocks
+        })
+        .min()
+        .expect("at least one sample")
 }
 
 /// A path is made absolute and, on macOS, folded to lower case once per

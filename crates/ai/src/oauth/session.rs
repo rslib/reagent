@@ -380,31 +380,20 @@ mod tests {
     use super::*;
 
     /// A folder of its own for one test, removed when it drops.
-    struct Folder(PathBuf);
+    struct Folder(tempfile::TempDir);
 
     impl Folder {
-        /// The folder `<tmp>/reagent-oauth-<name>-<process>`, empty.
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "a test makes and removes its own folder"
-        )]
+        /// A new temp folder named after `name`, empty.
         fn new(name: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("reagent-oauth-{name}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).expect("makes the folder");
-            Self(path)
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("reagent-oauth-{name}-"))
+                .tempdir()
+                .expect("makes a temp folder");
+            Self(dir)
         }
 
         fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for Folder {
-        #[expect(clippy::disallowed_methods, reason = "a test removes its own folder")]
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            self.0.path()
         }
     }
 

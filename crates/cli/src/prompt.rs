@@ -149,27 +149,25 @@ mod tests {
         );
     }
 
-    struct Dir(PathBuf);
+    struct Dir(tempfile::TempDir);
 
     impl Dir {
         fn new(name: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("reagent-prompt-{}-{name}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).unwrap();
-            Self(path)
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("reagent-prompt-{name}-"))
+                .tempdir()
+                .expect("makes a temp folder");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            self.0.path()
         }
 
         fn write(&self, rel: &str, text: &str) {
-            let path = self.0.join(rel);
+            let path = self.0.path().join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
-        }
-    }
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -178,7 +176,7 @@ mod tests {
         let d = Dir::new("order");
         d.write("AGENTS.md", "root rules");
         d.write("sub/CLAUDE.md", "sub rules");
-        let got = instructions(None, Some(&d.0), &d.0.join("sub")).await;
+        let got = instructions(None, Some(d.path()), &d.path().join("sub")).await;
         assert_eq!(
             got,
             "\n\n# Instructions from AGENTS.md\n\nroot rules\
@@ -191,7 +189,7 @@ mod tests {
         let d = Dir::new("wins");
         d.write("AGENTS.md", "agents");
         d.write("CLAUDE.md", "claude");
-        let got = instructions(None, Some(&d.0), &d.0).await;
+        let got = instructions(None, Some(d.path()), d.path()).await;
         assert!(got.contains("agents"));
         assert!(!got.contains("claude"));
     }
@@ -202,9 +200,9 @@ mod tests {
         d.write("g/AGENTS.md", "global rules");
         d.write("repo/AGENTS.md", "repo rules");
         let got = instructions(
-            Some(&d.0.join("g/AGENTS.md")),
-            Some(&d.0.join("repo")),
-            &d.0.join("repo"),
+            Some(&d.path().join("g/AGENTS.md")),
+            Some(&d.path().join("repo")),
+            &d.path().join("repo"),
         )
         .await;
         assert_eq!(
@@ -217,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn no_files_add_nothing() {
         let d = Dir::new("none");
-        let got = instructions(None, Some(&d.0), &d.0).await;
+        let got = instructions(None, Some(d.path()), d.path()).await;
         assert_eq!(got, "");
         assert_eq!(system_with("/work", &got), system("/work"));
     }
@@ -227,7 +225,7 @@ mod tests {
         let d = Dir::new("long");
         d.write("AGENTS.md", &"x".repeat(40 * 1024));
         d.write("sub/AGENTS.md", "never read");
-        let got = instructions(None, Some(&d.0), &d.0.join("sub")).await;
+        let got = instructions(None, Some(d.path()), &d.path().join("sub")).await;
         assert!(got.len() <= INSTRUCTIONS_LIMIT + CUT_NOTE.len());
         assert!(got.ends_with("\n[instructions cut at 32 KB]"));
         assert!(!got.contains("never read"));
@@ -238,7 +236,7 @@ mod tests {
         let d = Dir::new("off");
         d.write("other/AGENTS.md", "other rules");
         d.write("sub/AGENTS.md", "sub rules");
-        let got = instructions(None, Some(&d.0), &d.0.join("sub")).await;
+        let got = instructions(None, Some(d.path()), &d.path().join("sub")).await;
         assert!(got.contains("sub rules"));
         assert!(!got.contains("other rules"));
     }
@@ -248,7 +246,7 @@ mod tests {
         let d = Dir::new("norepo");
         d.write("AGENTS.md", "parent rules");
         d.write("sub/AGENTS.md", "sub rules");
-        let got = instructions(None, None, &d.0.join("sub")).await;
+        let got = instructions(None, None, &d.path().join("sub")).await;
         assert_eq!(got, "\n\n# Instructions from AGENTS.md\n\nsub rules");
     }
 }

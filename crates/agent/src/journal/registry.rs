@@ -158,6 +158,25 @@ pub mod model {
     pub const MODEL: u32 = 2;
 }
 
+/// Fields of a [`kinds::APPROVAL`] record.
+pub mod approval {
+    /// The call id the request is about.
+    pub const CALL_ID: u32 = 1;
+    /// The kind: 1 waits for an answer, 2 runs, 3 is refused.
+    pub const KIND: u32 = 2;
+}
+
+/// Fields of a [`kinds::SETTINGS`] record.
+pub mod settings {
+    /// The reasoning level the run moves to.
+    pub const LEVEL: u32 = 1;
+    /// The permission mode the run moves to, as [`PermissionMode::as_str`]
+    /// writes it.
+    ///
+    /// [`PermissionMode::as_str`]: reagent_config::permissions::PermissionMode::as_str
+    pub const MODE: u32 = 2;
+}
+
 /// Every pair the journal writes, in the order the golden test lists them.
 pub const FIELDS: &[(u8, u32, &str)] = &[
     (kinds::MESSAGE, message::ROLE, "message.role"),
@@ -319,6 +338,10 @@ pub const FIELDS: &[(u8, u32, &str)] = &[
     (kinds::BASE, base::ledger::REPEATS, "base.ledger.repeats"),
     (kinds::MODEL, model::PROVIDER, "model.provider"),
     (kinds::MODEL, model::MODEL, "model.model"),
+    (kinds::APPROVAL, approval::CALL_ID, "approval.call_id"),
+    (kinds::APPROVAL, approval::KIND, "approval.kind"),
+    (kinds::SETTINGS, settings::LEVEL, "settings.level"),
+    (kinds::SETTINGS, settings::MODE, "settings.mode"),
 ];
 
 #[cfg(test)]
@@ -414,6 +437,10 @@ mod tests {
 19 37 base.ledger.repeats
 20 1 model.provider
 20 2 model.model
+24 1 approval.call_id
+24 2 approval.kind
+26 1 settings.level
+26 2 settings.mode
 ";
         let mut listed = String::new();
         for (kind, field, name) in FIELDS {

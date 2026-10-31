@@ -18,10 +18,7 @@ async fn run(tmp: &Path, args: &[&str]) -> std::process::Output {
     Command::new(BIN)
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.join("state"))
         .args(args)
         .current_dir(tmp)
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
@@ -44,6 +41,68 @@ fn types(lines: &[Value]) -> Vec<&str> {
         .iter()
         .map(|line| line["type"].as_str().expect("each line has a type"))
         .collect()
+}
+
+#[tokio::test]
+async fn cli_json_prints_the_start_line_first() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let script = tmp.path().join("script.json");
+    tokio::fs::write(&script, r#"{"replies": [{"text": "hi"}]}"#)
+        .await
+        .expect("write script");
+    let script_arg = format!("fake:{}", script.display());
+    let output = run(
+        tmp.path(),
+        &["-p", "hi", "--json", "--provider", &script_arg],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "exit {} stderr {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The first line is the start line, with the format version and the
+    // binary's version, and it names the session before any event line.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout.lines().next().expect("a first line");
+    let start: Value = serde_json::from_str(first).expect("the first line is JSON");
+    assert_eq!(start["type"], "start", "{first}");
+    assert_eq!(start["version"], 1, "{first}");
+    assert_eq!(start["reagent"], env!("CARGO_PKG_VERSION"), "{first}");
+    let session = start["session"].as_str().expect("a session id");
+    assert!(!session.is_empty(), "{first}");
+    assert_eq!(types(&json_lines(&output.stdout))[0], "start");
+
+    // A run with no session prints the same line without the session key.
+    let output = run(
+        tmp.path(),
+        &[
+            "-p",
+            "hi",
+            "--json",
+            "--no-session",
+            "--provider",
+            &script_arg,
+        ],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "exit {} stderr {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout.lines().next().expect("a first line");
+    assert_eq!(
+        first,
+        format!(
+            "{{\"type\":\"start\",\"version\":1,\"reagent\":\"{}\"}}",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
 }
 
 #[tokio::test]
@@ -361,10 +420,7 @@ async fn usage_cost_and_context_tokens_in_the_summary() {
         .args(["-p", "hi"])
         .current_dir(tmp.path())
         .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
         .env("XDG_CACHE_HOME", tmp.path().join("cache"))
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
         .output()
@@ -442,10 +498,7 @@ async fn usage_cost_comes_from_the_cached_price() {
         .args(["-p", "hi"])
         .current_dir(tmp.path())
         .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
         .env("XDG_CACHE_HOME", tmp.path().join("cache"))
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
         .output()
@@ -497,10 +550,7 @@ async fn cli_json_a_transport_error_never_prints_the_api_key() {
     let output = Command::new(BIN)
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
         .args(["--json", "-p", "hi", "--deadline", "3"])
         .current_dir(tmp.path())
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
@@ -612,10 +662,7 @@ async fn cli_json_a_denied_call_names_the_rule() {
         .args(["-p", "hi"])
         .current_dir(tmp.path())
         .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
-        .env(
-            "XDG_STATE_HOME",
-            std::env::temp_dir().join("reagent-test-state"),
-        )
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
         .env("ANTHROPIC_API_KEY", FAKE_KEY)
         .output()
         .await

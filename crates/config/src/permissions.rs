@@ -7,7 +7,8 @@
 //! part is allowed), so a parse gap can make a call stricter, never looser.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use reagent_util::path::normalize;
 use serde::Deserialize;
@@ -42,6 +43,56 @@ pub enum Kind {
     Ask,
     /// The call does not run.
     Deny,
+}
+
+/// How the guard treats a call that its rules send to a person.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PermissionMode {
+    /// Ask a client, and refuse the call when there is no client to ask.
+    #[default]
+    Default,
+    /// Ask about everything but an edit that stays inside the working folder.
+    AcceptEdits,
+    /// Ask about nothing; a deny rule still stops a call.
+    Bypass,
+    /// Run a command whose rule would ask inside the sandbox with no network,
+    /// and ask about everything else.
+    Auto,
+}
+
+impl PermissionMode {
+    /// The text this mode is written as, which [`PermissionMode::from_str`]
+    /// reads back.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "accept-edits",
+            Self::Bypass => "bypass",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl std::str::FromStr for PermissionMode {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "default" => Ok(Self::Default),
+            "accept-edits" => Ok(Self::AcceptEdits),
+            "bypass" => Ok(Self::Bypass),
+            "auto" => Ok(Self::Auto),
+            _ => Err(format!(
+                "`{text}` is not a permission mode; write default, accept-edits, bypass or auto"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Where a decision came from.
@@ -89,10 +140,30 @@ pub struct Rules {
     default: Kind,
     cwd: PathBuf,
     home: Option<PathBuf>,
+    /// The allow rules a client approved for this session; see [`Session`].
+    session: Arc<Session>,
 }
 
+/// The allow rules a client approved for this session only.
+///
+/// They are matched with the strict allow logic of a config rule, so a session
+/// rule can never allow more than the rule the client was shown. Every clone of
+/// [`Rules`] shares one list, so the guard that answers questions fills the
+/// list the next call is decided with.
+#[derive(Debug, Default)]
+struct Session {
+    rules: Mutex<Vec<Rule>>,
+    /// How many rules the list holds, so a call that has none pays no lock.
+    count: AtomicUsize,
+}
+
+/// The file name a session rule reports in a decision.
+const SESSION_FILE: &str = "session";
+
+/// One parsed rule. It stays inside this crate: a caller outside it holds
+/// [`Rules`].
 #[derive(Debug, Clone)]
-struct Rule {
+pub(crate) struct Rule {
     kind: Kind,
     tool: Tool,
     pattern: Option<Pattern>,
@@ -136,6 +207,7 @@ impl Rules {
             default: Kind::Allow,
             cwd: PathBuf::new(),
             home: None,
+            session: Arc::default(),
         }
     }
 
@@ -182,7 +254,48 @@ impl Rules {
             default,
             cwd: normalize(cwd),
             home: home.map(normalize),
+            session: Arc::default(),
         })
+    }
+
+    /// The working folder the rules were built for.
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    /// Adds an allow rule a client approved for this session only.
+    ///
+    /// The text is parsed and matched exactly like a config rule, so it cannot
+    /// allow more than the rule the client was shown. Returns whether the rule
+    /// is in the session's list afterwards.
+    pub fn add_session_allow(&self, text: &str) -> bool {
+        self.add_saved_allow(text, SESSION_FILE)
+    }
+
+    /// Adds an allow rule a client saved in an earlier session, named by the
+    /// saved-rules `file` it comes from. It sits where an approval of this
+    /// session sits: above every ask rule and below every deny rule, since it
+    /// answers the ask rule that asked for it.
+    pub fn add_saved_allow(&self, text: &str, file: &str) -> bool {
+        let file: Arc<str> = Arc::from(file);
+        let mut rule = match parse_rule(Kind::Allow, text, &file) {
+            Ok(rule) => rule,
+            Err(_) => return false,
+        };
+        if let Some(Pattern::Glob(glob)) = &rule.pattern {
+            match path_glob(glob, &self.cwd, self.home.as_deref()) {
+                Ok(built) => rule.path = Some(built),
+                Err(_) => return false,
+            }
+        }
+        let Ok(mut session) = self.session.rules.lock() else {
+            return false;
+        };
+        if session.iter().all(|have| have.text != rule.text) {
+            session.push(rule);
+        }
+        self.session.count.store(session.len(), Ordering::Relaxed);
+        true
     }
 
     /// Whether no rule is set and the default allows, so every call runs.
@@ -260,17 +373,29 @@ impl Rules {
         {
             view.main_path = Some(ViewPath::new(self.absolute(&self.cwd, Path::new(value))));
         }
-        for kind in [Kind::Deny, Kind::Ask] {
-            if let Some(rule) = self
-                .rules
-                .iter()
-                .filter(|rule| rule.kind == kind)
-                .find(|rule| self.matches_loosely(rule, &view))
-            {
-                return rule.decision();
-            }
+        if let Some(rule) = self
+            .rules
+            .iter()
+            .filter(|rule| rule.kind == Kind::Deny)
+            .find(|rule| self.matches_loosely(rule, &view))
+        {
+            return rule.decision();
         }
-        if let Some(rule) = self.allowed_by(&view) {
+        // A rule a client approved for this session lets the call run: over an
+        // ask rule, since the client answered that question, and under a deny
+        // rule, which no answer may lift.
+        if let Some(decision) = self.session_decision(&view) {
+            return decision;
+        }
+        if let Some(rule) = self
+            .rules
+            .iter()
+            .filter(|rule| rule.kind == Kind::Ask)
+            .find(|rule| self.matches_loosely(rule, &view))
+        {
+            return rule.decision();
+        }
+        if let Some(rule) = self.allowed_by(&view, &self.rules) {
             return rule.decision();
         }
         Decision {
@@ -284,7 +409,27 @@ impl Rules {
     fn touches(&self, tool: &str) -> bool {
         self.rules.iter().any(|rule| {
             matches!(rule.tool, Tool::ReadEffect | Tool::EditEffect) || rule.tool.covers(tool)
-        })
+        }) || self.session_touches(tool)
+    }
+
+    /// Whether a rule a client added this session names the tool.
+    fn session_touches(&self, tool: &str) -> bool {
+        if self.session.count.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let Ok(session) = self.session.rules.lock() else {
+            return false;
+        };
+        session.iter().any(|rule| rule.tool.covers(tool))
+    }
+
+    /// The decision of the session's allow rules, when one lets the call run.
+    fn session_decision(&self, view: &View<'_>) -> Option<Decision> {
+        if self.session.count.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let session = self.session.rules.lock().ok()?;
+        self.allowed_by(view, &session).map(Rule::decision)
     }
 
     /// Whether a rule has a glob pattern, the only pattern that reads the
@@ -300,6 +445,14 @@ impl Rules {
         self.rules
             .iter()
             .any(|rule| matches!(rule.tool, Tool::ReadEffect | Tool::EditEffect))
+    }
+
+    /// Every rule with its kind, its text as written and the file it came
+    /// from, in the order the layers gave them, so a caller can list them.
+    pub fn entries(&self) -> impl Iterator<Item = (Kind, &str, &str)> {
+        self.rules
+            .iter()
+            .map(|rule| (rule.kind, rule.text.as_ref(), rule.file.as_ref()))
     }
 
     /// The tool names the rules name, other than `*`, `Read` and `Edit`, so
@@ -416,10 +569,10 @@ impl Rules {
         }
     }
 
-    /// The allow rule that lets the call run, if every piece of it is
-    /// allowed: each command part by some rule, each path by some rule.
-    fn allowed_by<'r>(&'r self, view: &View<'_>) -> Option<&'r Rule> {
-        let allows = || self.rules.iter().filter(|rule| rule.kind == Kind::Allow);
+    /// The allow rule of `rules` that lets the call run, if every piece of it
+    /// is allowed: each command part by some rule, each path by some rule.
+    fn allowed_by<'r>(&'r self, view: &View<'_>, rules: &'r [Rule]) -> Option<&'r Rule> {
+        let allows = || rules.iter().filter(|rule| rule.kind == Kind::Allow);
         // A bare rule for the tool allows every call of it.
         if let Some(rule) = allows().find(|rule| {
             rule.pattern.is_none()
@@ -453,7 +606,9 @@ impl Rules {
                 first.get_or_insert(rule);
             }
             // Redirect targets are writes, so they need an Edit allow too.
-            if !view.writes.is_empty() && !self.all_paths_allowed(&view.writes, Tool::EditEffect) {
+            if !view.writes.is_empty()
+                && !self.all_paths_allowed(&view.writes, Tool::EditEffect, rules)
+            {
                 return None;
             }
             return first;
@@ -471,8 +626,8 @@ impl Rules {
         if view.reads.is_empty() && view.writes.is_empty() {
             return None;
         }
-        if self.all_paths_allowed(&view.reads, Tool::ReadEffect)
-            && self.all_paths_allowed(&view.writes, Tool::EditEffect)
+        if self.all_paths_allowed(&view.reads, Tool::ReadEffect, rules)
+            && self.all_paths_allowed(&view.writes, Tool::EditEffect, rules)
         {
             return allows().find(|rule| {
                 matches!(rule.tool, Tool::ReadEffect | Tool::EditEffect)
@@ -486,9 +641,9 @@ impl Rules {
         None
     }
 
-    fn all_paths_allowed(&self, paths: &[ViewPath], effect: Tool) -> bool {
+    fn all_paths_allowed(&self, paths: &[ViewPath], effect: Tool, rules: &[Rule]) -> bool {
         paths.iter().all(|path| {
-            self.rules.iter().any(|rule| {
+            rules.iter().any(|rule| {
                 rule.kind == Kind::Allow && rule.tool == effect && self.path_matches(rule, path)
             })
         })
@@ -958,7 +1113,8 @@ impl PathGlob {
     }
 }
 
-fn parse_rule(kind: Kind, text: &str, file: &Arc<str>) -> Result<Rule, String> {
+/// The rule a list text names: its tool, its pattern and its text as written.
+pub(crate) fn parse_rule(kind: Kind, text: &str, file: &Arc<str>) -> Result<Rule, String> {
     let text = text.trim();
     let (name, pattern) = match text.split_once('(') {
         Some((name, rest)) => {
@@ -1116,6 +1272,104 @@ mod tests {
     }
 
     #[test]
+    fn mode_names_parse() {
+        for (text, mode) in [
+            ("default", PermissionMode::Default),
+            ("accept-edits", PermissionMode::AcceptEdits),
+            ("bypass", PermissionMode::Bypass),
+            ("auto", PermissionMode::Auto),
+            (" Auto ", PermissionMode::Auto),
+        ] {
+            assert_eq!(text.parse::<PermissionMode>().unwrap(), mode, "{text}");
+            assert_eq!(mode.as_str(), text.trim().to_ascii_lowercase());
+            assert_eq!(mode.to_string(), mode.as_str());
+        }
+        assert!("yolo".parse::<PermissionMode>().is_err());
+        assert!("".parse::<PermissionMode>().is_err());
+    }
+
+    #[test]
+    fn session_rule_allows_what_the_ask_rule_asked_about() {
+        let r = rules(&[], &["Bash(cargo test:*)"], &[], Some("deny"));
+        assert_eq!(bash(&r, "cargo test -p a"), Kind::Ask);
+        assert!(r.add_session_allow("Bash(cargo test:*)"));
+        assert_eq!(bash(&r, "cargo test -p a"), Kind::Allow);
+        assert_eq!(bash(&r, "cargo test -p b"), Kind::Allow);
+        assert_eq!(
+            r.decide(&Call {
+                tool: "bash",
+                main_arg: Some("command"),
+                value: Some("cargo test -p b"),
+                reads: &[],
+                writes: &[],
+            })
+            .reason,
+            Reason::Rule {
+                rule: Arc::from("Bash(cargo test:*)"),
+                file: Arc::from(SESSION_FILE),
+            }
+        );
+        // The rule the client approved is the rule asked about, and no other.
+        assert_eq!(bash(&r, "cargo testx"), Kind::Deny);
+        assert_eq!(bash(&r, "git test"), Kind::Deny);
+    }
+
+    #[test]
+    fn saved_rule_answers_an_ask_rule_names_its_file_and_never_lifts_a_deny() {
+        let r = rules(
+            &[],
+            &["Bash(cargo:*)"],
+            &["Bash(cargo publish:*)"],
+            Some("ask"),
+        );
+        let file = "/state/reagent/permissions/p-0123456789abcdef.toml";
+        assert!(r.add_saved_allow("Bash(cargo test:*)", file));
+        assert_eq!(bash(&r, "cargo test -p a"), Kind::Allow);
+        assert_eq!(
+            r.decide(&Call {
+                tool: "bash",
+                main_arg: Some("command"),
+                value: Some("cargo test -p a"),
+                reads: &[],
+                writes: &[],
+            })
+            .reason,
+            Reason::Rule {
+                rule: Arc::from("Bash(cargo test:*)"),
+                file: Arc::from(file),
+            }
+        );
+        assert_eq!(bash(&r, "cargo publish"), Kind::Deny);
+    }
+
+    #[test]
+    fn session_rule_never_widens_the_rule_or_lifts_a_deny() {
+        let r = rules(
+            &[],
+            &["Bash(cargo:*)"],
+            &["Bash(cargo publish:*)"],
+            Some("ask"),
+        );
+        assert!(r.add_session_allow("Bash(cargo test:*)"));
+        assert_eq!(bash(&r, "cargo test -p a"), Kind::Allow);
+        // One part the session rule does not cover keeps the call asked, and a
+        // deny rule still stops it.
+        assert_eq!(bash(&r, "cargo test && cargo build"), Kind::Ask);
+        assert_eq!(bash(&r, "cargo publish"), Kind::Deny);
+        // A rule that does not parse is not in the session's list.
+        assert!(!r.add_session_allow("not a rule"));
+    }
+
+    #[test]
+    fn session_rule_reaches_a_tool_with_no_config_rule() {
+        let r = rules(&[], &[], &[], Some("ask"));
+        assert_eq!(bash(&r, "ls"), Kind::Ask);
+        assert!(r.add_session_allow("Bash(ls:*)"));
+        assert_eq!(bash(&r, "ls -la"), Kind::Allow);
+        assert_eq!(bash(&r, "rm -rf x"), Kind::Ask);
+    }
+
+    #[test]
     fn chained_wrapped_and_sh_c_parts_are_denied() {
         let r = rules(&[], &[], &["Bash(git push:*)"], None);
         for command in [
@@ -1215,6 +1469,45 @@ mod tests {
         assert_eq!(write(&r, "secret.txt"), Kind::Deny);
         let r = rules(&[], &[], &["BASH(ls:*)"], None);
         assert_eq!(bash(&r, "ls -la"), Kind::Deny);
+    }
+
+    #[test]
+    fn a_saved_rule_lists_with_its_kind_text_and_file() {
+        let file = "/home/u/.local/state/reagent/permissions/work-0123456789abcdef.toml";
+        let saved = Layer {
+            path: PathBuf::from(file),
+            settings: Settings {
+                permissions: Lists {
+                    allow: vec!["Bash(cargo test:*)".into(), "Read(src/*)".into()],
+                    ..Lists::default()
+                },
+                ..Settings::default()
+            },
+        };
+        let global = Layer {
+            path: PathBuf::from("/home/u/.config/reagent/config.toml"),
+            settings: Settings {
+                permissions: Lists {
+                    ask: vec!["Bash(git push:*)".into()],
+                    ..Lists::default()
+                },
+                ..Settings::default()
+            },
+        };
+        let r = Rules::from_layers(&[global, saved], Path::new("/work"), None).unwrap();
+        let listed: Vec<(Kind, &str, &str)> = r.entries().collect();
+        assert_eq!(
+            listed,
+            [
+                (
+                    Kind::Ask,
+                    "Bash(git push:*)",
+                    "/home/u/.config/reagent/config.toml"
+                ),
+                (Kind::Allow, "Bash(cargo test:*)", file),
+                (Kind::Allow, "Read(src/*)", file),
+            ]
+        );
     }
 
     #[test]

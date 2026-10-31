@@ -2,19 +2,87 @@
 
 use std::borrow::Cow;
 
+use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
+use tokio::sync::{mpsc, oneshot};
 
 use reagent_ai::{Message, ToolCall};
 use reagent_util::text;
 
 use crate::coerce;
-use crate::guard::Guard;
+use crate::guard::{Ask, Grant, Guard, Verdict};
 use crate::tool::{Registry, Repaired, Reroute, Seen, Tool, ToolOutput};
 use tokio_util::sync::CancellationToken;
 
 /// One call's result: the message the reply records, and the lines a read
 /// showed for the loop's re-read note.
 pub type Outcome = (Message, Option<Box<Seen>>);
+
+/// A note the batch sends the loop while it runs.
+///
+/// A result reaches the loop as soon as it comes back, so the loop records and
+/// commits it while the other calls still run; a call that waits for a client
+/// reports its wait before it waits and its answer after, so a resume knows
+/// that it never ran.
+#[derive(Debug)]
+pub enum Note {
+    /// The result of the call at this place among the batch's calls.
+    Done(usize, Outcome),
+    /// The call at this place waits for a client's answer.
+    Wait {
+        /// The place of the call among the batch's calls.
+        at: usize,
+        /// Fired once the wait is on the disk; the call asks only then.
+        done: oneshot::Sender<()>,
+    },
+    /// A client answered the wait of the call at this place.
+    Answer {
+        /// The place of the call among the batch's calls.
+        at: usize,
+        /// Whether the client said that the call runs.
+        run: bool,
+        /// Fired once the answer is on the disk; the call runs only then.
+        done: oneshot::Sender<()>,
+    },
+}
+
+/// Where the notes of one call go: its place among the batch's calls and the
+/// channel the loop reads them on.
+#[derive(Clone, Copy)]
+struct Report<'a> {
+    at: usize,
+    notes: &'a mpsc::UnboundedSender<Note>,
+}
+
+impl Report<'_> {
+    /// Says that this call waits for a client's answer, and returns once the
+    /// wait is on the disk, so a crash before the ask leaves a call that never
+    /// ran.
+    async fn wait(self) {
+        let (done, written) = oneshot::channel();
+        if self.notes.send(Note::Wait { at: self.at, done }).is_ok() {
+            let _ = written.await;
+        }
+    }
+
+    /// Says that a client answered the wait of this call, and returns once the
+    /// answer is on the disk, so a call that runs is never read as one that
+    /// still waits.
+    async fn answer(self, run: bool) {
+        let (done, written) = oneshot::channel();
+        if self
+            .notes
+            .send(Note::Answer {
+                at: self.at,
+                run,
+                done,
+            })
+            .is_ok()
+        {
+            let _ = written.await;
+        }
+    }
+}
 
 /// Runs every tool call in `calls` and returns its result in call order.
 ///
@@ -51,44 +119,103 @@ pub async fn run_all_guarded_seen<'a>(
     guard: Option<&'a Guard>,
     token: &'a CancellationToken,
 ) -> Vec<Outcome> {
+    run_batch(calls, registry, guard, token, None, false)
+        .await
+        .into_iter()
+        .map(|outcome| outcome.expect("a batch answers every call"))
+        .collect()
+}
+
+/// [`run_all_guarded_seen`], sending each result on `notes` as it comes back
+/// instead of keeping it, so the loop records and commits it while the other
+/// calls still run.
+///
+/// `live` says that a client of a live session can answer a call; only then
+/// does a call that asks report its wait and its answer. A headless run keeps
+/// no such record: its guard refuses a call that asks at once.
+pub async fn run_all_noted<'a>(
+    calls: &'a [ToolCall],
+    registry: &'a Registry,
+    guard: Option<&'a Guard>,
+    token: &'a CancellationToken,
+    notes: &'a mpsc::UnboundedSender<Note>,
+    live: bool,
+) {
+    run_batch(calls, registry, guard, token, Some(notes), live).await;
+}
+
+/// Runs every call and either keeps each result in the returned slot or sends
+/// it on `notes`, which leaves its slot empty.
+async fn run_batch<'a>(
+    calls: &'a [ToolCall],
+    registry: &'a Registry,
+    guard: Option<&'a Guard>,
+    token: &'a CancellationToken,
+    notes: Option<&'a mpsc::UnboundedSender<Note>>,
+    live: bool,
+) -> Vec<Option<Outcome>> {
     if token.is_cancelled() {
-        return calls.iter().map(cancelled_message).collect();
+        return calls
+            .iter()
+            .enumerate()
+            .map(|(at, call)| settle(at, call, None, notes))
+            .collect();
     }
     // An unknown tool is not read-only, so it forces reply order.
     let parallel = calls
         .iter()
         .all(|call| registry.resolve(&call.name).is_some_and(Tool::read_only));
-
-    let outputs: Vec<Option<ToolOutput>> = if let [call] = calls {
-        vec![run_one(registry, guard, call, token).await]
-    } else if parallel {
-        let futures: Vec<BoxFuture<'a, Option<ToolOutput>>> = calls
-            .iter()
-            .map(|call| run_one(registry, guard, call, token))
-            .collect();
-        futures_util::future::join_all(futures).await
-    } else {
-        let mut outputs = Vec::with_capacity(calls.len());
-        for call in calls {
-            if token.is_cancelled() {
-                break;
-            }
-            outputs.push(run_one(registry, guard, call, token).await);
-        }
-        while outputs.len() < calls.len() {
-            outputs.push(None);
-        }
-        outputs
+    let reporter = move |at: usize| match notes {
+        Some(notes) if live => Some(Report { at, notes }),
+        _ => None,
     };
 
-    calls
-        .iter()
-        .zip(outputs)
-        .map(|(call, output)| match output {
-            Some(output) => result_message(call, output),
-            None => cancelled_message(call),
-        })
-        .collect()
+    if let [call] = calls {
+        let output = run_one_with(registry, guard, call, token, reporter(0)).await;
+        return vec![settle(0, call, output, notes)];
+    }
+    if parallel {
+        let futures: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .map(|(at, call)| {
+                run_one_with(registry, guard, call, token, reporter(at))
+                    .map(move |output| settle(at, call, output, notes))
+            })
+            .collect();
+        return futures_util::future::join_all(futures).await;
+    }
+    let mut slots = Vec::with_capacity(calls.len());
+    for (at, call) in calls.iter().enumerate() {
+        let output = if token.is_cancelled() {
+            None
+        } else {
+            run_one_with(registry, guard, call, token, reporter(at)).await
+        };
+        slots.push(settle(at, call, output, notes));
+    }
+    slots
+}
+
+/// Takes one call's result, or its cancellation when it did not finish, and
+/// gives it to `notes` when the loop asked for the notes.
+fn settle(
+    at: usize,
+    call: &ToolCall,
+    output: Option<ToolOutput>,
+    notes: Option<&mpsc::UnboundedSender<Note>>,
+) -> Option<Outcome> {
+    let outcome = match output {
+        Some(output) => result_message(call, output),
+        None => cancelled_message(call),
+    };
+    match notes {
+        Some(notes) => {
+            let _ = notes.send(Note::Done(at, outcome));
+            None
+        }
+        None => Some(outcome),
+    }
 }
 
 /// Runs one call as a direct call does: the name and argument repair, the
@@ -99,6 +226,18 @@ pub fn run_one<'a>(
     guard: Option<&'a Guard>,
     call: &'a ToolCall,
     token: &'a CancellationToken,
+) -> BoxFuture<'a, Option<ToolOutput>> {
+    run_one_with(registry, guard, call, token, None)
+}
+
+/// [`run_one`], sending the wait of a call for a client and the answer it gets
+/// on `report`.
+fn run_one_with<'a>(
+    registry: &'a Registry,
+    guard: Option<&'a Guard>,
+    call: &'a ToolCall,
+    token: &'a CancellationToken,
+    report: Option<Report<'a>>,
 ) -> BoxFuture<'a, Option<ToolOutput>> {
     match registry.resolve(&call.name) {
         Some(tool) => Box::pin(async move {
@@ -130,11 +269,12 @@ pub fn run_one<'a>(
             );
             // The rules see the tool's own name, not the model's spelling of
             // it: `bash</arg_key>` must meet the `Bash(...)` rules.
-            if let Some(refused) =
-                guard.and_then(|guard| guard.check(tool, tool.spec().name.as_str(), args))
-            {
-                return Some(refused);
-            }
+            let contain = match plan(guard, tool, args, token, report).await {
+                None => return None,
+                Some(Planned::Refuse(refused)) => return Some(refused),
+                Some(Planned::Run) => None,
+                Some(Planned::Contain(ask)) => Some(ask),
+            };
             if let Some(pending) = tool.reroute(args) {
                 let reroute = tokio::select! {
                     reroute = pending => reroute,
@@ -147,10 +287,7 @@ pub fn run_one<'a>(
                     return output.map(|output| with_note(output, note.as_deref()));
                 }
             }
-            let output = tokio::select! {
-                output = tool.run(args, token) => output,
-                () = token.cancelled() => return None,
-            };
+            let output = run_call(guard, tool, args, contain.as_ref(), token, report).await?;
             // A call whose values are of another type than its arguments
             // declare is what a tool reports as `invalid arguments`: run it
             // once more with the types its schema declares.
@@ -159,15 +296,14 @@ pub fn run_one<'a>(
                 && let Some(converted) = coerce::by_schema(args, &tool.spec().input_schema)
             {
                 // The rules see the arguments the second run would use.
-                if let Some(refused) =
-                    guard.and_then(|guard| guard.check(tool, tool.spec().name.as_str(), &converted))
-                {
-                    return Some(refused);
-                }
-                let retried = tokio::select! {
-                    retried = tool.run(&converted, token) => retried,
-                    () = token.cancelled() => return None,
+                let contain = match plan(guard, tool, &converted, token, report).await {
+                    None => return None,
+                    Some(Planned::Refuse(refused)) => return Some(refused),
+                    Some(Planned::Run) => None,
+                    Some(Planned::Contain(ask)) => Some(ask),
                 };
+                let retried =
+                    run_call(guard, tool, &converted, contain.as_ref(), token, report).await?;
                 let note = converted_note(note.as_deref());
                 return Some(with_note(retried, Some(&note)));
             }
@@ -177,6 +313,98 @@ pub fn run_one<'a>(
             let error = unknown_tool(registry, &call.name);
             Box::pin(async move { Some(ToolOutput::error(error)) })
         }
+    }
+}
+
+/// What the guard says to do with one call, once any client has answered.
+enum Planned {
+    /// The call runs as usual.
+    Run,
+    /// The call runs contained in the sandbox, and asks a client when the
+    /// sandbox cannot start; `Ask` holds what such a request shows.
+    Contain(Ask),
+    /// The call does not run; this is its result.
+    Refuse(ToolOutput),
+}
+
+/// Waits for a client's answer to `ask`.
+///
+/// The wait is on the disk before a client is asked, and the answer before the
+/// call runs, so a resume that reads a wait and no answer knows the call never
+/// ran.
+async fn approve(
+    guard: Option<&Guard>,
+    ask: &Ask,
+    token: &CancellationToken,
+    report: Option<Report<'_>>,
+) -> Option<Planned> {
+    let Some(guard) = guard else {
+        return Some(Planned::Run);
+    };
+    if let Some(report) = report {
+        report.wait().await;
+    }
+    let planned = match guard.approve(ask, token).await? {
+        Grant::Run => Planned::Run,
+        Grant::Refuse(output) => Planned::Refuse(output),
+    };
+    if let Some(report) = report {
+        report.answer(matches!(planned, Planned::Run)).await;
+    }
+    Some(planned)
+}
+
+/// Runs one call: contained when `contain` is set and the tool can hold it,
+/// and plainly when not. A tool that cannot start its sandbox for the call
+/// makes a client decide instead. `None` when the run was cancelled.
+async fn run_call(
+    guard: Option<&Guard>,
+    tool: &dyn Tool,
+    args: &str,
+    contain: Option<&Ask>,
+    token: &CancellationToken,
+    report: Option<Report<'_>>,
+) -> Option<ToolOutput> {
+    if let Some(ask) = contain {
+        let contained = tokio::select! {
+            output = tool.run_contained(args, token) => output,
+            () = token.cancelled() => return None,
+        };
+        if let Some(output) = contained {
+            return Some(output);
+        }
+        // No sandbox could hold the call, so a client decides after all.
+        match approve(guard, ask, token, report).await? {
+            Planned::Refuse(refused) => return Some(refused),
+            Planned::Run | Planned::Contain(_) => {}
+        }
+    }
+    tokio::select! {
+        output = tool.run(args, token) => Some(output),
+        () = token.cancelled() => None,
+    }
+}
+
+/// Asks the guard about `args` and waits for a client's answer when it asks
+/// one. `None` when the run was cancelled while the call waited.
+///
+/// A batch runs inside the loop's `watched`, which takes the commands of a live
+/// session, so the answer of a client reaches the guard while this waits.
+async fn plan(
+    guard: Option<&Guard>,
+    tool: &dyn Tool,
+    args: &str,
+    token: &CancellationToken,
+    report: Option<Report<'_>>,
+) -> Option<Planned> {
+    let Some(guard) = guard else {
+        return Some(Planned::Run);
+    };
+    match guard.check(tool, tool.spec().name.as_str(), args) {
+        Verdict::Run => Some(Planned::Run),
+        Verdict::Refuse(output) => Some(Planned::Refuse(output)),
+        Verdict::Contain(ask) => Some(Planned::Contain(ask)),
+        Verdict::Ask(ask) => approve(Some(guard), &ask, token, report).await,
     }
 }
 
@@ -253,7 +481,12 @@ async fn run_reroute(
     let Some(target) = registry.resolve(reroute.tool) else {
         return Rerouted::Fallback;
     };
-    if guard.is_some_and(|guard| guard.check(target, reroute.tool, &reroute.args).is_some()) {
+    if guard.is_some_and(|guard| {
+        !matches!(
+            guard.check(target, reroute.tool, &reroute.args),
+            Verdict::Run
+        )
+    }) {
         return Rerouted::Fallback;
     }
     let mut output = tokio::select! {
@@ -301,7 +534,10 @@ mod tests {
     use std::time::Duration;
 
     use reagent_ai::{Text, ToolSpec};
+    use reagent_config::permissions::{Lists, Rules};
 
+    use crate::event::Event;
+    use crate::guard::Answer;
     use crate::tool::Tool;
 
     /// A tool that optionally sleeps, records its completion to `log` and
@@ -1306,5 +1542,434 @@ mod tests {
             1,
             "the tool ran once, before the conversion"
         );
+    }
+
+    /// A guard that asks about `cargo test` and `rm` calls and allows the rest.
+    fn ask_guard() -> Guard {
+        let layer = reagent_config::Layer {
+            path: std::path::PathBuf::from("/c/config.toml"),
+            settings: reagent_config::Settings {
+                permissions: Lists {
+                    ask: vec!["Bash(cargo test:*)".into(), "Bash(rm:*)".into()],
+                    ..Lists::default()
+                },
+                ..reagent_config::Settings::default()
+            },
+        };
+        let rules = Rules::from_layers(&[layer], std::path::Path::new("/work"), None).unwrap();
+        Guard::new(rules)
+    }
+
+    /// A live session: `guard` listens on a new events channel, and a client
+    /// answers each approval request with the next of `answers`, recording
+    /// every event it sees.
+    fn session(
+        mut guard: Guard,
+        answers: Vec<Answer>,
+        token: &CancellationToken,
+    ) -> (Guard, Arc<Mutex<Vec<Event>>>, tokio::task::JoinHandle<()>) {
+        let (events, mut rx) = tokio::sync::mpsc::channel(64);
+        guard.listen(events);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let client = guard.clone();
+        let wait = token.clone();
+        let task = tokio::spawn(async move {
+            let mut answers = answers.into_iter();
+            while let Some(event) = rx.recv().await {
+                log.lock().expect("events lock").push(event.clone());
+                if let Event::ApprovalRequest(request) = event
+                    && let Some(answer) = answers.next()
+                {
+                    client.answer(7, request.id, answer, &wait).await;
+                }
+            }
+        });
+        (guard, seen, task)
+    }
+
+    /// The approval requests and the resolved events of `seen`, in order.
+    fn approvals(seen: &Arc<Mutex<Vec<Event>>>) -> Vec<Event> {
+        seen.lock()
+            .expect("events lock")
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    Event::ApprovalRequest(_) | Event::ApprovalResolved { .. }
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The arguments the existing bash stand-in records for `command`.
+    fn args_of(command: &str) -> String {
+        serde_json::json!({ "command": command }).to_string()
+    }
+
+    #[tokio::test]
+    async fn once_approval_runs_the_call_and_the_next_call_asks_again() {
+        let token = CancellationToken::new();
+        let (registry, ran) = shell_and_reader();
+        let (guard, seen, client) = session(ask_guard(), vec![Answer::Once, Answer::Once], &token);
+
+        let first = run_all_guarded(
+            &[bash_call("cargo test -p a")],
+            &registry,
+            Some(&guard),
+            &token,
+        )
+        .await;
+        let second = run_all_guarded(
+            &[bash_call("cargo test -p b")],
+            &registry,
+            Some(&guard),
+            &token,
+        )
+        .await;
+        client.abort();
+
+        assert_eq!(content_of(&first[0]), "from bash");
+        assert_eq!(content_of(&second[0]), "from bash");
+        assert_eq!(
+            *ran.lock().expect("ran lock"),
+            vec![args_of("cargo test -p a"), args_of("cargo test -p b")]
+        );
+        let events = approvals(&seen);
+        assert_eq!(events.len(), 4, "two requests and two answers: {events:?}");
+        assert!(
+            matches!(
+                &events[0],
+                Event::ApprovalRequest(request)
+                    if request.id == 0
+                        && request.save.as_deref() == Some("Bash(cargo test:*)")
+            ),
+            "{:?}",
+            events[0]
+        );
+        assert!(
+            matches!(
+                &events[1],
+                Event::ApprovalResolved {
+                    id: 0,
+                    client: 7,
+                    answer: Answer::Once
+                }
+            ),
+            "{:?}",
+            events[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_rule_answer_allows_the_next_call_with_no_request() {
+        let token = CancellationToken::new();
+        let (registry, ran) = shell_and_reader();
+        let (guard, seen, client) = session(ask_guard(), vec![Answer::Session], &token);
+
+        let first = run_all_guarded(
+            &[bash_call("cargo test -p a")],
+            &registry,
+            Some(&guard),
+            &token,
+        )
+        .await;
+        let second = run_all_guarded(
+            &[bash_call("cargo test -p b")],
+            &registry,
+            Some(&guard),
+            &token,
+        )
+        .await;
+        client.abort();
+
+        assert_eq!(content_of(&first[0]), "from bash");
+        assert_eq!(content_of(&second[0]), "from bash");
+        assert_eq!(ran.lock().expect("ran lock").len(), 2);
+        let requests = approvals(&seen)
+            .into_iter()
+            .filter(|event| matches!(event, Event::ApprovalRequest(_)))
+            .count();
+        assert_eq!(requests, 1, "the second call asked for nothing");
+    }
+
+    #[tokio::test]
+    async fn session_rule_of_a_compound_command_still_asks_for_another_part() {
+        let token = CancellationToken::new();
+        let (registry, ran) = shell_and_reader();
+        let (guard, seen, client) =
+            session(ask_guard(), vec![Answer::Session, Answer::Skip], &token);
+
+        let first = run_all_guarded(
+            &[bash_call("cargo build && cargo test")],
+            &registry,
+            Some(&guard),
+            &token,
+        )
+        .await;
+        let second = run_all_guarded(
+            &[bash_call("cargo build && rm -rf x")],
+            &registry,
+            Some(&guard),
+            &token,
+        )
+        .await;
+        client.abort();
+
+        assert_eq!(content_of(&first[0]), "from bash");
+        assert_eq!(
+            content_of(&second[0]),
+            "the user skipped this call; continue without it"
+        );
+        assert_eq!(
+            *ran.lock().expect("ran lock"),
+            vec![args_of("cargo build && cargo test")],
+            "the part the session rule does not cover never ran"
+        );
+        let requests = approvals(&seen)
+            .into_iter()
+            .filter(|event| matches!(event, Event::ApprovalRequest(_)))
+            .count();
+        assert_eq!(requests, 2, "the call with `rm` asked again");
+    }
+
+    #[tokio::test]
+    async fn an_approval_refused_with_a_reason_puts_it_in_the_result() {
+        let token = CancellationToken::new();
+        let (registry, ran) = shell_and_reader();
+        let (guard, _, client) = session(
+            ask_guard(),
+            vec![
+                Answer::Refuse {
+                    reason: Some(Text::from("run the test in the app folder")),
+                },
+                Answer::Refuse { reason: None },
+            ],
+            &token,
+        );
+
+        let results = run_all_guarded(
+            &[bash_call("cargo test -p a"), bash_call("rm -rf x")],
+            &registry,
+            Some(&guard),
+            &token,
+        )
+        .await;
+        client.abort();
+
+        let Message::ToolResult(named) = &results[0] else {
+            panic!("expected a tool result");
+        };
+        assert!(named.is_error);
+        assert_eq!(named.content.as_ref(), "run the test in the app folder");
+        let Message::ToolResult(bare) = &results[1] else {
+            panic!("expected a tool result");
+        };
+        assert!(bare.is_error);
+        assert_eq!(bare.content.as_ref(), "the user refused this call");
+        assert!(ran.lock().expect("ran lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_approval_skipped_gives_the_model_a_result_to_carry_on_from() {
+        let token = CancellationToken::new();
+        let (registry, ran) = shell_and_reader();
+        let (guard, _, client) = session(ask_guard(), vec![Answer::Skip], &token);
+
+        let results = run_all_guarded(
+            &[bash_call("cargo test -p a")],
+            &registry,
+            Some(&guard),
+            &token,
+        )
+        .await;
+        client.abort();
+
+        assert_eq!(
+            content_of(&results[0]),
+            "the user skipped this call; continue without it"
+        );
+        assert!(ran.lock().expect("ran lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_while_waiting_for_an_approval_stops_the_call() {
+        let token = CancellationToken::new();
+        let (registry, ran) = shell_and_reader();
+        // The session's client cancels instead of answering.
+        let (events, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut guard = ask_guard();
+        guard.listen(events);
+        let cancel = token.clone();
+        let driver = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if matches!(event, Event::ApprovalRequest(_)) {
+                    cancel.cancel();
+                }
+            }
+        });
+
+        let results = run_all_guarded(
+            &[bash_call("cargo test -p a")],
+            &registry,
+            Some(&guard),
+            &token,
+        )
+        .await;
+        driver.abort();
+
+        assert_eq!(content_of(&results[0]), "cancelled");
+        assert!(
+            ran.lock().expect("ran lock").is_empty(),
+            "the call did not run"
+        );
+    }
+
+    /// A bash stand-in that can run a call contained, like the real tool.
+    struct Containable {
+        spec: ToolSpec,
+        ran: Arc<Mutex<Vec<String>>>,
+        contained: Arc<Mutex<Vec<String>>>,
+        starts: bool,
+    }
+
+    impl Tool for Containable {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn main_arg(&self) -> Option<&'static str> {
+            Some("command")
+        }
+
+        fn can_contain(&self) -> bool {
+            self.starts
+        }
+
+        fn run<'a>(
+            &'a self,
+            args: &'a str,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, ToolOutput> {
+            self.ran.lock().expect("ran lock").push(args.to_owned());
+            Box::pin(async { ToolOutput::ok("plain") })
+        }
+
+        fn run_contained<'a>(
+            &'a self,
+            args: &'a str,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, Option<ToolOutput>> {
+            // A launcher that cannot start holds nothing.
+            if !self.starts {
+                return Box::pin(async { None });
+            }
+            self.contained
+                .lock()
+                .expect("contained lock")
+                .push(args.to_owned());
+            Box::pin(async { Some(ToolOutput::ok("contained")) })
+        }
+    }
+
+    /// What a stand-in tool records: one entry per call.
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    fn containable(starts: bool) -> (Registry, Log, Log) {
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let contained = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::new();
+        registry.add(Containable {
+            spec: ToolSpec {
+                name: "bash".into(),
+                description: "A shell.".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            ran: Arc::clone(&ran),
+            contained: Arc::clone(&contained),
+            starts,
+        });
+        (registry, ran, contained)
+    }
+
+    /// A guard in `auto` over the `cargo test` ask rule.
+    fn auto_guard() -> Guard {
+        let mut guard = ask_guard();
+        guard
+            .set_mode(reagent_config::permissions::PermissionMode::Auto)
+            .expect("auto needs no flag");
+        guard
+    }
+
+    #[tokio::test]
+    async fn auto_mode_runs_a_command_contained_with_no_request() {
+        let token = CancellationToken::new();
+        let (registry, ran, contained) = containable(true);
+        let (guard, seen, client) = session(auto_guard(), Vec::new(), &token);
+
+        let results = run_all_guarded(
+            &[bash_call("rm -rf target/debug")],
+            &registry,
+            Some(&guard),
+            &token,
+        )
+        .await;
+        client.abort();
+
+        assert_eq!(content_of(&results[0]), "contained");
+        assert_eq!(
+            *contained.lock().expect("contained lock"),
+            vec![args_of("rm -rf target/debug")]
+        );
+        assert!(ran.lock().expect("ran lock").is_empty(), "no plain run");
+        assert!(
+            approvals(&seen).is_empty(),
+            "auto asked nobody: {:?}",
+            approvals(&seen)
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_mode_asks_when_the_sandbox_cannot_start() {
+        let token = CancellationToken::new();
+        let (registry, ran, contained) = containable(false);
+        let (guard, seen, client) = session(auto_guard(), vec![Answer::Once], &token);
+
+        let results = run_all_guarded(
+            &[bash_call("rm -rf target/debug")],
+            &registry,
+            Some(&guard),
+            &token,
+        )
+        .await;
+        client.abort();
+
+        assert_eq!(content_of(&results[0]), "plain");
+        assert!(contained.lock().expect("contained lock").is_empty());
+        assert_eq!(ran.lock().expect("ran lock").len(), 1);
+        let requests = approvals(&seen)
+            .into_iter()
+            .filter(|event| matches!(event, Event::ApprovalRequest(_)))
+            .count();
+        assert_eq!(requests, 1, "the client decided the call");
+    }
+
+    #[tokio::test]
+    async fn a_headless_run_refuses_an_approval_request_as_before() {
+        let (registry, ran) = shell_and_reader();
+        let results = run_all_guarded(
+            &[bash_call("cargo test -p a")],
+            &registry,
+            Some(&ask_guard()),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(
+            content_of(&results[0]),
+            "needs approval by rule Bash(cargo test:*) in /c/config.toml, and this run cannot ask; the call did not run"
+        );
+        assert!(ran.lock().expect("ran lock").is_empty());
     }
 }

@@ -13,7 +13,7 @@ use reagent_ai::{
 use reagent_store::{DecodeError, Decoder, Encoder, Value};
 
 use crate::journal::kinds;
-use crate::journal::registry::{base, call_start, message, model, turn_end};
+use crate::journal::registry::{approval, base, call_start, message, model, settings, turn_end};
 use crate::journal::state::{LedgerEntry, State};
 use crate::tool::EffectClass;
 
@@ -34,6 +34,13 @@ const BLOCK_REDACTED: u64 = 3;
 const BLOCK_TOOL_CALL: u64 = 4;
 /// The content block byte of an image block.
 const BLOCK_IMAGE: u64 = 5;
+
+/// The kind byte of an approval record that waits for an answer.
+const APPROVAL_WAIT: u64 = 1;
+/// The kind byte of an approval record a client answered to run.
+const APPROVAL_RUN: u64 = 2;
+/// The kind byte of an approval record a client refused.
+const APPROVAL_REFUSED: u64 = 3;
 
 /// One journal record, decoded.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +86,59 @@ pub struct Model {
     pub provider: String,
     /// The model the run moves to.
     pub model: String,
+}
+
+/// A call that waits for a client's answer, or the answer it got.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Approval {
+    /// The call id the request is about.
+    pub id: String,
+    /// Whether the record is the wait or the answer.
+    pub kind: ApprovalKind,
+}
+
+/// What an [`Approval`] record says about its call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalKind {
+    /// The call waits for a client's answer.
+    Wait,
+    /// A client answered that the call runs.
+    Run,
+    /// A client refused the call.
+    Refused,
+}
+
+/// A change of the reasoning level or the permission mode.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Settings {
+    /// The reasoning level the run moves to, when the change sets one.
+    pub level: Option<String>,
+    /// The permission mode the run moves to, when the change sets one.
+    pub mode: Option<String>,
+}
+
+/// A record of a kind the replayed log does not carry: a call that waits for a
+/// client or the answer it got, or a settings change.
+///
+/// [`decode`] reports these kinds as [`Record::Unknown`], so a build that only
+/// shows the log still reads a log it does not know; the resume and the loop
+/// decode them here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Aside {
+    /// A call that waits for a client's answer, or the answer it got.
+    Approval(Approval),
+    /// A change of the reasoning level or the permission mode.
+    Settings(Settings),
+}
+
+/// Decodes one record of a kind [`decode`] leaves as [`Record::Unknown`], or
+/// `None` for a kind [`decode`] carries.
+pub fn decode_aside(kind: u8, payload: &Bytes) -> io::Result<Option<Aside>> {
+    match kind {
+        kinds::APPROVAL => decode_approval(payload).map(Aside::Approval).map(Some),
+        kinds::SETTINGS => decode_settings(payload).map(Aside::Settings).map(Some),
+        _ => Ok(None),
+    }
 }
 
 /// Decodes one record of `kind`.
@@ -247,6 +307,31 @@ pub fn encode_model(out: &mut Vec<u8>, provider: &str, model: &str) {
     let mut encoder = Encoder::new(out);
     encoder.str(model::PROVIDER, provider);
     encoder.str(model::MODEL, model);
+}
+
+/// Writes one approval record.
+pub fn encode_approval(out: &mut Vec<u8>, record: &Approval) {
+    let mut encoder = Encoder::new(out);
+    encoder.str(approval::CALL_ID, &record.id);
+    encoder.u64(
+        approval::KIND,
+        match record.kind {
+            ApprovalKind::Wait => APPROVAL_WAIT,
+            ApprovalKind::Run => APPROVAL_RUN,
+            ApprovalKind::Refused => APPROVAL_REFUSED,
+        },
+    );
+}
+
+/// Writes one settings change. A field the change leaves alone is not written.
+pub fn encode_settings(out: &mut Vec<u8>, record: &Settings) {
+    let mut encoder = Encoder::new(out);
+    if let Some(level) = &record.level {
+        encoder.str(settings::LEVEL, level);
+    }
+    if let Some(mode) = &record.mode {
+        encoder.str(settings::MODE, mode);
+    }
 }
 
 fn decode_message(payload: &Bytes) -> io::Result<Message> {
@@ -491,6 +576,41 @@ fn decode_model(payload: &Bytes) -> io::Result<Model> {
         match field {
             model::PROVIDER => record.provider = string_of(&value)?,
             model::MODEL => record.model = string_of(&value)?,
+            _ => {}
+        }
+    }
+    Ok(record)
+}
+
+fn decode_approval(payload: &Bytes) -> io::Result<Approval> {
+    let mut decoder = Decoder::new(payload);
+    let mut record = Approval {
+        id: String::new(),
+        kind: ApprovalKind::Wait,
+    };
+    while let Some((field, value)) = next(&mut decoder)? {
+        match field {
+            approval::CALL_ID => record.id = string_of(&value)?,
+            approval::KIND => {
+                record.kind = match varint_of(&value)? {
+                    APPROVAL_RUN => ApprovalKind::Run,
+                    APPROVAL_REFUSED => ApprovalKind::Refused,
+                    _ => ApprovalKind::Wait,
+                };
+            }
+            _ => {}
+        }
+    }
+    Ok(record)
+}
+
+fn decode_settings(payload: &Bytes) -> io::Result<Settings> {
+    let mut decoder = Decoder::new(payload);
+    let mut record = Settings::default();
+    while let Some((field, value)) = next(&mut decoder)? {
+        match field {
+            settings::LEVEL => record.level = Some(string_of(&value)?),
+            settings::MODE => record.mode = Some(string_of(&value)?),
             _ => {}
         }
     }

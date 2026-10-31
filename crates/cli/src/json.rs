@@ -1,9 +1,16 @@
-//! JSON line rendering for `--json` mode.
+//! JSON line rendering for `--json` mode and the worker's event messages.
 
 use serde::Serialize;
+use serde::ser::SerializeSeq;
 
 use reagent_agent::event::{Event, TurnEndReason};
+use reagent_agent::guard::Answer;
+use reagent_agent::live::{ClientId, SendMode};
 use reagent_ai::Usage;
+
+/// The version of the line format, named by the start line of every `--json`
+/// run.
+pub const JSON_VERSION: u32 = 1;
 
 /// One `--json` line, borrowed from the event so no text is copied.
 #[derive(Serialize)]
@@ -65,6 +72,40 @@ enum Line<'a> {
         replaced: u32,
         bytes: u32,
     },
+    Start {
+        version: u32,
+        reagent: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session: Option<&'a str>,
+    },
+    UserMessage {
+        client: ClientId,
+        mode: &'static str,
+        text: &'a str,
+    },
+    Committed {
+        record: u64,
+    },
+    ApprovalRequest {
+        id: u64,
+        tool: &'a str,
+        call: &'a str,
+        rule: &'a str,
+        /// The rules a save answer would add.
+        #[serde(skip_serializing_if = "Rules::is_empty")]
+        save: Rules<'a>,
+    },
+    ApprovalResolved {
+        id: u64,
+        client: ClientId,
+        answer: &'static str,
+        /// The reason a refusal answers the model with, when it has one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<&'a str>,
+    },
+    RuleToSave {
+        rule: &'a str,
+    },
     Summary {
         turns: u32,
         exit: &'static str,
@@ -83,6 +124,26 @@ enum Line<'a> {
     },
 }
 
+/// The rules a save answer would add, borrowed from the request, as the JSON
+/// array a client reads: empty when a save is not possible.
+struct Rules<'a>(Option<&'a str>);
+
+impl Rules<'_> {
+    fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl Serialize for Rules<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut rules = serializer.serialize_seq(Some(self.0.is_some() as usize))?;
+        if let Some(rule) = self.0 {
+            rules.serialize_element(rule)?;
+        }
+        rules.end()
+    }
+}
+
 /// One image of a tool result: what it is and how big, without its base64 text.
 #[derive(Serialize)]
 struct ImageLine<'a> {
@@ -93,8 +154,27 @@ struct ImageLine<'a> {
     bytes: usize,
 }
 
-/// Appends one agent event to `buf` as a JSON object and a newline.
+/// Appends the `--json` line of one agent event to `buf`.
+///
+/// A live session's own events have no `--json` line: `-p --json` prints
+/// exactly the lines it printed before they existed.
 pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
+    if matches!(
+        event,
+        Event::UserMessage { .. }
+            | Event::Committed { .. }
+            | Event::ApprovalRequest(_)
+            | Event::ApprovalResolved { .. }
+            | Event::RuleToSave { .. }
+    ) {
+        return;
+    }
+    write_line(buf, event);
+}
+
+/// Appends any agent event, a live session's own too, to `buf` as one JSON
+/// object and a newline: the bytes `--json` prints and the worker sends.
+pub fn write_line(buf: &mut Vec<u8>, event: &Event) {
     // The deltas of a streamed answer are the hot path of `--json`: their whole
     // line is written straight into the buffer, with the bytes the serializer
     // writes, instead of going through the serializer once per delta.
@@ -172,8 +252,44 @@ pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
             replaced: *replaced,
             bytes: *bytes,
         },
+        Event::UserMessage { client, mode, text } => Line::UserMessage {
+            client: *client,
+            mode: send_mode(*mode),
+            text,
+        },
+        Event::Committed { record } => Line::Committed { record: *record },
+        Event::ApprovalRequest(ask) => Line::ApprovalRequest {
+            id: ask.id,
+            tool: &ask.tool,
+            call: &ask.call,
+            rule: &ask.rule,
+            save: Rules(ask.save.as_deref()),
+        },
+        Event::ApprovalResolved { id, client, answer } => {
+            let (answer, reason) = answer_line(answer);
+            Line::ApprovalResolved {
+                id: *id,
+                client: *client,
+                answer,
+                reason,
+            }
+        }
+        Event::RuleToSave { rule } => Line::RuleToSave { rule },
     };
     push(buf, &line);
+}
+
+/// Appends the line an `--json` run starts with: the format version, the
+/// reagent version and the session the run writes, when it writes one.
+pub fn write_start(buf: &mut Vec<u8>, session: Option<&str>) {
+    push(
+        buf,
+        &Line::Start {
+            version: JSON_VERSION,
+            reagent: env!("CARGO_PKG_VERSION"),
+            session,
+        },
+    );
 }
 
 /// Appends the final summary line to `buf`: total usage, turns, the context
@@ -285,6 +401,25 @@ fn decoded_len(data: &str) -> usize {
     (data.len() / 4 * 3).saturating_sub(padding)
 }
 
+/// How a client's message joined the session.
+fn send_mode(mode: SendMode) -> &'static str {
+    match mode {
+        SendMode::Steer => "steer",
+        SendMode::Queue => "queue",
+    }
+}
+
+/// The word a client reads for an answer, and the reason of a refusal.
+fn answer_line(answer: &Answer) -> (&'static str, Option<&str>) {
+    match answer {
+        Answer::Once => ("once", None),
+        Answer::Session => ("session", None),
+        Answer::Save => ("save", None),
+        Answer::Refuse { reason } => ("refuse", reason.as_deref()),
+        Answer::Skip => ("skip", None),
+    }
+}
+
 fn turn_reason(reason: &TurnEndReason) -> &'static str {
     match reason {
         TurnEndReason::EndTurn => "end_turn",
@@ -324,9 +459,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn every_event_line_has_the_same_keys_and_values() {
-        let cases = [
+    /// The events `--json` prints, with the line each one writes, shared so the
+    /// worker's line is checked against the same events as the printed one.
+    fn cases() -> Vec<(Event, Value)> {
+        vec![
             (Event::TurnStart, json!({ "type": "turn_start" })),
             (
                 Event::TextDelta("a \"q\"\n".into()),
@@ -429,10 +565,141 @@ mod tests {
                 Event::PolicyNote("note".into()),
                 json!({ "type": "policy_note", "text": "note" }),
             ),
-        ];
-        for (event, expected) in cases {
+        ]
+    }
+
+    #[test]
+    fn every_event_line_has_the_same_keys_and_values() {
+        for (event, expected) in cases() {
             assert_eq!(line(&event), expected, "{event:?}");
         }
+    }
+
+    #[test]
+    fn every_json_line_is_the_worker_line() {
+        for (event, _) in cases() {
+            let mut printed = Vec::new();
+            write_event(&mut printed, &event);
+            let mut worker = Vec::new();
+            write_line(&mut worker, &event);
+            assert_eq!(printed, worker, "{event:?} is encoded twice for two paths");
+        }
+    }
+
+    #[test]
+    fn a_live_session_event_is_one_worker_line_and_no_json_line() {
+        let ask = |save: Option<&str>| {
+            Event::ApprovalRequest(Box::new(reagent_agent::event::ApprovalRequest {
+                id: 4,
+                tool: "bash".into(),
+                call: "bash: cargo test -p a".into(),
+                rule: "Bash(cargo test:*)".into(),
+                save: save.map(Into::into),
+            }))
+        };
+        let resolved = |answer| Event::ApprovalResolved {
+            id: 4,
+            client: 7,
+            answer,
+        };
+        let cases = [
+            (
+                Event::UserMessage {
+                    client: 7,
+                    mode: reagent_agent::live::SendMode::Steer,
+                    text: "use cargo nextest".into(),
+                },
+                json!({ "type": "user_message", "client": 7, "mode": "steer", "text": "use cargo nextest" }),
+            ),
+            (
+                Event::UserMessage {
+                    client: 3,
+                    mode: reagent_agent::live::SendMode::Queue,
+                    text: "later".into(),
+                },
+                json!({ "type": "user_message", "client": 3, "mode": "queue", "text": "later" }),
+            ),
+            (
+                Event::Committed { record: 12 },
+                json!({ "type": "committed", "record": 12 }),
+            ),
+            (
+                ask(Some("Bash(cargo test:*)")),
+                json!({ "type": "approval_request", "id": 4, "tool": "bash", "call": "bash: cargo test -p a", "rule": "Bash(cargo test:*)", "save": ["Bash(cargo test:*)"] }),
+            ),
+            (
+                ask(None),
+                json!({ "type": "approval_request", "id": 4, "tool": "bash", "call": "bash: cargo test -p a", "rule": "Bash(cargo test:*)" }),
+            ),
+            (
+                resolved(reagent_agent::guard::Answer::Once),
+                json!({ "type": "approval_resolved", "id": 4, "client": 7, "answer": "once" }),
+            ),
+            (
+                resolved(reagent_agent::guard::Answer::Session),
+                json!({ "type": "approval_resolved", "id": 4, "client": 7, "answer": "session" }),
+            ),
+            (
+                resolved(reagent_agent::guard::Answer::Save),
+                json!({ "type": "approval_resolved", "id": 4, "client": 7, "answer": "save" }),
+            ),
+            (
+                resolved(reagent_agent::guard::Answer::Refuse {
+                    reason: Some("that rewrite loses a column".into()),
+                }),
+                json!({ "type": "approval_resolved", "id": 4, "client": 7, "answer": "refuse", "reason": "that rewrite loses a column" }),
+            ),
+            (
+                resolved(reagent_agent::guard::Answer::Refuse { reason: None }),
+                json!({ "type": "approval_resolved", "id": 4, "client": 7, "answer": "refuse" }),
+            ),
+            (
+                resolved(reagent_agent::guard::Answer::Skip),
+                json!({ "type": "approval_resolved", "id": 4, "client": 7, "answer": "skip" }),
+            ),
+            (
+                Event::RuleToSave {
+                    rule: "Bash(cargo test:*)".into(),
+                },
+                json!({ "type": "rule_to_save", "rule": "Bash(cargo test:*)" }),
+            ),
+        ];
+        for (event, expected) in cases {
+            let mut printed = Vec::new();
+            write_event(&mut printed, &event);
+            assert!(
+                printed.is_empty(),
+                "{event:?} has no --json line but wrote {}",
+                String::from_utf8_lossy(&printed)
+            );
+            let mut worker = Vec::new();
+            write_line(&mut worker, &event);
+            assert_eq!(parse_line(&worker), expected, "{event:?}");
+        }
+    }
+
+    #[test]
+    fn start_line_names_the_version_and_the_session() {
+        assert_eq!(JSON_VERSION, 1);
+        let mut buf = Vec::new();
+        write_start(&mut buf, None);
+        assert_eq!(
+            std::str::from_utf8(&buf).expect("utf8"),
+            format!(
+                "{{\"type\":\"start\",\"version\":1,\"reagent\":\"{}\"}}\n",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+
+        let mut buf = Vec::new();
+        write_start(&mut buf, Some("s1"));
+        assert_eq!(
+            std::str::from_utf8(&buf).expect("utf8"),
+            format!(
+                "{{\"type\":\"start\",\"version\":1,\"reagent\":\"{}\",\"session\":\"s1\"}}\n",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
     }
 
     #[test]
@@ -515,6 +782,41 @@ mod tests {
         let text = std::str::from_utf8(&buf).unwrap();
         assert_eq!(text.lines().count(), 2);
         assert!(text.ends_with('\n'));
+    }
+
+    #[test]
+    fn a_live_session_event_writes_no_line() {
+        for event in [
+            Event::UserMessage {
+                client: 7,
+                mode: reagent_agent::live::SendMode::Steer,
+                text: "use cargo nextest".into(),
+            },
+            Event::Committed { record: 12 },
+            Event::ApprovalRequest(Box::new(reagent_agent::event::ApprovalRequest {
+                id: 0,
+                tool: "bash".into(),
+                call: "bash: cargo test -p a".into(),
+                rule: "Bash(cargo test:*)".into(),
+                save: Some("Bash(cargo test:*)".into()),
+            })),
+            Event::ApprovalResolved {
+                id: 0,
+                client: 7,
+                answer: reagent_agent::guard::Answer::Session,
+            },
+            Event::RuleToSave {
+                rule: "Bash(cargo test:*)".into(),
+            },
+        ] {
+            let mut buf = Vec::new();
+            write_event(&mut buf, &event);
+            assert!(
+                buf.is_empty(),
+                "{event:?} wrote {}",
+                String::from_utf8_lossy(&buf)
+            );
+        }
     }
 
     /// The line the serialize derive wrote before the fast path, so the fast
