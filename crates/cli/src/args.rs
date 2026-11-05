@@ -174,6 +174,12 @@ pub struct Args {
     pub provider_given: bool,
     /// Print one JSON object per event.
     pub json: bool,
+    /// Keep the terminal UI inline, under the shell's scrollback.
+    #[cfg_attr(
+        all(not(feature = "tui"), not(test)),
+        expect(dead_code, reason = "only the TUI and the tests read it")
+    )]
+    pub inline: bool,
     /// Serve the session as a worker instead of running it once.
     pub worker: bool,
     /// The provider model id.
@@ -351,6 +357,7 @@ fn usage() -> &'static str {
         "Options:\n",
         "  -p, --print <task>   the task for the agent to complete; `-` reads it from stdin\n",
         "      --json           print one JSON object per event on stdout\n",
+        "      --inline         keep the terminal UI inline, under the shell's scrollback\n",
         "      --model <id>     the provider model id\n",
         "      --provider <wire>  anthropic, openai-chat, openai-responses or pi-messages\n",
         "                       (default: anthropic)\n",
@@ -398,17 +405,6 @@ fn extra_usage() -> &'static str {
 
 fn bad(field: &str) -> String {
     format!("invalid value for {field}")
-}
-
-/// Whether the wire replays no reasoning that depends on earlier messages,
-/// so compaction may rewrite them. The test-only scripted wire replays none.
-fn may_compact(provider: &Wire) -> bool {
-    match provider {
-        Wire::OpenAiChat => true,
-        #[cfg(feature = "testing")]
-        Wire::Fake(_) => true,
-        _ => false,
-    }
 }
 
 /// Maps a `--provider` value to a wire, or to `fake:<file>` under testing.
@@ -533,8 +529,11 @@ fn expand_policy(names: &[String]) -> Result<Vec<String>, String> {
 }
 
 /// Parses the process arguments, or returns an exit decision.
-pub fn parse(argv: Vec<std::ffi::OsString>, worker: bool) -> Result<Outcome, String> {
-    parse_from(lexopt::Parser::from_args(argv), &load_settings, worker)
+///
+/// `worker` serves the session instead of running it once, and `ui` lets a run
+/// with no task start the terminal UI: a client then sends the messages.
+pub fn parse(argv: Vec<std::ffi::OsString>, worker: bool, ui: bool) -> Result<Outcome, String> {
+    parse_from(lexopt::Parser::from_args(argv), &load_settings, worker, ui)
 }
 
 /// Takes the leading `worker` word, which makes the run a session worker.
@@ -558,7 +557,12 @@ pub fn reparse(model: &str) -> Result<Outcome, String> {
     let mut argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let worker = worker_word(&mut argv);
     let argv = argv.into_iter().chain(["--model".into(), model.into()]);
-    parse_from(lexopt::Parser::from_args(argv), &load_settings, worker)
+    parse_from(
+        lexopt::Parser::from_args(argv),
+        &load_settings,
+        worker,
+        false,
+    )
 }
 
 /// Checks the policy and tool lists of `layer`, expanding `all` and `none`,
@@ -595,6 +599,18 @@ pub fn session_limits(cwd: &Path) -> Result<reagent_config::SessionSettings, Str
     let profile = profile_from(None, std::env::var("REAGENT_PROFILE").ok());
     let (settings, _, _) = load_settings(cwd, profile.as_deref())?;
     Ok(settings.session)
+}
+
+/// The `ui` setting the config files of `cwd` give for the profile `profile`,
+/// read and merged the way a run reads them.
+///
+/// An unknown value is an error that names the key. Nothing here starts a
+/// worker or writes anything, so a typo stops the start on its own. Reading the
+/// files blocks, so call it in `spawn_blocking`.
+#[cfg(feature = "tui")]
+pub fn ui_setting(cwd: &Path, profile: Option<&str>) -> Result<Option<reagent_config::Ui>, String> {
+    let layers = reagent_config::load_for(cwd, profile)?;
+    reagent_config::merge_all(&layers).ui()
 }
 
 /// Loads the config files for `cwd` and the profile `profile`, checks their
@@ -907,6 +923,7 @@ fn parse_from(
     mut parser: lexopt::Parser,
     load: &LoadSettings,
     worker: bool,
+    ui: bool,
 ) -> Result<Outcome, String> {
     let mut task: Option<TaskSource> = None;
     let mut sessions = Sessions::New;
@@ -915,6 +932,7 @@ fn parse_from(
     // A `--resume` whose reference is the next argument.
     let mut resume_value = false;
     let mut json = false;
+    let mut inline = false;
     let mut model = None;
     let mut provider = None;
     let mut base_url = None;
@@ -953,6 +971,7 @@ fn parse_from(
                 task = Some(text);
             }
             lexopt::Arg::Long("json") => json = true,
+            lexopt::Arg::Long("inline") => inline = true,
             lexopt::Arg::Long("model") => {
                 let value = parser
                     .value()
@@ -1144,10 +1163,12 @@ fn parse_from(
     if refresh {
         return Err("--refresh needs the models command".into());
     }
-    // Only a continue, a resume or a worker may run with no message: the run
-    // answers the calls its ledger left open, and a worker takes the ones its
-    // clients send.
-    let open = matches!(sessions, Sessions::Continue | Sessions::Resume(_)) || worker;
+    // Only a continue, a resume, a worker or the terminal UI may run with no
+    // message: the run answers the calls its ledger left open, a worker takes
+    // the ones its clients send, and the UI sends its own.
+    let open = matches!(sessions, Sessions::Continue | Sessions::Resume(_))
+        || worker
+        || (ui && matches!(sessions, Sessions::New));
     if task.is_none() {
         if json {
             return Err("the --json flag needs a task; use -p <task>".into());
@@ -1288,9 +1309,6 @@ fn parse_from(
     if policy.iter().any(|name| name == "mask") && provider != Wire::OpenAiChat {
         return Err("--policy mask needs --provider openai-chat".into());
     }
-    if policy.iter().any(|name| name == "compact") && !may_compact(&provider) {
-        return Err("--policy compact needs --provider openai-chat".into());
-    }
 
     let base_url = base_url.or_else(|| route.map(Route::endpoint));
     let compat = resolve_compat(
@@ -1310,6 +1328,7 @@ fn parse_from(
         model_given,
         provider_given,
         json,
+        inline,
         worker,
         model: model_id,
         provider,
@@ -1444,6 +1463,13 @@ mod tests {
             ..Settings::default()
         };
         assert!(!run_with(&["-p", "x"], off).bash_reads);
+    }
+
+    /// `--inline` asks for the inline UI, and is off unless it is given.
+    #[test]
+    fn the_inline_flag_asks_for_the_inline_ui() {
+        assert!(!run_with(&["-p", "x"], Settings::default()).inline);
+        assert!(run_with(&["-p", "x", "--inline"], Settings::default()).inline);
     }
 
     #[test]
@@ -1685,22 +1711,24 @@ mod tests {
     }
 
     #[test]
-    fn compact_policy_needs_the_chat_wire() {
-        let error = parse(&["-p", "task", "--policy", "compact"]).unwrap_err();
-        assert!(error.contains("openai-chat"), "{error}");
-        let chat = run(&[
-            "-p",
-            "task",
-            "--provider",
+    fn compact_policy_runs_on_every_wire() {
+        for wire in [
+            "anthropic",
             "openai-chat",
-            "--policy",
-            "compact",
-        ]);
-        assert_eq!(chat.policy, vec!["compact"]);
-        for wire in ["anthropic", "openai-responses"] {
-            let refused = parse(&["-p", "task", "--policy", "compact", "--provider", wire]);
-            assert!(refused.is_err(), "{wire}");
+            "openai-responses",
+            "pi-messages",
+        ] {
+            let args = parse(&["-p", "task", "--policy", "compact", "--provider", wire])
+                .unwrap_or_else(|error| panic!("{wire}: {error}"));
+            match args {
+                Outcome::Run(args) => assert_eq!(args.policy, vec!["compact"], "{wire}"),
+                other => panic!("expected a run outcome for {wire}, got {other:?}"),
+            }
         }
+        assert_eq!(
+            run(&["-p", "task", "--policy", "compact"]).policy,
+            vec!["compact"]
+        );
     }
 
     #[test]
@@ -1809,7 +1837,46 @@ mod tests {
                 ))
             },
             false,
+            false,
         )
+    }
+
+    /// Parses `args` as a default build does, where a run with no task may
+    /// open the terminal UI.
+    fn parse_ui(args: &[&str]) -> Result<Outcome, String> {
+        let argv = args.iter().map(std::ffi::OsString::from);
+        parse_from(
+            lexopt::Parser::from_args(argv),
+            &|_, _| {
+                Ok((
+                    Settings::default(),
+                    Rules::none(),
+                    McpConfig {
+                        servers: BTreeMap::new(),
+                        warn_many_direct: true,
+                        settings: Default::default(),
+                    },
+                ))
+            },
+            false,
+            true,
+        )
+    }
+
+    /// The UI opens only a new session or a continue, so a run that can do
+    /// neither still needs its task, in a build with the UI too.
+    #[test]
+    fn no_session_and_fork_still_need_a_task_when_the_ui_is_built() {
+        for args in [&["--no-session"][..], &["--fork", "abc"][..]] {
+            match parse_ui(args) {
+                Err(message) => assert!(message.contains("missing task"), "{args:?}: {message}"),
+                Ok(outcome) => panic!("{args:?} parsed with no task: {outcome:?}"),
+            }
+        }
+        assert!(
+            matches!(parse_ui(&[]), Ok(Outcome::Run(_))),
+            "a plain run opens the UI"
+        );
     }
 
     fn run_servers(
@@ -2460,6 +2527,7 @@ mod tests {
                     ))
                 },
                 false,
+                false,
             )
         };
         let models = parse(&["models", "--profile", "work"]).expect("parses");
@@ -2525,6 +2593,7 @@ mod tests {
         let error = parse_from(
             lexopt::Parser::from_args(argv),
             &|_, _| Err("bad".into()),
+            false,
             false,
         );
         assert_eq!(error.unwrap_err(), "bad");

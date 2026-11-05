@@ -32,6 +32,8 @@ pub struct Resumed {
     pub provider: String,
     /// The model the run was using.
     pub model: String,
+    /// The config provider id of the last switch, when the journal recorded one.
+    pub config_provider: Option<Text>,
     /// The number of the last turn that ended, 0 when none did.
     pub turns: u64,
     /// How many messages of `history` the part chain already holds.
@@ -106,6 +108,7 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
         state: State::default(),
         provider: String::new(),
         model: String::new(),
+        config_provider: None,
         turns: 0,
         recorded: 0,
         pending: Vec::new(),
@@ -197,10 +200,13 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
                 last_calls.clear();
                 resumed.level = None;
                 resumed.mode = None;
+                // A base carries no config provider id, so the one a switch
+                // recorded stays.
             }
             Record::Model(change) => {
                 resumed.state.provider = change.provider;
                 resumed.state.model = change.model;
+                resumed.config_provider = change.config;
             }
             Record::Unknown(_) => {}
         }
@@ -442,6 +448,26 @@ mod tests {
         assert_eq!(resumed.state.compaction, 2, "the rest of the base stays");
         assert_eq!(resumed.provider, "q");
         assert_eq!(resumed.model, "m2");
+    }
+
+    #[tokio::test]
+    async fn config_provider_of_the_last_switch_is_resumed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = journal(dir.path());
+        journal.base(&State::new("p", "m1", 0)).expect("base");
+        journal
+            .model_config("q", "m2", Some("openrouter"))
+            .expect("model");
+        journal
+            .model_config("r", "m3", Some("commandcode"))
+            .expect("model");
+        journal.commit().expect("commit");
+        journal.close().expect("close");
+
+        let resumed = load_now(dir.path());
+        assert_eq!(resumed.state.provider, "r");
+        assert_eq!(resumed.state.model, "m3");
+        assert_eq!(resumed.config_provider.as_deref(), Some("commandcode"));
     }
 
     #[tokio::test]

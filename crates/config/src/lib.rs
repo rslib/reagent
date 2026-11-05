@@ -50,6 +50,10 @@ pub struct Settings {
     pub codemode: CodemodeSettings,
     /// Whether a plain file read in bash runs as a `read` call; on when unset.
     pub bash_reads: Option<bool>,
+    /// How the terminal UI draws: `full` (the default) or `inline`.
+    pub ui: Option<String>,
+    /// The path of a TOML theme file that overrides the terminal UI's roles.
+    pub theme: Option<String>,
     /// The provider tables by name. Only the global file and a profile may
     /// hold them.
     #[serde(default)]
@@ -93,6 +97,41 @@ pub struct SessionSettings {
     pub keep_days: Option<u64>,
     /// MiB the sessions of all folders may take; 0 means no cap.
     pub max_mb: Option<u64>,
+}
+
+/// How the terminal UI draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ui {
+    /// The whole terminal, with the sidebar.
+    Full,
+    /// The live area under the shell's scrollback.
+    Inline,
+}
+
+impl Settings {
+    /// The `ui` setting, or `None` when no layer set it.
+    ///
+    /// An unknown value is an error that names the key, so a typo in a config
+    /// file is never silently ignored.
+    pub fn ui(&self) -> Result<Option<Ui>, String> {
+        match self.ui.as_deref() {
+            None => Ok(None),
+            Some("full") => Ok(Some(Ui::Full)),
+            Some("inline") => Ok(Some(Ui::Inline)),
+            Some(other) => Err(format!(
+                "config: ui must be full or inline, not \"{other}\""
+            )),
+        }
+    }
+
+    /// The path of the theme file, `None` when no layer set one and when the
+    /// path is empty. The app reads the file once, at start.
+    pub fn theme(&self) -> Option<&Path> {
+        self.theme
+            .as_deref()
+            .filter(|path| !path.is_empty())
+            .map(Path::new)
+    }
 }
 
 impl SessionSettings {
@@ -596,6 +635,8 @@ fn apply(merged: &mut Settings, settings: &Settings, profile: bool) {
         fold(merged.mcp.get_or_insert_with(Vec::new), list, true);
     }
     over(&mut merged.bash_reads, &settings.bash_reads);
+    over(&mut merged.ui, &settings.ui);
+    over(&mut merged.theme, &settings.theme);
     fold(&mut merged.skip, &settings.skip, false);
     if profile {
         for (name, table) in &settings.providers {
@@ -1386,6 +1427,32 @@ mod tests {
         write(dir.path(), "project/a/b/file", "");
         let nested = dir.path().join("project/a/b");
         assert_eq!(repo_root(&nested), Some(dir.path().join("project")));
+    }
+
+    #[test]
+    fn the_ui_setting_reads_full_or_inline_and_names_itself_on_a_typo() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = write(dir.path(), "config.toml", "ui = \"inline\"\n");
+        let found = settings(Some(&file), None);
+        assert_eq!(found.ui(), Ok(Some(Ui::Inline)));
+        let file = write(dir.path(), "config.toml", "ui = \"bogus\"\n");
+        let found = settings(Some(&file), None);
+        let error = found.ui().expect_err("an unknown value is an error");
+        assert!(error.contains("ui"), "{error}");
+        assert!(error.contains("bogus"), "{error}");
+    }
+
+    #[test]
+    fn the_theme_setting_is_a_path_and_a_later_layer_wins() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let global = write(dir.path(), "config.toml", "theme = \"one.toml\"\n");
+        let found = settings(Some(&global), None);
+        assert_eq!(found.theme(), Some(Path::new("one.toml")));
+        let repo = write(dir.path(), "repo.toml", "theme = \"two.toml\"\n");
+        let found = settings(Some(&global), Some(&repo));
+        assert_eq!(found.theme(), Some(Path::new("two.toml")));
+        let empty = write(dir.path(), "empty.toml", "theme = \"\"\n");
+        assert_eq!(settings(Some(&empty), None).theme(), None);
     }
 
     #[test]

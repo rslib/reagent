@@ -22,7 +22,7 @@ impl Encoder {
     /// the method that carries it.
     pub(crate) fn frame(&mut self, event: &Event) -> Frame {
         self.line.clear();
-        json::write_line(&mut self.line, event);
+        json::write_worker_line(&mut self.line, event);
         // The frame carries the line without the newline that ends it.
         assert_eq!(
             self.line.pop(),

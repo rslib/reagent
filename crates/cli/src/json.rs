@@ -7,6 +7,7 @@ use reagent_agent::event::{Event, TurnEndReason};
 use reagent_agent::guard::Answer;
 use reagent_agent::live::{ClientId, SendMode};
 use reagent_ai::Usage;
+use reagent_config::permissions::PermissionMode;
 
 /// The version of the line format, named by the start line of every `--json`
 /// run.
@@ -38,6 +39,13 @@ enum Line<'a> {
         bytes: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<&'a str>,
+        /// The tail of the output, in the worker's frames only.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<&'a str>,
+        /// How many lines `output` was cut down from, in the worker's frames
+        /// only.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        earlier: Option<u64>,
         /// The images the result carries, never their base64 text.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageLine<'a>>,
@@ -69,6 +77,7 @@ enum Line<'a> {
     },
     Compacted {
         before: u64,
+        after: u64,
         replaced: u32,
         bytes: u32,
     },
@@ -105,6 +114,14 @@ enum Line<'a> {
     },
     RuleToSave {
         rule: &'a str,
+    },
+    Settings {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        level: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<&'static str>,
     },
     Summary {
         turns: u32,
@@ -166,6 +183,7 @@ pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
             | Event::ApprovalRequest(_)
             | Event::ApprovalResolved { .. }
             | Event::RuleToSave { .. }
+            | Event::Settings { .. }
     ) {
         return;
     }
@@ -173,8 +191,23 @@ pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
 }
 
 /// Appends any agent event, a live session's own too, to `buf` as one JSON
-/// object and a newline: the bytes `--json` prints and the worker sends.
+/// object and a newline: the bytes `--json` prints.
 pub fn write_line(buf: &mut Vec<u8>, event: &Event) {
+    write(buf, event, false);
+}
+
+/// Appends any agent event, a live session's own too, to `buf` as one JSON
+/// object and a newline: the bytes a worker sends its clients.
+///
+/// A tool result's frame carries the tail of its output, so a client draws the
+/// text without reading the journal.
+pub fn write_worker_line(buf: &mut Vec<u8>, event: &Event) {
+    write(buf, event, true);
+}
+
+/// Appends `event` to `buf` as one JSON object and a newline, with the output
+/// tail of a tool result when `tailed` is set.
+fn write(buf: &mut Vec<u8>, event: &Event, tailed: bool) {
     // The deltas of a streamed answer are the hot path of `--json`: their whole
     // line is written straight into the buffer, with the bytes the serializer
     // writes, instead of going through the serializer once per delta.
@@ -201,23 +234,34 @@ pub fn write_line(buf: &mut Vec<u8>, event: &Event) {
             id,
             is_error,
             bytes,
-            error,
+            output,
             images,
-        } => Line::ToolResult {
-            id,
-            is_error: *is_error,
-            bytes: *bytes,
-            error: error.as_deref(),
-            images: images
-                .iter()
-                .map(|image| ImageLine {
-                    media_type: image.media_type.mime(),
-                    width: image.width,
-                    height: image.height,
-                    bytes: decoded_len(image.data.as_ref()),
-                })
-                .collect(),
-        },
+        } => {
+            let (tail, earlier) = match (tailed, output.as_deref()) {
+                (true, Some(text)) => {
+                    let (tail, earlier) = tail_of(text);
+                    (Some(tail), Some(earlier))
+                }
+                _ => (None, None),
+            };
+            Line::ToolResult {
+                id,
+                is_error: *is_error,
+                bytes: *bytes,
+                error: output.as_deref().filter(|_| *is_error),
+                output: tail,
+                earlier,
+                images: images
+                    .iter()
+                    .map(|image| ImageLine {
+                        media_type: image.media_type.mime(),
+                        width: image.width,
+                        height: image.height,
+                        bytes: decoded_len(image.data.as_ref()),
+                    })
+                    .collect(),
+            }
+        }
         Event::Usage(usage) => Line::Usage {
             input: usage.input_tokens,
             output: usage.output_tokens,
@@ -245,10 +289,12 @@ pub fn write_line(buf: &mut Vec<u8>, event: &Event) {
         Event::PolicyNote(text) => Line::PolicyNote { text },
         Event::Compacted {
             before,
+            after,
             replaced,
             bytes,
         } => Line::Compacted {
             before: *before,
+            after: *after,
             replaced: *replaced,
             bytes: *bytes,
         },
@@ -275,6 +321,11 @@ pub fn write_line(buf: &mut Vec<u8>, event: &Event) {
             }
         }
         Event::RuleToSave { rule } => Line::RuleToSave { rule },
+        Event::Settings { model, level, mode } => Line::Settings {
+            model: model.as_deref(),
+            level: level.as_deref(),
+            mode: mode.as_ref().map(PermissionMode::as_str),
+        },
     };
     push(buf, &line);
 }
@@ -290,6 +341,31 @@ pub fn write_start(buf: &mut Vec<u8>, session: Option<&str>) {
             session,
         },
     );
+}
+
+/// The bytes of a tool result's output a worker keeps in the frame: its last
+/// [`OUTPUT_KEEP`] bytes from the start of a line.
+const OUTPUT_KEEP: usize = 4096;
+
+/// The part of `text` a frame keeps: its last [`OUTPUT_KEEP`] bytes from the
+/// start of a line, and the count of the lines before them.
+///
+/// A cut inside a line moves forward to the start of the next one, and a line
+/// with no start in the kept part starts at a character boundary.
+fn tail_of(text: &str) -> (&str, u64) {
+    if text.len() <= OUTPUT_KEEP {
+        return (text, 0);
+    }
+    let mut at = text.len() - OUTPUT_KEEP;
+    if !text.is_char_boundary(at) {
+        at = text.ceil_char_boundary(at);
+    }
+    if !text[..at].ends_with('\n')
+        && let Some(end) = text[at..].find('\n')
+    {
+        at += end + 1;
+    }
+    (&text[at..], text[..at].matches('\n').count() as u64)
 }
 
 /// Appends the final summary line to `buf`: total usage, turns, the context
@@ -497,7 +573,7 @@ mod tests {
                     id: "c1".into(),
                     is_error: true,
                     bytes: 1234,
-                    error: Some("old_string not found in a.rs".into()),
+                    output: Some("old_string not found in a.rs".into()),
                     images: Vec::new(),
                 },
                 json!({ "type": "tool_result", "id": "c1", "is_error": true, "bytes": 1234, "error": "old_string not found in a.rs" }),
@@ -507,7 +583,7 @@ mod tests {
                     id: "c2".into(),
                     is_error: false,
                     bytes: 10,
-                    error: None,
+                    output: Some("the output".into()),
                     images: Vec::new(),
                 },
                 json!({ "type": "tool_result", "id": "c2", "is_error": false, "bytes": 10 }),
@@ -517,7 +593,7 @@ mod tests {
                     id: "c3".into(),
                     is_error: false,
                     bytes: 12,
-                    error: None,
+                    output: None,
                     images: vec![reagent_ai::Image {
                         media_type: reagent_ai::ImageType::Png,
                         width: 64,
@@ -576,14 +652,113 @@ mod tests {
     }
 
     #[test]
-    fn every_json_line_is_the_worker_line() {
+    fn the_worker_line_of_a_result_adds_the_tail_of_its_output() {
         for (event, _) in cases() {
             let mut printed = Vec::new();
             write_event(&mut printed, &event);
             let mut worker = Vec::new();
-            write_line(&mut worker, &event);
-            assert_eq!(printed, worker, "{event:?} is encoded twice for two paths");
+            write_worker_line(&mut worker, &event);
+            let mut line = parse_line(&worker);
+            // A result keeps its tail in the fields the printed line lacks.
+            let tail = line.as_object_mut().and_then(|line| {
+                let result = matches!(event, Event::ToolResult { .. });
+                result.then(|| line.remove("output")).flatten()
+            });
+            let earlier = line.as_object_mut().and_then(|line| {
+                let result = matches!(event, Event::ToolResult { .. });
+                result.then(|| line.remove("earlier")).flatten()
+            });
+            assert_eq!(
+                line,
+                parse_line(&printed),
+                "{event:?} is encoded twice for two paths"
+            );
+            match &event {
+                Event::ToolResult {
+                    output: Some(text), ..
+                } => {
+                    assert_eq!(
+                        tail.as_ref().and_then(Value::as_str),
+                        Some(text.as_ref()),
+                        "{event:?}"
+                    );
+                    assert_eq!(earlier, Some(Value::from(0)), "{event:?}");
+                }
+                _ => {
+                    assert!(tail.is_none(), "{event:?} carries a tail");
+                    assert!(earlier.is_none(), "{event:?} counts lines it has none of");
+                }
+            }
         }
+    }
+
+    #[test]
+    fn a_result_line_keeps_the_last_lines_of_a_long_output() {
+        let mut text = String::new();
+        for at in 1..=300 {
+            text.push_str(&format!("line {at} of a long output\n"));
+        }
+        assert!(text.len() > OUTPUT_KEEP);
+        let event = Event::ToolResult {
+            id: "c1".into(),
+            is_error: false,
+            bytes: text.len(),
+            output: Some(text.as_str().into()),
+            images: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        write_worker_line(&mut buf, &event);
+        let line = parse_line(&buf);
+        let output = line["output"].as_str().expect("a tail");
+        assert!(
+            output.len() <= OUTPUT_KEEP,
+            "{} bytes is over the {OUTPUT_KEEP} kept",
+            output.len()
+        );
+        assert!(text.ends_with(output), "the tail ends the output");
+        assert!(output.starts_with("line "), "the tail starts at a line");
+        let earlier = line["earlier"].as_u64().expect("a count");
+        assert_eq!(
+            earlier + output.lines().count() as u64,
+            300,
+            "the count and the tail make the lines of the output"
+        );
+        // The printed line of the same result carries neither.
+        let mut printed = Vec::new();
+        write_event(&mut printed, &event);
+        let printed = parse_line(&printed);
+        assert_eq!(
+            printed,
+            json!({ "type": "tool_result", "id": "c1", "is_error": false, "bytes": text.len() })
+        );
+    }
+
+    #[test]
+    fn a_failed_result_line_keeps_its_error_and_its_tail() {
+        let event = Event::ToolResult {
+            id: "c1".into(),
+            is_error: true,
+            bytes: 6,
+            output: Some("boom\n\n".into()),
+            images: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        write_worker_line(&mut buf, &event);
+        let line = parse_line(&buf);
+        assert_eq!(line["error"], "boom\n\n");
+        assert_eq!(line["output"], "boom\n\n");
+    }
+
+    #[test]
+    fn the_tail_of_a_long_output_starts_at_a_line_or_a_character() {
+        let text = format!("{}\né\n", "a".repeat(OUTPUT_KEEP));
+        assert_eq!(tail_of(&text), ("é\n", 1));
+        assert_eq!(tail_of("short\n"), ("short\n", 0));
+        let wide = format!("a{}", "é".repeat(3000));
+        let (tail, earlier) = tail_of(&wide);
+        assert!(tail.len() <= OUTPUT_KEEP, "{} bytes", tail.len());
+        assert!(tail.chars().all(|c| c == 'é'), "{tail:?}");
+        assert_eq!(earlier, 0);
     }
 
     #[test]
@@ -662,6 +837,23 @@ mod tests {
                     rule: "Bash(cargo test:*)".into(),
                 },
                 json!({ "type": "rule_to_save", "rule": "Bash(cargo test:*)" }),
+            ),
+            (
+                Event::Settings {
+                    model: Some("anthropic/m2".into()),
+                    level: Some("high".into()),
+                    mode: Some(reagent_config::permissions::PermissionMode::Auto),
+                },
+                json!({ "type": "settings", "model": "anthropic/m2", "level": "high", "mode": "auto" }),
+            ),
+            (
+                // A value the set did not name is left out, not written null.
+                Event::Settings {
+                    model: None,
+                    level: None,
+                    mode: Some(reagent_config::permissions::PermissionMode::AcceptEdits),
+                },
+                json!({ "type": "settings", "mode": "accept-edits" }),
             ),
         ];
         for (event, expected) in cases {

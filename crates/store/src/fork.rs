@@ -122,6 +122,26 @@ impl Session {
         })
     }
 
+    /// Every base of the chain with the last record of the commit it starts:
+    /// a base, the records it restates and their commit are written together.
+    /// A later commit of the part names the same base, so only the commit that
+    /// begins at the base says where the restatement ends.
+    pub fn base_ends(&self) -> Vec<(u64, u64)> {
+        let mut ends = Vec::new();
+        for link in &self.chain {
+            for at in link.part.commits() {
+                let commit = &at.commit;
+                if let Some((seq, _)) = commit.base
+                    && commit.last_seq <= link.limit
+                    && commit.last_seq + 1 == seq + commit.count
+                {
+                    ends.push((seq, commit.last_seq));
+                }
+            }
+        }
+        ends
+    }
+
     /// Where a fork at `seq` reads its parent from.
     ///
     /// The fork names the part that owns the record, so a fork of a fork
@@ -570,5 +590,54 @@ mod tests {
         let child = Session::open(dir.path()).expect("child");
         assert_eq!(child.header().part_id, 2);
         assert_eq!(child.last_base(), Some(2), "the base in the parent part");
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test makes its fixture folders"
+    )]
+    fn base_ends_reach_into_a_parent_session() {
+        let folder = TempDir::new().expect("temp dir");
+        let first = folder.path().join("01first");
+        let second = folder.path().join("01second");
+        std::fs::create_dir(&first).expect("first folder");
+        std::fs::create_dir(&second).expect("second folder");
+        let mut out = Vec::new();
+        let mut writer = PartWriter::new(&mut out, header(1, 10, None)).expect("part");
+        writer
+            .append(10, &Bytes::from_static(b"a"), false)
+            .expect("append");
+        writer.commit().expect("commit");
+        // A base and the two records it restates, committed together.
+        writer
+            .append(11, &Bytes::from_static(b"base"), true)
+            .expect("base");
+        for payload in [b"a" as &[u8], b"b"] {
+            writer
+                .append(10, &Bytes::copy_from_slice(payload), false)
+                .expect("append");
+        }
+        writer.commit().expect("commit");
+        writer
+            .append(10, &Bytes::from_static(b"c"), false)
+            .expect("append");
+        writer.commit().expect("commit");
+        writer.finish().expect("finish");
+        testutil::write(&paths::part_path(&first, 1), &out);
+        let parent = Session::open(&first).expect("parent");
+        assert_eq!(
+            parent.base_ends(),
+            vec![(2, 4)],
+            "the later commit is no base"
+        );
+        let fork = parent.fork_point(5);
+        write_part(&second, header(2, 20, Some(fork)), &["x"], 1);
+        let child = Session::open(&second).expect("child");
+        assert_eq!(
+            child.base_ends(),
+            vec![(2, 4)],
+            "the base in the parent session"
+        );
     }
 }

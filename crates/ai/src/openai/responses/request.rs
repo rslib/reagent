@@ -1055,4 +1055,63 @@ mod tests {
         let second = provider.request_body(&request).unwrap();
         assert_eq!(first, second);
     }
+
+    #[test]
+    fn a_compacted_history_is_a_valid_request() {
+        let checkpoint = "## Checkpoint 1\nUser: task\n#1 bash ls -> ok, 9 bytes".to_string();
+        let mut reply = AssistantMessage::new(
+            PROVIDER,
+            "gpt-5",
+            vec![
+                Content::Thinking {
+                    thinking: "consider".into(),
+                    signature: Some("sig".into()),
+                },
+                Content::ToolCall(ToolCall {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"a.rs"}"#.into(),
+                }),
+            ],
+        );
+        reply.stop_reason = Some(StopReason::ToolUse);
+        let history = [
+            Message::user("task"),
+            Message::user(checkpoint.clone()),
+            Message::assistant(reply),
+            Message::tool_result("call_1", "fn main() {}", false),
+            Message::assistant(AssistantMessage::new(
+                PROVIDER,
+                "gpt-5",
+                vec![Content::text("done")],
+            )),
+        ];
+        let body = body_of(&history);
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+        let input = body["input"].as_array().expect("input items");
+        let kinds: Vec<&str> = input
+            .iter()
+            .map(|item| item["type"].as_str().expect("a type"))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "message",
+                "message",
+                "reasoning",
+                "function_call",
+                "function_call_output",
+                "message"
+            ]
+        );
+        assert_eq!(input[0]["content"][0]["text"], "task");
+        assert_eq!(input[1]["content"][0]["text"], checkpoint);
+        assert_eq!(
+            input[2]["encrypted_content"], "sig",
+            "the reasoning of the kept reply is present"
+        );
+        assert_eq!(input[3]["call_id"], "call_1");
+        assert_eq!(input[4]["call_id"], "call_1");
+        assert_eq!(input[5]["content"][0]["text"], "done");
+    }
 }

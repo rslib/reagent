@@ -26,6 +26,7 @@ use reagent_agent::live::SendMode;
 use reagent_agent::live::Sender;
 use reagent_ai::Message;
 use reagent_ai::Text;
+use reagent_ai::oauth::session::Session;
 use reagent_config::permissions::PermissionMode;
 use reagent_protocol::discovery;
 use reagent_protocol::discovery::Entry;
@@ -61,6 +62,10 @@ const HANDSHAKE: Duration = Duration::from_secs(5);
 /// How long a worker with no work of its own waits for its first client.
 const FIRST_CLIENT: Duration = Duration::from_secs(10);
 
+/// How long a worker stays up after a client goes without `detach`, so one the
+/// hub cut can come back and catch up on what it missed.
+const LINGER: Duration = Duration::from_secs(5);
+
 /// The client id of the worker itself.
 const WORKER: live::ClientId = 0;
 
@@ -79,12 +84,19 @@ struct Empty {}
 
 /// Starts the worker of `plan`, or returns `None` when this run is not one.
 ///
+/// `model` is the provider and model text the run uses, `context_window` its
+/// context window and `level` the reasoning level it sends: the answer to
+/// `initialize` names the first two, and the `settings` notice every one.
+///
 /// A worker takes its session here: the lock, the socket and the entry of the discovery folder are all
 /// there before the ready line goes out.
 pub(crate) async fn start(
     args: &Args,
     plan: Option<&Plan>,
     cwd: &Path,
+    model: &str,
+    context_window: Option<u64>,
+    level: Option<&str>,
 ) -> Result<Option<Worker>, String> {
     if !args.worker {
         return Ok(None);
@@ -155,6 +167,13 @@ pub(crate) async fn start(
     .ok()
     .flatten();
     let (sender, inbox) = live::channel();
+    let model = Model::new(
+        Arc::from(model),
+        context_window,
+        level.map(Arc::from),
+        args.provider_name.as_deref().map(Arc::from),
+        crate::models::cache_dir(),
+    );
     Ok(Some(Worker {
         session,
         saved,
@@ -162,7 +181,7 @@ pub(crate) async fn start(
         _lock: lock,
         token: Arc::from(token),
         listener: Some(listener),
-        shared: Arc::new(Shared::new()),
+        shared: Arc::new(Shared::new(model)),
         events: None,
         sender: Some(sender),
         inbox: Some(inbox),
@@ -308,11 +327,21 @@ impl Worker {
 
     /// Starts serving clients: the tracker, the acceptor, and the record a
     /// client resumes its view from.
-    pub(crate) fn begin(&mut self, committed: u64) {
+    ///
+    /// `committed` is the number of the session's last record before this run,
+    /// and `listed` is the session the tracker lists when the journal commits a
+    /// record after it, or `None` for a session the list holds already.
+    pub(crate) fn begin(&mut self, committed: u64, listed: Option<crate::session::Listing>) {
         self.shared.set_committed(committed);
         if let Some(events) = self.events.take() {
             let saved = self.saved.take();
-            self.tracker = Some(tokio::spawn(track(events, Arc::clone(&self.shared), saved)));
+            self.tracker = Some(tokio::spawn(track(
+                events,
+                Arc::clone(&self.shared),
+                saved,
+                committed,
+                listed,
+            )));
         }
         let (leaving, wait) = oneshot::channel();
         self.leaving = Some(wait);
@@ -451,6 +480,9 @@ struct State {
     clients: u32,
     /// Whether a client has ever joined.
     seen: bool,
+    /// The deadline a client that left without `detach` keeps the worker up to,
+    /// or `None` when no such client left.
+    linger: Option<tokio::time::Instant>,
     /// The id the next client gets.
     next: live::ClientId,
     /// Why the last run ended.
@@ -466,6 +498,7 @@ impl Default for State {
             committed: 0,
             clients: 0,
             seen: false,
+            linger: None,
             next: 1,
             end: TurnEndReason::EndTurn,
         }
@@ -490,16 +523,91 @@ impl State {
     }
 
     /// Whether the worker may stop: no client is left, its own work is queued,
-    /// and no run is open, or the open run waits for an approval no client can
-    /// give.
-    fn idle(&self) -> bool {
-        self.clients == 0 && self.armed && (!self.running || self.approval.is_some())
+    /// no run is open (or the open run waits for an approval no client can
+    /// give), and the linger of a client that left without `detach` is over.
+    fn idle(&self, now: impl FnOnce() -> tokio::time::Instant) -> bool {
+        // `now` runs only when a linger is set, so a run a client watches
+        // reads no clock here.
+        self.alone() && self.linger.is_none_or(|at| at <= now())
     }
 
     /// Whether the worker may stop now, given that it may still be waiting for
     /// its first client, which the first one that joins ends.
     fn may_stop(&self, waiting: bool) -> bool {
-        self.idle() && (!waiting || self.seen)
+        self.idle(tokio::time::Instant::now) && (!waiting || self.seen)
+    }
+
+    /// The deadline of the linger that keeps the worker up, or `None` when a
+    /// client left with `detach` or none is left to come back.
+    ///
+    /// One timer at most: a client that is still attached, or a run that is
+    /// open, needs no deadline of its own.
+    fn lingering(&self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        match self.linger {
+            Some(at) if self.alone() && at > now => Some(at),
+            _ => None,
+        }
+    }
+
+    /// Whether no client is left, the worker queued its work, and no run is
+    /// open, or the open run waits for an approval no client can give.
+    fn alone(&self) -> bool {
+        self.clients == 0 && self.armed && (!self.running || self.approval.is_some())
+    }
+}
+
+/// The model a session runs, its context window and the settings a client set
+/// last, which the answer to `initialize` and the `settings` notice name.
+#[derive(Debug)]
+struct Model {
+    /// The provider and model text the run uses.
+    text: Arc<str>,
+    /// The context window of `text`, from the models cache or the config.
+    window: Option<u64>,
+    /// The reasoning level the session sends, when it sends one.
+    level: Option<Arc<str>>,
+    /// The permission mode the session decides with: the one the run started
+    /// with, which is `default`, replaced by the mode of every
+    /// `Event::Settings` that names one (the mode the session's guard took).
+    mode: PermissionMode,
+    /// The provider whose models cache names the window of another model.
+    provider: Option<Arc<str>>,
+    /// The models cache folder, when the run has one.
+    cache: Option<PathBuf>,
+}
+
+impl Model {
+    /// The model a run starts with: the level it sends and the cache its other
+    /// models are looked up in.
+    fn new(
+        text: Arc<str>,
+        window: Option<u64>,
+        level: Option<Arc<str>>,
+        provider: Option<Arc<str>>,
+        cache: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            text,
+            window,
+            level,
+            mode: PermissionMode::default(),
+            provider,
+            cache,
+        }
+    }
+
+    /// The text a client sees for the provider model id `id`: the provider the
+    /// run names and the id, as `crate::run::model_text` writes it for the
+    /// start line and the answer to `initialize`, or `id` alone when the run
+    /// names no provider.
+    ///
+    /// A `set` carries the bare provider model id, so its comparison with the
+    /// model of the run and the state it leaves are this text.
+    fn text_of(&self, id: &str) -> Arc<str> {
+        match &self.provider {
+            Some(name) => Arc::from(format!("{name}/{id}")),
+            None => Arc::from(id),
+        }
     }
 }
 
@@ -509,18 +617,51 @@ struct Shared {
     state: Mutex<State>,
     /// The frames of the session, and the queues of its clients.
     hub: Mutex<hub::Hub>,
+    /// The model of the session and the settings a client set last.
+    model: Mutex<Model>,
+    /// The login of the provider a client switched to, kept so its refresh
+    /// keeps working.
+    held: Mutex<Option<Arc<Session>>>,
     /// Bumped on every change of `state`, so a wait wakes on it.
     changed: watch::Sender<u64>,
 }
 
 impl Shared {
-    fn new() -> Self {
+    fn new(model: Model) -> Self {
         let (changed, _) = watch::channel(0);
         Self {
             state: Mutex::new(State::default()),
             hub: Mutex::new(hub::Hub::new()),
+            model: Mutex::new(model),
+            held: Mutex::new(None),
             changed,
         }
+    }
+
+    /// Switches the model of the session to the provider `name` a client set,
+    /// and keeps `session` alive for the session, so the refresh of a login
+    /// keeps working.
+    fn switch_provider(&self, name: &str, session: Option<Arc<Session>>) {
+        self.model().provider = Some(Arc::from(name));
+        // The login of the provider the session leaves is dropped: its
+        // refresh would serve no request.
+        *self
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = session;
+    }
+
+    /// The model of the session, locked for one short read or write.
+    fn model(&self) -> MutexGuard<'_, Model> {
+        self.model
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Queues the `settings` notice to every attached client, and for the ones
+    /// that attach after it.
+    fn notice(&self, frame: hub::Frame) {
+        self.hub().send(frame, hub::Kind::Other);
     }
 
     /// The hub, locked for one short step.
@@ -545,9 +686,12 @@ impl Shared {
     }
 
     /// Attaches the client of `id` for its request, and queues the frames it
-    /// missed.
+    /// missed, and the answer says whether a run is open now.
     fn attach(&self, id: live::ClientId, request: Option<u64>) {
-        self.hub().attach(id, request);
+        let running = self.state().running;
+        let mut frames = self.hub();
+        frames.set_running(running);
+        frames.attach(id, request);
     }
 
     /// Queues the answer in `out` to the client of `id`.
@@ -600,16 +744,30 @@ impl Shared {
             state.next += 1;
             state.clients += 1;
             state.seen = true;
+            // A client that came back ends the linger an earlier drop armed, so
+            // a later `detach` stops the worker at once.
+            state.linger = None;
             client
         };
         self.tell();
         client
     }
 
-    /// Counts a client as gone.
+    /// Counts a client that detached as gone: the worker stops as soon as
+    /// nothing else is open.
     fn left(&self) {
         let mut state = self.state();
         state.clients = state.clients.saturating_sub(1);
+        drop(state);
+        self.tell();
+    }
+
+    /// Counts a client that went away without `detach`, or that the hub cut, as
+    /// gone, and keeps the worker up for [`LINGER`] so it can come back.
+    fn dropped(&self) {
+        let mut state = self.state();
+        state.clients = state.clients.saturating_sub(1);
+        state.linger = Some(tokio::time::Instant::now() + LINGER);
         drop(state);
         self.tell();
     }
@@ -694,12 +852,20 @@ async fn accept(
     let deadline = tokio::time::Instant::now() + FIRST_CLIENT;
     let mut waiting = true;
     loop {
-        {
+        // The one deadline the wait needs: the linger of a client that left
+        // without `detach`, armed only while that is all that keeps the worker
+        // up.
+        let linger = {
             let state = shared.state();
             if state.may_stop(waiting) {
                 return;
             }
-        }
+            if state.alone() && state.linger.is_some() {
+                state.lingering(tokio::time::Instant::now())
+            } else {
+                None
+            }
+        };
         tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
@@ -723,7 +889,17 @@ async fn accept(
             () = tokio::time::sleep_until(deadline), if waiting => {
                 waiting = false;
             }
+            // The linger ran out: the next look at the state stops the worker.
+            () = waited(linger) => {}
         }
+    }
+}
+
+/// Waits for `until`, or for nothing when the worker has no linger armed.
+async fn waited(until: Option<tokio::time::Instant>) {
+    match until {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -797,6 +973,10 @@ async fn join(
     shared.listen(client, Text::from(name), queue, closing);
     let (mut read, write) = stream.into_split();
     let mut writer = tokio::spawn(hub::write(write, frames, cut));
+    let (model, context_window) = {
+        let model = shared.model();
+        (Arc::clone(&model.text), model.window)
+    };
     let body = InitializeResult {
         major: MAJOR,
         version: env!("CARGO_PKG_VERSION"),
@@ -804,12 +984,17 @@ async fn join(
         client: u64::from(client),
         capabilities: &[],
         committed: shared.committed(),
+        model: &model,
+        context_window,
     };
     message::result(&mut out, id, &body);
     shared.reply(client, &out);
     // This connection holds the sender of the session, which keeps it open for
     // its client until the connection ends.
     let mut cut = false;
+    // A client that detaches leaves at once; one that goes without it keeps
+    // the worker up for [`LINGER`], so it can come back.
+    let mut detached = false;
     loop {
         let next = tokio::select! {
             // The hub cut this client, or it went away: its connection ends
@@ -868,13 +1053,56 @@ async fn join(
                     }
                     None => None,
                 };
+                // The model text is a bare provider model id, which the
+                // session's provider takes, or the `provider/model` of another
+                // provider, which the worker builds and switches to.
+                let (model, provider, config, max_tokens) = match model {
+                    Some(text) => match switched(&shared, text.as_ref()).await {
+                        Ok(asked) => (
+                            Some(asked.model),
+                            asked.swap,
+                            asked.config,
+                            asked.max_tokens,
+                        ),
+                        Err(error) => {
+                            out.clear();
+                            message::error(&mut out, id, &error);
+                            shared.reply(client, &out);
+                            continue;
+                        }
+                    },
+                    None => (None, None, None, None),
+                };
+                // A model the session does not run brings the limits of its
+                // cache entry and the level it takes, so the first request it
+                // serves is the one that model takes.
+                let limits = match &model {
+                    Some(id) => limits_of(&shared, id, level.as_deref(), max_tokens).await,
+                    None => Limits::default(),
+                };
                 let settings = live::Settings {
-                    model: model.map(|text| Text::from(text.as_ref())),
-                    level: level.map(|text| Text::from(text.as_ref())),
+                    provider,
+                    config_provider: config,
+                    model,
+                    level: limits
+                        .level
+                        .or_else(|| level.map(|text| Text::from(text.as_ref()))),
                     mode,
+                    images: limits.images,
+                    max_tokens: limits.max_tokens,
+                    compact_budget: limits.compact_budget,
                 };
                 let set = live::Command::Set { client, settings };
+                // The settings the session applied come back as an event: the
+                // notice every client gets is sent once the session has them.
                 deliver(&shared, sender.as_ref(), client, id, &mut out, set).await;
+            }
+            Request::Compact { note } => {
+                let compact = live::Command::Compact {
+                    client,
+                    note: note.map(|text| Text::from(text.as_ref())),
+                };
+                deliver(&shared, sender.as_ref(), client, id, &mut out, compact).await;
             }
             Request::Approve {
                 id: ask,
@@ -894,6 +1122,7 @@ async fn join(
                     message::result(&mut out, id, &Empty {});
                     shared.reply(client, &out);
                 }
+                detached = true;
                 break;
             }
             Request::Initialize { .. } => {
@@ -915,10 +1144,16 @@ async fn join(
     {
         writer.abort();
     }
-    shared.left();
+    if detached {
+        shared.left();
+    } else {
+        shared.dropped();
+    }
 }
 
 /// Sends one command to the session, and answers `id` once it is in.
+///
+/// It says whether the session's channel took the command.
 async fn deliver(
     shared: &Shared,
     sender: Option<&Sender>,
@@ -926,13 +1161,13 @@ async fn deliver(
     id: Option<u64>,
     out: &mut Vec<u8>,
     command: live::Command,
-) {
+) -> bool {
     let sent = match sender {
         Some(sender) => sender.send(command).await.is_ok(),
         None => false,
     };
     let Some(id) = id else {
-        return;
+        return sent;
     };
     out.clear();
     if sent {
@@ -945,6 +1180,227 @@ async fn deliver(
         );
     }
     shared.reply(client, out);
+    sent
+}
+
+/// Takes the settings a session applied, from its `Event::Settings`, and
+/// returns the frame of the `settings` notice to send every client when the
+/// model, the level or the mode changed.
+///
+/// The event names what the session kept, so the mode here is the one its guard
+/// took: a mode the guard refused is not in the event, and a `set` the session
+/// applied nothing of sends no event at all. The window of another model comes
+/// from the models cache, which is a file: it is read off this task, and the
+/// state changes after it.
+async fn took_settings(shared: &Shared, set: &live::Settings) -> Option<hub::Frame> {
+    // The `set` names the bare provider model id and the model of the run is
+    // the text a client sees, so the two are compared as that text.
+    let (asked, changed) = {
+        let model = shared.model();
+        let asked = set.model.as_deref().map(|id| model.text_of(id));
+        let changed = asked
+            .as_ref()
+            .is_some_and(|text| text.as_ref() != &*model.text);
+        (asked, changed)
+    };
+    // The window is looked up under the bare id, which is what the cache of the
+    // provider lists and what the run looks up at its start.
+    let window = match (&set.model, changed) {
+        (Some(id), true) => window_of(shared, id.to_string()).await,
+        _ => None,
+    };
+    let mut model = shared.model();
+    let mut changed = changed;
+    if let (Some(text), true) = (&asked, changed) {
+        model.text = Arc::clone(text);
+        model.window = window;
+    }
+    if let Some(level) = &set.level
+        && model.level.as_deref() != Some(&**level)
+    {
+        model.level = Some(Arc::clone(level));
+        changed = true;
+    }
+    // The mode is the one the session now decides with, since its guard kept
+    // it: nothing here has to guess which mode the run started with.
+    if let Some(mode) = set.mode
+        && mode != model.mode
+    {
+        model.mode = mode;
+        changed = true;
+    }
+    if !changed {
+        return None;
+    }
+    let mut out = Vec::with_capacity(LINE);
+    message::settings(
+        &mut out,
+        &message::SettingsNotice {
+            model: &model.text,
+            context_window: model.window,
+            level: model.level.as_deref(),
+            mode: model.mode.as_str(),
+        },
+    );
+    Some(Arc::from(out))
+}
+
+/// The model a `set` of `text` sends, and the provider the session switches to
+/// when `text` names another one.
+#[derive(Debug)]
+struct Asked {
+    /// The provider model id the session takes.
+    model: Text,
+    /// The provider the session switches to, when it switches.
+    swap: Option<live::Swap>,
+    /// The config provider id of `model`, which a resume builds the provider
+    /// from, when the session stays on a provider the config names.
+    config: Option<Text>,
+    /// The cap on reply tokens the config of another provider names.
+    max_tokens: Option<u32>,
+}
+
+/// What a `set` that changes the model takes from the cache entry of the new
+/// model.
+#[derive(Debug, Default)]
+struct Limits {
+    /// Whether the new model takes images.
+    images: Option<bool>,
+    /// The cap on reply tokens of another provider's config.
+    max_tokens: Option<u32>,
+    /// The prompt size, in tokens, that compacts the new model's window.
+    compact_budget: Option<u64>,
+    /// The level the new model takes for the reasoning the session sends.
+    level: Option<Text>,
+}
+
+/// The limits a `set` gives the session for the model `id`, read from the cache
+/// entry of the provider the session now runs.
+///
+/// `asked` is the level the `set` carries, or `None` when it carries none, and
+/// `max_tokens` is the cap the config of another provider names. A `set` of the
+/// model the session runs and a cache that holds no entry for `id` change no
+/// limit.
+async fn limits_of(
+    shared: &Shared,
+    id: &str,
+    asked: Option<&str>,
+    max_tokens: Option<u32>,
+) -> Limits {
+    let mut limits = Limits {
+        max_tokens,
+        ..Limits::default()
+    };
+    let (cache, provider, current, changed) = {
+        let model = shared.model();
+        let changed = model.text_of(id).as_ref() != &*model.text;
+        (
+            model.cache.clone(),
+            model.provider.clone(),
+            model.level.clone(),
+            changed,
+        )
+    };
+    let (Some(cache), Some(provider), true) = (cache, provider, changed) else {
+        return limits;
+    };
+    // The cache is a file, and the entry of a provider lists many models: it is
+    // read off this task.
+    let id = id.to_string();
+    let entry =
+        tokio::task::spawn_blocking(move || crate::run::cached_entry(&cache, Some(&provider), &id))
+            .await
+            .ok()
+            .flatten();
+    let Some(entry) = entry else {
+        return limits;
+    };
+    limits.images = Some(entry.images != Some(false));
+    limits.compact_budget = entry
+        .context_window
+        .map(|window| crate::run::compact_budget(Some(window)));
+    let level = asked.or(current.as_deref());
+    let mapped = level
+        .and_then(|level| crate::run::reasoning_text(level, entry.reasoning.as_ref()))
+        .map(Text::from);
+    // A level the session already sends, which the new model maps to itself, is
+    // no change: sending it would record the same settings again.
+    limits.level = mapped.filter(|mapped| asked.is_some() || current.as_deref() != Some(&**mapped));
+    limits
+}
+
+/// The model a `set` of `text` sends.
+///
+/// A text with no `/` is a bare model of the provider the session runs. So is a
+/// prefix the config does not know, and the `provider/model` of that provider,
+/// whose model part goes alone. The `provider/model` of another configured
+/// provider builds that provider and switches the session to it; a switch that
+/// fails leaves the session as it was and says why, naming the provider.
+async fn switched(shared: &Shared, text: &str) -> Result<Asked, RpcError> {
+    let Some((name, id)) = text.split_once('/') else {
+        return Ok(Asked {
+            model: Text::from(text),
+            swap: None,
+            config: None,
+            max_tokens: None,
+        });
+    };
+    let current = shared.model().provider.clone();
+    if current.as_deref() == Some(name) {
+        return Ok(Asked {
+            model: Text::from(id),
+            swap: None,
+            config: current,
+            max_tokens: None,
+        });
+    }
+    // Naming the model reads the config files, which blocks.
+    let asked = text.to_string();
+    let next = tokio::task::spawn_blocking(move || crate::args::reparse(&asked))
+        .await
+        .map_err(|error| failed(name, &format!("the config could not be read: {error}")))?;
+    let next = match next {
+        Ok(crate::args::Outcome::Run(next)) if next.provider_name.as_deref() == Some(name) => next,
+        // A prefix no provider has is part of the model id.
+        Ok(_) => {
+            return Ok(Asked {
+                model: Text::from(text),
+                swap: None,
+                config: None,
+                max_tokens: None,
+            });
+        }
+        Err(message) => return Err(failed(name, &message)),
+    };
+    let (provider, session, _) = crate::run::build_provider(&next)
+        .await
+        .map_err(|message| failed(name, &message))?;
+    shared.switch_provider(name, session);
+    Ok(Asked {
+        model: Text::from(next.model),
+        swap: Some(live::Swap(Arc::from(provider))),
+        config: Some(Text::from(name)),
+        // The config of the new provider names the cap its model takes.
+        max_tokens: Some(next.max_tokens),
+    })
+}
+
+/// The error a `set` answers when the switch to the provider `name` fails.
+fn failed(name: &str, reason: &str) -> RpcError {
+    RpcError::invalid_params(format!("provider {name}: {reason}"))
+}
+
+/// The context window the models cache names for `text`, the model a `set`
+/// asks for, or `None` when no cache names it.
+async fn window_of(shared: &Shared, text: String) -> Option<u64> {
+    let (cache, provider) = {
+        let model = shared.model();
+        (model.cache.clone()?, Arc::clone(model.provider.as_ref()?))
+    };
+    tokio::task::spawn_blocking(move || crate::run::window_of(&cache, &provider, &text))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// How a `send` joins the run.
@@ -1030,16 +1486,40 @@ async fn refuse(stream: &mut UnixStream, out: &mut Vec<u8>, id: Option<u64>, err
 ///
 /// The rule of a save is written to the project's saved-rules file off this
 /// task: the observer runs under the shared lock, and a file write must not
-/// hold it. The writes left when the events end are awaited here, so a session
-/// that saved a rule has it on disk before the worker reports its end.
+/// hold it. The settings a session applied become the `settings` notice of the
+/// clients instead of a frame of their own, since the notice names the same
+/// values in the protocol a client reads them in. The writes left when the
+/// events end are awaited here, so a session that saved a rule has it on disk
+/// before the worker reports its end.
 async fn track(
     mut events: mpsc::Receiver<Event>,
     shared: Arc<Shared>,
     saved: Option<PathBuf>,
+    committed: u64,
+    mut listed: Option<crate::session::Listing>,
 ) -> TurnEndReason {
     let mut encode = Encoder::default();
     let mut writes = Vec::new();
     while let Some(event) = events.recv().await {
+        // A worker lists its session at its first committed record, so a
+        // session it never runs a message in keeps its place in the list. A
+        // resumed session starts after the records of the parts it continues.
+        if let Event::Committed { record } = &event
+            && *record > committed
+            && let Some(listing) = listed.take()
+        {
+            match tokio::task::spawn_blocking(move || {
+                crate::session::started(&listing.plan, listing.turns)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    eprintln!("reagent: warning: could not record the session: {error}")
+                }
+                Err(_) => eprintln!("reagent: warning: the session store failed"),
+            }
+        }
         if let Event::RuleToSave { rule } = &event {
             let rule = rule.clone();
             let path = saved.clone();
@@ -1049,6 +1529,18 @@ async fn track(
                     "reagent: the saved rule was not written: no state folder; set HOME or XDG_STATE_HOME"
                 ),
             }));
+        }
+        if let Event::Settings { model, level, mode } = &event {
+            let applied = live::Settings {
+                model: model.clone(),
+                level: level.clone(),
+                mode: *mode,
+                ..live::Settings::default()
+            };
+            if let Some(frame) = took_settings(&shared, &applied).await {
+                shared.notice(frame);
+            }
+            continue;
         }
         let frame = encode.frame(&event);
         shared.observe(&event, frame);
@@ -1135,17 +1627,50 @@ mod tests {
 
     #[test]
     fn idle_needs_no_client_a_queued_work_and_no_open_run() {
+        let now = tokio::time::Instant::now();
         let mut state = State::default();
-        assert!(!state.idle(), "the worker has not queued its work");
+        assert!(!state.idle(|| now), "the worker has not queued its work");
         state.armed = true;
-        assert!(state.idle());
+        assert!(state.idle(|| now));
         state.clients = 1;
-        assert!(!state.idle(), "a client is still here");
+        assert!(!state.idle(|| now), "a client is still here");
         state.clients = 0;
         event_turn_start(&mut state);
-        assert!(!state.idle(), "a run is open");
+        assert!(!state.idle(|| now), "a run is open");
         state.approval = Some(3);
-        assert!(state.idle(), "no client can answer the approval");
+        assert!(state.idle(|| now), "no client can answer the approval");
+    }
+
+    #[test]
+    fn a_client_that_left_without_detach_keeps_the_worker_up() {
+        let mut state = State {
+            armed: true,
+            ..State::default()
+        };
+        let now = tokio::time::Instant::now();
+        assert!(state.idle(|| now), "nothing is open and no client is left");
+        state.linger = Some(now + LINGER);
+        assert!(
+            !state.idle(|| now),
+            "a client that went without detach may come back"
+        );
+        assert_eq!(state.lingering(now), state.linger, "one deadline is armed");
+        assert!(
+            state.idle(|| now + LINGER),
+            "the worker stops once the linger ran out"
+        );
+        assert_eq!(state.lingering(now + LINGER), None, "no timer is left");
+        // A client that is back, or a run that is open, needs no timer.
+        state.linger = Some(now + LINGER);
+        state.clients = 1;
+        assert_eq!(state.lingering(now), None, "a client is attached");
+        state.clients = 0;
+        event_turn_start(&mut state);
+        assert_eq!(state.lingering(now), None, "a run is open");
+        assert!(
+            !state.idle(|| now + LINGER * 2),
+            "a run that is open outlives the linger"
+        );
     }
 
     #[test]
@@ -1154,7 +1679,7 @@ mod tests {
             armed: true,
             ..State::default()
         };
-        assert!(state.idle(), "nothing is open");
+        assert!(state.idle(tokio::time::Instant::now), "nothing is open");
         assert!(!state.may_stop(true), "a worker still waits for a client");
         state.seen = true;
         assert!(state.may_stop(true), "a client that joined ends the wait");
@@ -1163,11 +1688,84 @@ mod tests {
 
     #[test]
     fn a_client_takes_the_next_id_from_one() {
-        let shared = Shared::new();
+        let shared = Shared::new(Model::new(Arc::from("m"), None, None, None, None));
         assert_eq!(shared.joined(), 1);
         assert_eq!(shared.joined(), 2);
         shared.left();
         assert_eq!(shared.state().clients, 1);
         assert_eq!(shared.joined(), 3);
+        shared.left();
+        assert_eq!(shared.state().clients, 1);
+        assert!(shared.state().linger.is_none(), "a detach arms no linger");
+        shared.dropped();
+        assert_eq!(shared.state().clients, 0);
+        assert!(
+            shared.state().linger.is_some(),
+            "a client that went without detach arms the linger"
+        );
+    }
+
+    /// The limits a `set` sends are the ones the cache entry of the new model
+    /// names, under the provider the session switched to.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn switch_limits_take_the_limits_of_the_new_model() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let cache = dir.path().join("models");
+        tokio::fs::create_dir_all(&cache)
+            .await
+            .expect("the cache folder");
+        tokio::fs::write(
+            cache.join("two.json"),
+            concat!(
+                r#"{"fetched_at":1,"models":[{"id":"model-b","context_window":32000,"#,
+                r#""images":false,"reasoning":{"levels":["low","high"]}}]}"#
+            ),
+        )
+        .await
+        .expect("the cache file");
+        let shared = Shared::new(Model::new(
+            Arc::from("one/model-a"),
+            Some(200_000),
+            Some(Arc::from("medium")),
+            Some(Arc::from("one")),
+            Some(cache),
+        ));
+        shared.switch_provider("two", None);
+        let limits = limits_of(&shared, "model-b", None, Some(16_000)).await;
+        assert_eq!(
+            limits.compact_budget,
+            Some(24_000),
+            "three quarters of the window of the new model"
+        );
+        assert_eq!(limits.images, Some(false), "a model that takes no images");
+        assert_eq!(
+            limits.level.as_deref(),
+            Some("high"),
+            "the level the new model takes for the one the session sends"
+        );
+        assert_eq!(
+            limits.max_tokens,
+            Some(16_000),
+            "the cap the config of the new provider names"
+        );
+    }
+
+    /// A `set` of the model the session runs changes no limit.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn switch_limits_of_the_same_model_change_nothing() {
+        let shared = Shared::new(Model::new(
+            Arc::from("one/model-a"),
+            Some(200_000),
+            Some(Arc::from("medium")),
+            Some(Arc::from("one")),
+            Some(std::path::PathBuf::from("/nonexistent/reagent-test-models")),
+        ));
+        let limits = limits_of(&shared, "model-a", Some("high"), None).await;
+        assert_eq!(limits.compact_budget, None);
+        assert_eq!(limits.images, None);
+        assert_eq!(limits.level, None, "the level of the set goes as written");
+        assert_eq!(limits.max_tokens, None);
     }
 }

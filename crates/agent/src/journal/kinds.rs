@@ -6,7 +6,10 @@
 use reagent_store::kind::RECORD_FIRST;
 
 /// One `reagent_ai::Message`: a user message, an assistant reply, or a tool result.
-pub const MESSAGE: u8 = RECORD_FIRST;
+///
+/// The codec of the record lives with the type, in [`reagent_ai::record`]; this
+/// is the same byte, re-exported so a caller of the journal does not change.
+pub use reagent_ai::record::MESSAGE;
 
 /// A tool call about to run: its id, tool name and effect class.
 pub const CALL_START: u8 = RECORD_FIRST + 1;
@@ -46,7 +49,7 @@ pub const SETTINGS: u8 = RECORD_FIRST + 10;
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use reagent_ai::{AssistantMessage, Content, Message, StopReason, ToolCall, Usage};
+    use reagent_ai::{Text, Usage};
     use reagent_store::Encoder;
 
     use crate::journal::record::{
@@ -56,94 +59,6 @@ mod tests {
     use crate::tool::EffectClass;
 
     use super::*;
-
-    fn user_with_content() -> Message {
-        Message::user_content(vec![
-            Content::text("look at this"),
-            Content::text("and this"),
-        ])
-    }
-
-    fn assistant_with_everything() -> Message {
-        let mut reply = AssistantMessage::new(
-            "anthropic",
-            "claude-sonnet-4-5",
-            vec![
-                Content::Thinking {
-                    thinking: "hmm".into(),
-                    signature: Some("sig".into()),
-                },
-                Content::Thinking {
-                    thinking: "no signature".into(),
-                    signature: None,
-                },
-                Content::RedactedThinking {
-                    data: "opaque".into(),
-                },
-                Content::text("hello"),
-                Content::ToolCall(ToolCall {
-                    id: "toolu_01".into(),
-                    name: "read".into(),
-                    arguments: r#"{"path":"a.rs"}"#.into(),
-                }),
-            ],
-        );
-        reply.stop_reason = Some(StopReason::ToolUse);
-        reply.usage = Usage {
-            input_tokens: 10,
-            output_tokens: 20,
-            cache_read_tokens: 30,
-            cache_write_tokens: 40,
-            reasoning_tokens: 50,
-            cost: Some(0.0125),
-        };
-        reply.replay = Some(r#"{"k":"v"}"#.into());
-        Message::assistant(reply)
-    }
-
-    fn assert_message_round_trips(message: Message) {
-        let mut out = Vec::new();
-        record::encode_message(&mut out, &message);
-        let payload = Bytes::from(out);
-        let decoded = record::decode(MESSAGE, &payload).expect("decode");
-        assert_eq!(decoded, Record::Message(message));
-    }
-
-    #[test]
-    fn every_message_shape_round_trips() {
-        assert_message_round_trips(user_with_content());
-        assert_message_round_trips(assistant_with_everything());
-        assert_message_round_trips(Message::assistant(AssistantMessage::new(
-            "fake",
-            "m",
-            Vec::new(),
-        )));
-        assert_message_round_trips(Message::tool_result("call_1", "text", false));
-        assert_message_round_trips(Message::tool_result("call_2", "boom", true));
-    }
-
-    #[test]
-    fn an_empty_content_text_round_trips() {
-        let mut reply = AssistantMessage::new("fake", "m", Vec::new());
-        reply.stop_reason = Some(StopReason::Error);
-        let message = Message::assistant(reply);
-        let mut out = Vec::new();
-        record::encode_message(&mut out, &message);
-        let decoded = record::decode(MESSAGE, &Bytes::from(out)).expect("decode");
-        assert_eq!(decoded, Record::Message(message));
-    }
-
-    #[test]
-    fn an_unknown_field_is_skipped() {
-        let message = Message::user("hello");
-        let mut out = Vec::new();
-        record::encode_message(&mut out, &message);
-        let mut encoder = Encoder::new(&mut out);
-        encoder.u64(99, 7);
-        encoder.str(98, "a field from a later build");
-        let decoded = record::decode(MESSAGE, &Bytes::from(out)).expect("decode");
-        assert_eq!(decoded, Record::Message(message));
-    }
 
     #[test]
     fn an_unknown_kind_is_skipped() {
@@ -252,11 +167,48 @@ mod tests {
         let model = Model {
             provider: "openai".into(),
             model: "gpt-5".into(),
+            config: None,
         };
         let mut out = Vec::new();
-        record::encode_model(&mut out, &model.provider, &model.model);
+        record::encode_model(&mut out, &model.provider, &model.model, None);
         let decoded = record::decode(MODEL, &Bytes::from(out)).expect("decode");
         assert_eq!(decoded, Record::Model(model));
+    }
+
+    #[test]
+    fn config_provider_round_trips() {
+        let model = Model {
+            provider: "openai-chat".into(),
+            model: "gpt-5".into(),
+            config: Some(Text::from("openrouter")),
+        };
+        let mut out = Vec::new();
+        record::encode_model(
+            &mut out,
+            &model.provider,
+            &model.model,
+            model.config.as_deref(),
+        );
+        let decoded = record::decode(MODEL, &Bytes::from(out)).expect("decode");
+        assert_eq!(decoded, Record::Model(model));
+    }
+
+    #[test]
+    fn config_provider_absent_in_an_old_record_decodes_as_none() {
+        // The two fields a build before the config provider id wrote.
+        let mut out = Vec::new();
+        let mut encoder = Encoder::new(&mut out);
+        encoder.str(crate::journal::registry::model::PROVIDER, "openai-chat");
+        encoder.str(crate::journal::registry::model::MODEL, "gpt-5");
+        let decoded = record::decode(MODEL, &Bytes::from(out)).expect("decode");
+        assert_eq!(
+            decoded,
+            Record::Model(Model {
+                provider: "openai-chat".into(),
+                model: "gpt-5".into(),
+                config: None,
+            })
+        );
     }
 
     #[test]

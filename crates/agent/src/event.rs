@@ -1,6 +1,7 @@
 //! Events the agent loop emits on its channel.
 
 use reagent_ai::{StopReason, Text, Usage};
+use reagent_config::permissions::PermissionMode;
 
 use crate::guard::Answer;
 use crate::live::{ClientId, SendMode};
@@ -54,9 +55,9 @@ pub enum Event {
         is_error: bool,
         /// The UTF-8 length of the output text the model receives.
         bytes: usize,
-        /// The output text of a failed call, shared with history; `None`
-        /// when the call succeeded.
-        error: Option<Text>,
+        /// The output text, shared with history; `None` for a result that
+        /// carries images only.
+        output: Option<Text>,
         /// The images the result carries, shared with history; empty for the
         /// text results that are almost every call, which allocates nothing.
         images: Vec<reagent_ai::Image>,
@@ -103,6 +104,8 @@ pub enum Event {
     Compacted {
         /// The prompt size, in tokens, that triggered it.
         before: u64,
+        /// The estimated prompt size, in tokens, after it.
+        after: u64,
         /// How many messages the checkpoint replaced.
         replaced: u32,
         /// The size of the checkpoint, in bytes.
@@ -124,6 +127,19 @@ pub enum Event {
     RuleToSave {
         /// The rule to write into the `allow` list.
         rule: Text,
+    },
+    /// The settings the session applied, sent once after a `set` took them, so
+    /// a client hears what the session kept rather than what the `set` asked
+    /// for: a mode its guard refused is not here.
+    Settings {
+        /// The model the session now runs, when the `set` named one.
+        model: Option<Text>,
+        /// The reasoning level the next request sends, when the `set` named
+        /// one.
+        level: Option<Text>,
+        /// The permission mode the session now decides with, when its guard
+        /// accepted the one the `set` named.
+        mode: Option<PermissionMode>,
     },
 }
 

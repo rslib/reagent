@@ -13,6 +13,9 @@ mod run;
 mod sandbox;
 mod session;
 mod snapshot;
+#[cfg(feature = "tui")]
+mod tui;
+mod tui_host;
 mod worker;
 
 /// The estimated-token budget for the system prompt and tool specs: 1000,
@@ -48,7 +51,7 @@ fn main() -> std::process::ExitCode {
     // `worker` runs the same path as `-p`, with a flag that makes it serve the
     // session instead of running it once.
     let worker = args::worker_word(&mut argv);
-    let outcome = match args::parse(argv, worker) {
+    let outcome = match args::parse(argv, worker, cfg!(feature = "tui")) {
         Ok(outcome) => outcome,
         Err(error) => {
             eprintln!("reagent: {error}");
@@ -68,6 +71,15 @@ fn main() -> std::process::ExitCode {
         args::Outcome::Run(args) => *args,
     };
 
+    // With no task for a terminal, the run is the UI: a worker for the new or
+    // the continued session, and the app attached to it. Every other shape,
+    // `--json` and a run with no terminal included, keeps the plain path.
+    #[cfg(feature = "tui")]
+    if tui::wanted(&args) {
+        let code = runtime().block_on(tui::run(args));
+        reagent_tools::spill::cleanup();
+        return code;
+    }
     let code = runtime().block_on(run::run(args));
     // Every way out of a run comes back here, Ctrl-C and the deadline too, so
     // the spill folder of this run goes at its end, once the runtime is gone.

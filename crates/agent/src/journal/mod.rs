@@ -108,8 +108,19 @@ impl Journal {
 
     /// Appends a change of provider and model.
     pub fn model(&mut self, provider: &str, model: &str) -> io::Result<()> {
+        self.model_config(provider, model, None)
+    }
+
+    /// Appends a change of provider and model, with the config provider id the
+    /// switch used when one is known.
+    pub fn model_config(
+        &mut self,
+        provider: &str,
+        model: &str,
+        config: Option<&str>,
+    ) -> io::Result<()> {
         self.scratch.clear();
-        record::encode_model(&mut self.scratch, provider, model);
+        record::encode_model(&mut self.scratch, provider, model, config);
         self.append(kinds::MODEL, false)
     }
 

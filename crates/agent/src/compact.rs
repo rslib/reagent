@@ -55,6 +55,8 @@ pub struct Compacted {
     pub replaced: usize,
     /// The size of the new checkpoint, in bytes.
     pub bytes: usize,
+    /// The estimated prompt size, in tokens, after it.
+    pub after: u64,
 }
 
 /// Replaces older turns with checkpoints at the token budget.
@@ -78,6 +80,11 @@ impl Compact {
         }
     }
 
+    /// Compacts at `budget` tokens from the next compaction on.
+    pub fn set_budget(&mut self, budget: u64) {
+        self.budget = budget;
+    }
+
     /// Compacts `history` when the last reply's prompt reached the budget.
     ///
     /// Tool outputs that leave the history are kept in `archive`. Returns
@@ -87,6 +94,41 @@ impl Compact {
         if before < self.budget || history.is_empty() {
             return None;
         }
+        self.compact(history, archive, None, before, true).await
+    }
+
+    /// Compacts `history` now, whatever its size, ending the new checkpoint
+    /// with `note` when one is given.
+    ///
+    /// A session that has made no request yet has no usage, so its prompt size
+    /// is estimated from the history bytes. Returns `None` when nothing is
+    /// older than the kept tail, which stays whole.
+    pub async fn request(
+        &self,
+        history: &mut Vec<Message>,
+        archive: &Archive,
+        note: Option<&str>,
+    ) -> Option<Compacted> {
+        if history.is_empty() {
+            return None;
+        }
+        let before = match last_prompt(history) {
+            Some(before) => before,
+            None => (history_bytes(history) / 4) as u64,
+        };
+        self.compact(history, archive, note, before, false).await
+    }
+
+    /// The body of [`Compact::apply`] and [`Compact::request`]: `budgeted`
+    /// drops a compaction that would replace less than the budget.
+    async fn compact(
+        &self,
+        history: &mut Vec<Message>,
+        archive: &Archive,
+        note: Option<&str>,
+        before: u64,
+        budgeted: bool,
+    ) -> Option<Compacted> {
         let checkpoints = history[1..]
             .iter()
             .take_while(|message| is_checkpoint(message))
@@ -97,7 +139,7 @@ impl Compact {
         // Each compaction breaks the cache once, so it waits until a quarter
         // of the budget (at 4 bytes per token) can go, not one turn at a time.
         let replaceable: usize = history[start..tail].iter().map(size).sum();
-        if (replaceable as u64) < self.budget {
+        if budgeted && (replaceable as u64) < self.budget {
             return None;
         }
 
@@ -112,7 +154,11 @@ impl Compact {
         archive.flush().await;
 
         let number = next_number(&history[1..1 + checkpoints]);
-        let built = checkpoint::build(number, &history[start..tail], archive);
+        let mut built = checkpoint::build(number, &history[start..tail], archive);
+        if let Some(note) = note {
+            built.text.push_str("\n\nNote from the user: ");
+            built.text.push_str(note);
+        }
         let bytes = built.text.len();
         let files = self.files_message(&built.changed).await;
 
@@ -131,6 +177,7 @@ impl Compact {
             before,
             replaced: tail - start,
             bytes,
+            after: (history_bytes(history) / 4) as u64,
         })
     }
 
@@ -171,6 +218,11 @@ impl Compact {
         }
         (!text.is_empty()).then(|| Message::user(format!("{FILES_HEAD}{text}")))
     }
+}
+
+/// The bytes of every message, which a prompt size is estimated from.
+fn history_bytes(history: &[Message]) -> usize {
+    history.iter().map(size).sum()
 }
 
 /// The last reply's prompt size in tokens, from its usage.
@@ -359,6 +411,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switch_limits_set_budget_takes_a_smaller_one() {
+        let archive = Archive::default();
+        let mut history = session(60, &archive);
+        set_prompt(&mut history, 1_000);
+        let mut compact = Compact::new(".");
+        // Under the default budget nothing changes.
+        assert_eq!(compact.apply(&mut history, &archive).await, None);
+        compact.set_budget(1_000);
+        let done = compact.apply(&mut history, &archive).await.unwrap();
+        assert_eq!(done.before, 1_000);
+        assert!(is_checkpoint(&history[1]));
+    }
+
+    #[tokio::test]
     async fn at_the_budget_old_turns_become_one_checkpoint() {
         let archive = Archive::default();
         let mut history = session(60, &archive);
@@ -461,6 +527,63 @@ mod tests {
         );
         assert!(files.contains("text 7"));
         assert!(matches!(history[3], Message::Assistant(_)));
+    }
+
+    #[tokio::test]
+    async fn a_requested_compaction_runs_under_the_budget() {
+        let archive = Archive::default();
+        let mut history = session(60, &archive);
+        set_prompt(&mut history, 1_000);
+        let done = Compact::new(".")
+            .request(&mut history, &archive, None)
+            .await
+            .expect("a requested compaction ignores the budget");
+        assert_eq!(done.before, 1_000);
+        assert!(is_checkpoint(&history[1]));
+        assert_eq!(done.after, (history_bytes(&history) / 4) as u64);
+    }
+
+    #[tokio::test]
+    async fn a_requested_compaction_ends_the_checkpoint_with_the_note() {
+        let archive = Archive::default();
+        let mut history = session(60, &archive);
+        set_prompt(&mut history, 1_000);
+        Compact::new(".")
+            .request(&mut history, &archive, Some("keep the API notes"))
+            .await
+            .unwrap();
+        let text = first_text(&history[1]).unwrap();
+        assert!(
+            text.ends_with("\n\nNote from the user: keep the API notes"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_requested_compaction_of_an_empty_history_changes_nothing() {
+        let archive = Archive::default();
+        let mut history = Vec::new();
+        assert_eq!(
+            Compact::new(".")
+                .request(&mut history, &archive, None)
+                .await,
+            None
+        );
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_requested_compaction_with_one_turn_changes_nothing() {
+        let archive = Archive::default();
+        let mut history = session(1, &archive);
+        let before = history.clone();
+        assert_eq!(
+            Compact::new(".")
+                .request(&mut history, &archive, None)
+                .await,
+            None
+        );
+        assert_eq!(history, before);
     }
 
     fn bash_turn(history: &mut Vec<Message>, archive: &Archive, n: usize) {

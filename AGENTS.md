@@ -8,15 +8,17 @@ A minimal coding agent in Rust, in the style of pi. Cargo workspace, toolchain p
 cargo build --workspace
 cargo test --workspace
 cargo nextest run -p reagent-agent -E 'test(/^session::/)'   # one module; fails when no test matches
-cargo nextest run -p reagent --features testing   # cli end-to-end tests; skipped without the feature
+cargo nextest run -p reagent --features testing --test e2e   # cli end-to-end tests; skipped without the feature
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 cargo build --profile min -p reagent             # size build for footprint checks
 cargo nextest run --release -p reagent-agent --test budget                    # loop heap and CPU budgets
-cargo nextest run --release -p reagent --features testing --test footprint    # process RSS and CPU budgets
+cargo nextest run --release -p reagent --features testing --test footprint -E 'test(/^process::/)'   # process RSS and CPU budgets
 cargo nextest run -p reagent-ai --features testing --test allocs   # heap blocks per stream event and body build
 cargo nextest run -p reagent-tools --test allocs                   # heap blocks for edit, read, walk and effects
-cargo nextest run -p reagent-agent --test journal_allocs           # heap blocks per journal record and stuck turn
+cargo nextest run -p reagent-agent --test allocs                   # heap blocks per journal record, stuck turn and delta
+cargo nextest run -p reagent-tui --test allocs                     # TUI heap blocks per frame, streamed delta and worker line
+cargo nextest run --release -p reagent --features testing --test footprint -E 'test(/^tui::/)'   # TUI start, idle RSS, key latency, idle wakeups, streaming CPU
 bash bench/instructions.sh                                         # Linux: Callgrind instruction counts against the merge base
 bash bench/syscalls.sh   # Linux: syscalls of fixed scenarios against bench/syscall-budget.txt
 bash bench/size.sh   # size build against bench/size-budget.txt
@@ -54,12 +56,12 @@ A feature that does not move 1 or 2 in a measured run does not ship as a default
 | Images for models: format sniffing, decoders, EXIF orientation, resize, PNG and JPEG encode, limits. No file system; AVIF only on macOS (ImageIO in `src/imageio.rs`, the crate's one `unsafe` module) | `crates/image` (`reagent-image`) | no other reagent crate |
 | Config files, providers and models, permission rules and their shell lexer and glob | `crates/config` (`reagent-config`) | depends on util |
 | Shared OAuth (PKCE, device flow, JWT, loopback callback) and the HTTP client | `crates/oauth` (`reagent-oauth`) | depends on config |
-| Message types, providers, SSE, `FakeProvider`, OAuth logins | `crates/ai` (`reagent-ai`) | `reagent-config` (the auth file) and oauth |
+| Message types, providers, SSE, `FakeProvider`, OAuth logins, the message record codec of the journal (`record.rs`) | `crates/ai` (`reagent-ai`) | `reagent-config` (the auth file), oauth and store |
 | Loop, events, session journal, context policy, `Tool` trait, the permission guard and its modes, live sessions (`live.rs`: steer, queue, cancel, settings) and client approvals (`approval.rs`) | `crates/agent` (`reagent-agent`) | depends on ai, config, store and util |
 | Native tools; `read` returns images through `reagent-image` | `crates/tools` (`reagent-tools`) | depends on agent, ai, config, image and util |
 | The `codemode` tool: a QuickJS script that calls the other tools | `crates/script` (`reagent-script`) | depends on agent, ai and tools |
 | MCP client and its OAuth login | `crates/mcp` (`reagent-mcp`) | depends on agent, ai, oauth and config |
-| Terminal UI and markdown | `crates/tui` (`reagent-tui`) | depends on agent |
+| Terminal UI: screen buffer and diff, full-screen transcript ring, streaming markdown, editor, layout, mouse, the slot API and the built-in panels, async tty input (`src/app/input`, the crate's one `unsafe` module), worker client. Never the agent loop | `crates/tui` (`reagent-tui`) | depends on protocol, store and ai |
 | Binary and flags | `crates/cli` (`reagent`) | depends on all |
 | Model-facing prompt templates | none: `prompts/` at the root | baked into `crates/agent` and `crates/cli` with `include_str!` |
 | Harbor adapter | `bench/harbor` | Python, run with `uv` |
@@ -79,7 +81,7 @@ Design decisions and their reasons: `docs/plans/architecture.md` (local only, ig
 - A new dependency needs `default-features = false` and only the features it uses. Add it with `cargo add -p <package> <dep> --no-default-features -F <features>`.
 - Claim a speed or size gain only with a measured number and the command that produced it.
 - A hot path runs per stream event, per request, per tool call or per line or file a tool touches. A change to one keeps its `allocs` test, `bench/instructions.sh` and `bench/syscalls.sh` passing (2% on instructions and estimated cycles, 12% for `find`, `grep` and `capture`, which touch the file system or a child process). A new hot path adds a dhat case that fails on the old code, with the bound set near the measured value. Raise a bound only with the old and new number in the commit body.
-- Every test in a dhat file takes the file's shared lock as its first line. dhat counts every thread, and `cargo test` runs tests in parallel threads, so another test's setup lands in the count.
+- Every test in a dhat program takes the program's shared lock (`SERIAL` in its `main.rs`) as its first line. dhat counts every thread, and `cargo test` runs tests in parallel threads, so another test's setup lands in the count.
 - No per-event syscall: batch output writes, and read the clock only when the value is used.
 - No stack array over 16 KB in an async function; put the buffer on the heap. Clippy's `large_futures`, `large_stack_arrays` and `large_enum_variant` fire on x86_64 Linux with sizes macOS does not show, so a change to an async function, a buffer or an enum runs clippy on Linux too.
 
@@ -91,6 +93,7 @@ Design decisions and their reasons: `docs/plans/architecture.md` (local only, ig
 
 - Loop and provider tests use `FakeProvider` (feature `testing` of `reagent-ai`). No test calls a real API.
 - A bug fix lands with a test that fails before the fix.
+- A new integration test goes in a module of the crate's existing test program (`tests/<program>/main.rs`), not in a new file at `tests/`: each file there links its own program, and macOS checks every new program before it runs, which slowed a full run by minutes. dhat tests go in the crate's `allocs` program.
 - Task checks use `cargo nextest run`, not `cargo test <filter>`. `cargo test` passes when the filter matches no test.
 - Tools are tested on temp folders (`tempfile`), never on the repo.
 - A test that runs `reagent models` sets `REAGENT_MODELS_DEV_URL` to a closed port, or it fetches the real models.dev.

@@ -32,6 +32,10 @@ const RADIUS: &str = "radius";
 /// Every provider `login` names.
 const PROVIDERS: &str = "openrouter, chatgpt, radius";
 
+/// The providers a login can open, in the order the model sheet lists them.
+#[cfg(feature = "tui")]
+pub(crate) const LOGIN_PROVIDERS: &[&str] = &[OPENROUTER, CHATGPT, RADIUS];
+
 /// The path of the ChatGPT callback, part of its redirect URI.
 const CHATGPT_PATH: &str = "/auth/callback";
 
@@ -134,68 +138,130 @@ async fn login(args: &[OsString]) -> Result<(), String> {
     // the default, so a second subscription is a table of its own.
     let account = as_name.unwrap_or_else(|| name.clone());
     let dir = reagent_config::auth::dir()?;
-    match name.as_str() {
+    flow(
+        &name,
+        &account,
+        &dir,
+        browser,
+        &Announce::printing(),
+        tokio::io::BufReader::new(tokio::io::stdin()),
+    )
+    .await
+}
+
+/// Runs one login for the TUI: the page and the code go to `announce`, and no
+/// pasted URL is read, since the terminal belongs to the UI.
+#[cfg(feature = "tui")]
+pub(crate) async fn tui(provider: &str, announce: &Announce<'_>) -> Result<(), String> {
+    let dir = reagent_config::auth::dir()?;
+    flow(provider, provider, &dir, true, announce, &b""[..]).await
+}
+
+/// Runs the login `name` asks for, saved under `account` in `dir`.
+///
+/// `browser` opens the page in a browser and `input` is where a pasted URL is
+/// read from, so the command passes stdin and a test drives its own.
+pub(crate) async fn flow(
+    name: &str,
+    account: &str,
+    dir: &Path,
+    browser: bool,
+    announce: &Announce<'_>,
+    input: impl AsyncBufRead + Unpin + Send + 'static,
+) -> Result<(), String> {
+    match name {
         OPENROUTER => {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .map_err(|error| format!("cannot listen on a local port: {error}"))?;
             let path = format!("/oauth/callback/{}", oauth::random_token()?);
             openrouter(
-                &account,
-                &dir,
+                account,
+                dir,
                 oauth::openrouter::KEYS,
                 &listener,
                 &path,
                 browser,
                 EXCHANGE_TIMEOUT,
-                tokio::io::BufReader::new(tokio::io::stdin()),
+                input,
+                announce,
             )
             .await
         }
         CHATGPT => {
             // The port is fixed because it is part of the redirect URI the
             // provider is told about. A busy port costs the callback, not the
-            // login: the URL is printed either way and a paste still works.
+            // login: the URL is shown either way and a paste still works.
             let listener = match TcpListener::bind(("127.0.0.1", oauth::chatgpt::PORT)).await {
                 Ok(listener) => Some(listener),
                 Err(error) => {
-                    eprintln!(
-                        "reagent: cannot listen on port {} ({error}); paste the URL you are sent to instead",
+                    (announce.line)(&format!(
+                        "cannot listen on port {} ({error}); paste the URL you are sent to instead",
                         oauth::chatgpt::PORT
-                    );
+                    ));
                     None
                 }
             };
             let flow = Flow {
-                name: account,
-                dir,
+                name: account.to_string(),
+                dir: dir.to_path_buf(),
                 endpoints: chatgpt_endpoints(),
                 port: oauth::chatgpt::PORT,
                 listener,
                 browser,
                 exchange_timeout: EXCHANGE_TIMEOUT,
             };
-            chatgpt_login(
-                &flow,
-                tokio::io::BufReader::new(tokio::io::stdin()),
-                announce,
-            )
-            .await
+            chatgpt_login(&flow, input, announce).await
         }
         RADIUS => {
             device_login(
                 RADIUS,
-                &account,
-                &dir,
+                account,
+                dir,
                 &oauth::device::Endpoints::radius(),
                 browser,
                 &crate::run::sleeper(),
-                announce_code,
+                announce,
             )
             .await
         }
         other => Err(format!("login supports: {PROVIDERS}; there is no {other}")),
     }
+}
+
+/// How a login tells the user what to do: the page to open, the page and code
+/// of a device login, and the lines it prints as it goes.
+///
+/// The command prints them; the TUI host turns them into the steps of its
+/// sheet. No key and no token ever passes through one.
+pub(crate) struct Announce<'a> {
+    /// The page to open in a browser.
+    pub(crate) open: &'a (dyn Fn(&str) + Send + Sync),
+    /// The page to show and the code to enter there.
+    pub(crate) code: &'a (dyn Fn(&str, &str) + Send + Sync),
+    /// A line to print, without the `reagent: ` prefix.
+    pub(crate) line: &'a (dyn Fn(&str) + Send + Sync),
+}
+
+/// The stderr lines the command prints, shared by every login it runs.
+static PRINT_OPEN: fn(&str) = announce;
+static PRINT_CODE: fn(&str, &str) = announce_code;
+static PRINT_LINE: fn(&str) = announce_line;
+
+impl Announce<'static> {
+    /// The callbacks of `reagent login`: the lines it always printed.
+    fn printing() -> Self {
+        Announce {
+            open: &PRINT_OPEN,
+            code: &PRINT_CODE,
+            line: &PRINT_LINE,
+        }
+    }
+}
+
+/// Prints the line of a login as the command has always written it.
+fn announce_line(line: &str) {
+    eprintln!("reagent: {line}");
 }
 
 /// Prints the page to open and the code to enter there.
@@ -215,10 +281,10 @@ async fn device_login(
     endpoints: &oauth::device::Endpoints,
     browser: bool,
     sleep: &reagent_ai::oauth::session::Sleeper,
-    announce: impl Fn(&str, &str),
+    announce: &Announce<'_>,
 ) -> Result<(), String> {
     let code = oauth::device::start(endpoints).await?;
-    announce(&code.page, &code.user_code);
+    (announce.code)(&code.page, &code.user_code);
     if browser {
         opener(&code.page);
     }
@@ -241,7 +307,7 @@ async fn device_login(
         auth::write(&dir, &logins)
     })
     .await?;
-    eprintln!("reagent: logged in to {provider} as {name}");
+    (announce.line)(&format!("logged in to {provider} as {name}"));
     Ok(())
 }
 
@@ -350,7 +416,7 @@ async fn save(dir: &Path, mut logins: Logins, key: &str, name: &str) -> Result<(
 /// passes a fresh local listener, the real endpoint and stdin.
 #[expect(
     clippy::too_many_arguments,
-    reason = "one login flow: the account, the folder, the endpoint, the callback, the browser and the input"
+    reason = "one login flow: the account, the folder, the endpoint, the callback, the browser, the input and the announce"
 )]
 async fn openrouter(
     name: &str,
@@ -361,6 +427,7 @@ async fn openrouter(
     browser: bool,
     exchange_timeout: Duration,
     input: impl AsyncBufRead + Unpin + Send + 'static,
+    announce: &Announce<'_>,
 ) -> Result<(), String> {
     let pkce = oauth::pkce()?;
     // The auth file is read before the URL is printed: a refused or broken
@@ -375,7 +442,7 @@ async fn openrouter(
         .port();
     let callback = format!("http://127.0.0.1:{port}{path}");
     let url = oauth::openrouter::authorize_url(&callback, &pkce.challenge);
-    announce(&url);
+    (announce.open)(&url);
     if browser {
         opener(&url);
     }
@@ -389,7 +456,7 @@ async fn openrouter(
     .await
     .map_err(|_| "openrouter login timed out".to_string())??;
     save(dir, logins, &key, name).await?;
-    eprintln!("reagent: logged in to {name}");
+    (announce.line)(&format!("logged in to {name}"));
     Ok(())
 }
 
@@ -419,7 +486,7 @@ struct Flow {
 async fn chatgpt_login(
     flow: &Flow,
     input: impl AsyncBufRead + Unpin + Send + 'static,
-    announce: impl Fn(&str),
+    announce: &Announce<'_>,
 ) -> Result<(), String> {
     let pkce = oauth::pkce()?;
     let state = oauth::random_token()?;
@@ -464,7 +531,7 @@ async fn chatgpt_login(
         first: prior.is_none(),
         id_token_hint: hint.as_deref(),
     });
-    announce(&url);
+    (announce.open)(&url);
     if flow.browser {
         opener(&url);
     }
@@ -560,10 +627,10 @@ async fn chatgpt_login(
     logins.set(&flow.name, login);
     let dir = flow.dir.clone();
     auth_task(move || auth::write(&dir, &logins)).await?;
-    eprintln!("reagent: logged in to {}", flow.name);
+    (announce.line)(&format!("logged in to {}", flow.name));
     if prior.is_none() {
-        eprintln!(
-            "reagent: this uses your ChatGPT plan; manage usage at https://chatgpt.com/settings/usage"
+        (announce.line)(
+            "this uses your ChatGPT plan; manage usage at https://chatgpt.com/settings/usage",
         );
     }
     Ok(())
@@ -637,6 +704,23 @@ mod tests {
         std::fs::metadata(path).expect("stats").permissions().mode() & 0o777
     }
 
+    /// The callbacks of a test that prints nothing and records nothing.
+    fn quiet() -> Announce<'static> {
+        static NOTHING: fn(&str) = nothing;
+        static NOTHING_CODE: fn(&str, &str) = nothing_code;
+        Announce {
+            open: &NOTHING,
+            code: &NOTHING_CODE,
+            line: &NOTHING,
+        }
+    }
+
+    /// The callback of a line a test never checks.
+    fn nothing(_: &str) {}
+
+    /// The callback of a code a test never checks.
+    fn nothing_code(_: &str, _: &str) {}
+
     /// Connects once the flow has bound its port.
     async fn connect(port: u16) -> TcpStream {
         for _ in 0..100 {
@@ -664,6 +748,7 @@ mod tests {
             false,
             EXCHANGE_TIMEOUT,
             pasted,
+            &quiet(),
         )
         .await
         .expect("the login works");
@@ -692,6 +777,7 @@ mod tests {
             false,
             EXCHANGE_TIMEOUT,
             pasted,
+            &quiet(),
         )
         .await
         .unwrap_err();
@@ -719,6 +805,7 @@ mod tests {
                 false,
                 EXCHANGE_TIMEOUT,
                 pasted,
+                &quiet(),
             )
             .await
         });
@@ -800,6 +887,7 @@ mod tests {
             false,
             EXCHANGE_TIMEOUT,
             pasted,
+            &quiet(),
         )
         .await
         .unwrap_err();
@@ -837,6 +925,7 @@ mod tests {
             false,
             Duration::from_millis(100),
             pasted,
+            &quiet(),
         )
         .await
         .unwrap_err();
@@ -931,6 +1020,7 @@ mod tests {
             false,
             EXCHANGE_TIMEOUT,
             pasted,
+            &quiet(),
         )
         .await
         .expect("the login works");
@@ -1140,10 +1230,19 @@ mod tests {
                 exchange_timeout: EXCHANGE_TIMEOUT,
             };
             let task = tokio::spawn(async move {
-                let announce = move |url: &str| {
+                let open = |url: &str| {
                     let _ = sender.send(url.to_string());
                 };
-                chatgpt_login(&flow, tokio::io::BufReader::new(client), announce).await
+                let line = |line: &str| {
+                    let _ = sender.send(line.to_string());
+                };
+                let code = |_: &str, _: &str| {};
+                let announce = Announce {
+                    open: &open,
+                    code: &code,
+                    line: &line,
+                };
+                chatgpt_login(&flow, tokio::io::BufReader::new(client), &announce).await
             });
             Harness {
                 input,
@@ -1585,6 +1684,12 @@ mod tests {
         };
         let dir = tempfile::tempdir().expect("temp dir");
         let shown = std::sync::Mutex::new(Vec::new());
+        let code = |page: &str, code: &str| shown.lock().unwrap().push(format!("{page} {code}"));
+        let quiet = quiet();
+        let announce = Announce {
+            code: &code,
+            ..quiet
+        };
         let instant: reagent_ai::oauth::session::Sleeper =
             std::sync::Arc::new(|_| Box::pin(std::future::ready(())));
         device_login(
@@ -1594,7 +1699,7 @@ mod tests {
             &endpoints,
             false,
             &instant,
-            |page, code| shown.lock().unwrap().push(format!("{page} {code}")),
+            &announce,
         )
         .await
         .expect("the login");

@@ -1065,6 +1065,54 @@ mod tests {
     }
 
     #[test]
+    fn a_compacted_history_is_a_valid_request() {
+        let checkpoint = "## Checkpoint 1\nUser: task\n#1 bash ls -> ok, 9 bytes".to_string();
+        let mut reply = AssistantMessage::new(
+            PROVIDER,
+            "claude-sonnet-4-5",
+            vec![
+                Content::Thinking {
+                    thinking: "consider".into(),
+                    signature: Some("sig".into()),
+                },
+                Content::ToolCall(ToolCall {
+                    id: "toolu_1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"a.rs"}"#.into(),
+                }),
+            ],
+        );
+        reply.stop_reason = Some(StopReason::ToolUse);
+        let history = [
+            Message::user("task"),
+            Message::user(checkpoint.clone()),
+            Message::assistant(reply),
+            Message::tool_result("toolu_1", "fn main() {}", false),
+            Message::assistant(AssistantMessage::new(
+                PROVIDER,
+                "claude-sonnet-4-5",
+                vec![Content::text("done")],
+            )),
+        ];
+        let body = body_of(&history);
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+        let messages = body["messages"].as_array().expect("messages");
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|message| message["role"].as_str().expect("a role"))
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user", "assistant"]);
+        let first = messages[0]["content"].as_array().expect("blocks");
+        assert_eq!(first.len(), 2, "the two user messages merged: {first:?}");
+        assert_eq!(first[0]["text"], "task");
+        assert_eq!(first[1]["text"], checkpoint);
+        let kept = messages[1]["content"].as_array().expect("blocks");
+        assert_eq!(kept[0]["type"], "thinking");
+        assert_eq!(kept[0]["signature"], "sig", "the signature is intact");
+        assert_eq!(kept[1]["type"], "tool_use");
+    }
+
+    #[test]
     fn request_body_replaces_a_compacted_history() {
         let provider = Anthropic::new("key", "http://localhost");
         let long_history = vec![

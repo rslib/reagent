@@ -22,6 +22,9 @@ pub mod methods {
     pub const CLIENT_JOINED: &str = "client_joined";
     pub const CLIENT_LEFT: &str = "client_left";
     pub const CLOSING: &str = "closing";
+    /// The model, its context window, the level and the mode after a `set`
+    /// changed the model.
+    pub const SETTINGS: &str = "settings";
 }
 
 const JSONRPC: &str = "2.0";
@@ -82,6 +85,9 @@ pub enum Request<'a> {
         model: Option<Cow<'a, str>>,
         level: Option<Cow<'a, str>>,
         mode: Option<Cow<'a, str>>,
+    },
+    Compact {
+        note: Option<Cow<'a, str>>,
     },
 }
 
@@ -162,6 +168,36 @@ pub struct InitializeResult<'a> {
     pub client: u64,
     pub capabilities: &'a [&'a str],
     pub committed: u64,
+    /// The provider and model text the run uses.
+    pub model: &'a str,
+    /// The context window of the model, when the run knows it.
+    pub context_window: Option<u64>,
+}
+
+/// What the `settings` notice tells every client: the model the session took,
+/// its context window, the reasoning level and the permission mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SettingsNotice<'a> {
+    /// The provider and model text the run uses, as `initialize` names it.
+    pub model: &'a str,
+    /// The context window of the model, when it is known.
+    pub context_window: Option<u64>,
+    /// The reasoning level the session sends, when it sends one.
+    pub level: Option<&'a str>,
+    /// The permission mode the session decides with.
+    pub mode: &'a str,
+}
+
+/// The worker's answer to `attach`.
+///
+/// `committed` is the newest record the journal committed when it attached, and
+/// `running` says whether a run is open at that moment. The `run_end` of a run
+/// that ended before `committed` is in no frame the client catches up on, so the
+/// answer is what tells a client that reattached that the run is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AttachResult {
+    pub committed: u64,
+    pub running: bool,
 }
 
 #[derive(Deserialize)]
@@ -230,6 +266,12 @@ struct SetParams<'a> {
     mode: Option<Text<'a>>,
 }
 
+#[derive(Deserialize)]
+struct CompactParams<'a> {
+    #[serde(borrow, default)]
+    note: Option<Text<'a>>,
+}
+
 fn params<'a, P: Deserialize<'a>>(line: &'a [u8]) -> Result<P, RpcError> {
     match serde_json::from_slice::<Params<P>>(line) {
         Ok(found) => Ok(found.params),
@@ -285,6 +327,12 @@ pub fn decode(line: &[u8]) -> Result<(Option<u64>, Request<'_>), RpcError> {
                 mode: texts(found.mode),
             }
         }
+        "compact" => {
+            let found: CompactParams<'_> = params(line)?;
+            Request::Compact {
+                note: texts(found.note),
+            }
+        }
         _ => return Err(RpcError::method_not_found()),
     };
     Ok((head.id, request))
@@ -336,6 +384,22 @@ pub fn error(buf: &mut Vec<u8>, id: Option<u64>, err: &RpcError) {
     if push_json(buf, &line) {
         buf.push(b'\n');
     }
+}
+
+/// Writes the `settings` notice line into `buf`.
+///
+/// The notice goes to every client of a session, so it is written once and
+/// shared as one frame.
+pub fn settings(buf: &mut Vec<u8>, settings: &SettingsNotice<'_>) {
+    let start = buf.len();
+    buf.extend_from_slice(br#"{"jsonrpc":"2.0","method":""#);
+    buf.extend_from_slice(methods::SETTINGS.as_bytes());
+    buf.extend_from_slice(br#"","params":"#);
+    if !push_json(buf, settings) {
+        buf.truncate(start);
+        return;
+    }
+    buf.extend_from_slice(b"}\n");
 }
 
 /// Writes a notification line into `buf`, copying `params` once as given.
@@ -464,6 +528,21 @@ mod tests {
                     mode: None,
                 }
             )
+        );
+        assert_eq!(
+            decode_ok(
+                br#"{"jsonrpc":"2.0","id":11,"method":"compact","params":{"note":"keep the API notes"}}"#
+            ),
+            (
+                Some(11),
+                Request::Compact {
+                    note: Some(Cow::Borrowed("keep the API notes")),
+                }
+            )
+        );
+        assert_eq!(
+            decode_ok(br#"{"jsonrpc":"2.0","id":12,"method":"compact","params":{}}"#),
+            (Some(12), Request::Compact { note: None })
         );
     }
 
@@ -605,6 +684,116 @@ mod tests {
         assert_eq!(
             text(&buf),
             "{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n"
+        );
+    }
+
+    #[test]
+    fn the_attach_answer_carries_the_record_and_whether_a_run_is_open() {
+        let mut buf = Vec::new();
+        result(
+            &mut buf,
+            3,
+            &AttachResult {
+                committed: 42,
+                running: true,
+            },
+        );
+        assert_eq!(
+            text(&buf),
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"committed\":42,\"running\":true}}\n"
+        );
+        let mut buf = Vec::new();
+        result(
+            &mut buf,
+            4,
+            &AttachResult {
+                committed: 0,
+                running: false,
+            },
+        );
+        assert_eq!(
+            text(&buf),
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"committed\":0,\"running\":false}}\n"
+        );
+    }
+
+    #[test]
+    fn the_initialize_answer_names_the_model_and_its_window() {
+        let mut buf = Vec::new();
+        result(
+            &mut buf,
+            1,
+            &InitializeResult {
+                major: 1,
+                version: "0.1.0",
+                session: "s1",
+                client: 2,
+                capabilities: &[],
+                committed: 9,
+                model: "fi/m",
+                context_window: Some(200_000),
+            },
+        );
+        assert_eq!(
+            text(&buf),
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"major\":1,\"version\":\"0.1.0\",\
+             \"session\":\"s1\",\"client\":2,\"capabilities\":[],\"committed\":9,\
+             \"model\":\"fi/m\",\"context_window\":200000}}\n"
+        );
+        let mut buf = Vec::new();
+        result(
+            &mut buf,
+            3,
+            &InitializeResult {
+                major: 1,
+                version: "0.1.0",
+                session: "s1",
+                client: 1,
+                capabilities: &[],
+                committed: 0,
+                model: "m",
+                context_window: None,
+            },
+        );
+        assert_eq!(
+            text(&buf),
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"major\":1,\"version\":\"0.1.0\",\
+             \"session\":\"s1\",\"client\":1,\"capabilities\":[],\"committed\":0,\
+             \"model\":\"m\",\"context_window\":null}}\n"
+        );
+    }
+
+    #[test]
+    fn the_settings_notice_names_the_model_its_window_the_level_and_the_mode() {
+        let mut buf = Vec::new();
+        settings(
+            &mut buf,
+            &SettingsNotice {
+                model: "m2",
+                context_window: Some(8_000),
+                level: Some("high"),
+                mode: "auto",
+            },
+        );
+        assert_eq!(
+            text(&buf),
+            "{\"jsonrpc\":\"2.0\",\"method\":\"settings\",\"params\":\
+             {\"model\":\"m2\",\"context_window\":8000,\"level\":\"high\",\"mode\":\"auto\"}}\n"
+        );
+        let mut buf = Vec::new();
+        settings(
+            &mut buf,
+            &SettingsNotice {
+                model: "m3",
+                context_window: None,
+                level: None,
+                mode: "default",
+            },
+        );
+        assert_eq!(
+            text(&buf),
+            "{\"jsonrpc\":\"2.0\",\"method\":\"settings\",\"params\":\
+             {\"model\":\"m3\",\"context_window\":null,\"level\":null,\"mode\":\"default\"}}\n"
         );
     }
 

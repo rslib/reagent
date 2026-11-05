@@ -33,6 +33,7 @@ const FIELD_PROVIDER: u32 = 6;
 const FIELD_MODEL: u32 = 7;
 const FIELD_PART: u32 = 8;
 const FIELD_STATE: u32 = 9;
+const FIELD_HEADLESS: u32 = 10;
 
 /// How a session ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +88,8 @@ pub struct Entry {
     pub part: u64,
     /// How the run ended.
     pub state: State,
+    /// Whether a headless run wrote the part.
+    pub headless: bool,
 }
 
 impl Entry {
@@ -102,6 +105,11 @@ impl Entry {
         enc.str(FIELD_MODEL, &self.model);
         enc.u64(FIELD_PART, self.part);
         enc.u64(FIELD_STATE, self.state.code());
+        // An entry of a run with a terminal UI writes no flag, so an old list
+        // and a new one cost the same bytes.
+        if self.headless {
+            enc.bool(FIELD_HEADLESS, true);
+        }
     }
 
     /// Reads a list frame payload.
@@ -117,6 +125,7 @@ impl Entry {
             model: String::new(),
             part: 0,
             state: State::Open,
+            headless: false,
         };
         let mut state = State::Open.code();
         while let Some((field, value)) = decoder.next_field().map_err(codec_error)? {
@@ -130,6 +139,7 @@ impl Entry {
                 FIELD_MODEL => entry.model = text_of(&value)?.as_str().to_owned(),
                 FIELD_PART => entry.part = varint_of(&value)?,
                 FIELD_STATE => state = varint_of(&value)?,
+                FIELD_HEADLESS => entry.headless = varint_of(&value)? != 0,
                 _ => {}
             }
         }
@@ -493,6 +503,7 @@ mod tests {
             model: "claude".to_owned(),
             part: updated_ms * 7,
             state: State::Done,
+            headless: false,
         }
     }
 
@@ -665,6 +676,47 @@ mod tests {
             again.newest().expect("newest").session,
             "01jbbb",
             "an append is enough"
+        );
+    }
+
+    #[test]
+    fn headless_round_trips() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut list = SessionList::open(dir.path(), meta).expect("list");
+        let mut marked = entry("01jaaa", 100, "work");
+        marked.headless = true;
+        write_session(dir.path(), &marked);
+        list.record(marked).expect("record");
+
+        let again = SessionList::open(dir.path(), meta).expect("reopen");
+        assert!(again.newest().expect("newest").headless);
+        // A rebuild reads the part header, which carries the flag too.
+        remove_list_file(again.path());
+        let rebuilt = SessionList::open(dir.path(), meta).expect("rebuild");
+        assert_eq!(rebuilt.all().len(), 1);
+        assert!(rebuilt.newest().expect("newest").headless);
+    }
+
+    #[test]
+    fn headless_absent_in_an_old_entry_reads_false() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut list = SessionList::open(dir.path(), meta).expect("list");
+        list.record(entry("01jaaa", 100, "work")).expect("record");
+        let path = list.path().to_path_buf();
+        drop(list);
+
+        // An entry of a build before the flag writes no field 10 at all.
+        let bytes = Bytes::from(testutil::read(&path));
+        let frame = frame::read(&bytes, 0, LIST_SEED, NO_SEQ).expect("frame");
+        let mut decoder = Decoder::new(&frame.payload);
+        while let Some((field, _)) = decoder.next_field().expect("field") {
+            assert_ne!(field, FIELD_HEADLESS, "an unmarked entry writes no flag");
+        }
+
+        let list = SessionList::open(dir.path(), meta).expect("reopen");
+        assert!(
+            !list.newest().expect("newest").headless,
+            "an entry with no flag is not headless"
         );
     }
 

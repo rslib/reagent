@@ -24,6 +24,7 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use crate::message;
+use crate::message::AttachResult;
 use crate::message::methods;
 
 /// How many frames one client's queue holds before the hub cuts it.
@@ -95,12 +96,6 @@ pub fn channel() -> (mpsc::Sender<Entry>, mpsc::Receiver<Entry>) {
     mpsc::channel(CAPACITY)
 }
 
-/// The answer of `attach`.
-#[derive(Serialize)]
-struct Committed {
-    committed: u64,
-}
-
 /// The notice of a client that attached.
 #[derive(Serialize)]
 struct Joined<'a> {
@@ -128,6 +123,8 @@ pub struct Hub {
     waiting: Vec<(u64, Frame)>,
     /// The newest record the journal committed.
     committed: u64,
+    /// Whether a run is open, which the answer to `attach` names.
+    running: bool,
     /// The line of the notice being built, reused.
     line: Vec<u8>,
     /// The frame of the notice being built, reused.
@@ -171,6 +168,11 @@ impl Hub {
         });
     }
 
+    /// Sets whether a run is open: the answer to `attach` names it.
+    pub fn set_running(&mut self, running: bool) {
+        self.running = running;
+    }
+
     /// Sets the newest record the journal committed.
     pub fn set_committed(&mut self, record: u64) {
         self.committed = self.committed.max(record);
@@ -202,6 +204,10 @@ impl Hub {
     /// All of them are queued under the hub's lock, so no live frame slips
     /// between the catch-up and what follows it. The catch-up is one frame, so
     /// a long open reply does not fill the queue of the client that missed it.
+    ///
+    /// The answer names `running`, whether a run is open: a client that missed
+    /// the `run_end` of a run the journal committed since its last record would
+    /// otherwise not know the run is over.
     pub fn attach(&mut self, id: ClientId, request: Option<u64>) {
         let Some(at) = self.position(id) else {
             return;
@@ -240,8 +246,9 @@ impl Hub {
             message::result(
                 &mut self.frame,
                 request,
-                &Committed {
+                &AttachResult {
                     committed: self.committed,
+                    running: self.running,
                 },
             );
             let frame: Frame = Arc::from(self.frame.as_slice());
@@ -824,6 +831,44 @@ mod tests {
             .find(|frame| frame["id"] == 2)
             .expect("the attach answer");
         assert_eq!(answer["result"]["committed"], 5);
+    }
+
+    #[test]
+    fn the_attach_answer_says_whether_a_run_is_open() {
+        // The run ended before the record the journal committed, so its
+        // `run_end` is in no frame the client catches up on: the answer says
+        // the run is over.
+        let (mut hub, mut queues, _cuts) = hub_with(&[1]);
+        hub.send(
+            frame(r#"{"type":"run_end","reason":"end_turn"}"#),
+            Kind::RunEnd,
+        );
+        hub.set_committed(5);
+        hub.send(frame(r#"{"type":"committed"}"#), Kind::Committed);
+        hub.attach(1, Some(2));
+        let caught = lines(&frames(drain(&mut queues[0])));
+        let answer = caught
+            .iter()
+            .find(|frame| frame["id"] == 2)
+            .expect("the attach answer");
+        assert_eq!(answer["result"]["running"], false, "{answer}");
+        assert!(
+            !caught
+                .iter()
+                .any(|frame| frame["params"]["type"] == "run_end"),
+            "the end of the run is past the catch-up: {caught:?}"
+        );
+
+        let (mut hub, mut queues, _cuts) = hub_with(&[1]);
+        hub.send(frame(r#"{"type":"turn_start"}"#), Kind::Other);
+        hub.set_running(true);
+        hub.attach(1, Some(1));
+        let again = lines(&frames(drain(&mut queues[0])));
+        let answer = again
+            .iter()
+            .find(|frame| frame["id"] == 1)
+            .expect("the attach answer");
+        assert_eq!(answer["result"]["running"], true, "{answer}");
     }
 
     #[test]

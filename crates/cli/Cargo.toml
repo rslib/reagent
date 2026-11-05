@@ -11,6 +11,10 @@ name = "reagent"
 path = "src/main.rs"
 
 [features]
+default = ["tui"]
+# The terminal UI. `--no-default-features` builds the headless run and the
+# worker only, which is what the eval and `min` builds use.
+tui = ["dep:reagent-tui"]
 testing = ["reagent-ai/testing", "dep:tempfile"]
 
 [dependencies]
@@ -19,9 +23,9 @@ reagent-agent.workspace = true
 reagent-tools.workspace = true
 reagent-script.workspace = true
 reagent-mcp.workspace = true
-reagent-tui.workspace = true
+reagent-tui = { workspace = true, optional = true }
 lexopt = { version = "0.3.2", default-features = false }
-tokio = { version = "1.53.3", default-features = false, features = ["signal", "io-util", "io-std", "time", "rt", "macros", "sync", "net", "process"] }
+tokio = { version = "1.54.1", default-features = false, features = ["signal", "io-util", "io-std", "time", "rt", "macros", "sync", "net", "process"] }
 tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
@@ -38,9 +42,10 @@ nix = { version = "0.31.3", default-features = false, features = ["user"] }
 base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 gungraun = "0.20.0"
 png = { version = "0.18", default-features = false }
-nix = { version = "0.31.3", default-features = false, features = ["resource"] }
+nix = { version = "0.31.3", default-features = false, features = ["resource", "term"] }
 tempfile = { version = "3.27.0", default-features = false }
-tokio = { version = "1.53.3", default-features = false, features = ["rt", "macros", "process", "io-std", "io-util", "time", "sync"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "macros", "process", "io-std", "io-util", "time", "sync"] }
+vt100 = { version = "0.18.1", default-features = false }
 
 [lints]
 workspace = true

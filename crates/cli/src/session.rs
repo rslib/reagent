@@ -8,10 +8,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use reagent_agent::journal::Journal;
+use reagent_agent::journal::kinds;
 use reagent_agent::journal::record::{self, Record};
 use reagent_agent::journal::resume::{self, Resumed};
 use reagent_ai::Message;
 use reagent_store::list::title;
+use reagent_store::part::FIRST_SEQ;
 use reagent_store::paths;
 use reagent_store::{
     Decoder, Encoder, Entry, ForkPoint, Header, Lookup, Session, SessionList, State, Text, Value,
@@ -30,6 +32,8 @@ const META_MODEL: u32 = 3;
 const META_CWD: u32 = 4;
 /// The part header field that keeps the title of a session.
 const META_TITLE: u32 = 5;
+/// The part header field that keeps whether a headless run wrote the part.
+const META_HEADLESS: u32 = 6;
 /// The byte offset of the local time zone rules of this machine.
 const LOCALTIME: &str = "/etc/localtime";
 /// Where the zone files of a named zone live.
@@ -52,6 +56,8 @@ pub struct Meta {
     pub cwd: String,
     /// The first user message, cut.
     pub title: String,
+    /// Whether a headless run wrote the part.
+    pub headless: bool,
 }
 
 impl Meta {
@@ -66,6 +72,10 @@ impl Meta {
         enc.str(META_MODEL, &self.model);
         enc.str(META_CWD, &self.cwd);
         enc.str(META_TITLE, &self.title);
+        // A run with a terminal UI writes no flag, so its part reads as one.
+        if self.headless {
+            enc.bool(META_HEADLESS, true);
+        }
         Bytes::from(out)
     }
 
@@ -75,6 +85,10 @@ impl Meta {
         let mut meta = Meta::default();
         let mut decoder = Decoder::new(bytes);
         while let Ok(Some((field, value))) = decoder.next_field() {
+            if field == META_HEADLESS {
+                meta.headless = value.varint() == Some(1);
+                continue;
+            }
             let Some(text) = text_of(&value) else {
                 continue;
             };
@@ -102,6 +116,7 @@ impl Meta {
             model: self.model.clone(),
             part: header.part_id,
             state: State::Interrupted,
+            headless: self.headless,
         }
     }
 }
@@ -151,6 +166,8 @@ pub struct Ask<'a> {
     /// Whether the session is served by a worker, which may resume a session
     /// with nothing to continue.
     pub worker: bool,
+    /// Whether a headless run writes the part: a task and no terminal UI.
+    pub headless: bool,
 }
 
 /// Runs the `session` command: `ls`, `cat <ref>`, `rm <ref>` or `gc`.
@@ -328,17 +345,22 @@ pub fn plan(ask: &Ask<'_>) -> Result<Option<Plan>, String> {
 
 /// The provider and model the session a run continues ran with.
 pub struct Stored {
-    /// The provider name the newest part was planned with.
+    /// The config provider id the session last switched to, or the provider
+    /// name the newest part was planned with.
     pub provider: String,
-    /// The model the newest part was planned with.
+    /// The model the session last switched to, or the model the newest part
+    /// was planned with.
     pub model: String,
 }
 
 /// The provider and model of the session a run continues.
 ///
+/// A switch the journal recorded names the config provider id it moved to,
+/// which the header of the part does not, so the last switch wins and the
+/// header answers only for a journal that holds none.
 /// A run reads this before it plans the new part, so the header and the list
 /// entry of that part name the provider and model the run actually uses.
-/// Reading a header blocks, so a caller runs this in `spawn_blocking`.
+/// Reading a session blocks, so a caller runs this in `spawn_blocking`.
 pub fn stored(ask: &Ask<'_>) -> Result<Option<Stored>, String> {
     let Some(folder) = folder_of(ask.cwd) else {
         return Ok(None);
@@ -354,11 +376,36 @@ pub fn stored(ask: &Ask<'_>) -> Result<Option<Stored>, String> {
         return Ok(None);
     };
     let session = Session::open(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    let switched = switched(&session).map_err(|error| format!("{}: {error}", dir.display()))?;
     let meta = Meta::decode(&session.header().meta);
-    Ok(Some(Stored {
-        provider: meta.provider,
-        model: meta.model,
+    Ok(Some(match switched {
+        Some((provider, model)) => Stored { provider, model },
+        None => Stored {
+            provider: meta.provider,
+            model: meta.model,
+        },
     }))
+}
+
+/// The config provider id and model of the last switch of `session`, from the
+/// records a resume continues from.
+fn switched(session: &Session) -> io::Result<Option<(String, String)>> {
+    let from = session.last_base().unwrap_or(FIRST_SEQ);
+    let mut found = None;
+    for record in session.records_from(from) {
+        let record = record?;
+        if record.kind != kinds::MODEL {
+            continue;
+        }
+        // A record of a build before the config provider id carries none, and
+        // names no provider a resume could build.
+        if let Record::Model(change) = record::decode(record.kind, &record.payload)?
+            && let Some(config) = change.config
+        {
+            found = Some((config.to_string(), change.model));
+        }
+    }
+    Ok(found)
 }
 
 /// The folder of the session a continue takes: the newest of the folder, or
@@ -402,6 +449,7 @@ fn create(
         model: ask.model.to_owned(),
         cwd: ask.cwd.to_string_lossy().into_owned(),
         title,
+        headless: ask.headless,
     };
     let header = Header::new(id.clone(), paths::now_ms(), fork, meta.encode());
     Ok(Plan {
@@ -439,6 +487,7 @@ fn resume_into(folder: &Path, dir: &Path, ask: &Ask<'_>) -> Result<Option<Plan>,
         } else {
             parent.title
         },
+        headless: ask.headless,
     };
     let header = Header::new(
         id.clone(),
@@ -502,6 +551,15 @@ fn inside(folder: &Path, reference: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// What a worker records when its session commits a record: the entry to
+/// write, and the turns the session carried before this run.
+pub struct Listing {
+    /// The session the worker serves.
+    pub plan: Plan,
+    /// The turns the session had before this run.
+    pub turns: u64,
+}
+
 /// Records an entry for the part before its first request.
 pub fn started(plan: &Plan, turns: u64) -> io::Result<()> {
     let entry = entry(plan, State::Open, turns);
@@ -527,6 +585,7 @@ fn entry(plan: &Plan, state: State, turns: u64) -> Entry {
         model: meta.model,
         part: plan.header.part_id,
         state,
+        headless: meta.headless,
     }
 }
 
@@ -838,6 +897,30 @@ pub fn state_of(done: bool) -> State {
 pub fn close(journal: Journal, plan: &Plan, state: State, turns: u64) -> Result<(), String> {
     journal.close().map_err(|error| error.to_string())?;
     finish(plan, state, turns).map_err(|error| error.to_string())
+}
+
+/// Closes a part's journal and takes what the run added back out of the store,
+/// for a worker session that committed no record: no list names it, and a
+/// session it resumed keeps its folder, its earlier parts and its entry.
+///
+/// Closing blocks on a sync and the removal on the disk, so a caller runs this
+/// in `spawn_blocking`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs inside spawn_blocking, once per discarded session"
+)]
+pub fn discard(journal: Journal, plan: &Plan) -> Result<(), String> {
+    let part = paths::part_path(&plan.dir, journal.part_id());
+    journal.close().map_err(|error| error.to_string())?;
+    std::fs::remove_file(&part).map_err(|error| format!("{}: {error}", part.display()))?;
+    // A part that was the folder's only one leaves no session behind.
+    let left =
+        paths::part_ids(&plan.dir).map_err(|error| format!("{}: {error}", plan.dir.display()))?;
+    if left.is_empty() {
+        std::fs::remove_dir(&plan.dir)
+            .map_err(|error| format!("{}: {error}", plan.dir.display()))?;
+    }
+    Ok(())
 }
 
 /// How many turns a session has before a run adds its own.

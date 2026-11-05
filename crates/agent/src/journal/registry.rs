@@ -7,87 +7,9 @@
 
 use crate::journal::kinds;
 
-/// Fields of a [`kinds::MESSAGE`] record.
-pub mod message {
-    /// Which of the three message shapes it is: 1 user, 2 assistant, 3 tool result.
-    pub const ROLE: u32 = 1;
-    /// One content block of a user or assistant message; repeated.
-    pub const CONTENT: u32 = 2;
-    /// The provider that produced an assistant reply.
-    pub const PROVIDER: u32 = 3;
-    /// The model that produced an assistant reply.
-    pub const MODEL: u32 = 4;
-    /// Why an assistant reply ended: 1 end turn, 2 tool use, 3 max tokens, 4 refusal, 5 error.
-    pub const STOP_REASON: u32 = 5;
-    /// Input tokens of an assistant reply's usage.
-    pub const INPUT_TOKENS: u32 = 6;
-    /// Output tokens of an assistant reply's usage.
-    pub const OUTPUT_TOKENS: u32 = 7;
-    /// Tokens read from the prompt cache.
-    pub const CACHE_READ_TOKENS: u32 = 8;
-    /// Tokens written to the prompt cache.
-    pub const CACHE_WRITE_TOKENS: u32 = 9;
-    /// Tokens spent on private reasoning.
-    pub const REASONING_TOKENS: u32 = 10;
-    /// The cost in USD, as the bits of its `f64`.
-    pub const COST_BITS: u32 = 11;
-    /// The wire fields an assistant reply needs back, as JSON.
-    pub const REPLAY: u32 = 12;
-    /// The call a tool result answers.
-    pub const CALL_ID: u32 = 13;
-    /// The text a tool result carries.
-    pub const RESULT: u32 = 14;
-    /// Whether a tool result is a failure.
-    pub const IS_ERROR: u32 = 15;
-    /// One image a tool result carries, in call order; repeated.
-    pub const IMAGE: u32 = 16;
-
-    /// Fields of one image inside [`IMAGE`].
-    ///
-    /// The numbers start at 32, above the fields of the message itself, so
-    /// this one flat table has no repeated pair.
-    pub mod image {
-        /// The image format: 1 png, 2 jpeg, 3 gif, 4 webp.
-        pub const MEDIA_TYPE: u32 = 44;
-        /// The width in pixels.
-        pub const WIDTH: u32 = 45;
-        /// The height in pixels.
-        pub const HEIGHT: u32 = 46;
-        /// The image bytes as base64 text.
-        pub const DATA: u32 = 47;
-    }
-
-    /// Fields of one content block inside [`CONTENT`].
-    ///
-    /// The numbers start at 32, above the fields of the message itself, so
-    /// this one flat table has no repeated pair.
-    pub mod content {
-        /// The block kind: 1 text, 2 thinking, 3 redacted thinking, 4 tool call, 5 image.
-        pub const KIND: u32 = 32;
-        /// The visible text of a text block.
-        pub const TEXT: u32 = 33;
-        /// The reasoning text of a thinking block.
-        pub const THINKING: u32 = 34;
-        /// The provider token a thinking block is sent back with.
-        pub const SIGNATURE: u32 = 35;
-        /// The opaque payload of a redacted thinking block.
-        pub const DATA: u32 = 36;
-        /// The call id of a tool call block.
-        pub const CALL_ID: u32 = 37;
-        /// The tool name of a tool call block.
-        pub const NAME: u32 = 38;
-        /// The JSON arguments of a tool call block.
-        pub const ARGUMENTS: u32 = 39;
-        /// The image format of an image block: 1 png, 2 jpeg, 3 gif, 4 webp.
-        pub const MEDIA_TYPE: u32 = 40;
-        /// The width of an image block, in pixels.
-        pub const WIDTH: u32 = 41;
-        /// The height of an image block, in pixels.
-        pub const HEIGHT: u32 = 42;
-        /// The image bytes of an image block, as base64 text.
-        pub const IMAGE_DATA: u32 = 43;
-    }
-}
+/// Fields of a [`kinds::MESSAGE`] record, kept with the message codec in
+/// `reagent-ai` so the two never drift.
+pub use reagent_ai::record::message;
 
 /// Fields of a [`kinds::CALL_START`] record.
 pub mod call_start {
@@ -156,6 +78,8 @@ pub mod model {
     pub const PROVIDER: u32 = 1;
     /// The model the run moves to.
     pub const MODEL: u32 = 2;
+    /// The config provider id the run moves to, when one is known.
+    pub const CONFIG: u32 = 3;
 }
 
 /// Fields of a [`kinds::APPROVAL`] record.
@@ -338,6 +262,7 @@ pub const FIELDS: &[(u8, u32, &str)] = &[
     (kinds::BASE, base::ledger::REPEATS, "base.ledger.repeats"),
     (kinds::MODEL, model::PROVIDER, "model.provider"),
     (kinds::MODEL, model::MODEL, "model.model"),
+    (kinds::MODEL, model::CONFIG, "model.config"),
     (kinds::APPROVAL, approval::CALL_ID, "approval.call_id"),
     (kinds::APPROVAL, approval::KIND, "approval.kind"),
     (kinds::SETTINGS, settings::LEVEL, "settings.level"),
@@ -437,6 +362,7 @@ mod tests {
 19 37 base.ledger.repeats
 20 1 model.provider
 20 2 model.model
+20 3 model.config
 24 1 approval.call_id
 24 2 approval.kind
 26 1 settings.level

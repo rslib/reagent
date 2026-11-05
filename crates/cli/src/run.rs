@@ -203,7 +203,7 @@ async fn read_stdin_task() -> Result<String, String> {
 
 /// The estimated-token budget that compaction keeps the session under: three
 /// quarters of the context window, capped at the default budget.
-fn compact_budget(context_window: Option<u64>) -> u64 {
+pub(crate) fn compact_budget(context_window: Option<u64>) -> u64 {
     let default = reagent_agent::compact::BUDGET;
     context_window.map_or(default, |window| {
         (window.saturating_mul(3) / 4).min(default)
@@ -211,13 +211,37 @@ fn compact_budget(context_window: Option<u64>) -> u64 {
 }
 
 /// The cache entry the models cache of provider `name` holds for `model`.
-fn cached_entry(
+pub(crate) fn cached_entry(
     dir: &std::path::Path,
     name: Option<&str>,
     model: &str,
 ) -> Option<reagent_ai::catalog::Entry> {
     let cache = reagent_ai::catalog::read(dir, name?)?;
     cache.models.into_iter().find(|entry| entry.id == model)
+}
+
+/// The context window the models cache of `provider` names for `model`, or
+/// `None` when it names none: what a client that switches the model of a worker
+/// is told.
+pub(crate) fn window_of(dir: &std::path::Path, provider: &str, model: &str) -> Option<u64> {
+    cached_entry(dir, Some(provider), model).and_then(|entry| entry.context_window)
+}
+
+/// The reasoning text a run sends for `asked` on a model whose cache entry
+/// holds `reasoning`, or `None` when the model sends no reasoning for it.
+pub(crate) fn reasoning_text(asked: &str, reasoning: Option<&Reasoning>) -> Option<String> {
+    map_reasoning(asked, reasoning).sent
+}
+
+/// The provider and model text a run uses: `provider/model` when it names a
+/// provider, else the model alone.
+///
+/// The start line and the answer a worker gives to `initialize` both name it.
+fn model_text(provider: Option<&str>, model: &str) -> String {
+    match provider {
+        Some(name) => format!("{name}/{model}"),
+        None => model.to_string(),
+    }
 }
 
 /// What a run sends as its reasoning text, and the note the start line prints
@@ -413,6 +437,9 @@ pub async fn run(mut args: Args) -> ExitCode {
     // The task moves out of `args`; `args` is still borrowed below. A continue
     // or a resume may run with no message at all.
     let source = args.task.take();
+    // A run with a task and no terminal UI is headless: `-p`, or a task piped
+    // in. The worker a terminal UI starts has no task, so it is not one.
+    let headless = source.is_some();
     let mut task = match source {
         None => None,
         Some(crate::args::TaskSource::Text(text)) => Some(text),
@@ -440,7 +467,7 @@ pub async fn run(mut args: Args) -> ExitCode {
     // puts them in its header and its list entry, so the session shows the
     // model the run uses.
     if !args.model_given && args.profile.is_none() {
-        match stored_model(&args, &cwd, &title, !args.provider_given).await {
+        match stored_model(&args, &cwd, &title, !args.provider_given, headless).await {
             Ok(Some(model)) => {
                 match tokio::task::spawn_blocking(move || crate::args::reparse(&model))
                     .await
@@ -499,7 +526,7 @@ pub async fn run(mut args: Args) -> ExitCode {
             }
         }
     }
-    let plan = match plan_session(&args, &cwd, &title).await {
+    let plan = match plan_session(&args, &cwd, &title, headless).await {
         Ok(plan) => plan,
         Err(message) => {
             eprintln!("reagent: {message}");
@@ -508,7 +535,19 @@ pub async fn run(mut args: Args) -> ExitCode {
     };
     // A worker takes its session before it names it: the lock, the socket and
     // the entry a client reads are all there before the ready line goes out.
-    let mut worker = match crate::worker::start(&args, plan.as_ref(), &cwd).await {
+    // The model it serves is the one this run uses, and the window is the one
+    // the `--json` summary reports.
+    let model = model_text(args.provider_name.as_deref(), &args.model);
+    let mut worker = match crate::worker::start(
+        &args,
+        plan.as_ref(),
+        &cwd,
+        &model,
+        args.context_window,
+        reasoning.as_ref().and_then(|mapped| mapped.sent.as_deref()),
+    )
+    .await
+    {
         Ok(worker) => worker,
         Err(message) => {
             eprintln!("reagent: {message}");
@@ -658,6 +697,9 @@ pub async fn run(mut args: Args) -> ExitCode {
     } else {
         Agent::with_policies(provider.as_ref(), &registry, config, cancel, policies)
     };
+    // A switch the run records names the config provider id it moves to, so the
+    // id this run started on goes with it and a resume takes both back.
+    agent = agent.with_config_provider(args.provider_name.as_deref().map(Text::from));
     if let Some(archive) = &archive {
         agent = agent.with_archive(Arc::clone(archive));
     }
@@ -670,6 +712,8 @@ pub async fn run(mut args: Args) -> ExitCode {
             Some(_) => Compact::with_budget(compact_budget(args.context_window), cwd.clone()),
             None => Compact::new(cwd.clone()),
         });
+    } else {
+        agent = agent.with_compact_on_request(Compact::new(cwd.clone()));
     }
     if completion_enabled {
         agent = agent.with_workspace(&folder);
@@ -721,9 +765,16 @@ pub async fn run(mut args: Args) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // A worker lists its session at its first committed record, so a session
+    // it never runs a message in keeps its place in the list and its parts as
+    // they were. A `-p` run lists its session at once.
+    let lists_at_commit = args.worker;
+    // The record the resumed chain ends at before this part appends one, so
+    // "nothing new" is this number, not zero.
+    let committed_at_start = journal.as_ref().map_or(0, |(journal, _)| journal.record());
     // Recording the entry opens a list and writes it, so it runs on the
     // blocking pool like every other store call.
-    if let Some(plan) = journal.as_ref().map(|(_, plan)| plan) {
+    if !lists_at_commit && let Some(plan) = journal.as_ref().map(|(_, plan)| plan) {
         let plan = clone_plan(plan);
         match tokio::task::spawn_blocking(move || crate::session::started(&plan, carried)).await {
             Ok(Ok(())) => {}
@@ -737,8 +788,14 @@ pub async fn run(mut args: Args) -> ExitCode {
     // A worker starts serving before the first run, so a client can follow the
     // calls a resumed session left open.
     if let Some(worker) = worker.as_mut() {
-        let record = journal.as_ref().map_or(0, |(journal, _)| journal.record());
-        worker.begin(record);
+        let listed = journal
+            .as_ref()
+            .filter(|_| lists_at_commit)
+            .map(|(_, plan)| crate::session::Listing {
+                plan: clone_plan(plan),
+                turns: carried,
+            });
+        worker.begin(committed_at_start, listed);
     }
     if let Some(worker) = worker.as_mut() {
         if let Some((journal, _)) = journal.as_mut() {
@@ -857,8 +914,16 @@ pub async fn run(mut args: Args) -> ExitCode {
             reason,
             TurnEndReason::EndTurn | TurnEndReason::MaxTurns
         ));
+        // A worker whose session committed no record serves nothing worth
+        // keeping: a new session's folder goes and the list never takes it,
+        // and a resumed session keeps its folder, its parts and its entry.
+        let unlisted = lists_at_commit && journal.record() == committed_at_start;
         let closed = tokio::task::spawn_blocking(move || {
-            crate::session::close(journal, &plan, state, turns)
+            if unlisted {
+                crate::session::discard(journal, &plan)
+            } else {
+                crate::session::close(journal, &plan, state, turns)
+            }
         })
         .await;
         match closed {
@@ -901,6 +966,7 @@ async fn stored_model(
     cwd: &std::path::Path,
     title: &str,
     with_provider: bool,
+    headless: bool,
 ) -> Result<Option<String>, String> {
     let sessions = args.sessions.clone();
     let cwd = cwd.to_path_buf();
@@ -918,6 +984,7 @@ async fn stored_model(
             model: &model,
             title: &title,
             worker,
+            headless,
         };
         crate::session::stored(&ask)
     })
@@ -948,6 +1015,7 @@ async fn plan_session(
     args: &Args,
     cwd: &std::path::Path,
     title: &str,
+    headless: bool,
 ) -> Result<Option<crate::session::Plan>, String> {
     let sessions = args.sessions.clone();
     let cwd = cwd.to_path_buf();
@@ -965,6 +1033,7 @@ async fn plan_session(
             model: &model,
             title: &title,
             worker,
+            headless,
         };
         crate::session::plan(&ask)
     })
@@ -1442,10 +1511,7 @@ fn start_line(
     source: Option<&Source>,
     note: Option<&str>,
 ) -> String {
-    let target = match provider {
-        Some(name) => format!("{name}/{model}"),
-        None => model.to_string(),
-    };
+    let target = model_text(provider, model);
     let mut line = format!(
         "reagent: profile {}, model {target}, credential {}",
         profile.unwrap_or("none"),
@@ -1461,7 +1527,7 @@ fn start_line(
 /// Builds the provider named on the command line, or reports why not, with the
 /// saved login the run may have to warn about and where the credential came
 /// from. The scripted testing provider has no credential, so it gives none.
-async fn build_provider(
+pub(crate) async fn build_provider(
     args: &Args,
 ) -> Result<
     (

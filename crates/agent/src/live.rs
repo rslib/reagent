@@ -6,10 +6,12 @@
 //! waits on the channel only while no run is open.
 
 use std::collections::VecDeque;
+use std::fmt;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use reagent_ai::{Message, Text};
+use reagent_ai::{Message, Provider, Text};
 use reagent_config::permissions::PermissionMode;
 
 use crate::agent_loop::Agent;
@@ -29,15 +31,45 @@ pub enum SendMode {
     Queue,
 }
 
+/// A provider a client switches the session to, shared so a request that is
+/// already in flight keeps the one it was sent with.
+#[derive(Clone)]
+pub struct Swap(pub Arc<dyn Provider>);
+
+impl fmt::Debug for Swap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Swap({})", self.0.name())
+    }
+}
+
+impl PartialEq for Swap {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Swap {}
+
 /// What a client asks the session to change for the next request.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
+    /// The provider the next request goes to, when the client switches it.
+    pub provider: Option<Swap>,
+    /// The config provider id of that provider, when the client switches it.
+    pub config_provider: Option<Text>,
     /// The provider model id, when the client changes it.
     pub model: Option<Text>,
     /// The reasoning level text, when the client changes it.
     pub level: Option<Text>,
     /// The permission mode to switch to; the mode stays when it is `None`.
     pub mode: Option<PermissionMode>,
+    /// Whether the model takes images, when the client changes it.
+    pub images: Option<bool>,
+    /// The cap on reply tokens, when the client changes it.
+    pub max_tokens: Option<u32>,
+    /// The prompt size, in tokens, that triggers a compaction, when the
+    /// client changes it.
+    pub compact_budget: Option<u64>,
 }
 
 /// One request of one client.
@@ -57,12 +89,21 @@ pub enum Command {
         /// The client that asked.
         client: ClientId,
     },
-    /// Change the model, the level or the mode for the next request.
+    /// Change the model, the level, the mode or the limits for the next
+    /// request.
     Set {
         /// The client that asked.
         client: ClientId,
         /// The values to change; each is left alone when it is `None`.
         settings: Settings,
+    },
+    /// Replace the older turns with a checkpoint now, ending it with `note`
+    /// when one is given.
+    Compact {
+        /// The client that asked.
+        client: ClientId,
+        /// The text the checkpoint ends with, when the client gives one.
+        note: Option<Text>,
     },
     /// Answer a call that waits for approval: run it once, allow its rule for
     /// this session, save the rule, refuse it or skip it.
@@ -92,6 +133,8 @@ pub struct Inbox {
     queue: VecDeque<(ClientId, Text)>,
     /// Settings taken during a stream, applied before the next request.
     held: Vec<Settings>,
+    /// Compactions taken during a stream, run before the next request.
+    compactions: Vec<Option<Text>>,
 }
 
 /// Creates the command channel of one session.
@@ -102,6 +145,7 @@ pub fn channel() -> (Sender, Inbox) {
         pending: Vec::new(),
         queue: VecDeque::new(),
         held: Vec::new(),
+        compactions: Vec::new(),
     };
     (sender, inbox)
 }
@@ -143,6 +187,16 @@ impl Inbox {
     /// Holds settings a stream took, for the next boundary.
     pub(crate) fn hold(&mut self, settings: Settings) {
         self.held.push(settings);
+    }
+
+    /// Holds a compaction a stream took, for the next request.
+    pub(crate) fn hold_compaction(&mut self, note: Option<Text>) {
+        self.compactions.push(note);
+    }
+
+    /// The compactions waiting for a request, oldest first.
+    pub(crate) fn take_compactions(&mut self) -> std::vec::Drain<'_, Option<Text>> {
+        self.compactions.drain(..)
     }
 
     /// The steer texts waiting for a boundary, oldest first.
@@ -212,7 +266,9 @@ pub async fn run_live(
             let Some(command) = inbox.wait().await else {
                 return;
             };
-            agent.idle(command, inbox, events).await;
+            agent
+                .idle(command, history, &mut journal, inbox, events)
+                .await;
         }
         // A run starts with the steer texts taken while the session waited, or
         // else the oldest queued message. They go to history only: the run
@@ -236,7 +292,9 @@ pub async fn run_live(
         // A cancel that arrived after the run ended has nothing to stop; it
         // must not stop the next run before its first request.
         while let Some(command) = inbox.ready() {
-            agent.idle(command, inbox, events).await;
+            agent
+                .idle(command, history, &mut journal, inbox, events)
+                .await;
         }
     }
 }
@@ -257,6 +315,7 @@ mod tests {
 
     use super::*;
     use crate::agent_loop::AgentConfig;
+    use crate::compact::Compact;
     use crate::event::TurnEndReason;
     use crate::tool::{Registry, Tool, ToolOutput};
 
@@ -453,6 +512,124 @@ mod tests {
             }
         }
         panic!("the events ended before the one the test waited for");
+    }
+
+    fn compact(note: Option<&str>) -> Command {
+        Command::Compact {
+            client: 9,
+            note: note.map(Text::from),
+        }
+    }
+
+    /// A resumed history of `turns` turns of 10 KB each, longer than the tail a
+    /// compaction keeps.
+    fn long_history(turns: usize) -> Vec<Message> {
+        let mut history = vec![Message::user("task")];
+        let chunk = "x".repeat(10_000);
+        for _ in 0..turns {
+            history.push(Message::user(chunk.as_str()));
+            history.push(Message::assistant(reagent_ai::AssistantMessage::new(
+                "p",
+                "m",
+                vec![Content::Text {
+                    text: Text::from(chunk.as_str()),
+                }],
+            )));
+        }
+        history
+    }
+
+    /// Sends `command` to an idle session of `history` and waits for the
+    /// event `wanted` answers.
+    async fn idle_compact(
+        mut agent: Agent<'_>,
+        history: &mut Vec<Message>,
+        command: Command,
+        wanted: impl Fn(&Event) -> bool,
+    ) {
+        let (tx, mut inbox) = channel();
+        let (events, mut rx) = mpsc::channel(256);
+        let driver = async {
+            tx.send(command).await.expect("the session is open");
+            until(&mut rx, wanted).await;
+            drop(tx);
+        };
+        let session = run_live(&mut agent, history, None, &events, &mut inbox);
+        tokio::join!(session, driver);
+    }
+
+    #[tokio::test]
+    async fn a_compact_command_compacts_an_idle_session_at_once() {
+        let script = Script::new(vec![], vec![], channel().0);
+        let registry = registry();
+        let agent = Agent::new(&script, &registry, config(), CancellationToken::new())
+            .with_compact(Compact::with_budget(10_000_000, "."));
+        let mut history = long_history(20);
+        idle_compact(
+            agent,
+            &mut history,
+            compact(Some("keep the API notes")),
+            |event| matches!(event, Event::Compacted { .. }),
+        )
+        .await;
+
+        assert_eq!(text_of(&history[0]), "task", "the first message stays");
+        let checkpoint = text_of(&history[1]);
+        assert!(checkpoint.contains("## Checkpoint 1"), "{checkpoint}");
+        assert!(
+            checkpoint.ends_with("\n\nNote from the user: keep the API notes"),
+            "{checkpoint}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_compact_command_compacts_with_the_policy_off() {
+        let script = Script::new(vec![], vec![], channel().0);
+        let registry = registry();
+        let agent = Agent::new(&script, &registry, config(), CancellationToken::new())
+            .with_compact_on_request(Compact::new("."));
+        let mut history = long_history(20);
+        let turns = history.len();
+        idle_compact(agent, &mut history, compact(None), |event| {
+            matches!(event, Event::Compacted { .. })
+        })
+        .await;
+
+        assert!(text_of(&history[1]).contains("## Checkpoint 1"));
+        assert!(
+            history.len() < turns,
+            "older turns went into the checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_compact_command_with_nothing_to_go_reaches_the_client() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(vec![text_reply("one")], vec![], tx.clone());
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new())
+            .with_compact_on_request(Compact::new("."));
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            until(&mut rx, |event| matches!(event, Event::RunEnd(_))).await;
+            tx.send(compact(None)).await.expect("the session is open");
+            until(
+                &mut rx,
+                |event| matches!(event, Event::Error(error) if &**error == "nothing to compact"),
+            )
+            .await;
+            script.close();
+            drop(tx);
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        tokio::join!(session, driver);
+
+        assert_eq!(history.len(), 2, "the history is unchanged");
     }
 
     #[tokio::test]
@@ -837,7 +1014,7 @@ mod tests {
                     id: Text::from("call_1"),
                     is_error: false,
                     bytes: 2,
-                    error: None,
+                    output: Some(Text::from("hi")),
                     images: Vec::new(),
                 },
                 Event::TurnEnd(TurnEndReason::EndTurn),

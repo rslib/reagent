@@ -815,6 +815,105 @@ async fn a_set_of_the_level_and_the_mode_is_in_the_journal_and_a_resume() {
 }
 
 #[tokio::test]
+async fn a_settings_event_names_what_the_journal_recorded() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let provider = FakeProvider::new(vec![text_reply("done")]);
+    let registry = Registry::new();
+    let (tx, mut inbox) = live::channel();
+    let (events, mut rx) = mpsc::channel(64);
+    let mut history = Vec::new();
+    let mut journal = journal(dir.path());
+    let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new())
+        .with_guard(asking_guard());
+
+    let session = live::run_live(
+        &mut agent,
+        &mut history,
+        Some(&mut journal),
+        &events,
+        &mut inbox,
+    );
+    let client = async {
+        tx.send(Command::Set {
+            client: 1,
+            settings: Settings {
+                level: Some(Text::from("high")),
+                mode: Some(PermissionMode::AcceptEdits),
+                ..Settings::default()
+            },
+        })
+        .await
+        .expect("the session is open");
+        tx.send(Command::Send {
+            client: 1,
+            text: Text::from("hello"),
+            mode: SendMode::Steer,
+        })
+        .await
+        .expect("the session is open");
+        drop(tx);
+        let mut seen = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let ended = matches!(event, Event::RunEnd(_));
+            seen.push(event);
+            if ended {
+                break;
+            }
+        }
+        seen
+    };
+    let (_, seen) = tokio::join!(session, client);
+    journal.close().expect("close the journal");
+
+    // One event per `set`, naming exactly what the session applied.
+    let settings: Vec<&Event> = seen
+        .iter()
+        .filter(|event| matches!(event, Event::Settings { .. }))
+        .collect();
+    assert_eq!(
+        settings,
+        [&Event::Settings {
+            model: None,
+            level: Some(Text::from("high")),
+            mode: Some(PermissionMode::AcceptEdits),
+        }],
+        "the event names the level and the mode the session applied: {seen:?}"
+    );
+
+    // The writer takes the event as a notice, not as a record: the journal holds
+    // the one settings record the `set` itself made (in the base the run opens
+    // with, which leaves the flush nothing to write), naming exactly what the
+    // event names, and none from the event itself.
+    let mut recorded = Vec::new();
+    for record in Session::open(dir.path())
+        .expect("open the session")
+        .records()
+    {
+        let record = record.expect("a record reads");
+        if record.kind != crate::journal::kinds::SETTINGS {
+            continue;
+        }
+        match record::decode_aside(record.kind, &record.payload).expect("the record decodes") {
+            Some(Aside::Settings(settings)) => recorded.push(settings),
+            _ => panic!("a settings kind decodes as a settings record"),
+        }
+    }
+    assert_eq!(
+        recorded.len(),
+        1,
+        "the base, and nothing for the flush or the event: {recorded:?}"
+    );
+    for settings in &recorded {
+        assert_eq!(settings.level.as_deref(), Some("high"), "{settings:?}");
+        assert_eq!(
+            settings.mode.as_deref(),
+            Some("accept-edits"),
+            "{settings:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_resume_of_a_waiting_approval_asks_the_same_question() {
     let dir = tempfile::tempdir().expect("temp dir");
     let runs = Arc::new(Mutex::new(0usize));

@@ -13,7 +13,7 @@ use reagent_ai::{
 
 use crate::archive::Archive;
 use crate::batch::{Note, Outcome, run_all_noted};
-use crate::compact::Compact;
+use crate::compact::{Compact, Compacted};
 use crate::event::{Event, TurnEndReason};
 use crate::guard::{Answer, Guard};
 use crate::journal::Journal;
@@ -90,6 +90,9 @@ pub struct AgentConfig {
 /// or a cap is reached.
 pub struct Agent<'a> {
     provider: &'a dyn Provider,
+    /// The provider a client switched the session to, if any: the next request
+    /// goes to it instead of the borrowed one.
+    swapped: Option<Arc<dyn Provider>>,
     registry: &'a Registry,
     config: AgentConfig,
     token: CancellationToken,
@@ -97,11 +100,16 @@ pub struct Agent<'a> {
     mask: Option<Mask>,
     archive: Option<Arc<Archive>>,
     compact: Option<Compact>,
+    /// The compaction a client may ask for when the policy is off.
+    requested: Option<Compact>,
     guard: Option<Guard>,
     ledger: Ledger,
     workspace: Option<&'a dyn Workspace>,
     fingerprint: Option<u64>,
     provider_name: Text,
+    /// The config provider id of the provider, when one is known: the name
+    /// `reagent --model <config>/<model>` takes.
+    config_provider: Option<Text>,
     model: Text,
     /// How many compactions replaced the history so far, for the base record.
     compactions: u32,
@@ -132,17 +140,20 @@ impl<'a> Agent<'a> {
     ) -> Self {
         Self {
             provider,
+            swapped: None,
             registry,
             token,
             policies: Vec::new(),
             mask: None,
             archive: None,
             compact: None,
+            requested: None,
             guard: None,
             ledger: Ledger::default(),
             workspace: None,
             fingerprint: None,
             provider_name: Text::from(provider.name()),
+            config_provider: None,
             model: Text::from(config.model.as_str()),
             compactions: 0,
             completed: 0,
@@ -167,17 +178,20 @@ impl<'a> Agent<'a> {
     ) -> Self {
         Self {
             provider,
+            swapped: None,
             registry,
             token,
             policies,
             mask: None,
             archive: None,
             compact: None,
+            requested: None,
             guard: None,
             ledger: Ledger::default(),
             workspace: None,
             fingerprint: None,
             provider_name: Text::from(provider.name()),
+            config_provider: None,
             model: Text::from(config.model.as_str()),
             compactions: 0,
             completed: 0,
@@ -187,6 +201,14 @@ impl<'a> Agent<'a> {
             changed_settings: false,
             config,
         }
+    }
+
+    /// Names the config provider id of the starting provider, so a request and
+    /// a resume keep it.
+    #[must_use]
+    pub fn with_config_provider(mut self, config: Option<Text>) -> Self {
+        self.config_provider = config;
+        self
     }
 
     /// Numbers the first turn of this run `first`.
@@ -223,6 +245,15 @@ impl<'a> Agent<'a> {
     pub fn with_compact(mut self, compact: Compact) -> Self {
         self.compact = Some(compact);
         self.archive.get_or_insert_with(Archive::new);
+        self
+    }
+
+    /// Lets a client ask for a compaction while the policy is off. The
+    /// outputs it removes are not kept for the expand tool, which such a run
+    /// does not offer.
+    #[must_use]
+    pub fn with_compact_on_request(mut self, compact: Compact) -> Self {
+        self.requested = Some(compact);
         self
     }
 
@@ -311,6 +342,9 @@ impl<'a> Agent<'a> {
         // A new session starts with a base: the state and the history. A
         // resumed run's parent part holds the history already, so it writes
         // only what came after it (a new message, an interrupted result).
+        let base = journal
+            .as_ref()
+            .is_some_and(|journal| journal.recorded().is_none());
         if let Some(journal) = journal.as_mut()
             && let Err(error) = match journal.recorded() {
                 None => write_base(journal, self, history),
@@ -321,6 +355,9 @@ impl<'a> Agent<'a> {
             emit(events, &self.token, Event::Error(error)).await;
             emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
             return;
+        }
+        if base {
+            self.based();
         }
         committed(&journal, self.live, events, &self.token).await;
         let mut run_reason = loop {
@@ -351,25 +388,13 @@ impl<'a> Agent<'a> {
                 _ => None,
             };
             if let Some(done) = compacted {
-                let event = Event::Compacted {
-                    before: done.before,
-                    replaced: done.replaced as u32,
-                    bytes: done.bytes as u32,
-                };
-                let closed = emit(events, &self.token, event).await;
-                self.compactions += 1;
-                // A compaction replaced the history: a base records the state
-                // and the history the run continues with.
-                if let Some(journal) = journal.as_mut()
-                    && let Err(error) = write_base(journal, self, history)
-                {
-                    let error = journal_error(&error);
-                    emit(events, &self.token, Event::Error(error)).await;
-                    break TurnEndReason::Error;
-                }
-                committed(&journal, self.live, events, &self.token).await;
-                if closed {
-                    break TurnEndReason::Cancelled;
+                match self.compacted(done, history, &mut journal, events).await {
+                    Ok(true) => break TurnEndReason::Cancelled,
+                    Ok(false) => {}
+                    Err(error) => {
+                        emit(events, &self.token, Event::Error(error)).await;
+                        break TurnEndReason::Error;
+                    }
                 }
             }
             if let (Some(mask), Some(archive)) = (&self.mask, &self.archive)
@@ -482,6 +507,17 @@ impl<'a> Agent<'a> {
             drained.steered = true;
         }
         self.apply_held(inbox, events).await;
+        // A compaction a client asked for runs before the next request, as the
+        // automatic one does.
+        for note in inbox.take_compactions() {
+            if let Some(error) = self
+                .compact_now(note.as_deref(), history, journal, events)
+                .await
+            {
+                drained.error = Some(error);
+                return drained;
+            }
+        }
         // A settings change reaches the journal before the request it applies
         // to, so a resume applies the values the model saw.
         let mut wrote = false;
@@ -490,7 +526,12 @@ impl<'a> Agent<'a> {
             let Some(journal) = journal.as_mut() else {
                 break;
             };
-            match write_settings(journal, self.provider_name.as_ref(), &settings) {
+            match write_settings(
+                journal,
+                self.provider_name.as_ref(),
+                self.config_provider.as_deref(),
+                &settings,
+            ) {
                 Ok(()) => wrote = true,
                 Err(error) => {
                     self.unrecorded.push(settings);
@@ -526,12 +567,78 @@ impl<'a> Agent<'a> {
                     return true;
                 }
                 Command::Set { settings, .. } => inbox.hold(settings),
+                Command::Compact { note, .. } => inbox.hold_compaction(note),
                 Command::Approve { client, id, answer } => {
                     self.approve(client, id, answer, events).await;
                 }
             }
         }
         false
+    }
+
+    /// Records a compaction of the history: the event, the base a resume reads
+    /// and the committed record. Returns whether the channel closed.
+    async fn compacted(
+        &mut self,
+        done: Compacted,
+        history: &[Message],
+        journal: &mut Option<&mut Journal>,
+        events: &mpsc::Sender<Event>,
+    ) -> Result<bool, Text> {
+        let closed = emit(
+            events,
+            &self.token,
+            Event::Compacted {
+                before: done.before,
+                after: done.after,
+                replaced: done.replaced as u32,
+                bytes: done.bytes as u32,
+            },
+        )
+        .await;
+        self.compactions += 1;
+        // A compaction replaced the history: a base records the state and the
+        // history the run continues with.
+        if let Some(journal) = journal.as_mut() {
+            write_base(journal, self, history).map_err(|error| journal_error(&error))?;
+            self.based();
+        }
+        committed(journal, self.live, events, &self.token).await;
+        Ok(closed)
+    }
+
+    /// Runs a compaction a client asked for, ending the new checkpoint with
+    /// `note`. A history with nothing older than the kept tail is reported to
+    /// every client, and returns the journal error, if any.
+    async fn compact_now(
+        &mut self,
+        note: Option<&str>,
+        history: &mut Vec<Message>,
+        journal: &mut Option<&mut Journal>,
+        events: &mpsc::Sender<Event>,
+    ) -> Option<Text> {
+        let done = match self.compact.as_ref().or(self.requested.as_ref()) {
+            Some(compact) => {
+                let archive = match &self.archive {
+                    Some(archive) => Arc::clone(archive),
+                    None => Archive::new(),
+                };
+                compact.request(history, &archive, note).await
+            }
+            None => None,
+        };
+        let Some(done) = done else {
+            let _ = emit(
+                events,
+                &self.token,
+                Event::Error(Text::from("nothing to compact")),
+            )
+            .await;
+            return None;
+        };
+        self.compacted(done, &history[..], journal, events)
+            .await
+            .err()
     }
 
     /// Waits for `work` while it takes the commands a client sends meanwhile,
@@ -597,6 +704,8 @@ impl<'a> Agent<'a> {
     pub(crate) async fn idle(
         &mut self,
         command: Command,
+        history: &mut Vec<Message>,
+        journal: &mut Option<&mut Journal>,
         inbox: &mut Inbox,
         events: &mpsc::Sender<Event>,
     ) {
@@ -605,6 +714,23 @@ impl<'a> Agent<'a> {
                 self.accept(client, text, mode, inbox, events).await;
             }
             Command::Set { settings, .. } => self.set(settings, events).await,
+            // No run is open to compact before a request, so it runs at once.
+            Command::Compact { note, .. } => {
+                let compactions = self.compactions;
+                if let Some(error) = self
+                    .compact_now(note.as_deref(), history, journal, events)
+                    .await
+                {
+                    emit(events, &self.token, Event::Error(error)).await;
+                }
+                // The base holds the whole history now, so the next run writes
+                // only the messages after it.
+                if self.compactions > compactions
+                    && let Some(journal) = journal.as_deref_mut()
+                {
+                    crate::journal::resume::mark_recorded(journal, history.len());
+                }
+            }
             Command::Approve { client, id, answer } => {
                 self.approve(client, id, answer, events).await;
             }
@@ -647,15 +773,35 @@ impl<'a> Agent<'a> {
         }
     }
 
-    /// Applies settings to the next request: the model, the reasoning level and
-    /// the permission mode. A request that is already in flight keeps the values
-    /// it was sent with.
+    /// The provider the next request goes to: the one a client switched to,
+    /// else the borrowed one.
+    fn provider(&self) -> &dyn Provider {
+        match &self.swapped {
+            Some(provider) => &**provider,
+            None => self.provider,
+        }
+    }
+
+    /// Applies settings to the next request: the provider and its config id,
+    /// the model, the reasoning level, the permission mode and the limits. A
+    /// request that is already in flight keeps the values it was sent with.
     ///
     /// The change waits for the next [`Agent::flush`], which writes it to the
     /// journal: no journal is open here when a session applies a setting while
     /// no run is running.
     async fn set(&mut self, settings: Settings, events: &mpsc::Sender<Event>) {
         let mut recorded = Settings::default();
+        // The provider goes first: the model and the level are the new one's.
+        if let Some(swap) = &settings.provider {
+            self.swapped = Some(Arc::clone(&swap.0));
+            let name = self.provider().name();
+            self.provider_name = Text::from(name);
+            // A provider names its own config id, or none.
+            self.config_provider = None;
+        }
+        if let Some(config) = &settings.config_provider {
+            self.config_provider = Some(config.clone());
+        }
         if let Some(model) = &settings.model {
             self.model = model.clone();
             self.config.model = model.to_string();
@@ -681,12 +827,48 @@ impl<'a> Agent<'a> {
                 recorded.mode = Some(mode);
             }
         }
+        // The limits are neither journal records nor settings events: the
+        // client that asks knows the model and the window it picked them from.
+        if let Some(images) = settings.images {
+            self.config.images = images;
+        }
+        if let Some(max_tokens) = settings.max_tokens {
+            self.config.max_tokens = max_tokens;
+        }
+        if let Some(budget) = settings.compact_budget
+            && let Some(compact) = self.compact.as_mut()
+        {
+            compact.set_budget(budget);
+        }
         if recorded.level.is_some() || recorded.mode.is_some() {
             self.changed_settings = true;
         }
         if recorded.model.is_some() || recorded.level.is_some() || recorded.mode.is_some() {
+            // Every client hears what the session applied, not what the `set`
+            // asked for: this is the record the journal writes, so a refused
+            // mode is in neither.
+            let applied = Event::Settings {
+                model: recorded.model.clone(),
+                level: recorded.level.clone(),
+                mode: recorded.mode,
+            };
             self.unrecorded.push(recorded);
+            let _ = emit(events, &self.token, applied).await;
         }
+    }
+
+    /// Drops the level and the mode of the changes still to record, once a base
+    /// holds the ones the run has now. A model change stays: the base does not
+    /// name the config provider its record carries.
+    fn based(&mut self) {
+        if !self.changed_settings {
+            return;
+        }
+        for settings in &mut self.unrecorded {
+            settings.level = None;
+            settings.mode = None;
+        }
+        self.unrecorded.retain(|settings| settings.model.is_some());
     }
 
     /// Handles one command of a live session that arrived while the model
@@ -705,6 +887,7 @@ impl<'a> Agent<'a> {
                 self.token.cancel();
             }
             Command::Set { settings, .. } => inbox.hold(settings),
+            Command::Compact { note, .. } => inbox.hold_compaction(note),
             Command::Approve { client, id, answer } => {
                 self.approve(client, id, answer, events).await;
             }
@@ -877,7 +1060,7 @@ impl<'a> Agent<'a> {
         for result in slots {
             history.push(result.expect("the batch answers every call"));
         }
-        let facts: Vec<(usize, Option<Text>, Vec<Image>)> = facts
+        let facts: Vec<Fact> = facts
             .into_iter()
             .map(|fact| fact.expect("the batch answers every call"))
             .collect();
@@ -889,12 +1072,12 @@ impl<'a> Agent<'a> {
             emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
             return TurnEndReason::Error;
         }
-        for (call, (bytes, error, images)) in calls.iter().zip(facts) {
+        for (call, (bytes, output, is_error, images)) in calls.iter().zip(facts) {
             let event = Event::ToolResult {
                 id: call.id.clone(),
-                is_error: error.is_some(),
+                is_error,
                 bytes,
-                error,
+                output,
                 images,
             };
             if emit(events, &self.token, event).await {
@@ -1264,12 +1447,13 @@ impl<'a> Agent<'a> {
                     return TurnOutcome::Error(error);
                 }
                 for (call, fact) in calls.iter().zip(facts) {
-                    let (bytes, error, images) = fact.expect("the batch answers every call");
+                    let (bytes, output, is_error, images) =
+                        fact.expect("the batch answers every call");
                     let event = Event::ToolResult {
                         id: call.id.clone(),
-                        is_error: error.is_some(),
+                        is_error,
                         bytes,
-                        error,
+                        output,
                         images,
                     };
                     if emit(events, &self.token, event).await {
@@ -1398,7 +1582,7 @@ impl<'a> Agent<'a> {
         mut inbox: Option<&mut Inbox>,
     ) -> ConsumeOutcome {
         let request = self.request(history);
-        let mut stream = self.provider.stream(&request);
+        let mut stream = self.provider().stream(&request);
         // Room is reserved for a whole batch of events at once, so a streamed
         // answer waits on the channel once per batch instead of once per
         // delta. A channel smaller than a batch keeps its one-event behaviour.
@@ -1473,9 +1657,9 @@ impl<'a> Agent<'a> {
     }
 }
 
-/// The event fields of one tool result: its size, its error text and its
-/// images.
-type Fact = (usize, Option<Text>, Vec<Image>);
+/// The event fields of one tool result: its size, its output text, whether it
+/// failed and its images.
+type Fact = (usize, Option<Text>, bool, Vec<Image>);
 
 /// What the loop does with each note of a tool batch as it arrives: the note
 /// for the agent's own repair, the re-read ledger, the journal record and its
@@ -1569,7 +1753,13 @@ impl Results<'_, '_, '_> {
             }
             _ => result,
         };
-        self.facts[at] = Some((tool_bytes(&result), tool_error(&result), images(&result)));
+        let failed = matches!(&result, Message::ToolResult(result) if result.is_error);
+        self.facts[at] = Some((
+            tool_bytes(&result),
+            tool_output(&result),
+            failed,
+            images(&result),
+        ));
         let mut wrote = false;
         if let Some(journal) = self.journal.as_mut() {
             match journal.message(&result).and_then(|()| journal.commit()) {
@@ -1617,11 +1807,12 @@ impl Results<'_, '_, '_> {
 fn write_settings(
     journal: &mut Journal,
     provider: &str,
+    config: Option<&str>,
     settings: &Settings,
 ) -> std::io::Result<()> {
     let mut wrote = false;
     if let Some(model) = &settings.model {
-        journal.model(provider, model)?;
+        journal.model_config(provider, model, config)?;
         wrote = true;
     }
     if settings.level.is_some() || settings.mode.is_some() {
@@ -1865,7 +2056,7 @@ impl std::fmt::Debug for Agent<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Agent")
-            .field("provider", &self.provider.name())
+            .field("provider", &self.provider().name())
             .field("config", &self.config)
             .finish_non_exhaustive()
     }
@@ -2267,10 +2458,13 @@ fn with_note(message: Message, note: &str) -> Message {
     Message::ToolResult(result)
 }
 
-/// The text of a failed result, shared with the message, or `None`.
-fn tool_error(message: &Message) -> Option<Text> {
+/// The output text of a result, shared with the message: a clone of the text
+/// is an `Arc` clone. A result with images and no text carries `None`.
+fn tool_output(message: &Message) -> Option<Text> {
     match message {
-        Message::ToolResult(result) if result.is_error => Some(Text::clone(&result.content)),
+        Message::ToolResult(result) if !result.content.is_empty() => {
+            Some(Text::clone(&result.content))
+        }
         _ => None,
     }
 }
@@ -2553,13 +2747,15 @@ mod tests {
         assert!(matches!(message.content[1], Content::Thinking { .. }));
     }
     use std::path::Path;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use bytes::Bytes;
     use futures_util::future::BoxFuture;
     use reagent_ai::Error;
     use reagent_ai::fake::FakeProvider;
-    use reagent_ai::{Role, ToolSpec};
+    use reagent_ai::{Image, ImageType, Role, ToolSpec};
+    use reagent_config::permissions::PermissionMode;
     use reagent_store::{Header, Session};
     use serde::Deserialize;
     use serde_json::json;
@@ -3656,6 +3852,86 @@ mod tests {
             .filter(|record| matches!(record, Record::TurnEnd(_)))
             .count();
         assert_eq!(turn_ends, 2, "one per turn");
+    }
+
+    #[tokio::test]
+    async fn config_provider_of_a_set_reaches_the_model_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let provider = FakeProvider::new(Vec::new());
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let (sender, mut inbox) = crate::live::channel();
+        let mut history = Vec::new();
+        let mut journal = journal(dir.path());
+        let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new());
+
+        agent
+            .set(
+                Settings {
+                    model: Some(Text::from("gpt-5")),
+                    config_provider: Some(Text::from("openrouter")),
+                    ..Settings::default()
+                },
+                &tx,
+            )
+            .await;
+        agent
+            .flush(&mut history, &mut Some(&mut journal), &mut inbox, &tx)
+            .await;
+        journal.close().expect("close the journal");
+        drop(sender);
+
+        assert_eq!(
+            read_records(dir.path()),
+            [Record::Model(record::Model {
+                provider: "fake".into(),
+                model: "gpt-5".into(),
+                config: Some(Text::from("openrouter")),
+            })]
+        );
+    }
+
+    /// The first base of a new session holds a level set before its first run,
+    /// so the change is not written a second time after it.
+    #[tokio::test]
+    async fn a_level_set_before_the_first_run_is_recorded_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let provider = FakeProvider::new(vec![text_reply("done")]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let (sender, mut inbox) = crate::live::channel();
+        let mut history = vec![Message::user("hello")];
+        let mut journal = journal(dir.path());
+        let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new());
+
+        agent
+            .set(
+                Settings {
+                    level: Some(Text::from("high")),
+                    ..Settings::default()
+                },
+                &tx,
+            )
+            .await;
+        agent
+            .run_with_inbox(&mut history, Some(&mut journal), &tx, &mut inbox)
+            .await;
+        journal.close().expect("close the journal");
+        drop(sender);
+
+        let session = Session::open(dir.path()).expect("open the session");
+        let settings = session
+            .records()
+            .filter(|record| {
+                record
+                    .as_ref()
+                    .is_ok_and(|record| record.kind == crate::journal::kinds::SETTINGS)
+            })
+            .count();
+        assert_eq!(
+            settings, 1,
+            "the base holds the level, and nothing after it"
+        );
     }
 
     /// A tool whose result is too big for a record of the log.
@@ -5007,6 +5283,507 @@ mod tests {
 
         assert_eq!(thinkings_in(&history), vec!["why"]);
         assert_eq!(texts_in(&history), vec!["x</think>\ny"]);
+    }
+
+    /// A guard over no rules: every call runs, and the mode `bypass` is off.
+    fn guard() -> Guard {
+        Guard::new(reagent_config::permissions::Rules::none())
+    }
+
+    #[tokio::test]
+    async fn a_settings_event_names_what_the_session_applied() {
+        let provider = FakeProvider::new(Vec::new());
+        let registry = Registry::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_guard(guard());
+
+        agent
+            .set(
+                Settings {
+                    model: Some(Text::from("m2")),
+                    level: Some(Text::from("high")),
+                    mode: Some(PermissionMode::Auto),
+                    ..Settings::default()
+                },
+                &tx,
+            )
+            .await;
+
+        // One event, with every value the session took, in one place.
+        let events = drain(tx, &mut rx);
+        assert_eq!(
+            events,
+            [Event::Settings {
+                model: Some(Text::from("m2")),
+                level: Some(Text::from("high")),
+                mode: Some(PermissionMode::Auto),
+            }]
+        );
+        assert_eq!(&*agent.model, "m2");
+        assert_eq!(agent.config.reasoning.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn a_settings_event_leaves_out_a_mode_the_guard_refused() {
+        let provider = FakeProvider::new(Vec::new());
+        let registry = Registry::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_guard(guard());
+
+        // `bypass` is off for this run, so the guard keeps the old mode: the
+        // error says so, and the model still applies.
+        agent
+            .set(
+                Settings {
+                    model: Some(Text::from("m2")),
+                    mode: Some(PermissionMode::Bypass),
+                    ..Settings::default()
+                },
+                &tx,
+            )
+            .await;
+
+        let events = drain(tx, &mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Error(text) if text.contains("bypass"))),
+            "the refusal is an error event: {events:?}"
+        );
+        // What the session applied is the model alone: the refused mode is not
+        // in the event, so no client is told it is.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Settings { .. }))
+                .collect::<Vec<_>>(),
+            [&Event::Settings {
+                model: Some(Text::from("m2")),
+                level: None,
+                mode: None,
+            }]
+        );
+
+        // A set of nothing but a refused mode applies nothing: no event at all.
+        let (tx, mut rx) = mpsc::channel(8);
+        agent
+            .set(
+                Settings {
+                    mode: Some(PermissionMode::Bypass),
+                    ..Settings::default()
+                },
+                &tx,
+            )
+            .await;
+        let events = drain(tx, &mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Settings { .. })),
+            "nothing applied, so nothing is named: {events:?}"
+        );
+    }
+
+    /// A provider that plays a [`FakeProvider`]'s replies under its own name.
+    struct Named {
+        name: &'static str,
+        inner: FakeProvider,
+    }
+
+    impl Named {
+        fn new(name: &'static str, replies: Vec<Vec<StreamEvent>>) -> Self {
+            Self {
+                name,
+                inner: FakeProvider::new(replies),
+            }
+        }
+    }
+
+    impl Provider for Named {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn stream(
+            &self,
+            request: &Request<'_>,
+        ) -> futures_util::stream::BoxStream<'static, Result<StreamEvent, Error>> {
+            self.inner.stream(request)
+        }
+    }
+
+    /// A [`Named`] provider that sends `plan` into the session while its first
+    /// request streams.
+    struct Planning {
+        named: Named,
+        plan: std::sync::Mutex<Vec<Command>>,
+        sender: crate::live::Sender,
+    }
+
+    impl Provider for Planning {
+        fn name(&self) -> &'static str {
+            self.named.name()
+        }
+
+        fn stream(
+            &self,
+            request: &Request<'_>,
+        ) -> futures_util::stream::BoxStream<'static, Result<StreamEvent, Error>> {
+            for command in std::mem::take(&mut *self.plan.lock().expect("plan lock")) {
+                let _ = self.sender.try_send(command);
+            }
+            self.named.stream(request)
+        }
+    }
+
+    /// The name of the provider the last message of `history` names.
+    fn last_provider(history: &[Message]) -> String {
+        match history.last() {
+            Some(Message::Assistant(reply)) => reply.provider.to_string(),
+            other => panic!("the run ends with a reply: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_switch_sends_the_next_request_to_the_new_provider() {
+        let first = Named::new("first", vec![text_reply("one"), text_reply("two")]);
+        let second = Arc::new(Named::new("second", vec![text_reply("three")]));
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let (_sender, mut inbox) = crate::live::channel();
+        let mut history = vec![Message::user("hello")];
+        let mut agent = Agent::new(&first, &registry, config(), CancellationToken::new());
+
+        agent.run(&mut history, None, &tx).await;
+        let mut journal = None;
+        agent
+            .idle(
+                Command::Set {
+                    client: 1,
+                    settings: Settings {
+                        provider: Some(crate::live::Swap(Arc::clone(&second) as Arc<dyn Provider>)),
+                        model: Some(Text::from("model-b")),
+                        ..Settings::default()
+                    },
+                },
+                &mut history,
+                &mut journal,
+                &mut inbox,
+                &tx,
+            )
+            .await;
+        agent.run(&mut history, None, &tx).await;
+
+        let seen = second.inner.seen();
+        assert_eq!(seen.len(), 1, "the second provider sends the next request");
+        assert_eq!(seen[0].model, "model-b", "the set carried the model too");
+        assert_eq!(
+            first.inner.seen().len(),
+            1,
+            "the first provider sends one request"
+        );
+        assert_eq!(last_provider(&history), "second", "the reply names it");
+    }
+
+    #[tokio::test]
+    async fn provider_switch_held_during_a_stream_waits_for_the_next_request() {
+        let (sender, mut inbox) = crate::live::channel();
+        let second = Arc::new(Named::new("second", vec![text_reply("three")]));
+        let first = Planning {
+            named: Named::new("first", vec![text_reply("one"), text_reply("two")]),
+            plan: std::sync::Mutex::new(vec![
+                Command::Set {
+                    client: 1,
+                    settings: Settings {
+                        provider: Some(crate::live::Swap(Arc::clone(&second) as Arc<dyn Provider>)),
+                        model: Some(Text::from("model-b")),
+                        ..Settings::default()
+                    },
+                },
+                Command::Send {
+                    client: 1,
+                    text: Text::from("say more"),
+                    mode: SendMode::Steer,
+                },
+            ]),
+            sender,
+        };
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+        let mut agent = Agent::new(&first, &registry, config(), CancellationToken::new());
+
+        agent
+            .run_with_inbox(&mut history, None, &tx, &mut inbox)
+            .await;
+
+        let seen = second.inner.seen();
+        assert_eq!(seen.len(), 1, "the held switch waits for the next request");
+        assert_eq!(seen[0].model, "model-b", "the set carried the model too");
+        assert_eq!(seen[0].messages, 3, "the reply, then the steer message");
+        assert_eq!(
+            first.named.inner.seen().len(),
+            1,
+            "the request in flight keeps its provider"
+        );
+        assert_eq!(last_provider(&history), "second", "the reply names it");
+    }
+
+    #[tokio::test]
+    async fn provider_switch_with_no_provider_keeps_the_old_one() {
+        let first = Named::new("first", vec![text_reply("one"), text_reply("two")]);
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let (_sender, mut inbox) = crate::live::channel();
+        let mut history = vec![Message::user("hello")];
+        let mut agent = Agent::new(&first, &registry, config(), CancellationToken::new());
+
+        agent.run(&mut history, None, &tx).await;
+        let mut journal = None;
+        agent
+            .idle(
+                Command::Set {
+                    client: 1,
+                    settings: Settings {
+                        model: Some(Text::from("model-b")),
+                        ..Settings::default()
+                    },
+                },
+                &mut history,
+                &mut journal,
+                &mut inbox,
+                &tx,
+            )
+            .await;
+        agent.run(&mut history, None, &tx).await;
+
+        let seen = first.inner.seen();
+        assert_eq!(seen.len(), 2, "the first provider sends both requests");
+        assert_eq!(seen[1].model, "model-b", "the model changed");
+        assert_eq!(
+            last_provider(&history),
+            "first",
+            "the reply still names the old provider"
+        );
+    }
+
+    /// A provider that keeps the caps and the image flag of every request.
+    struct Limits {
+        inner: FakeProvider,
+        seen: Arc<Mutex<Vec<(u32, bool)>>>,
+    }
+
+    impl Provider for Limits {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn stream(
+            &self,
+            request: &Request<'_>,
+        ) -> futures_util::stream::BoxStream<'static, Result<StreamEvent, Error>> {
+            self.seen
+                .lock()
+                .expect("requests lock")
+                .push((request.max_tokens, request.images));
+            self.inner.stream(request)
+        }
+    }
+
+    /// A history of `turns` tool turns, each result 4 KB, whose newest reply
+    /// reports `prompt` input tokens, so compaction has room to cut.
+    fn long_history(turns: usize, prompt: u64) -> Vec<Message> {
+        let mut history = vec![Message::user("fix the bug")];
+        for n in 1..=turns {
+            let id = format!("call_{n}");
+            let mut reply = AssistantMessage::new(
+                "fake",
+                "fake",
+                vec![Content::ToolCall(ToolCall {
+                    id: Text::from(id.as_str()),
+                    name: Text::from("echo"),
+                    arguments: Text::from(r#"{"message":"a"}"#),
+                })],
+            );
+            reply.usage = Usage {
+                input_tokens: prompt,
+                ..Usage::default()
+            };
+            history.push(Message::assistant(reply));
+            history.push(Message::tool_result(id, "x".repeat(4_000), false));
+        }
+        history
+    }
+
+    /// The prompt sizes, in tokens, of the compactions the events report.
+    fn compacted(events: &[Event]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Compacted { before, .. } => Some(*before),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn switch_limits_take_the_new_compaction_budget() {
+        let provider = FakeProvider::new(vec![text_reply("done")]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = long_history(60, 1_000);
+        let archive = Archive::new();
+        let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_archive(Arc::clone(&archive))
+            .with_compact(Compact::with_budget(10_000_000, "."));
+
+        agent
+            .set(
+                Settings {
+                    compact_budget: Some(1_000),
+                    ..Settings::default()
+                },
+                &tx,
+            )
+            .await;
+        agent.run(&mut history, None, &tx).await;
+
+        assert_eq!(compacted(&drain(tx, &mut rx)), [1_000]);
+        assert!(
+            history.iter().any(|message| match message {
+                Message::User { content } => content.iter().any(|content| matches!(
+                    content,
+                    Content::Text { text } if text.contains("## Checkpoint 1")
+                )),
+                _ => false,
+            }),
+            "the old turns are one checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_limits_without_compaction_change_nothing() {
+        let provider = FakeProvider::new(vec![text_reply("done")]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = long_history(60, 1_000);
+        let archive = Archive::new();
+        let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_archive(Arc::clone(&archive))
+            .with_compact(Compact::with_budget(10_000_000, "."));
+
+        // A set that names no budget keeps the one the session runs.
+        agent
+            .set(
+                Settings {
+                    max_tokens: Some(4_096),
+                    images: Some(false),
+                    ..Settings::default()
+                },
+                &tx,
+            )
+            .await;
+        agent.run(&mut history, None, &tx).await;
+        assert!(
+            compacted(&drain(tx, &mut rx)).is_empty(),
+            "nothing compacts"
+        );
+
+        // A budget with no compact policy cuts nothing either.
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = long_history(60, 1_000);
+        let provider = FakeProvider::new(vec![text_reply("done")]);
+        let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_archive(Arc::clone(&archive));
+        agent
+            .set(
+                Settings {
+                    compact_budget: Some(1_000),
+                    ..Settings::default()
+                },
+                &tx,
+            )
+            .await;
+        agent.run(&mut history, None, &tx).await;
+        assert!(
+            compacted(&drain(tx, &mut rx)).is_empty(),
+            "no policy, no cut"
+        );
+        assert_eq!(history.len(), 2 + 60 * 2, "the history keeps its turns");
+    }
+
+    #[tokio::test]
+    async fn switch_limits_turn_images_off() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = Limits {
+            inner: FakeProvider::new(vec![text_reply("done")]),
+            seen: Arc::clone(&seen),
+        };
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![
+            Message::user("go"),
+            Message::tool_result_with_images(
+                "call_0",
+                "one image",
+                false,
+                vec![Image {
+                    media_type: ImageType::Png,
+                    width: 1,
+                    height: 1,
+                    data: Text::from("aGk="),
+                }],
+            ),
+        ];
+        let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new());
+
+        agent
+            .set(
+                Settings {
+                    images: Some(false),
+                    ..Settings::default()
+                },
+                &tx,
+            )
+            .await;
+        agent.run(&mut history, None, &tx).await;
+
+        let seen = seen.lock().expect("requests lock").clone();
+        assert_eq!(seen, [(128, false)], "the next request sends no image");
+        // The image stays in the history: only the request leaves it out.
+        assert!(
+            matches!(&history[1], Message::ToolResult(result) if !result.images.is_empty()),
+            "the result keeps its image"
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_limits_take_max_tokens() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = Limits {
+            inner: FakeProvider::new(vec![text_reply("done")]),
+            seen: Arc::clone(&seen),
+        };
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("go")];
+        let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new());
+
+        agent
+            .set(
+                Settings {
+                    max_tokens: Some(4_096),
+                    ..Settings::default()
+                },
+                &tx,
+            )
+            .await;
+        agent.run(&mut history, None, &tx).await;
+
+        let seen = seen.lock().expect("requests lock").clone();
+        assert_eq!(seen, [(4_096, true)]);
     }
 }
 

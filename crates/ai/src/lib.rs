@@ -12,6 +12,7 @@ pub mod oauth;
 pub mod openai;
 pub mod pi;
 pub mod providers;
+pub mod record;
 mod request_images;
 pub mod sse;
 pub mod types;
@@ -28,6 +29,7 @@ pub use types::{
 };
 
 use futures_util::stream::BoxStream;
+use std::borrow::Cow;
 
 /// One event of a streaming assistant reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,11 +152,55 @@ impl Error {
     }
 }
 
+/// The message of a provider error body, parsed without copying it.
+#[derive(serde::Deserialize)]
+struct ErrorBody<'a> {
+    #[serde(borrow)]
+    error: Option<ErrorField<'a>>,
+    #[serde(borrow)]
+    message: Option<Cow<'a, str>>,
+}
+
+/// The `error` field of a provider error body: an object or a string.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ErrorField<'a> {
+    /// An object with an optional message.
+    Object {
+        #[serde(borrow)]
+        message: Option<Cow<'a, str>>,
+    },
+    /// The message itself.
+    Text(#[serde(borrow)] Cow<'a, str>),
+}
+
+/// The message of a provider error body, else the body as it is.
+fn status_message(body: &str) -> Cow<'_, str> {
+    let Ok(ErrorBody { error, message }) = serde_json::from_str::<ErrorBody<'_>>(body) else {
+        return Cow::Borrowed(body);
+    };
+    let error = error.map(|error| match error {
+        ErrorField::Object { message } => message,
+        ErrorField::Text(text) => Some(text),
+    });
+    let message = match error.flatten().or(message) {
+        Some(Cow::Borrowed(text)) => Cow::Borrowed(text.trim()),
+        Some(Cow::Owned(text)) => Cow::Owned(text.trim().to_string()),
+        None => Cow::Borrowed(body),
+    };
+    if message.is_empty() {
+        return Cow::Borrowed(body);
+    }
+    message
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Http(message) => write!(f, "http error: {message}"),
-            Error::Status { code, body, .. } => write!(f, "provider status {code}: {body}"),
+            Error::Status { code, body, .. } => {
+                write!(f, "provider status {code}: {}", status_message(body))
+            }
             Error::Json(error) => write!(f, "json error: {error}"),
             Error::Transient(message) => write!(f, "transient provider error: {message}"),
             Error::Protocol(message) => write!(f, "protocol error: {message}"),
@@ -326,6 +372,56 @@ mod tests {
             retry.wait_ms,
             Some(1500),
             "retry-after-ms wins over retry-after"
+        );
+    }
+
+    fn status_body(body: &str) -> String {
+        Error::Status {
+            code: 400,
+            body: body.into(),
+            retry: Retry::default(),
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn status_message_reads_error_message() {
+        let body = r#"{"error":{"message":"m is not a valid model ID","code":400},"user_id":"u"}"#;
+        assert_eq!(
+            status_body(body),
+            "provider status 400: m is not a valid model ID"
+        );
+    }
+
+    #[test]
+    fn status_message_reads_a_top_level_message() {
+        assert_eq!(
+            status_body(r#"{"message":"bad"}"#),
+            "provider status 400: bad"
+        );
+    }
+
+    #[test]
+    fn status_message_reads_a_string_error() {
+        assert_eq!(
+            status_body(r#"{"error":"bad key"}"#),
+            "provider status 400: bad key"
+        );
+    }
+
+    #[test]
+    fn status_message_keeps_a_plain_body() {
+        assert_eq!(
+            status_body("upstream timed out"),
+            "provider status 400: upstream timed out"
+        );
+    }
+
+    #[test]
+    fn status_message_keeps_a_body_with_no_message() {
+        assert_eq!(
+            status_body(r#"{"detail":"x"}"#),
+            r#"provider status 400: {"detail":"x"}"#
         );
     }
 

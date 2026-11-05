@@ -15,7 +15,7 @@ reagent-store.workspace = true
 reagent-util.workspace = true
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
-tokio = { version = "1.53.3", default-features = false, features = ["rt", "time", "sync", "fs", "io-util", "macros"] }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "time", "sync", "fs", "io-util", "macros"] }
 tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
@@ -25,7 +25,7 @@ nix = { version = "0.31.3", default-features = false, features = ["time"] }
 reagent-ai = { workspace = true, features = ["testing"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 tempfile = { version = "3.27.0", default-features = false }
-tokio = { version = "1.53.3", default-features = false, features = ["test-util"] }
+tokio = { version = "1.54.1", default-features = false, features = ["test-util"] }
 
 [lints]
 workspace = true
