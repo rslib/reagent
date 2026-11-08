@@ -183,6 +183,9 @@ pub struct Input {
     resize: SignalEvent,
     /// The bytes read and not yet parsed.
     parser: Parser,
+    /// The event [`Input::ready`] took out of the parser, which
+    /// [`Input::next`] answers first.
+    peeked: Option<Event>,
     /// Where the answers to the first frame's two queries go.
     background: Background,
 }
@@ -200,7 +203,31 @@ impl Input {
             resize: tokio::signal::unix::signal(SignalKind::window_change())?,
             parser: Parser::new(),
             background,
+            peeked: None,
         })
+    }
+
+    /// Whether [`Input::next`] answers at once, with no wait for the tty.
+    ///
+    /// A signal takes no event slot: the answers to the first frame's two
+    /// queries are recorded here, as `next` records them, so no byte of either
+    /// is ever read as a key. Only a whole event counts: a lone `ESC` or the
+    /// front of a sequence waits for the bytes the parser does not have yet.
+    pub fn ready(&mut self) -> bool {
+        if self.peeked.is_some() {
+            return true;
+        }
+        loop {
+            match self.parser.next_event() {
+                Some(Signal::Event(event)) => {
+                    self.peeked = Some(event);
+                    return true;
+                }
+                Some(Signal::Background(color)) => self.background.record(color),
+                Some(Signal::DeviceAttributes) => self.background.record_attributes(),
+                None => return false,
+            }
+        }
     }
 
     /// The next event: the next whole event in the bytes already read, else the
@@ -214,6 +241,9 @@ impl Input {
     /// parsed out of them stay in `self`, so a key is not lost when the future
     /// is dropped, which the app does whenever another of its branches is ready.
     pub async fn next(&mut self) -> io::Result<Event> {
+        if let Some(event) = self.peeked.take() {
+            return Ok(event);
+        }
         loop {
             while let Some(signal) = self.parser.next_event() {
                 match signal {
@@ -325,4 +355,52 @@ fn tty_path(fd: libc::c_int) -> io::Result<PathBuf> {
     // buffer, which `from_ptr` reads up to that NUL and no further.
     let name = unsafe { CStr::from_ptr(name.as_ptr()) };
     Ok(PathBuf::from(OsStr::from_bytes(name.to_bytes())))
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::*;
+
+    /// An input whose parser already holds `bytes`: a socket pair stands in for
+    /// the tty, which this reads no byte of, so no test needs a terminal.
+    fn input(bytes: &[u8]) -> Input {
+        let (read, _write) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+        #[expect(clippy::disallowed_types, reason = "the tty's own descriptor")]
+        let tty = std::fs::File::from(std::os::fd::OwnedFd::from(read));
+        // SAFETY: the descriptor stays open and unchanged for as long as the
+        // reactor holds it, which is the life of the input.
+        let tty = unsafe { AsyncFd::register(tty) }.expect("a registered descriptor");
+        let mut parser = Parser::new();
+        let room = parser.tail();
+        room[..bytes.len()].copy_from_slice(bytes);
+        parser.commit(bytes.len(), false);
+        Input {
+            tty,
+            resize: tokio::signal::unix::signal(SignalKind::window_change()).expect("a signal"),
+            parser,
+            background: Background::default(),
+            peeked: None,
+        }
+    }
+
+    /// A ready event is answered once: `ready` takes it out of the parser and
+    /// `next` returns it, and the parser holds no second copy of it.
+    #[tokio::test]
+    async fn ready_then_next_answers_the_same_event_once() {
+        let mut input = input(b"a");
+        assert!(input.ready(), "a whole key is already read");
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(input.next().await.expect("an event"), key);
+        assert!(!input.ready(), "the event was answered once");
+    }
+
+    /// A part of a sequence waits for the bytes behind it, so it is no event to
+    /// draw over.
+    #[tokio::test]
+    async fn ready_waits_for_the_rest_of_a_sequence() {
+        let mut input = input(b"\x1b[1;");
+        assert!(!input.ready(), "the sequence is not whole yet");
+    }
 }

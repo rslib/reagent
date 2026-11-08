@@ -143,6 +143,24 @@ impl Host for CliHost {
             Ok(opened(&state, &cwd, &entry))
         })
     }
+
+    fn delete(&self, session: &str) -> HostFuture<Result<(), String>> {
+        let state = self.state.clone();
+        let cwd = self.cwd.clone();
+        let session = session.to_owned();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let (folder, dir) = crate::session::locate_in(&state, &cwd, &session)?;
+                crate::session::remove(&folder, &dir)
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        })
+    }
+
+    fn copy(&self, text: &str) {
+        reagent_tui::clipboard::copy(text);
+    }
 }
 
 /// The answer a worker's discovery entry gives, with the folder the store keeps
@@ -246,6 +264,7 @@ fn entries_in(dir: &Path, name: &str) -> Vec<Model> {
             prices: entry
                 .price
                 .map(|price| (price.input * MILLION, price.output * MILLION)),
+            reasoning: entry.reasoning,
         })
         .collect()
 }
@@ -381,6 +400,56 @@ mod tests {
         assert!(models.providers[2].models.is_empty(), "no cache, no model");
     }
 
+    /// The model list of the TUI carries the reasoning plan of the cache, so the
+    /// level sheet lists the words of the model the session runs.
+    #[test]
+    fn the_tui_model_list_carries_the_reasoning_plan() {
+        use reagent_ai::catalog::{Cache, Entry};
+        use reagent_ai::levels::{Level, Levels, Reasoning};
+
+        let cache_dir = tempfile::tempdir().expect("temp dir");
+        let mut levels = Levels::default();
+        levels.insert(Level::Low);
+        levels.insert(Level::High);
+        let entry = Entry {
+            id: "fast".to_string(),
+            context_window: Some(200_000),
+            max_output: None,
+            price: None,
+            price_source: None,
+            reasoning: Some(Reasoning {
+                levels,
+                off: Some(true),
+                mandatory: false,
+                default: Some(Level::High),
+                unknown: vec!["ultra".to_string()],
+            }),
+            images: None,
+        };
+        reagent_ai::catalog::write(
+            cache_dir.path(),
+            "paid",
+            &Cache {
+                fetched_at: 1,
+                models: vec![entry],
+            },
+        )
+        .expect("writes the cache");
+
+        let models = models_in(&settings(), &logins(), Some(cache_dir.path()), None);
+        let plan = models.providers[1].models[0]
+            .reasoning
+            .as_ref()
+            .expect("the plan of the model");
+        assert_eq!(&*models.providers[1].models[0].id, "paid/fast");
+        assert_eq!(plan.off, Some(true));
+        assert!(!plan.mandatory);
+        assert_eq!(plan.default, Some(Level::High));
+        assert!(plan.levels.contains(Level::Low));
+        assert!(plan.levels.contains(Level::High));
+        assert_eq!(plan.unknown, ["ultra"]);
+    }
+
     #[tokio::test]
     async fn list_files_tui_host_leaves_the_ignored_ones_out_and_cuts_at_the_cap() {
         let root = tempfile::tempdir().expect("temp dir");
@@ -502,5 +571,69 @@ mod tests {
             1,
             "the answer started no worker"
         );
+    }
+
+    /// A session folder of `cwd` under `state`, with one part, and the folder.
+    fn session(state: &Path, cwd: &Path, id: &str) -> PathBuf {
+        let dir = paths::sessions_root(state)
+            .join(paths::cwd_key(cwd))
+            .join(id);
+        let writer = reagent_store::Writer::create(
+            &dir,
+            reagent_store::Header {
+                part_id: 1,
+                session_id: id.to_owned(),
+                created_ms: 1,
+                fork: None,
+                meta: Default::default(),
+            },
+        )
+        .expect("a session part");
+        writer.close().expect("close the part");
+        assert!(dir.is_dir());
+        dir
+    }
+
+    #[tokio::test]
+    async fn delete_tui_host_removes_a_session_folder() {
+        let state = tempfile::tempdir().expect("state");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let dir = session(state.path(), cwd.path(), "s1");
+        let host = CliHost::new(
+            cwd.path().to_path_buf(),
+            None,
+            state.path().to_path_buf(),
+            Vec::new(),
+        );
+
+        let answer = host.delete("s1").await;
+
+        assert_eq!(answer, Ok(()));
+        assert!(!dir.exists(), "the session folder is gone");
+        let folder = paths::sessions_root(state.path()).join(paths::cwd_key(cwd.path()));
+        let list = reagent_store::SessionList::open(&folder, crate::session::entry_of)
+            .expect("the session list")
+            .all()
+            .to_vec();
+        assert!(list.is_empty(), "the list names the session no more");
+    }
+
+    #[tokio::test]
+    async fn delete_tui_host_answers_err_for_an_unknown_id() {
+        let state = tempfile::tempdir().expect("state");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let host = CliHost::new(
+            cwd.path().to_path_buf(),
+            None,
+            state.path().to_path_buf(),
+            Vec::new(),
+        );
+
+        let answer = host.delete("0000").await;
+
+        let Err(text) = answer else {
+            panic!("an unknown session has no folder: {answer:?}");
+        };
+        assert!(text.contains("no session matches"), "{text}");
     }
 }

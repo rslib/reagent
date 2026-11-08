@@ -15,10 +15,9 @@ linux-x86_64 7479296
 #
 # The full build with the TUI (default features), checked by the same script
 # against the `-tui` lines; the lines above are the build without it.
-# darwin-arm64-tui: measured 5520448 bytes on 2026-10-30 (TUI change 1: screen,
-# streaming markdown with pulldown-cmark, editor, worker client; 5155056
-# without the TUI), budget 5799936.
+# darwin-arm64-tui: measured 5754832 bytes on 2026-11-05 (with the native
+# clipboard; 5754096 before it), budget 5799936 set on 2026-10-30.
 darwin-arm64-tui 5799936
-# linux-x86_64-tui: measured 7708072 bytes on 2026-10-30 (dftu-gate; 7130568
-# without the TUI), budget 8093696.
-linux-x86_64-tui 8093696
+# linux-x86_64-tui: measured 8404888 bytes on 2026-11-05 (lab workspace, with the
+# native clipboard: wl-clipboard-rs and x11rb; 8093096 before them), budget 8826880.
+linux-x86_64-tui 8826880

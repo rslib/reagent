@@ -952,7 +952,13 @@ pub async fn run(mut args: Args) -> ExitCode {
     if worker.is_some() {
         return ExitCode::SUCCESS;
     }
-    exit_code(&reason, Cause::from_u8(cause.load(Ordering::SeqCst)))
+    let cause = Cause::from_u8(cause.load(Ordering::SeqCst));
+    if !args.json
+        && let Some(note) = stop_note(&reason, cause, plan.as_ref().map(|plan| plan.id.as_str()))
+    {
+        eprintln!("reagent: {note}");
+    }
+    exit_code(&reason, cause)
 }
 
 /// The provider and model of the session a run continues, as one `--model`
@@ -1273,6 +1279,39 @@ fn stop_string(reason: &TurnEndReason) -> Option<&'static str> {
         }),
         _ => None,
     }
+}
+
+/// Why a run that did not finish stopped, for a plain run's stderr: these
+/// endings send no error event, and the last turn may have left no answer, so
+/// nothing else says it. An error printed its own message, and a person who
+/// pressed Ctrl+C knows.
+fn stop_note(reason: &TurnEndReason, cause: Cause, session: Option<&str>) -> Option<String> {
+    let note = match (reason, cause) {
+        (TurnEndReason::EndTurn | TurnEndReason::Error, _)
+        | (TurnEndReason::Cancelled, Cause::CtrlC) => return None,
+        (TurnEndReason::MaxTurns, _) => {
+            let mut note =
+                format!("stopped at the limit of {MAX_TURNS} turns; the task may not be done");
+            if let Some(session) = session {
+                note.push_str(&format!(
+                    "; continue with: reagent --resume {session} -p continue"
+                ));
+            }
+            return Some(note);
+        }
+        (TurnEndReason::Cancelled, Cause::Deadline) => {
+            "stopped at the deadline; the task may not be done"
+        }
+        (TurnEndReason::Cancelled, _) => "the run was cancelled",
+        (TurnEndReason::Stopped(StopReason::MaxTokens), _) => {
+            "stopped: the reply hit the model's output limit"
+        }
+        (TurnEndReason::Stopped(StopReason::Refusal), _) => {
+            "stopped: the model refused the request"
+        }
+        (TurnEndReason::Stopped(_), _) => "stopped: the provider ended the reply with an error",
+    };
+    Some(note.to_owned())
 }
 
 /// Maps the run outcome to the documented exit code. The cause counts only
@@ -1647,6 +1686,45 @@ mod fake {
 
     use reagent_ai::fake::FakeProvider;
     use reagent_ai::{Error, StopReason, StreamEvent, Text};
+
+    /// Each ending that sends no error names itself, and the others stay quiet.
+    #[test]
+    fn a_plain_run_says_why_it_stopped_for_each_ending() {
+        use super::{Cause, TurnEndReason};
+
+        let note = |reason, cause| super::stop_note(&reason, cause, Some("abc"));
+        assert_eq!(note(TurnEndReason::EndTurn, Cause::None), None);
+        assert_eq!(note(TurnEndReason::Error, Cause::None), None, "it printed");
+        assert_eq!(note(TurnEndReason::Cancelled, Cause::CtrlC), None);
+        let limit = note(TurnEndReason::MaxTurns, Cause::None).expect("the limit");
+        assert!(limit.contains("limit of 200"), "{limit}");
+        assert!(limit.contains("--resume abc"), "{limit}");
+        let unsaved = super::stop_note(&TurnEndReason::MaxTurns, Cause::None, None);
+        assert!(!unsaved.expect("the limit").contains("--resume"));
+        let words = [
+            (TurnEndReason::Cancelled, Cause::Deadline, "deadline"),
+            (TurnEndReason::Cancelled, Cause::None, "cancelled"),
+            (
+                TurnEndReason::Stopped(StopReason::MaxTokens),
+                Cause::None,
+                "output limit",
+            ),
+            (
+                TurnEndReason::Stopped(StopReason::Refusal),
+                Cause::None,
+                "refused",
+            ),
+            (
+                TurnEndReason::Stopped(StopReason::Error),
+                Cause::None,
+                "error",
+            ),
+        ];
+        for (reason, cause, word) in words {
+            let text = note(reason, cause).expect("a note");
+            assert!(text.contains(word), "{word}: {text}");
+        }
+    }
 
     /// One parsed reply: assistant text, any tool calls it makes and optional
     /// token usage.

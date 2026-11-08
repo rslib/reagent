@@ -31,6 +31,10 @@ enum Command {
     Commit {
         reply: Option<oneshot::Sender<io::Result<()>>>,
     },
+    /// Answer once every command before this one is done.
+    Written {
+        reply: oneshot::Sender<io::Result<()>>,
+    },
     /// Commit, sync, and stop.
     Close,
 }
@@ -103,6 +107,22 @@ impl Writer {
             Ok(()) => Ok(()),
             Err(_) => Err(self.latch.stopped()),
         }
+    }
+
+    /// Answers once the writer thread has done every commit asked for so far, so
+    /// a reader of the file finds them and a killed process keeps them. No sync:
+    /// a power cut can still lose them. An I/O error answers as the error.
+    pub fn written(&self) -> oneshot::Receiver<io::Result<()>> {
+        let (reply, rx) = oneshot::channel();
+        if let Err(error) = self.latch.check() {
+            let _ = reply.send(Err(error));
+            return rx;
+        }
+        if let Err(SendError(Command::Written { reply })) = self.tx.send(Command::Written { reply })
+        {
+            let _ = reply.send(Err(self.latch.stopped()));
+        }
+        rx
     }
 
     /// Commits and syncs; the reply arrives after the data is on the disk.
@@ -189,7 +209,7 @@ fn run(mut writer: PartWriter<std::fs::File>, rx: Receiver<Command>, latch: Arc<
     while let Ok(command) = rx.recv() {
         if let Some(error) = latch.error() {
             match command {
-                Command::Commit { reply: Some(reply) } => {
+                Command::Commit { reply: Some(reply) } | Command::Written { reply } => {
                     let _ = reply.send(Err(error));
                 }
                 Command::Close => return,
@@ -215,6 +235,9 @@ fn run(mut writer: PartWriter<std::fs::File>, rx: Receiver<Command>, latch: Arc<
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(step(&latch, result));
+            }
+            Command::Written { reply } => {
+                let _ = reply.send(Ok(()));
             }
             Command::Close => {
                 let _ = finish(&mut writer, &latch);
@@ -368,6 +391,44 @@ mod tests {
             "flush, write the chunk, then sync"
         );
         writer.close().expect("close");
+    }
+
+    #[tokio::test]
+    async fn written_answers_after_the_commit_is_written_with_no_sync() {
+        let dir = TempDir::new().expect("temp dir");
+        let part = 81;
+        let mut writer = Writer::create(dir.path(), header(part)).expect("writer");
+        let _ = hook::take(part);
+        writer
+            .append(10, Bytes::from_static(b"a record"), false)
+            .expect("append");
+        writer.commit().expect("commit");
+        writer.written().await.expect("reply").expect("written");
+        assert_eq!(
+            hook::take(part),
+            vec![hook::Event::Flush, hook::Event::Write],
+            "the commit is written, and nothing synced it"
+        );
+        writer.close().expect("close");
+    }
+
+    #[tokio::test]
+    async fn written_answers_the_error_of_a_failed_write() {
+        let dir = TempDir::new().expect("temp dir");
+        let part = 82;
+        let mut writer = Writer::create(dir.path(), header(part)).expect("writer");
+        writer
+            .append(10, Bytes::from_static(b"a record"), false)
+            .expect("append");
+        hook::fail_next_write(part);
+        writer.commit().expect("the thread takes the commit");
+        let error = writer
+            .written()
+            .await
+            .expect("reply")
+            .expect_err("the injected write fails");
+        assert!(error.to_string().contains("injected"), "{error}");
+        assert!(writer.close().is_err(), "closing reports it too");
     }
 
     #[tokio::test]

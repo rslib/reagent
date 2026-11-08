@@ -25,6 +25,8 @@ pub struct Model {
     pub window: Option<u64>,
     /// The price in USD per million tokens: in, out.
     pub prices: Option<(f64, f64)>,
+    /// The reasoning levels the model takes, when they are known.
+    pub reasoning: Option<reagent_ai::levels::Reasoning>,
 }
 
 /// The models of one configured provider.
@@ -128,6 +130,10 @@ pub trait Host: Send + Sync {
     fn login(&self, provider: &str) -> tokio::sync::mpsc::Receiver<LoginStep>;
     /// Starts or finds the worker `target` names.
     fn open(&self, target: Target) -> HostFuture<Result<Opened, String>>;
+    /// Removes the session `session` names from the disk.
+    fn delete(&self, session: &str) -> HostFuture<Result<(), String>>;
+    /// Puts text in the local system clipboard; returns at once.
+    fn copy(&self, text: &str);
 }
 
 /// A [`Host`] that answers at once from what it was given, for tests.
@@ -138,8 +144,11 @@ pub struct FakeHost {
     providers: Vec<&'static str>,
     steps: Vec<Vec<LoginStep>>,
     open: Result<Opened, String>,
+    delete: Result<(), String>,
     logged: Mutex<Vec<String>>,
     opened: Mutex<Vec<Target>>,
+    deleted: Mutex<Vec<String>>,
+    copied: Mutex<Vec<String>>,
 }
 
 impl FakeHost {
@@ -173,6 +182,17 @@ impl FakeHost {
         self
     }
 
+    /// Sets what deleting a session answers.
+    pub fn with_delete(mut self, delete: Result<(), String>) -> Self {
+        self.delete = delete;
+        self
+    }
+
+    /// The sessions `delete` was called with, in order.
+    pub fn deleted(&self) -> Vec<String> {
+        self.deleted.lock().expect("no poisoned lock").clone()
+    }
+
     /// The providers `login` was called with, in order.
     pub fn logged(&self) -> Vec<String> {
         self.logged.lock().expect("no poisoned lock").clone()
@@ -181,6 +201,11 @@ impl FakeHost {
     /// The targets `open` was called with, in order.
     pub fn opened(&self) -> Vec<Target> {
         self.opened.lock().expect("no poisoned lock").clone()
+    }
+
+    /// The texts `copy` was called with, in order.
+    pub fn copied(&self) -> Vec<String> {
+        self.copied.lock().expect("no poisoned lock").clone()
     }
 }
 
@@ -192,8 +217,11 @@ impl Default for FakeHost {
             providers: Vec::new(),
             steps: Vec::new(),
             open: Err("no session".to_owned()),
+            delete: Ok(()),
             logged: Mutex::new(Vec::new()),
             opened: Mutex::new(Vec::new()),
+            deleted: Mutex::new(Vec::new()),
+            copied: Mutex::new(Vec::new()),
         }
     }
 }
@@ -232,6 +260,22 @@ impl Host for FakeHost {
         let open = self.open.clone();
         Box::pin(async move { open })
     }
+
+    fn delete(&self, session: &str) -> HostFuture<Result<(), String>> {
+        self.deleted
+            .lock()
+            .expect("no poisoned lock")
+            .push(session.to_owned());
+        let delete = self.delete.clone();
+        Box::pin(async move { delete })
+    }
+
+    fn copy(&self, text: &str) {
+        self.copied
+            .lock()
+            .expect("no poisoned lock")
+            .push(text.to_owned());
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +293,7 @@ mod tests {
                     id: Arc::from("anthropic/opus"),
                     window: Some(200_000),
                     prices: Some((15.0, 75.0)),
+                    reasoning: None,
                 }],
             }],
         }
@@ -339,5 +384,16 @@ mod tests {
             .with_login("anthropic", vec![LoginStep::Done]);
 
         assert_eq!(host.logins(), ["openai", "anthropic"]);
+    }
+
+    #[tokio::test]
+    async fn fake_records_deletes_and_answers_what_it_was_given() {
+        let host = FakeHost::new();
+        assert_eq!(host.delete("s1").await, Ok(()));
+        assert_eq!(host.deleted(), ["s1"]);
+
+        let host = FakeHost::new().with_delete(Err("a fork reads it".to_owned()));
+        assert_eq!(host.delete("s2").await, Err("a fork reads it".to_owned()));
+        assert_eq!(host.deleted(), ["s2"]);
     }
 }

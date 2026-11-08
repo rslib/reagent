@@ -211,6 +211,25 @@ fn inline_code_has_one_space_of_fill_each_side() {
     }
 }
 
+/// A theme with no fill interns the code style as the body's, so the code pad
+/// must come from the span itself: bold keeps one space on each side and inline
+/// code keeps its two.
+#[test]
+fn bold_spacing_in_a_theme_with_no_fill() {
+    for mode in [Mode::Terminal, Mode::NoColor] {
+        let theme = Theme::resolve(mode, Depth::Ansi256, &Overrides::default());
+        let mut markdown = Markdown::new(40);
+        markdown.set_theme(&theme);
+        markdown.push("Some **bold** text with `code` end\n");
+        markdown.finish();
+        assert_eq!(
+            rows(&markdown),
+            ["Some bold text with  code  end"],
+            "{mode:?} pads a piece that is not code"
+        );
+    }
+}
+
 #[test]
 fn streaming_a_second_paragraph_adds_its_blank_row_once() {
     let mut markdown = Markdown::new(40);

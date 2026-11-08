@@ -4,7 +4,7 @@
 //! queues while no popup is open, Shift+Enter or Ctrl+J starts a new line, Esc
 //! cancels, the second Ctrl+C within [`QUIT_WINDOW`] quits, the arrows, Home,
 //! End, Backspace, Delete, Ctrl+A, B, E, K, U and W edit, and Up and Down go to
-//! the history when the editor cannot move. Every key a terminal reports in
+//! the history when the editor cannot move, as Ctrl+P and Ctrl+N do. Every key a terminal reports in
 //! more than one form maps the same way: the legacy forms are in the tests.
 //! Mapping one key allocates nothing.
 //!
@@ -30,8 +30,9 @@
 //! sheet in its place, and each one takes its own keys in its own function
 //! ([`list_key`] and [`sheet_key`]); the text box keeps the rest of the map, so
 //! typing in a list still edits the query. The leader gains Ctrl+X m for the
-//! model sheet and Ctrl+X l for the sessions sheet, both plain keys, and Esc
-//! right after Ctrl+X closes the leader instead of cancelling the run. The one
+//! model sheet, Ctrl+X l for the sessions sheet and Ctrl+X t for the level
+//! sheet, all plain keys, and Esc right after Ctrl+X closes the leader instead
+//! of cancelling the run. The one
 //! table ([`HINTS`], with [`STATUS`] for the status line) is what the hints, the
 //! which-key list and the help sheet read, and [`Keys::leader_pending`] tells the
 //! app when to draw the which-key list.
@@ -74,6 +75,9 @@ pub enum Action {
     Pick,
     /// Esc in a list or a sheet: close it.
     Close,
+    /// Ctrl+D in the sessions sheet: arm the row on screen, and delete it on
+    /// the second press.
+    Delete,
     /// A key the editor handles.
     Edit(EditKey),
     /// Ctrl+L: draw the whole screen again.
@@ -91,9 +95,9 @@ pub enum EditKey {
     Left,
     /// One grapheme right.
     Right,
-    /// One visual line up, else the history.
+    /// Up or Ctrl+P: one visual line up, else the history.
     Up,
-    /// One visual line down, else the history.
+    /// Down or Ctrl+N: one visual line down, else the history.
     Down,
     /// The start of the visual row.
     Home,
@@ -145,8 +149,10 @@ pub enum EditKey {
     Mark,
     /// Ctrl+X Ctrl+X: exchange the cursor and the mark.
     Exchange,
-    /// Ctrl+Q and Ctrl+V: insert the next key as it is.
+    /// Ctrl+Q: insert the next key as it is.
     Quote,
+    /// Ctrl+V: put the image of the clipboard in the box as a chip.
+    PasteImage,
     /// Ctrl+]: move to the next character the next key names.
     CharSearch,
     /// Alt+Ctrl+]: move to the last one the next key names.
@@ -157,10 +163,6 @@ pub enum EditKey {
     NegativeArgument,
     /// The key a quoted insert or a character search waited for.
     NextKey(Option<char>),
-    /// Ctrl+P: the previous message of the session.
-    HistoryUp,
-    /// Ctrl+N: the next message of the session, and the draft last.
-    HistoryDown,
     /// Alt+<: the oldest message of the session.
     HistoryOldest,
     /// Alt+>: the draft again.
@@ -206,6 +208,8 @@ pub enum Leader {
     FocusSidebar,
     /// Ctrl+X m: the model sheet.
     Model,
+    /// Ctrl+X t: the level sheet.
+    Level,
     /// Ctrl+X l: the sessions sheet.
     Sessions,
     /// Ctrl+X /: the command palette.
@@ -396,6 +400,10 @@ pub struct Hint {
     pub words: &'static str,
     /// Where the key works.
     pub group: Group,
+    /// The `section:action` of each key of the hint, in order, which says which
+    /// keys a file moved; a token with no section is printed as it is. Empty
+    /// for a hint whose keys are already all there.
+    pub acts: &'static str,
 }
 
 /// Every key the help sheet lists, in its order.
@@ -404,151 +412,193 @@ pub const HINTS: &[Hint] = &[
         keys: "enter",
         words: "send or steer",
         group: Group::TextBox,
+        acts: "keys:send",
     },
     Hint {
         keys: "alt+enter",
         words: "queue",
         group: Group::TextBox,
+        acts: "keys:queue",
     },
     Hint {
         keys: "shift+enter",
         words: "new line",
         group: Group::TextBox,
+        acts: "keys:new-line",
     },
     Hint {
         keys: "ctrl+x /",
         words: "commands",
         group: Group::TextBox,
+        acts: "keys:leader leader:commands",
     },
     Hint {
         keys: "/",
         words: "commands",
         group: Group::TextBox,
+        acts: "",
     },
     Hint {
         keys: "@",
         words: "files",
         group: Group::TextBox,
+        acts: "",
     },
     Hint {
         keys: "?",
         words: "keys",
         group: Group::TextBox,
+        acts: "",
     },
     Hint {
-        keys: "esc",
+        keys: "esc ctrl+g",
         words: "interrupt",
         group: Group::TextBox,
+        acts: "keys:cancel keys:abort-search",
     },
     Hint {
         keys: "ctrl+c ctrl+c",
         words: "quit",
         group: Group::TextBox,
+        acts: "keys:quit keys:quit",
     },
     Hint {
         keys: "ctrl+a ctrl+e",
         words: "line ends",
         group: Group::TextBox,
+        acts: "keys:line-start keys:line-end",
     },
     Hint {
         keys: "alt+b alt+f",
         words: "by word",
         group: Group::TextBox,
+        acts: "keys:backward-word keys:forward-word",
     },
     Hint {
         keys: "ctrl+k ctrl+u ctrl+w",
         words: "kill",
         group: Group::TextBox,
+        acts: "keys:kill-end keys:kill-start keys:kill-word",
     },
     Hint {
         keys: "ctrl+y alt+y",
         words: "yank",
         group: Group::TextBox,
+        acts: "keys:yank keys:yank-pop",
     },
     Hint {
         keys: "ctrl+t alt+t",
         words: "transpose",
         group: Group::TextBox,
+        acts: "keys:transpose keys:transpose-words",
     },
     Hint {
         keys: "ctrl+_",
         words: "undo",
         group: Group::TextBox,
+        acts: "keys:undo",
     },
     Hint {
         keys: "ctrl+q",
         words: "quote",
         group: Group::TextBox,
+        acts: "keys:quote",
+    },
+    Hint {
+        keys: "ctrl+v",
+        words: "paste an image",
+        group: Group::TextBox,
+        acts: "keys:paste-image",
     },
     Hint {
         keys: "alt+0-9 ctrl+space",
         words: "arg, mark",
         group: Group::TextBox,
+        acts: "alt+0-9 keys:mark",
     },
     Hint {
         keys: "ctrl+r ctrl+s",
         words: "search history",
         group: Group::TextBox,
+        acts: "keys:search-backward keys:search-forward",
     },
     Hint {
         keys: "ctrl+p ctrl+n",
-        words: "history",
+        words: "up, down",
         group: Group::TextBox,
+        acts: "keys:up.1 keys:down.1",
     },
     Hint {
         keys: "alt+< alt+>",
         words: "its ends",
         group: Group::TextBox,
+        acts: "keys:history-oldest keys:history-newest",
     },
     Hint {
         keys: "alt+.",
         words: "last word",
         group: Group::TextBox,
+        acts: "keys:yank-last-word",
     },
     Hint {
         keys: "tab",
         words: "fold the block",
         group: Group::Transcript,
+        acts: "keys:fold",
     },
     Hint {
         keys: "ctrl+o",
         words: "open all",
         group: Group::Transcript,
+        acts: "keys:open-all",
     },
     Hint {
         keys: "pgup pgdn",
         words: "scroll",
         group: Group::Transcript,
+        acts: "keys:page-up keys:page-down",
     },
     Hint {
         keys: "end",
         words: "jump down",
         group: Group::Transcript,
+        acts: "keys:jump-down",
     },
     Hint {
         keys: "b",
         words: "sidebar",
         group: Group::Leader,
+        acts: "leader:sidebar",
     },
     Hint {
         keys: "l",
         words: "sessions",
         group: Group::Leader,
+        acts: "leader:sessions",
     },
     Hint {
         keys: "m",
         words: "model",
         group: Group::Leader,
+        acts: "leader:model",
+    },
+    Hint {
+        keys: "t",
+        words: "level",
+        group: Group::Leader,
+        acts: "leader:level",
     },
     Hint {
         keys: "tab",
         words: "sidebar focus",
         group: Group::Leader,
+        acts: "leader:sidebar-focus",
     },
     Hint {
         keys: "/",
         words: "commands",
         group: Group::Leader,
+        acts: "leader:commands",
     },
 ];
 
@@ -558,16 +608,19 @@ pub const STATUS: &[Hint] = &[
         keys: "ctrl+x /",
         words: "commands",
         group: Group::TextBox,
+        acts: "keys:leader leader:commands",
     },
     Hint {
         keys: "ctrl+x",
         words: "more",
         group: Group::Leader,
+        acts: "keys:leader",
     },
     Hint {
         keys: "?",
         words: "keys",
         group: Group::TextBox,
+        acts: "",
     },
 ];
 
@@ -696,6 +749,13 @@ fn is_ctrl_c(key: &KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
+/// Ctrl+G, which cancels as Esc does.
+pub(crate) fn is_ctrl_g(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('g' | 'G'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
 /// Ctrl+X, the leader: 0x18 reaches crossterm as `Char('x')` with CONTROL.
 fn is_leader(key: &KeyEvent) -> bool {
     key.code == KeyCode::Char('x')
@@ -717,6 +777,7 @@ fn leader_command(key: &KeyEvent) -> Option<Leader> {
         KeyCode::Char('b') | KeyCode::Char('B') => Some(Leader::ToggleSidebar),
         KeyCode::Char('l') | KeyCode::Char('L') => Some(Leader::Sessions),
         KeyCode::Char('m') | KeyCode::Char('M') => Some(Leader::Model),
+        KeyCode::Char('t') | KeyCode::Char('T') => Some(Leader::Level),
         KeyCode::Tab => Some(Leader::FocusSidebar),
         _ => None,
     }
@@ -833,7 +894,8 @@ fn map(key: &KeyEvent, overlay: Overlay, card: &mut Card, after_leader: bool) ->
                     'w' => Action::Edit(EditKey::KillWord),
                     'y' => Action::Edit(EditKey::Yank),
                     't' => Action::Edit(EditKey::Transpose),
-                    'q' | 'v' => Action::Edit(EditKey::Quote),
+                    'q' => Action::Edit(EditKey::Quote),
+                    'v' => Action::Edit(EditKey::PasteImage),
                     // 0x00: Ctrl+Space, which crossterm also reports as Ctrl+@.
                     ' ' | '@' => Action::Edit(EditKey::Mark),
                     // 0x1F: Ctrl+_, which crossterm reports as Ctrl+7, and the
@@ -845,8 +907,8 @@ fn map(key: &KeyEvent, overlay: Overlay, card: &mut Card, after_leader: bool) ->
                     'h' => Action::Edit(EditKey::Backspace),
                     'j' => Action::NewLine,
                     'm' => Action::Send,
-                    'p' => Action::Edit(EditKey::HistoryUp),
-                    'n' => Action::Edit(EditKey::HistoryDown),
+                    'p' => Action::Edit(EditKey::Up),
+                    'n' => Action::Edit(EditKey::Down),
                     'r' => Action::Edit(EditKey::SearchBackward),
                     's' => Action::Edit(EditKey::SearchForward),
                     'g' => Action::Edit(EditKey::AbortSearch),
@@ -862,10 +924,25 @@ fn map(key: &KeyEvent, overlay: Overlay, card: &mut Card, after_leader: bool) ->
     }
 }
 
+/// The step of a pick that Ctrl+P or Ctrl+N asks for, as Up and Down do.
+fn ctrl_step(key: &KeyEvent) -> Option<i8> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('p' | 'P') => Some(-1),
+        KeyCode::Char('n' | 'N') => Some(1),
+        _ => None,
+    }
+}
+
 /// One key of a list above the text box: the arrows move its pick, Tab completes
 /// it, Enter takes it and Esc closes it. `None` for every other key, which maps
 /// as it does with no overlay, since the text box text is the list's query.
 fn list_key(key: &KeyEvent) -> Option<Action> {
+    if let Some(step) = ctrl_step(key) {
+        return Some(Action::Move(step));
+    }
     match key.code {
         KeyCode::Up => Some(Action::Move(-1)),
         KeyCode::Down => Some(Action::Move(1)),
@@ -881,6 +958,9 @@ fn list_key(key: &KeyEvent) -> Option<Action> {
 /// a printable key is its filter. Every other key is ignored, and Ctrl+C is
 /// still the quit, which the map takes before a key reaches here.
 fn sheet_key(key: &KeyEvent) -> Action {
+    if let Some(step) = ctrl_step(key) {
+        return Action::Move(step);
+    }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
@@ -893,6 +973,7 @@ fn sheet_key(key: &KeyEvent) -> Action {
         KeyCode::Esc => Action::Close,
         KeyCode::Backspace if alt => Action::Edit(EditKey::KillWordBackward),
         KeyCode::Backspace => Action::Edit(EditKey::Backspace),
+        KeyCode::Char('d') if ctrl => Action::Delete,
         KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => Action::Edit(EditKey::Insert(c)),
         _ => Action::Ignore,
     }
@@ -1065,7 +1146,8 @@ mod tests {
             (key(Char('t'), CTRL), Action::Edit(EditKey::Transpose)),
             (key(Char('y'), CTRL), Action::Edit(EditKey::Yank)),
             (key(Char('q'), CTRL), Action::Edit(EditKey::Quote)),
-            (key(Char('v'), CTRL), Action::Edit(EditKey::Quote)),
+            // Ctrl+V is the image paste now, and Ctrl+Q quotes on its own.
+            (key(Char('v'), CTRL), Action::Edit(EditKey::PasteImage)),
             (key(Char(' '), CTRL), Action::Edit(EditKey::Mark)),
             (key(Char('@'), CTRL), Action::Edit(EditKey::Mark)),
             (key(Char('7'), CTRL), Action::Edit(EditKey::Undo)),
@@ -1603,6 +1685,35 @@ mod tests {
         assert_eq!(keys.take_leader(), None);
     }
 
+    /// Ctrl+X t is the level sheet, on t or T, a plain key as Ctrl+X m is.
+    #[test]
+    fn ctrl_x_t_is_the_level_key() {
+        let mut keys = Keys::new();
+        let now = Instant::now();
+        for second in [key(Char('t'), NONE), key(Char('T'), SHIFT)] {
+            assert_eq!(
+                keys.action(key(Char('x'), CTRL), Overlay::None, now),
+                Action::Ignore
+            );
+            assert_eq!(
+                keys.action(second, Overlay::None, now),
+                Action::Ignore,
+                "Ctrl+X then {second:?} is a command"
+            );
+            assert_eq!(keys.take_leader(), Some(Leader::Level));
+        }
+        assert_eq!(
+            keys.action(key(Char('x'), CTRL), Overlay::None, now),
+            Action::Ignore
+        );
+        assert_eq!(
+            keys.action(key(Char('t'), CTRL), Overlay::None, now),
+            Action::Edit(EditKey::Transpose),
+            "Ctrl+T is still transpose"
+        );
+        assert_eq!(keys.take_leader(), None);
+    }
+
     /// Esc closes a leader that waits and goes no further: it must not cancel
     /// the run the person aimed the Esc at the leader with.
     #[test]
@@ -1653,36 +1764,46 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_p_is_the_previous_history_entry() {
+    fn ctrl_p_and_ctrl_n_are_up_and_down_in_every_place() {
         let mut keys = Keys::new();
         let now = Instant::now();
-        let ctrl_p = key(Char('p'), CTRL);
-        for overlay in [Overlay::None, Overlay::List] {
+        let (ctrl_p, ctrl_n) = (key(Char('p'), CTRL), key(Char('n'), CTRL));
+        for (overlay, up, down) in [
+            (
+                Overlay::None,
+                Action::Edit(EditKey::Up),
+                Action::Edit(EditKey::Down),
+            ),
+            (Overlay::List, Action::Move(-1), Action::Move(1)),
+            (Overlay::Sheet, Action::Move(-1), Action::Move(1)),
+        ] {
+            assert_eq!(keys.action(ctrl_p, overlay, now), up, "{overlay:?}");
+            assert_eq!(keys.action(ctrl_n, overlay, now), down, "{overlay:?}");
             assert_eq!(
-                keys.action(ctrl_p, overlay, now),
-                Action::Edit(EditKey::HistoryUp),
-                "Ctrl+P is the history with {overlay:?} over the box"
+                keys.action(key(Char('P'), CTRL), overlay, now),
+                up,
+                "a shifted Ctrl+P is the same key"
+            );
+            assert_eq!(
+                keys.action(key(KeyCode::Up, NONE), overlay, now),
+                up,
+                "Up does the same with {overlay:?}"
             );
         }
         assert_eq!(
-            keys.action(key(Char('P'), CTRL), Overlay::None, now),
-            Action::Edit(EditKey::HistoryUp),
-            "a shifted Ctrl+P is the same key"
-        );
-        assert_eq!(
             keys.action(key(Char('p'), CTRL | ALT), Overlay::None, now),
             Action::Ignore,
-            "Ctrl+Alt+P is neither the history nor a palette"
+            "Ctrl+Alt+P is not the key"
+        );
+        assert_eq!(
+            keys.action(key(Char('p'), CTRL | ALT), Overlay::Sheet, now),
+            Action::Ignore,
+            "nor in a sheet"
         );
         assert_eq!(
             keys.action(key(Char('p'), NONE), Overlay::None, now),
             Action::Edit(EditKey::Insert('p')),
             "p alone is text"
-        );
-        assert_eq!(
-            keys.action(ctrl_p, Overlay::Sheet, now),
-            Action::Ignore,
-            "the sheet owns the keys while it is up"
         );
         // Ctrl+X / opens the palette.
         assert_eq!(
@@ -1711,10 +1832,6 @@ mod tests {
         assert_eq!(
             keys.action(key(Char('g'), CTRL), Overlay::None, now),
             Action::Edit(EditKey::AbortSearch)
-        );
-        assert_eq!(
-            keys.action(key(Char('n'), CTRL), Overlay::None, now),
-            Action::Edit(EditKey::HistoryDown)
         );
         assert_eq!(
             keys.action(key(Char('<'), ALT), Overlay::None, now),
@@ -1823,7 +1940,7 @@ mod tests {
         let mut keys = Keys::new();
         let now = Instant::now();
         let rows: Vec<&Hint> = hints(Group::Leader).collect();
-        assert_eq!(rows.len(), 5, "the leader has five rows");
+        assert_eq!(rows.len(), 6, "the leader has six rows");
         let mut resolved = Vec::new();
         for row in rows {
             let second = match row.keys {
@@ -1851,6 +1968,7 @@ mod tests {
                 Leader::ToggleSidebar,
                 Leader::Sessions,
                 Leader::Model,
+                Leader::Level,
                 Leader::FocusSidebar,
                 Leader::Commands,
             ]
@@ -1866,9 +1984,9 @@ mod tests {
             assert!(width <= 30, "{} {} is {width} columns", row.keys, row.words);
         }
         for (group, rows) in [
-            (Group::TextBox, 21),
+            (Group::TextBox, 22),
             (Group::Transcript, 4),
-            (Group::Leader, 5),
+            (Group::Leader, 6),
         ] {
             assert_eq!(hints(group).count(), rows, "{group:?} lists {rows} rows");
         }
@@ -1878,6 +1996,25 @@ mod tests {
                 + hints(Group::Leader).count(),
             HINTS.len(),
             "the groups hold every row"
+        );
+    }
+
+    /// Ctrl+D deletes in a sheet and deletes a character outside one.
+    #[test]
+    fn ctrl_d_in_a_sheet_is_the_delete_key() {
+        let mut keys = Keys::new();
+        let now = Instant::now();
+        assert_eq!(
+            keys.action(key(Char('d'), CTRL), Overlay::Sheet, now),
+            Action::Delete
+        );
+        assert_eq!(
+            keys.action(key(Char('d'), CTRL), Overlay::None, now),
+            Action::Edit(EditKey::DeleteChar)
+        );
+        assert_eq!(
+            keys.action(key(Char('d'), CTRL), Overlay::List, now),
+            Action::Edit(EditKey::DeleteChar)
         );
     }
 

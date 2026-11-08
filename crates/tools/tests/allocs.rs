@@ -238,10 +238,10 @@ fn effects_skip_the_text_they_do_not_read() {
 /// Bytes the capture case pushes through a `bash` call.
 const CAPTURE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// The most blocks one 8 MB `bash` call may allocate: 597 measured, all of
+/// The most blocks one 8 MB `bash` call may allocate: 544 measured, all of
 /// them around the 128 spill writes and the pipes, none per byte. A copy per
 /// chunk on top of that would put the count over this bound.
-const CAPTURE_BLOCKS: u64 = 750;
+const CAPTURE_BLOCKS: u64 = 600;
 const _: () = assert!(CAPTURE_BLOCKS < 2000);
 
 /// 8 MB through the capture: the head and the tail are kept with one copy per
@@ -260,6 +260,11 @@ fn perf_capture_eight_megabytes_does_not_allocate_per_chunk() {
         r#"{{"command":"head -c {CAPTURE_BYTES} /dev/zero | tr '\\000' x","timeout_ms":60000}}"#
     );
     let cancel = CancellationToken::new();
+    // The first spill of a process sweeps the folders earlier runs left, at
+    // about 5 blocks each, so that sweep must stay out of the count.
+    runtime
+        .block_on(reagent_tools::spill::folder())
+        .expect("the run folder");
     let mut output = None;
     let capture_blocks = blocks(|| {
         output = Some(runtime.block_on(bash.run(&args, &cancel)));

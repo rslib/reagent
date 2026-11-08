@@ -17,12 +17,13 @@
 //! inline as `≡ <first line> … +<lines>` over the code fill, and the one the edit
 //! point holds carries an accent underline and a hint row under the text; opened,
 //! its bytes are editor text behind a thin accent `│` gutter over a fill a step
-//! darker than the box. The chip is drawn from the ranges of its one buffer, so a
-//! frame copies none of the paste, and a steady frame allocates nothing.
+//! darker than the box, and the hint row says how to fold it. The chip is drawn
+//! from the ranges of its one buffer, so a frame copies none of the paste, and a
+//! steady frame allocates nothing.
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::editor::{CHIP, CHIP_MORE, MARK_BYTES, Paste};
+use crate::editor::{CHIP, CHIP_MORE, IMAGE_LABEL, IMAGE_LABEL_END, MARK_BYTES, Paste};
 use crate::screen::{Cell, Color, Screen, Style};
 use crate::slot::{Component, Role as Line, Size, Text};
 use crate::theme::{self, Emphasis, Role, Theme};
@@ -67,6 +68,8 @@ const GUTTER: &str = "│ ";
 const GUTTER_WIDTH: u16 = 2;
 /// The hint under the text while the edit point holds a folded chip.
 const HINT_PASTE: &str = "tab or a click opens the paste to edit · backspace removes it";
+/// The hint under the text while a chip is open.
+const HINT_OPEN: &str = "tab or a click folds the paste";
 
 /// The styles one frame of the box draws with, all over the input fill.
 #[derive(Debug, Clone, Copy)]
@@ -123,7 +126,7 @@ impl App {
             return open.sheet.height(rows);
         }
         if self.editor_dirty {
-            let columns = self.text_width().saturating_sub(BAR + PAD).max(1);
+            let columns = self.editor_columns();
             let most = self.text_rows_max();
             // A search holds the first of those rows for its prompt, so the text
             // has one row fewer: the box is the rows it shows, the prompt
@@ -141,9 +144,22 @@ impl App {
     }
 
     /// The rows the box draws around the text: a padding row above and below it,
-    /// the footer, and the hint row a folded chip at the edit point adds.
+    /// the footer, and the hint row a chip adds.
     fn box_chrome(&self) -> u16 {
-        CHROME + u16::from(self.holds_folded_paste())
+        CHROME + u16::from(self.paste_hint().is_some())
+    }
+
+    /// The hint row under the text: what a tab and a click do with the chip the
+    /// edit point holds, or with the chip an open one leaves. `None` when no chip
+    /// waits for a key.
+    fn paste_hint(&self) -> Option<&'static str> {
+        if self.editor.pastes().iter().any(Paste::is_open) {
+            Some(HINT_OPEN)
+        } else if self.holds_folded_paste() {
+            Some(HINT_PASTE)
+        } else {
+            None
+        }
     }
 
     /// Whether the edit point holds a folded chip: its hint row shows and the
@@ -152,6 +168,18 @@ impl App {
         self.editor
             .selected_paste()
             .is_some_and(|index| !self.editor.pastes()[index].is_open())
+    }
+
+    /// The columns the editor's text lays out in: the box's width less the bar
+    /// and its padding, and less the gutter while a chip is open, so a wrapped
+    /// row of an open chip keeps its last cells off the right edge.
+    pub(crate) fn editor_columns(&self) -> u16 {
+        let gutter = if self.editor.pastes().iter().any(Paste::is_open) {
+            GUTTER_WIDTH
+        } else {
+            0
+        };
+        self.text_width().saturating_sub(BAR + PAD + gutter).max(1)
     }
 
     /// The most text rows the box shows: a third of the terminal's rows, less
@@ -176,8 +204,8 @@ impl App {
         let (y, given) = (y + TOP, height);
         let height = height.saturating_sub(TOP);
         // The hint row shows only when the rows the box was given carry it.
-        let hint = self.holds_folded_paste() && height >= CHROME + GAP + 2;
-        let chrome = CHROME + u16::from(hint);
+        let hint = self.paste_hint().filter(|_| height >= CHROME + GAP + 2);
+        let chrome = CHROME + u16::from(hint.is_some());
         let shown = height
             .saturating_sub(chrome + GAP)
             .clamp(1, self.text_rows_max());
@@ -187,7 +215,7 @@ impl App {
         let prompt = u16::from(self.editor.searching());
         let mut rows = std::mem::take(&mut self.rows);
         let (cursor_row, cursor_col) = {
-            let columns = width.saturating_sub(BAR + PAD).max(1);
+            let columns = self.editor_columns();
             let layout = self
                 .editor
                 .layout(columns, shown.saturating_sub(prompt).max(1));
@@ -213,7 +241,8 @@ impl App {
             self.paint_box_row(at, width, &pen);
             if empty {
                 if offset == prompt {
-                    let placeholder = placeholder(self.running);
+                    let labels = self.keyfile.as_ref().map(crate::keyfile::KeyFile::labels);
+                    let placeholder = placeholder(self.running, labels);
                     self.screen.put_str(BAR + PAD, at, placeholder, pen.dim);
                 }
                 continue;
@@ -226,10 +255,9 @@ impl App {
         // footer.
         let below = y + 1 + shown;
         self.paint_box_row(below, width, &pen);
-        let footer = if hint {
+        let footer = if let Some(hint) = hint {
             self.paint_box_row(below + 1, width, &pen);
-            self.screen
-                .put_str(BAR + PAD, below + 1, HINT_PASTE, pen.dim);
+            self.screen.put_str(BAR + PAD, below + 1, hint, pen.dim);
             below + 2
         } else {
             below + 1
@@ -280,7 +308,7 @@ impl App {
     fn sheet_inks(&mut self) -> SheetInks {
         let theme = self.look.theme;
         let fill = theme.fill(Role::InputFill);
-        let picked = theme.fill(Role::CardAccent);
+        let picked = theme.fill(Role::PickedFill);
         let query = theme.fill(Role::CodeFill);
         SheetInks {
             plain: sheet_row(&mut self.screen, theme, fill),
@@ -294,16 +322,17 @@ impl App {
     fn list_inks(&mut self) -> ListInks {
         let theme = self.look.theme;
         let fill = theme.fill(Role::SurfaceFill);
-        let picked = theme.fill(Role::CardAccent);
+        let picked = theme.fill(Role::PickedFill);
         ListInks {
             plain: list_row(&mut self.screen, theme, fill),
             picked: list_row(&mut self.screen, theme, picked),
         }
     }
 
-    /// Opens the folded paste chip at the clicked cell, and answers whether the
-    /// click landed on one. A click on a chip selects it and opens it, the same
-    /// as Tab on it.
+    /// Opens the folded paste chip at the clicked cell, or folds the open one
+    /// there, and answers whether the click landed on a chip. A click on a chip
+    /// selects it and opens it, the same as Tab on it; a click on any row of an
+    /// open chip folds it back.
     pub(crate) fn click_paste(&mut self, at: crate::mouse::Cell) -> bool {
         let top = self.editor_top;
         // The row above the text is the box's own padding.
@@ -346,9 +375,23 @@ impl App {
                 break;
             }
         }
+        // A click on any row of an open chip folds it, the first row its gutter
+        // starts on or a later one of its lines.
+        let hit = hit.or_else(|| {
+            self.editor
+                .pastes()
+                .iter()
+                .position(|chip| chip.is_open() && chip.range().0 < end && start < chip.range().1)
+        });
         let Some(index) = hit else {
             return false;
         };
+        if self.editor.pastes()[index].is_open() {
+            self.editor.fold_paste(index);
+            self.editor_dirty = true;
+            self.touch();
+            return true;
+        }
         let mark = self.editor.pastes()[index].range().0;
         while self.editor.cursor() > mark {
             self.editor.left();
@@ -356,7 +399,11 @@ impl App {
         while self.editor.cursor() < mark {
             self.editor.right();
         }
-        self.editor.toggle_paste();
+        // A click on an image chip only puts the edit point on it: the chip
+        // never opens.
+        if self.editor.pastes()[index].image().is_none() {
+            self.editor.toggle_paste();
+        }
         self.editor_dirty = true;
         self.touch();
         true
@@ -470,7 +517,19 @@ impl App {
             }
             x = self.screen.put_str(x, y, settings.as_str(), pen.dim);
         }
-        let keys = if self.running { KEYS_BUSY } else { KEYS_IDLE };
+        let Self {
+            screen, keyfile, ..
+        } = self;
+        let word = if self.running { "steer" } else { "send" };
+        let moved = keyfile
+            .as_ref()
+            .map(crate::keyfile::KeyFile::labels)
+            .map(|labels| [(labels.send(), word), (labels.queue(), "queue")]);
+        let keys = match &moved {
+            Some(moved) => moved.as_slice(),
+            None if self.running => KEYS_BUSY,
+            None => KEYS_IDLE,
+        };
         let mut at = width.saturating_sub(1).saturating_sub(keys_width(keys));
         if at <= x {
             return;
@@ -479,9 +538,9 @@ impl App {
             if index > 0 {
                 at += 2;
             }
-            at = self.screen.put_str(at, y, key, pen.text);
-            at = self.screen.put_str(at, y, " ", pen.text);
-            at = self.screen.put_str(at, y, word, pen.dim);
+            at = screen.put_str(at, y, key, pen.text);
+            at = screen.put_str(at, y, " ", pen.text);
+            at = screen.put_str(at, y, word, pen.dim);
         }
     }
 
@@ -637,9 +696,10 @@ fn gutter_at(editor: &crate::editor::Editor, cursor: usize) -> bool {
 
 /// Draws a folded chip at column `x` of row `y`: the `≡` in the accent, the
 /// first line, then the count of the lines it holds back in dim, all on the code
-/// fill the pen's styles carry. It stops at `width`, so a chip wider than the row
-/// is cut to fit, and it copies nothing: the line is the range of the chip's one
-/// buffer that was measured at paste.
+/// fill the pen's styles carry. The line gets only the columns the mark, the
+/// spaces and the count leave, so a narrow row always shows the count; it copies
+/// nothing: the line is the range of the chip's one buffer that was measured at
+/// paste.
 fn draw_chip(
     screen: &mut Screen,
     x: u16,
@@ -653,19 +713,29 @@ fn draw_chip(
         Some(held) => (held.mark, held.line, held.count),
         None => (pen.pasted_mark, pen.pasted, pen.pasted_count),
     };
+    let mut digits = [0u8; 20];
+    // An image chip is its label: no first line, and no count of the lines it
+    // holds back.
+    if let Some(number) = chip.image() {
+        let number = decimal(&mut digits, number as usize);
+        let mut x = screen.put_str_until(x, y, IMAGE_LABEL, line, width);
+        x = screen.put_str_until(x, y, number, line, width);
+        return screen.put_str_until(x, y, IMAGE_LABEL_END, line, width);
+    }
+    let count_text = decimal(&mut digits, chip.other());
+    let tail = UnicodeWidthStr::width(CHIP_MORE) + UnicodeWidthStr::width(count_text);
     let mut x = screen.put_str_until(x, y, CHIP, mark, width);
     x = screen.put_str_until(x, y, " ", line, width);
-    x = screen.put_str_until(x, y, chip.first_line(), line, width);
+    let room = width.saturating_sub(x).saturating_sub(1 + tail as u16 + 1);
+    x = screen.put_str_until(x, y, chip.first_line(), line, x.saturating_add(room));
     x = screen.put_str_until(x, y, " ", line, width);
     x = screen.put_str_until(x, y, CHIP_MORE, count, width);
-    let mut digits = [0u8; 20];
-    let count_text = decimal(&mut digits, chip.other());
     screen.put_str_until(x, y, count_text, count, width)
 }
 
 /// Writes `n` in decimal at the end of `out` and answers the text: twenty digits
 /// hold every `usize`, so counting the lines a chip holds back costs no heap.
-fn decimal(out: &mut [u8; 20], mut n: usize) -> &str {
+pub(super) fn decimal(out: &mut [u8; 20], mut n: usize) -> &str {
     let mut index = out.len();
     loop {
         index -= 1;
@@ -697,9 +767,9 @@ fn mid(a: u8, b: u8) -> u8 {
 
 /// The placeholder of the box: what a key does with the text, by whether a turn
 /// runs.
-fn placeholder(running: bool) -> &'static str {
+fn placeholder(running: bool, labels: Option<&crate::keyfile::Labels>) -> &str {
     if running {
-        PLACEHOLDER_BUSY
+        labels.map_or(PLACEHOLDER_BUSY, crate::keyfile::Labels::busy)
     } else {
         PLACEHOLDER
     }
@@ -813,6 +883,17 @@ mod tests {
         text
     }
 
+    /// A paste whose first line is 300 columns of `x` and whose six other lines
+    /// are 120 columns of `y`.
+    fn long_first_line() -> String {
+        let mut text = "x".repeat(300);
+        for _ in 0..6 {
+            text.push('\n');
+            text.push_str(&"y".repeat(120));
+        }
+        text
+    }
+
     /// An app in full screen, its editor holding `text`.
     fn app_rows(text: &str, rows: u16) -> App {
         let mut app = App::new(&Initialized::default(), (COLUMNS, rows), true);
@@ -823,6 +904,28 @@ mod tests {
 
     fn app(text: &str) -> App {
         app_rows(text, ROWS)
+    }
+
+    /// The picked row of a list and of a sheet both draw on the picked fill.
+    #[test]
+    fn picked_fill_is_the_fill_of_a_picked_row() {
+        let mut app = app("");
+        let mode = crate::theme::Mode::Rich {
+            background: Rgb::new(30, 30, 30),
+            dark: true,
+        };
+        app.look.theme = crate::theme::Theme::resolve(
+            mode,
+            Depth::TrueColor,
+            &crate::theme::Overrides::default(),
+        );
+        let fill = crate::screen::Style {
+            bg: app.look.theme.fill(Role::PickedFill),
+            ..crate::screen::Style::default()
+        };
+        let fill = app.screen.intern(fill);
+        assert_eq!(app.sheet_inks().picked.fill, fill, "the sheet's");
+        assert_eq!(app.list_inks().picked.fill, fill, "the list's");
     }
 
     /// An app in full screen whose editor holds a bracketed paste of `lines`
@@ -976,6 +1079,27 @@ mod tests {
             "the idle keys: {idle:?}"
         );
         assert!(!idle.contains("steer"), "no busy key when idle: {idle:?}");
+    }
+
+    #[test]
+    fn custom_key_label_box_footer_and_placeholder() {
+        let mut app = app("");
+        app.read_keys_text(
+            "[keys]\nsend = \"ctrl+s\"\nsearch-forward = \"alt+s\"\nqueue = \"alt+q\"\nfold = \"alt+o\"\n",
+        );
+        let _ = frame(&mut app);
+        let idle = row(&app, footer(&app));
+        assert!(idle.contains("ctrl+s send  alt+q queue"), "{idle:?}");
+        assert!(!idle.contains("enter"), "{idle:?}");
+        app.running = true;
+        app.status_dirty = true;
+        let _ = frame(&mut app);
+        let busy = row(&app, footer(&app));
+        assert!(busy.contains("ctrl+s steer  alt+q queue"), "{busy:?}");
+        assert!(
+            row(&app, at(&app, "Steer the run")).contains("alt+q queues for the next turn"),
+            "the busy placeholder names the moved key"
+        );
     }
 
     #[test]
@@ -1377,16 +1501,159 @@ mod tests {
         app.editor_dirty = true;
         let _ = frame(&mut app);
         let y = at(&app, "≡ error:");
-        assert_eq!(
-            UnicodeWidthStr::width(row(&app, y).as_str()),
-            COLUMNS as usize,
-            "the chip fills the row and stops there"
-        );
         assert!(
-            !row(&app, y).contains("+3"),
-            "the count is cut with the rest: {}",
+            row(&app, y).contains("+3"),
+            "the first line is cut and the count stays: {}",
             row(&app, y)
         );
+    }
+
+    #[test]
+    fn the_text_box_cuts_a_long_chip_label_and_keeps_its_count() {
+        let mut app = App::new(&Initialized::default(), (COLUMNS, ROWS), true);
+        app.editor.paste(long_first_line());
+        app.editor_dirty = true;
+        let _ = frame(&mut app);
+        let y = at(&app, "≡");
+        assert!(
+            app.editor.pastes()[0].width() <= 49,
+            "the label is at most forty-nine columns: {}",
+            app.editor.pastes()[0].width()
+        );
+        assert!(
+            row(&app, y).contains("… +6"),
+            "the row shows the count: {:?}",
+            row(&app, y)
+        );
+        assert!(
+            row(&app, y).contains("xxxx"),
+            "and the head of the first line: {:?}",
+            row(&app, y)
+        );
+    }
+
+    #[test]
+    fn the_text_box_keeps_the_chip_label_count_on_a_narrow_row() {
+        let mut app = App::new(&Initialized::default(), (30, ROWS), true);
+        app.editor.paste(long_first_line());
+        app.editor_dirty = true;
+        let _ = frame(&mut app);
+        let y = at(&app, "≡");
+        assert!(
+            row(&app, y).contains("… +6"),
+            "a row of thirty columns still shows the count: {:?}",
+            row(&app, y)
+        );
+        assert!(
+            UnicodeWidthStr::width(row(&app, y).as_str()) <= 30,
+            "and the label stops at the row: {:?}",
+            row(&app, y)
+        );
+    }
+
+    #[test]
+    fn an_open_chip_folds_from_a_click_on_any_of_its_rows() {
+        let mut app = app_paste(6);
+        let pasted = log(6);
+        assert!(app.editor.toggle_paste(), "tab opens the chip");
+        app.editor_dirty = true;
+        let _ = frame(&mut app);
+        // The second row of the open chip, under its first line.
+        let y = at(&app, "line 2");
+        app.clicked(crate::mouse::Cell { column: 6, row: y });
+        app.editor_dirty = true;
+        let _ = frame(&mut app);
+        assert!(
+            !app.editor.pastes()[0].is_open(),
+            "a click on a row of the open chip folds it"
+        );
+        at(&app, "≡");
+        assert_eq!(app.editor.take(), pasted, "the text is the same");
+
+        // The first row of the open chip folds it too.
+        let mut app = app_paste(6);
+        assert!(app.editor.toggle_paste(), "tab opens the chip");
+        app.editor_dirty = true;
+        let _ = frame(&mut app);
+        let y = at(&app, FIRST);
+        app.clicked(crate::mouse::Cell { column: 6, row: y });
+        app.editor_dirty = true;
+        let _ = frame(&mut app);
+        assert!(
+            !app.editor.pastes()[0].is_open(),
+            "a click on the first row folds it too"
+        );
+        assert_eq!(app.editor.take(), pasted, "and the text is the same");
+    }
+
+    #[test]
+    fn an_open_chip_folds_beside_a_hint_row() {
+        let mut app = app_paste(4);
+        assert!(app.editor.toggle_paste(), "tab opens the chip");
+        app.editor_dirty = true;
+        let _ = frame(&mut app);
+        let hint = at(&app, super::HINT_OPEN);
+        assert!(
+            box_only(&app).contains(&hint),
+            "the hint row is inside the box: {hint} in {:?}",
+            box_only(&app)
+        );
+        assert_eq!(
+            footer(&app),
+            hint + 1,
+            "the footer follows the open chip's hint row"
+        );
+        assert!(
+            (0..ROWS).all(|y| !row(&app, y).contains("≡")),
+            "the open chip draws no folded label"
+        );
+        assert!(app.editor.toggle_paste(), "tab folds it back");
+        app.editor_dirty = true;
+        let _ = frame(&mut app);
+        assert!(
+            (0..ROWS).all(|y| !row(&app, y).contains(super::HINT_OPEN)),
+            "no open hint while no chip is open"
+        );
+        // The folded chip the edit point holds keeps a hint row of its own.
+        let shut = at(&app, super::HINT_PASTE);
+        assert!(box_only(&app).contains(&shut));
+        assert_eq!(
+            footer(&app),
+            shut + 1,
+            "the footer follows the folded chip's hint row"
+        );
+        at(&app, "≡");
+    }
+
+    #[test]
+    fn an_open_chip_wraps_beside_its_gutter() {
+        let digits = "0123456789".repeat(30);
+        let mut app = App::new(&Initialized::default(), (COLUMNS, ROWS), true);
+        app.editor.paste(format!("{digits}\n1\n2\n3"));
+        assert!(app.editor.toggle_paste(), "tab opens the chip");
+        app.editor_dirty = true;
+        let bytes = frame(&mut app);
+        let mut seen = String::new();
+        for y in box_only(&app) {
+            let text = row(&app, y);
+            if let Some((_, rest)) = text.split_once("│ ") {
+                seen.push_str(rest);
+            }
+        }
+        assert_eq!(seen, digits, "every character wraps inside the gutter");
+        // The cursor stands on the first cell of the text, after the gutter.
+        let y = at(&app, "│");
+        assert_eq!(
+            placed(&bytes).0,
+            after(&app, y, "│ "),
+            "the cursor column keeps the gutter"
+        );
+        let row_y = at(&app, "│");
+        app.clicked(crate::mouse::Cell {
+            column: 6,
+            row: row_y,
+        });
+        assert!(app.editor_dirty, "the fold lays the box out again");
     }
 
     #[test]

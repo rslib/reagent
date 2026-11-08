@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use reagent_ai::{Message, Provider, Text};
+use reagent_ai::{Content, Message, Provider, Text};
 use reagent_config::permissions::PermissionMode;
 
 use crate::agent_loop::Agent;
@@ -81,6 +81,9 @@ pub enum Command {
         client: ClientId,
         /// The text of the message.
         text: Text,
+        /// What follows the text in the user message: the images an `@path`
+        /// word attached, and nothing for most messages.
+        blocks: Vec<Content>,
         /// How it joins the session.
         mode: SendMode,
     },
@@ -117,6 +120,61 @@ pub enum Command {
     },
 }
 
+/// One message a client sent, waiting for the boundary or the run that carries
+/// it into the conversation.
+#[derive(Debug)]
+pub(crate) struct Waiting {
+    /// The client that sent it.
+    pub(crate) client: ClientId,
+    /// The text of the message.
+    pub(crate) text: Text,
+    /// What follows the text: the images an `@path` word attached, and nothing
+    /// for most messages.
+    pub(crate) blocks: Vec<Content>,
+}
+
+impl Waiting {
+    /// The message `client` sent: its text and the blocks that follow it.
+    pub(crate) fn new(client: ClientId, text: Text, blocks: Vec<Content>) -> Self {
+        Self {
+            client,
+            text,
+            blocks,
+        }
+    }
+
+    /// The user message it becomes: the text alone, or the text and then the
+    /// blocks.
+    pub(crate) fn message(self) -> Message {
+        if self.blocks.is_empty() {
+            return Message::user(self.text);
+        }
+        let mut content = Vec::with_capacity(self.blocks.len() + 1);
+        content.push(Content::text(self.text));
+        content.extend(self.blocks);
+        Message::user_content(content)
+    }
+
+    /// The message [`Waiting::message`] built, as the waiting message it was,
+    /// so a message the journal refused goes back to the inbox with its blocks
+    /// and no image is copied.
+    pub(crate) fn restored(client: ClientId, message: Message) -> Self {
+        let Message::User { content } = message else {
+            unreachable!("a waiting message is a user message")
+        };
+        let mut content = content.into_iter();
+        let text = match content.next() {
+            Some(Content::Text { text }) => text,
+            _ => Text::default(),
+        };
+        Self {
+            client,
+            text,
+            blocks: content.collect(),
+        }
+    }
+}
+
 /// How many commands may be in flight before a client waits.
 pub const COMMANDS: usize = 64;
 
@@ -127,10 +185,10 @@ pub type Sender = mpsc::Sender<Command>;
 #[derive(Debug)]
 pub struct Inbox {
     commands: mpsc::Receiver<Command>,
-    /// Steer texts taken from the channel that no request has carried yet.
-    pending: Vec<(ClientId, Text)>,
+    /// Steer messages taken from the channel that no request has carried yet.
+    pending: Vec<Waiting>,
     /// Messages that start a run once the current one ends, oldest first.
-    queue: VecDeque<(ClientId, Text)>,
+    queue: VecDeque<Waiting>,
     /// Settings taken during a stream, applied before the next request.
     held: Vec<Settings>,
     /// Compactions taken during a stream, run before the next request.
@@ -174,14 +232,14 @@ impl Inbox {
         self.commands.try_recv().ok()
     }
 
-    /// Adds a steer text, which lands before the next request.
-    pub(crate) fn steer(&mut self, client: ClientId, text: Text) {
-        self.pending.push((client, text));
+    /// Adds a steer message, which lands before the next request.
+    pub(crate) fn steer(&mut self, waiting: Waiting) {
+        self.pending.push(waiting);
     }
 
     /// Adds a message for the next run.
-    pub(crate) fn queue(&mut self, client: ClientId, text: Text) {
-        self.queue.push_back((client, text));
+    pub(crate) fn queue(&mut self, waiting: Waiting) {
+        self.queue.push_back(waiting);
     }
 
     /// Holds settings a stream took, for the next boundary.
@@ -199,18 +257,14 @@ impl Inbox {
         self.compactions.drain(..)
     }
 
-    /// The steer texts waiting for a boundary, oldest first.
-    pub(crate) fn take_pending(&mut self) -> Vec<(ClientId, Text)> {
+    /// The steer messages waiting for a boundary, oldest first.
+    pub(crate) fn take_pending(&mut self) -> Vec<Waiting> {
         std::mem::take(&mut self.pending)
     }
 
-    /// Puts back steer texts that could not join the conversation, in order,
+    /// Puts back steer messages that could not join the conversation, in order,
     /// ahead of any that arrived since.
-    pub(crate) fn restore(
-        &mut self,
-        first: (ClientId, Text),
-        rest: impl Iterator<Item = (ClientId, Text)>,
-    ) {
+    pub(crate) fn restore(&mut self, first: Waiting, rest: impl Iterator<Item = Waiting>) {
         let newer = std::mem::take(&mut self.pending);
         self.pending.push(first);
         self.pending.extend(rest);
@@ -235,7 +289,7 @@ impl Inbox {
     }
 
     /// The oldest message waiting for a run.
-    pub(crate) fn pop(&mut self) -> Option<(ClientId, Text)> {
+    pub(crate) fn pop(&mut self) -> Option<Waiting> {
         self.queue.pop_front()
     }
 
@@ -279,7 +333,7 @@ pub async fn run_live(
         {
             start.push(first);
         }
-        history.extend(start.into_iter().map(|(_, text)| Message::user(text)));
+        history.extend(start.into_iter().map(Waiting::message));
         agent.apply_held(inbox, events).await;
         agent
             .run_with_inbox(history, journal.as_deref_mut(), events, inbox)
@@ -488,11 +542,31 @@ mod tests {
     }
 
     fn send(client: ClientId, text: &str, mode: SendMode) -> Command {
+        send_with(client, text, Vec::new(), mode)
+    }
+
+    /// One message of `text` and the `blocks` that follow it.
+    fn send_with(client: ClientId, text: &str, blocks: Vec<Content>, mode: SendMode) -> Command {
         Command::Send {
             client,
             text: Text::from(text),
+            blocks,
             mode,
         }
+    }
+
+    /// The blocks a message that names one image carries: its note, then the
+    /// image.
+    fn image_blocks() -> Vec<Content> {
+        vec![
+            Content::text("[image 64x48]"),
+            Content::Image(reagent_ai::Image {
+                media_type: reagent_ai::ImageType::Png,
+                width: 64,
+                height: 48,
+                data: Text::from("cG5n"),
+            }),
+        ]
     }
 
     /// The events `rx` holds now, without waiting.
@@ -768,6 +842,73 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_worker_image_message_queued_and_steered_reaches_the_history() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![
+                text_reply("first"),
+                text_reply("second"),
+                text_reply("third"),
+            ],
+            vec![vec![
+                send_with(7, "look at shot.png", image_blocks(), SendMode::Steer),
+                send_with(8, "and again", image_blocks(), SendMode::Queue),
+            ]],
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            for _ in 0..2 {
+                until(&mut rx, |event| matches!(event, Event::RunEnd(_))).await;
+            }
+            script.close();
+            drop(tx);
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        tokio::join!(session, driver);
+
+        let carried: Vec<(String, usize)> = history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User { content } => Some((
+                    texts(content),
+                    content
+                        .iter()
+                        .filter(|block| matches!(block, Content::Image(_)))
+                        .count(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            carried,
+            vec![
+                ("hello".to_string(), 0),
+                ("look at shot.png[image 64x48]".to_string(), 1),
+                ("and again[image 64x48]".to_string(), 1),
+            ],
+            "the steered and the queued message keep their blocks after the text"
+        );
+        let requests = script.requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "one request per run, one more for the steer: {requests:?}"
+        );
+        assert!(
+            format!("{:?}", requests[1]).contains("[image 64x48]"),
+            "the steered message reaches the next request: {requests:?}"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_idle_session_makes_no_request() {
         let (tx, mut inbox) = channel();
@@ -959,7 +1100,9 @@ mod tests {
         let sent: Vec<(ClientId, SendMode, String)> = seen
             .into_iter()
             .filter_map(|event| match event {
-                Event::UserMessage { client, mode, text } => Some((client, mode, text.to_string())),
+                Event::UserMessage {
+                    client, mode, text, ..
+                } => Some((client, mode, text.to_string())),
                 _ => None,
             })
             .collect();

@@ -9,7 +9,7 @@ cargo build --workspace
 cargo test --workspace
 cargo nextest run -p reagent-agent -E 'test(/^session::/)'   # one module; fails when no test matches
 cargo nextest run -p reagent --features testing --test e2e   # cli end-to-end tests; skipped without the feature
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features reagent/testing -- -D warnings   # the feature brings in the e2e tests
 cargo fmt --all
 cargo build --profile min -p reagent             # size build for footprint checks
 cargo nextest run --release -p reagent-agent --test budget                    # loop heap and CPU budgets
@@ -53,7 +53,7 @@ A feature that does not move 1 or 2 in a measured run does not ship as a default
 | OS sandbox for one process and its children: Seatbelt on macOS, Landlock on Linux | `crates/sandbox` (`reagent-sandbox`) | no other reagent crate |
 | Durable append-only session log: frames, fields, CRC, part writer and reader, recovery, fork pointers, zstd stream, session list. No message types | `crates/store` (`reagent-store`) | no other reagent crate |
 | Client protocol: JSON-RPC message types, the line codec, the discovery folder and the join token. No agent types | `crates/protocol` (`reagent-protocol`) | no other reagent crate |
-| Images for models: format sniffing, decoders, EXIF orientation, resize, PNG and JPEG encode, limits. No file system; AVIF only on macOS (ImageIO in `src/imageio.rs`, the crate's one `unsafe` module) | `crates/image` (`reagent-image`) | no other reagent crate |
+| Images for models: format sniffing, decoders, EXIF orientation, resize, PNG and JPEG encode, limits. No file system; AVIF only on macOS, and HEIC through the same path there (ImageIO in `src/imageio.rs`, the crate's one `unsafe` module) | `crates/image` (`reagent-image`) | no other reagent crate |
 | Config files, providers and models, permission rules and their shell lexer and glob | `crates/config` (`reagent-config`) | depends on util |
 | Shared OAuth (PKCE, device flow, JWT, loopback callback) and the HTTP client | `crates/oauth` (`reagent-oauth`) | depends on config |
 | Message types, providers, SSE, `FakeProvider`, OAuth logins, the message record codec of the journal (`record.rs`) | `crates/ai` (`reagent-ai`) | `reagent-config` (the auth file), oauth and store |
@@ -61,7 +61,7 @@ A feature that does not move 1 or 2 in a measured run does not ship as a default
 | Native tools; `read` returns images through `reagent-image` | `crates/tools` (`reagent-tools`) | depends on agent, ai, config, image and util |
 | The `codemode` tool: a QuickJS script that calls the other tools | `crates/script` (`reagent-script`) | depends on agent, ai and tools |
 | MCP client and its OAuth login | `crates/mcp` (`reagent-mcp`) | depends on agent, ai, oauth and config |
-| Terminal UI: screen buffer and diff, full-screen transcript ring, streaming markdown, editor, layout, mouse, the slot API and the built-in panels, async tty input (`src/app/input`, the crate's one `unsafe` module), worker client. Never the agent loop | `crates/tui` (`reagent-tui`) | depends on protocol, store and ai |
+| Terminal UI: screen buffer and diff, full-screen transcript ring, streaming markdown, editor, layout, mouse, the slot API and the built-in panels, async tty input (`src/app/input`), the native clipboard (`src/clipboard/macos.rs`, which loads AppKit at the first copy), worker client. Those two are the crate's `unsafe` modules. Never the agent loop | `crates/tui` (`reagent-tui`) | depends on protocol, store, ai and image |
 | Binary and flags | `crates/cli` (`reagent`) | depends on all |
 | Model-facing prompt templates | none: `prompts/` at the root | baked into `crates/agent` and `crates/cli` with `include_str!` |
 | Harbor adapter | `bench/harbor` | Python, run with `uv` |
@@ -87,7 +87,7 @@ Design decisions and their reasons: `docs/plans/architecture.md` (local only, ig
 
 ## Unsafe
 
-`unsafe_code` is denied in the workspace. A crate that needs it allows it in one module, and each block has a `// SAFETY:` line.
+`unsafe_code` is denied in the workspace. A crate that needs it allows it in one module, and each block has a `// SAFETY:` line. `reagent-tui` is the one exception, with two modules.
 
 ## Tests
 

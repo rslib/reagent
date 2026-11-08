@@ -170,6 +170,19 @@ impl Journal {
         self.writer.commit()
     }
 
+    /// Waits until the writer thread has written every commit asked for so far,
+    /// with no sync: a reader of the part finds them and a killed process keeps
+    /// them.
+    pub async fn written(&self) -> io::Result<()> {
+        match self.writer.written().await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the journal writer stopped before the write",
+            )),
+        }
+    }
+
     /// Commits and waits until the records are on the disk.
     pub async fn sync(&mut self) -> io::Result<()> {
         match self.writer.commit_and_sync().await {

@@ -41,9 +41,10 @@ mod tests;
 pub use term::Real;
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,16 +54,19 @@ use reagent_protocol::message::{AnswerKind, Mode};
 use serde::Deserialize;
 
 use crate::client::{Approval, Client, Frame, Initialized, Next};
-use crate::editor::Editor;
+use crate::editor::{Editor, IMAGE_LABEL};
 use crate::highlight::{self, Lang};
-use crate::history::{self, Tail};
+use crate::history::{self, RecentMessages, Tail};
 use crate::host::{Files, Host, HostFuture, LoginStep, Models, Opened, Target};
 use crate::input::Background;
-use crate::keys::{Action, Choice, EditKey, Keys, Leader, Overlay, quoted_char};
+use crate::keyfile::{self, Foot, Section};
+use crate::keys::{self, Action, Choice, EditKey, HINTS, Keys, Leader, Overlay, quoted_char};
 use crate::layout::{self, Rect};
 use crate::markdown::Markdown;
 use crate::mouse::Mouse;
 use crate::panels::{ContextPanel, SessionRow, SessionsPanel};
+use crate::picture::{self, Picture, Source as PictureSource, StyleBudget};
+use crate::picture_native::{self, Native, Protocol};
 use crate::screen::{Color, SYNC_PAIR, Screen, Style, Terminal};
 use crate::slot::{Sidebar, Update};
 use crate::theme::{Depth, Emphasis, Overrides, Role, Theme};
@@ -71,11 +75,11 @@ use self::fold::Folds;
 use self::list::{List, Source};
 use self::paint::{
     Block, CompactedRow, Diff, DiffKind, Entry, GroupRow, LineSink, SPANS, Span, SpanRole, State,
-    ToolRow, Usage,
+    ToolRow, Usage, pane_width,
 };
 use self::sheet::Sheet;
 use self::sheet::login::Login;
-use self::sheet::{model, sessions};
+use self::sheet::{PreviewRow, level, model, sessions};
 
 /// How long a frame waits for the frames that stream in behind it.
 pub const FRAME: Duration = Duration::from_millis(16);
@@ -83,6 +87,10 @@ pub const FRAME: Duration = Duration::from_millis(16);
 /// The id of the Sessions panel, whose rows open a session and whose footer
 /// turns its page.
 const SESSIONS: &str = "sessions";
+
+/// What the transcript says when the turn limit ended a run.
+const TURN_LIMIT_LINE: &str =
+    "stopped at the turn limit; the task may not be done; send a message to go on";
 
 /// How many rows the editor shows before it scrolls.
 pub const EDITOR_ROWS: u16 = 6;
@@ -116,9 +124,6 @@ const PREVIEW_COLUMNS: u16 = 100;
 /// screen. The text box, the cards, the lists and the status line keep the whole
 /// width.
 const MARGIN: u16 = 2;
-
-/// The reasoning levels `/level` takes.
-const LEVELS: [&str; 3] = ["low", "medium", "high"];
 
 /// The permission modes `/mode` takes, as the worker names them.
 const MODES: [&str; 4] = ["default", "accept-edits", "bypass", "auto"];
@@ -155,6 +160,9 @@ pub struct Options {
     /// The theme file the config's `theme` names, read once at start, or `None`
     /// for the theme the terminal's mode gives.
     pub theme: Option<PathBuf>,
+    /// The keys file of the config folder, read once at start, or `None` for the
+    /// table's own keys.
+    pub keys: Option<PathBuf>,
     /// Where the terminal's answers to the first frame's two queries arrive, for
     /// a terminal that sends them; `None` draws in the mode the terminal's own.
     pub background: Option<Background>,
@@ -213,13 +221,22 @@ impl Exit {
 
 /// The look a session the app switches to draws with: its theme mode, the
 /// depth, the theme file's colors and whether it draws color at all.
-type Carried = (crate::theme::Mode, Depth, Overrides, bool);
+/// What the session the app switches to keeps from the last one: the look it
+/// drew with, and the keys table it read at its start, which is read once for
+/// the whole run.
+struct Carried {
+    /// The mode the last session drew in, its depth, its overrides and whether
+    /// the terminal reported a color.
+    look: (crate::theme::Mode, Depth, Overrides, bool),
+    /// The keys the last session read.
+    keys: Option<crate::keyfile::KeyFile>,
+}
 
 /// The session a sheet opened: its worker, the client already connected to it
 /// and the look it draws with.
 struct Switch {
     opened: Opened,
-    look: Carried,
+    carried: Carried,
     client: Client,
     init: Initialized,
 }
@@ -236,7 +253,7 @@ pub async fn run(mut options: Options, mut terminal: impl Terminal) -> io::Resul
         };
         // The last session left the alternate screen the way a quit does; the
         // next one enters it again, with the look the last one had.
-        carried = Some((next.look, next.client, next.init));
+        carried = Some((next.carried, next.client, next.init));
         options.socket = next.opened.socket;
         options.token = next.opened.token;
         options.session_dir = next.opened.session_dir;
@@ -250,17 +267,23 @@ async fn run_session(
     terminal: &mut impl Terminal,
     carried: Option<(Carried, Client, Initialized)>,
 ) -> io::Result<(Exit, Option<Switch>)> {
-    let (look, (mut client, init)) = match carried {
-        Some((look, client, init)) => (Some(look), (client, init)),
+    let (carried, (mut client, init)) = match carried {
+        Some((carried, client, init)) => (Some(carried), (client, init)),
         None => (
             None,
             Client::connect(&options.socket, &options.token, &options.client_name).await?,
         ),
     };
     let mut app = App::new(&init, terminal.size(), options.full);
-    // A session the app switched to draws with the look the last one had.
-    if let Some((mode, depth, overrides, color)) = look {
+    // A session the app switched to draws with the look the last one had, and
+    // reads the keys the last one read.
+    let looked = carried.is_some();
+    if let Some(carried) = carried {
+        let (mode, depth, overrides, color) = carried.look;
         app.look = Look::resolve(mode, depth, overrides, color, &mut app.screen);
+        if let Some(file) = carried.keys {
+            app.set_keyfile(file);
+        }
     }
     app.state = options.state.clone();
     app.host = options.host.clone();
@@ -287,13 +310,19 @@ async fn run_session(
     // between the two is in neither the replay nor a read up to the handshake.
     let attached = client.attach(init.committed).await?;
     if let Some(dir) = app.journal.clone() {
-        match history::read(dir, attached.committed).await {
-            Ok(tail) => app.history(&tail),
+        let room = app.room();
+        match history::read(dir, attached.committed, room).await {
+            Ok(mut tail) => {
+                app.placeholder_tail(&mut tail).await;
+                app.history(&mut tail);
+            }
             Err(error) => app.note(format!("history: {error}")),
         }
     }
     app.read = attached.committed;
     app.drawn = attached.committed;
+    app.pictured = attached.committed;
+    app.picture_read = attached.committed;
     // The run may have ended while this client was away, and its `run_end` is in
     // a record the worker did not replay: the answer says whether one is open.
     app.set_running(attached.running);
@@ -306,12 +335,15 @@ async fn run_session(
     // the queries would answer for a terminal that has not changed.
     let mut background: Option<Background> = None;
     app.enter(terminal).await;
-    if look.is_none() {
+    if !looked {
         // The theme file, then the first frame's two queries: the frame waits only
         // for the device attributes answer, which every terminal gives, so it is
         // drawn in the mode the terminal can show within a few milliseconds, and a
         // late background answer draws one more frame in rich mode.
         background = options.background.take();
+        // The keys file, read once for the whole run: a session the app
+        // switches to keeps the table and its notes show once.
+        app.read_keys(options.keys.take()).await;
         if let Some(color) = app
             .start(terminal, options.theme.take(), background.as_ref())
             .await
@@ -332,6 +364,7 @@ async fn run_session(
                     Ok(Event::Mouse(mouse)) => app.mouse(mouse),
                     Ok(Event::Resize(columns, rows)) => app.resize(columns, rows),
                     Ok(Event::Paste(text)) => app.paste(text),
+                    Ok(Event::FocusGained) => app.focused(),
                     Ok(_) => {}
                     Err(error) => {
                         // The input side is gone, so every later read would fail
@@ -355,9 +388,12 @@ async fn run_session(
                 app.files = Some(files.paths);
                 app.files_ready = true;
             }
+            (id, exchange) = preview_answer(&mut app.preview_job) => app.exchange_arrived(id, exchange),
             models = models_answer(&mut app.waits.models) => app.models_arrived(models),
             step = login_answer(&mut app.waits.login) => app.login_step(step),
             opened = open_answer(&mut app.waits.open) => app.opened(opened),
+            deleted = delete_answer(&mut app.waits.delete) => app.deleted(deleted.0, deleted.1, deleted.2),
+            (request, image) = image_answer(&mut app.image_job) => app.image_pasted(request, image),
             frame = client.next_frame() => {
                 match frame {
                     Ok(Next::Frame(frame)) => app.frame(frame),
@@ -375,7 +411,10 @@ async fn run_session(
                     }
                 }
             }
-            () = wait(until) => app.timer(),
+            () = wait(until) => if let Err(error) = app.timer(terminal).await {
+                broken = Some(error);
+                break;
+            },
             () = signals.recv() => signal_end(&mut app),
         }
         if std::mem::take(&mut app.files_ready) {
@@ -399,7 +438,10 @@ async fn run_session(
                     let _ = client.detach().await;
                     next = Some(Switch {
                         opened,
-                        look,
+                        carried: Carried {
+                            look,
+                            keys: app.keyfile.take(),
+                        },
                         client: next_client,
                         init: next_init,
                     });
@@ -434,6 +476,7 @@ async fn run_session(
             }
         }
         if app.needs_draw()
+            && !terminal.input_ready()
             && let Err(error) = app.draw(terminal).await
         {
             broken = Some(error);
@@ -451,6 +494,36 @@ async fn run_session(
             Ok((Exit { code: app.code }, next))
         }
     }
+}
+
+/// Fills the PNG payload of `picture` for a terminal that draws placeholders,
+/// or drops its source when the image makes no PNG: the picture then keeps its
+/// half-block cells.
+async fn placeholder_picture(picture: &mut Picture) {
+    let Some(source) = picture.source.as_ref() else {
+        return;
+    };
+    if source.png {
+        return;
+    }
+    let data = Arc::clone(&source.data);
+    let made = tokio::task::spawn_blocking(move || picture_native::png_payload(&data))
+        .await
+        .ok()
+        .flatten();
+    let bytes = made.as_deref().map_or(0, picture::decoded_bytes);
+    picture.source = made.map(|png| PictureSource {
+        data: png.into(),
+        bytes,
+        png: true,
+    });
+}
+
+/// The first image id of the run: one of the 24 bits a placeholder's color
+/// names, taken from the process id so two runs in one terminal keep their
+/// images apart.
+fn first_image_id() -> u32 {
+    1 + (std::process::id().wrapping_mul(2_654_435_761) & 0x00FF_FFFF) % 0x00FF_0000
 }
 
 /// The folder of the session `id`, whichever folder under the sessions root
@@ -496,6 +569,9 @@ fn signal_end(app: &mut App) {
     app.exit = true;
 }
 
+/// How long the status line says what a mouse copy took.
+const COPIED_FOR: Duration = Duration::from_secs(3);
+
 /// Waits until `at`, or forever when no frame is due.
 async fn wait(at: Option<tokio::time::Instant>) {
     match at {
@@ -515,6 +591,26 @@ async fn files_answer(slot: &mut Option<HostFuture<Files>>) -> Files {
     };
     *slot = None;
     answer
+}
+
+/// Waits for the messages the sessions sheet is reading, with the id of the
+/// row it is for; stays pending while no read is in flight.
+async fn preview_answer(
+    slot: &mut Option<(
+        Arc<str>,
+        tokio::task::JoinHandle<io::Result<RecentMessages>>,
+    )>,
+) -> (Arc<str>, io::Result<RecentMessages>) {
+    // The job stays in its slot while it runs, as the files' job does.
+    let wait = match slot.as_mut() {
+        Some((_, job)) => job.await,
+        None => std::future::pending().await,
+    };
+    let answer = wait.unwrap_or_else(|error| Err(io::Error::other(error.to_string())));
+    match slot.take() {
+        Some((id, _)) => (id, answer),
+        None => std::future::pending().await,
+    }
 }
 
 /// Waits for the model list the host is reading; stays pending while no read is
@@ -537,6 +633,37 @@ async fn login_answer(
 ) -> Option<LoginStep> {
     match slot.as_mut() {
         Some(steps) => steps.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The answer to the image paste in flight, with the request it ran for, and
+/// never when none is in flight.
+async fn image_answer(
+    slot: &mut Option<ImageJob>,
+) -> (ImageRequest, Result<Option<Pasted>, String>) {
+    // The job stays in its slot while it runs, as the files' job does.
+    let result = match slot.as_mut() {
+        Some(job) => (&mut job.handle).await,
+        None => std::future::pending().await,
+    };
+    let result = result.unwrap_or_else(|error| Err(format!("the image job stopped: {error}")));
+    match slot.take() {
+        Some(job) => (job.request, result),
+        None => std::future::pending().await,
+    }
+}
+
+/// The answer to the delete in flight, with the id and the title it started
+/// with, and never when no delete is in flight.
+async fn delete_answer(slot: &mut Option<Deleting>) -> (Arc<str>, Arc<str>, Result<(), String>) {
+    // The job stays in its slot while it runs, so a further Ctrl+D sees it.
+    let answer = match slot.as_mut() {
+        Some(deleting) => (&mut deleting.job).await,
+        None => std::future::pending().await,
+    };
+    match slot.take() {
+        Some(deleting) => (deleting.id, deleting.title, answer),
         None => std::future::pending().await,
     }
 }
@@ -667,6 +794,8 @@ enum Item {
     Steer { text: Arc<str>, queued: bool },
     /// Plain lines that never change again.
     Plain { lines: Vec<String>, dim: bool },
+    /// One image of the session: its half-block cells and the chip under them.
+    Picture(Box<Picture>),
     /// The one line an approval answer leaves, colored by the answer: `ok` for
     /// the add role of an allowed call, the error role for a refused one.
     Answer { line: String, ok: bool },
@@ -1499,10 +1628,31 @@ impl std::fmt::Debug for FilesJob {
 struct Waits {
     /// The host's read of the model list, while it is in flight.
     models: Option<HostFuture<Models>>,
+    /// What the list the host answers is for.
+    after_models: AfterModels,
     /// The steps of the login now running, while one runs.
     login: Option<tokio::sync::mpsc::Receiver<LoginStep>>,
     /// The host's start of another session's worker, while it is in flight.
     open: Option<HostFuture<Result<Opened, String>>>,
+    /// The host's delete of a session, while it is in flight.
+    delete: Option<Deleting>,
+}
+
+/// A session the sessions sheet armed and the host is deleting: the id it acts
+/// on, the title its row showed, and the host's answer when it comes.
+struct Deleting {
+    /// The session the second Ctrl+D named, whatever the sheet shows later.
+    id: Arc<str>,
+    /// The title of the row the sheet armed, for the note the answer writes.
+    title: Arc<str>,
+    /// The host's answer.
+    job: HostFuture<Result<(), String>>,
+}
+
+impl std::fmt::Debug for Deleting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Deleting(..)")
+    }
 }
 
 impl std::fmt::Debug for Waits {
@@ -1525,12 +1675,92 @@ impl std::fmt::Debug for Open {
     }
 }
 
+impl Open {
+    /// Names the keys a keys file moved in the words of the sheet: its hint,
+    /// when it has one that names a key, and its footer, from the words the
+    /// file printed once when it was read.
+    fn name_keys(&mut self, file: Option<&keyfile::KeyFile>) {
+        let (hint, footer) = match &self.kind {
+            SheetKind::Model(_) => (None, Foot::Model),
+            SheetKind::Level => (None, Foot::Level),
+            SheetKind::Sessions(_) => (Some(Foot::SessionsHint), Foot::Sessions),
+            SheetKind::Login(login) => (Some(Foot::LoginHint), login.foot()),
+            SheetKind::Help => (None, Foot::Help),
+        };
+        self.sheet.moved(file, hint, footer);
+    }
+
+    /// Clears what a first Ctrl+D armed: any other key of the sheet does.
+    fn disarm(&mut self) {
+        if let SheetKind::Sessions(state) = &mut self.kind {
+            state.armed = None;
+        }
+        self.sheet.confirm = None;
+    }
+}
+
+/// What the app does with the model list when the host answers. One value, so
+/// the last key wins while the list is on its way.
+#[derive(Debug, Default)]
+enum AfterModels {
+    /// Opens the model sheet.
+    #[default]
+    ModelSheet,
+    /// Opens the level sheet.
+    LevelSheet,
+    /// Judges a word of `/level` against the plan of the current model.
+    LevelWord(String),
+}
+
+/// The rows a sessions sheet was built from, so a delete names a row of the
+/// disk and not an index into a list that may have changed under it.
+struct Sessions {
+    /// The rows on screen, in the order the sheet lists them.
+    rows: Vec<SessionRow>,
+    /// The id of the row a first Ctrl+D armed.
+    armed: Option<Arc<str>>,
+    /// What the sheet read and built for the rows, by id, kept while the sheet
+    /// is open: a row read once draws at once when a key comes back to it.
+    reads: HashMap<Arc<str>, Preview>,
+}
+
+/// What the sessions sheet read and built for one row of the folder.
+#[derive(Debug)]
+struct Preview {
+    /// The newest messages with text the row's journal held.
+    messages: RecentMessages,
+    /// The rows built from them, and the pane width they were built at.
+    built: Option<(u16, Arc<Vec<PreviewRow>>)>,
+}
+
+/// The preview rows of a row of the sheet: the ones the cache holds for this
+/// pane width, so a key that comes back to a row builds none, and the messages
+/// it holds built again when the width changed.
+fn preview_rows(
+    state: &mut Sessions,
+    id: &Arc<str>,
+    pane: u16,
+    theme: &Theme,
+) -> Option<Arc<Vec<PreviewRow>>> {
+    let read = state.reads.get_mut(id)?;
+    if let Some((width, rows)) = &read.built
+        && *width == pane
+    {
+        return Some(Arc::clone(rows));
+    }
+    let rows = Arc::new(sessions::preview_rows(&read.messages, pane, theme));
+    read.built = Some((pane, Arc::clone(&rows)));
+    Some(rows)
+}
+
 /// What a sheet is for.
 enum SheetKind {
     /// The model list the sheet was built from.
     Model(Models),
-    /// The sessions of the folder.
-    Sessions,
+    /// The rows of the reasoning levels of the current model.
+    Level,
+    /// The sessions of the folder, and the row a delete armed.
+    Sessions(Sessions),
     /// The providers and the lines of the login now running.
     Login(Login),
     /// Every key, grouped.
@@ -1560,6 +1790,9 @@ struct App {
     editor: Editor,
     /// The key map.
     keys: Keys,
+    /// The table the keys file moved, and the keys it shows; `None` for an app
+    /// that read no file, which does no work per key.
+    keyfile: Option<crate::keyfile::KeyFile>,
     /// The bytes of the frame being written, reused.
     frame: Vec<u8>,
     /// The message text of the send this key made, reused.
@@ -1628,8 +1861,17 @@ struct App {
     sheet: Option<Open>,
     /// The futures the open sheet waits on.
     waits: Waits,
+    /// The newest messages the sessions sheet is reading, with the id of the
+    /// row it is for, while the read runs: one read at a time, so holding the
+    /// down key reads the row the user stops on and the one in flight.
+    preview_job: Option<(
+        Arc<str>,
+        tokio::task::JoinHandle<io::Result<RecentMessages>>,
+    )>,
     /// The model list the host answered, kept for the next opening.
     models: Option<Models>,
+    /// The reasoning level the session runs, as its `settings` frame names it.
+    level: Option<Arc<str>>,
     /// The worker of the session the sheet picked, when the app switches to it.
     switch: Option<Opened>,
     /// The query of the list for this key, reused.
@@ -1646,6 +1888,13 @@ struct App {
     armed: bool,
     /// How many rows the editor showed last.
     editor_rows: u16,
+    /// The lines the last mouse copy took, for the status line.
+    copied: usize,
+    /// When the status line stops saying so; `None` while it does not.
+    copied_until: Option<Instant>,
+    /// How many rows of the live entries the last frame's live area cut from
+    /// the top, so a click on a live block counts from the rows it drew.
+    live_skip: u16,
     /// The screen row the text box starts on last frame, so a click can find
     /// the paste chips it drew.
     editor_top: u16,
@@ -1667,6 +1916,21 @@ struct App {
     read: u64,
     /// The newest journal record the app drew.
     drawn: u64,
+    /// The newest journal record whose picture of an image the app drew: no path
+    /// draws the pictures of that record or of an older one again.
+    pictured: u64,
+    /// The newest journal record the app read for pictures: the next read starts
+    /// after it, so a record whose message names no image costs one read.
+    picture_read: u64,
+    /// Whether a live frame named an image whose bytes a record that has not
+    /// committed yet holds. It stays set until the run ends or a read finds a
+    /// picture, since the record that commits before the one holding the image
+    /// carries nothing.
+    pictures: bool,
+    /// Whether a committed record waits for the read of the pictures it holds.
+    pictures_wait: bool,
+    /// The color pairs the pictures of this transcript may still take.
+    budget: StyleBudget,
     /// The user messages the app drew from live frames, oldest first: the record
     /// that commits each of them follows the frame, so a journal read matches
     /// them in order instead of drawing them twice.
@@ -1710,10 +1974,8 @@ struct App {
     selecting: bool,
     /// The copy of the last release: the OSC 52 sequence the next frame writes.
     clipboard: Vec<u8>,
-    /// The plain text of that copy, the scratch the sequence is built in.
+    /// The plain text of that copy, the scratch the next one is built in.
     clip: String,
-    /// The text of the rows the copy read, reused.
-    picked: Vec<String>,
     /// The state folder the folder's sessions and the live workers are under.
     state: Option<PathBuf>,
     /// The sessions the panel shows, with the current one marked.
@@ -1722,6 +1984,302 @@ struct App {
     reading: Option<tokio::task::JoinHandle<Vec<reagent_store::list::Entry>>>,
     /// When the next tick of a panel that wants one is due.
     tick: Option<Instant>,
+    /// The image paste in flight, and the ones that wait behind it.
+    image_job: Option<ImageJob>,
+    /// The image pastes that wait for the one in flight, oldest first.
+    image_queue: VecDeque<ImageRequest>,
+    /// The terminal's own image protocol, decided at the first picture of the
+    /// run and kept for the rest of it.
+    native: Option<Native>,
+    /// Whether the protocol of the terminal was decided.
+    native_decided: bool,
+    /// When the pictures that moved or were lost go out.
+    picture_deadline: Option<tokio::time::Instant>,
+    /// The id the next picture of a placeholder terminal takes.
+    image_id: u32,
+    /// The ids of the images the terminal holds, whose placeholders go with the
+    /// screen.
+    image_ids: Vec<u32>,
+    /// The image sequences of the pictures going out, reused.
+    images: Vec<u8>,
+}
+
+/// Where the bytes of a pasted image come from.
+#[derive(Debug, Clone)]
+enum ImageSource {
+    /// The local clipboard.
+    Clipboard,
+    /// A file a dropped path names.
+    File(PathBuf),
+}
+
+/// One image paste the app runs, or waits to run behind another.
+#[derive(Debug, Clone)]
+struct ImageRequest {
+    /// Where the bytes come from.
+    source: ImageSource,
+    /// The paste's own text, for a dropped path whose file cannot be read: it
+    /// goes in the box as a normal paste instead.
+    fallback: Option<String>,
+    /// Whether a clipboard with no image says nothing: a paste of no text asked.
+    quiet: bool,
+}
+
+impl ImageRequest {
+    /// The clipboard's image; `quiet` says that no image there is no note.
+    fn clipboard(quiet: bool) -> Self {
+        ImageRequest {
+            source: ImageSource::Clipboard,
+            fallback: None,
+            quiet,
+        }
+    }
+
+    /// The image of the file `path` names, and the paste to fall back on.
+    fn file(path: PathBuf, text: String) -> Self {
+        ImageRequest {
+            source: ImageSource::File(path),
+            fallback: Some(text),
+            quiet: false,
+        }
+    }
+}
+
+/// The image paste in flight: the request it runs and the handle of its answer.
+#[derive(Debug)]
+struct ImageJob {
+    /// The request the job runs for.
+    request: ImageRequest,
+    /// The job's answer, when it ends.
+    handle: tokio::task::JoinHandle<Result<Option<Pasted>, String>>,
+}
+
+/// The image a job wrote, with the number of its chip.
+#[derive(Debug, Clone)]
+struct Pasted {
+    /// The path the chip's text quotes.
+    path: String,
+    /// The number in the chip's label.
+    number: u32,
+}
+
+/// How many bytes of a pasted image the app takes: the clipboard's cap.
+const IMAGE_CAP: usize = crate::clipboard::CAP;
+
+/// The words of an image over the cap, as the clipboard and the file both say
+/// them.
+const IMAGE_CAP_TEXT: &str = "the image is over 64 MiB";
+
+/// The note of a clipboard that holds no image.
+const IMAGE_NONE: &str = "no image in the clipboard";
+
+/// The note of an image paste in a session with no folder.
+const IMAGE_NO_FOLDER: &str = "this session has no folder for images";
+
+/// The folder of a session's pasted images.
+const PASTED: &str = "pasted";
+
+/// The kinds a path can name to be a dropped image, in lower case.
+const IMAGE_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "heic", "avif",
+];
+
+/// Where this app's own image pastes land: the word a chip stands for.
+const PASTED_WORD: &str = "/pasted/image-";
+
+/// Writes the image of `source` into the `pasted` folder of the session at
+/// `folder`, and answers the file it wrote and the number of its chip.
+///
+/// The folder and every file are the user's own alone, and a new number takes a
+/// file rather than write over one that is already there. All of it is the work
+/// of one blocking job: no frame waits for it.
+#[expect(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "runs inside spawn_blocking"
+)]
+fn save_image(folder: &Path, source: &ImageSource) -> Result<Option<Pasted>, String> {
+    let (bytes, ext) = match source {
+        ImageSource::Clipboard => match crate::clipboard::read_image()? {
+            Some(image) => (image.bytes, image.ext.to_owned()),
+            None => return Ok(None),
+        },
+        ImageSource::File(path) => {
+            let size = std::fs::metadata(path)
+                .map_err(|error| error.to_string())?
+                .len();
+            if size > IMAGE_CAP as u64 {
+                return Err(IMAGE_CAP_TEXT.to_owned());
+            }
+            let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+            let ext = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            if ext.is_empty() {
+                return Err("the image path names no kind".to_owned());
+            }
+            (bytes, ext)
+        }
+    };
+    let folder = folder.join(PASTED);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&folder)
+        .map_err(|error| format!("the pasted folder: {error}"))?;
+    // The number follows the files the folder holds, so the second image of a
+    // session is not the second of another one.
+    let mut number = 1;
+    let entries =
+        std::fs::read_dir(&folder).map_err(|error| format!("the pasted folder: {error}"))?;
+    for entry in entries {
+        entry.map_err(|error| format!("the pasted folder: {error}"))?;
+        number += 1;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let (path, mut file) = loop {
+        let path = folder.join(format!("image-{number}.{ext}"));
+        // A chip quotes its path, so a name no quote can close is a name no chip
+        // draws.
+        match path.to_str() {
+            Some(name) if !name.contains('"') => {}
+            _ => return Err("the image path holds a quote".to_owned()),
+        }
+        match options.open(&path) {
+            Ok(file) => break (path, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => number += 1,
+            Err(error) => return Err(format!("the image file: {error}")),
+        }
+    };
+    file.write_all(&bytes)
+        .map_err(|error| format!("the image file: {error}"))?;
+    let path = path
+        .to_str()
+        .ok_or_else(|| "the image path is no text".to_owned())?
+        .to_owned();
+    Ok(Some(Pasted { path, number }))
+}
+
+/// The path an image paste names, when its text is one path to one image.
+///
+/// A terminal sends a dropped file as a plain path, a quoted one, or one with
+/// its spaces escaped, so all three are one path here. The text trims one
+/// trailing line break and the spaces around it, and it names no image unless it
+/// starts at `/` or `~/`, ends in a kind [`IMAGE_EXTS`] knows, and holds no line
+/// break, no quote and no unescaped space that would make it two paths.
+fn image_path(text: &str) -> Option<PathBuf> {
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let text = text.trim_matches(' ');
+    if text.is_empty() {
+        return None;
+    }
+    let raw = if let Some(inner) = text
+        .strip_prefix('\'')
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        Cow::Borrowed(inner)
+    } else if let Some(inner) = text
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        Cow::Borrowed(inner)
+    } else {
+        let mut path = String::with_capacity(text.len());
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                // Terminals also escape brackets and the like in a dropped path.
+                '\\' => path.push(chars.next()?),
+                ' ' | '"' | '\n' | '\r' => return None,
+                c => path.push(c),
+            }
+        }
+        Cow::Owned(path)
+    };
+    if raw.contains('"') || raw.contains(['\n', '\r']) {
+        return None;
+    }
+    let ext = raw.rsplit_once('.')?.1;
+    if !IMAGE_EXTS.iter().any(|kind| kind.eq_ignore_ascii_case(ext)) {
+        return None;
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")?;
+        return Some(PathBuf::from(home).join(rest));
+    }
+    if !raw.starts_with('/') {
+        return None;
+    }
+    Some(PathBuf::from(raw.as_ref()))
+}
+
+/// The text of a user message as a transcript row draws it: an image chip's
+/// `@"<path>"` word is the label of its number, and the space in front of it goes
+/// with it when the text before it ends in one, so the row reads as the box did.
+///
+/// The message the worker gets, the journal and the history keep the real text.
+fn shown_user_text(text: &str) -> Cow<'_, str> {
+    if !text.contains(PASTED_WORD) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let Some(at) = rest.find(" @\"") else {
+            out.push_str(rest);
+            return Cow::Owned(out);
+        };
+        let quoted = &rest[at + 3..];
+        let Some(end) = quoted.find('"') else {
+            out.push_str(rest);
+            return Cow::Owned(out);
+        };
+        let Some(number) = pasted_number(&quoted[..end]) else {
+            out.push_str(&rest[..at + 3]);
+            rest = &rest[at + 3..];
+            continue;
+        };
+        let before = &rest[..at];
+        out.push_str(before);
+        if !before.is_empty() && !before.ends_with(' ') {
+            out.push(' ');
+        }
+        out.push_str(IMAGE_LABEL);
+        out.push_str(number);
+        out.push(']');
+        rest = &rest[at + 3 + end + 1..];
+    }
+}
+
+/// The number of the image a `/pasted/image-<n>.<ext>` path names, when the path
+/// is one of this app's own pastes.
+fn pasted_number(path: &str) -> Option<&str> {
+    if !path.contains(PASTED_WORD) {
+        return None;
+    }
+    let name = path.rsplit('/').next()?;
+    let name = name.strip_prefix("image-")?;
+    let (number, ext) = name.split_once('.')?;
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if !IMAGE_EXTS.iter().any(|kind| kind.eq_ignore_ascii_case(ext)) {
+        return None;
+    }
+    Some(number)
 }
 
 /// What ended this client's connection, and so what a resync falls back to when
@@ -1762,11 +2320,15 @@ impl App {
             main: layout::layout(columns, rows, false).main,
             editor: Editor::new(),
             keys: Keys::new(),
+            keyfile: None,
             frame: Vec::new(),
             session: init.session.clone(),
             client: init.client,
             pending: Vec::new(),
             live: Vec::new(),
+            copied: 0,
+            copied_until: None,
+            live_skip: 0,
             block_lines: LineSink::default(),
             finished: Vec::new(),
             folds: Folds::new(),
@@ -1783,7 +2345,7 @@ impl App {
             queue: VecDeque::new(),
             history: Vec::new(),
             commands: VecDeque::new(),
-            slash: commands::table(),
+            slash: commands::table(None),
             list: None,
             leader_list: List::leader(),
             files: None,
@@ -1792,7 +2354,9 @@ impl App {
             host: None,
             sheet: None,
             waits: Waits::default(),
+            preview_job: None,
             models: None,
+            level: init.level.clone(),
             switch: None,
             query: String::new(),
             rows: Vec::new(),
@@ -1811,6 +2375,11 @@ impl App {
             place: Arc::from(""),
             read: 0,
             drawn: 0,
+            pictured: 0,
+            picture_read: 0,
+            pictures: false,
+            pictures_wait: false,
+            budget: StyleBudget::new(),
             unwritten: VecDeque::new(),
             fed: VecDeque::new(),
             upto: 0,
@@ -1829,11 +2398,18 @@ impl App {
             selecting: false,
             clipboard: Vec::new(),
             clip: String::new(),
-            picked: Vec::new(),
             state: None,
             sessions: Vec::new(),
             reading: None,
             tick: None,
+            image_job: None,
+            image_queue: VecDeque::new(),
+            native: None,
+            native_decided: false,
+            picture_deadline: None,
+            image_id: first_image_id(),
+            image_ids: Vec::new(),
+            images: Vec::new(),
         };
         // The sidebar the start asks for, and the main area it leaves.
         app.reflow();
@@ -1841,7 +2417,7 @@ impl App {
     }
 
     /// Takes the messages read from the journal as finished entries.
-    fn history(&mut self, tail: &Tail) {
+    fn history(&mut self, tail: &mut Tail) {
         if tail.omitted > 0 {
             self.push_plain(vec![format!("... {} earlier messages", tail.omitted)], true);
         }
@@ -1866,6 +2442,9 @@ impl App {
                     if !text.is_empty() {
                         self.history.push(text);
                     }
+                    if let Some(pictures) = tail.pictures.get_mut(index) {
+                        self.pictures_of(pictures.drain(..));
+                    }
                 }
                 Message::Assistant(reply) => {
                     calls.extend(calls_of(&reply.content));
@@ -1887,6 +2466,14 @@ impl App {
                         .chain(calls.iter().copied())
                         .find(|call| call.id == result.call_id);
                     run.push(self.replayed(result, call));
+                    // A picture stands under the row of the call that returned
+                    // it, so the run of rows before it closes first.
+                    if let Some(pictures) = tail.pictures.get_mut(index)
+                        && !pictures.is_empty()
+                    {
+                        self.close_group(&mut run);
+                        self.pictures_of(pictures.drain(..));
+                    }
                 }
             }
         }
@@ -1990,7 +2577,9 @@ impl App {
     /// Adds a user turn: the block wraps the message at the width of the main
     /// area, so the text stays in the buffer this makes for it.
     fn push_user(&mut self, text: &str) {
-        let text: Arc<str> = Arc::from(text);
+        // A chip's word reads as its label on the row; the history and the
+        // journal keep the text the worker gets.
+        let text: Arc<str> = Arc::from(shown_user_text(text).as_ref());
         self.freeze_all();
         self.pending.push(Item::User { text });
         self.dirty = true;
@@ -2043,6 +2632,62 @@ impl App {
     fn note(&mut self, text: String) {
         let width = usize::from(self.transcript_width());
         self.push_plain(wrap_note(&text, width), false);
+    }
+
+    /// The keys the frames show: the file's table, or `None` for the table's
+    /// own, which every draw falls back to.
+    pub(crate) fn labels(&self) -> Option<&keyfile::Labels> {
+        self.keyfile.as_ref().map(keyfile::KeyFile::labels)
+    }
+
+    /// The keys table `text` answers, for the tests of the frames that draw it.
+    #[cfg(test)]
+    pub(crate) fn read_keys_text(&mut self, text: &str) {
+        let (file, _) = keyfile::KeyFile::parse(text);
+        self.set_keyfile(file);
+    }
+
+    /// Reads the keys file once, before the first frame.
+    ///
+    /// A missing file is no note and no table, a file that cannot be read is one
+    /// note, and a line the file gets wrong is one note too: the other lines
+    /// apply either way.
+    async fn read_keys(&mut self, path: Option<PathBuf>) {
+        let Some(path) = path else {
+            return;
+        };
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(error) => {
+                self.note(format!("keys: {}: {error}", path.display()));
+                return;
+            }
+        };
+        let (file, notes) = crate::keyfile::KeyFile::parse(&text);
+        for note in notes {
+            self.note(format!("keys: {note} ({})", path.display()));
+        }
+        self.set_keyfile(file);
+    }
+
+    /// Takes the table a keys file answers: the frames read it, and the
+    /// which-key list prints its own copy of the leader's keys here, once, so a
+    /// frame draws no text it has to build.
+    fn set_keyfile(&mut self, file: keyfile::KeyFile) {
+        let labels = file.labels();
+        let grid: Arc<[Arc<str>]> = HINTS
+            .iter()
+            .enumerate()
+            .filter(|(_, hint)| hint.group == keys::Group::Leader)
+            .map(|(index, _)| Arc::from(labels.hint(index)))
+            .collect::<Vec<_>>()
+            .into();
+        let title: Arc<str> = Arc::from(labels.leader());
+        self.leader_list.set_keys(list::LeaderKeys { title, grid });
+        self.leader_list.set_labels(Some(labels));
+        self.slash = commands::table(Some(labels));
+        self.keyfile = Some(file);
     }
 
     /// Moves the first `count` live entries to the transcript, freezing their
@@ -2247,11 +2892,15 @@ impl App {
             }
             Frame::TextDelta(text) => {
                 self.running();
+                let bytes = text.len();
                 self.text(&text);
+                self.panels_update(&Update::Streamed { bytes });
             }
             Frame::ThinkingDelta(text) => {
                 self.running();
+                let bytes = text.len();
                 self.thinking(&text);
+                self.panels_update(&Update::Streamed { bytes });
             }
             Frame::ToolStart { id, name } => {
                 self.running();
@@ -2268,15 +2917,30 @@ impl App {
                 error,
                 output,
                 earlier,
+                images,
                 ..
             } => {
                 let tail = output.as_deref().map(|output| (output, earlier));
                 self.tool_result(&id, bytes, tail, error.as_deref());
+                // The bytes of an image are in the journal, and the record that
+                // holds them comes next.
+                self.pictures = self.pictures || images > 0;
             }
             Frame::TurnEnd => self.turn_end(false),
-            Frame::RunEnd => self.turn_end(true),
-            Frame::UserMessage { text } => {
+            Frame::RunEnd { at_limit } => {
+                if at_limit {
+                    self.note(TURN_LIMIT_LINE.to_string());
+                }
+                // The run ends with every record that carries its images, so no
+                // commit of it asks for another read.
+                self.pictures = false;
+                self.turn_end(true);
+            }
+            Frame::UserMessage { text, images } => {
                 self.push_user(&text);
+                // The images of the message, pasted or attached with `@`, are in
+                // the journal: the frame carries only their count.
+                self.pictures = self.pictures || images > 0;
                 // The message the worker echoes is the one a steer row held, so
                 // the row goes now that the turn has it.
                 self.live.retain(|item| !matches!(item, Item::Steer { .. }));
@@ -2311,6 +2975,11 @@ impl App {
                 if !self.unfilled {
                     self.read = self.read.max(self.upto);
                 }
+                // A record can commit before the one that holds the image a frame
+                // named, so every commit while the flag is set asks for a read.
+                if self.pictures {
+                    self.pictures_wait = true;
+                }
             }
             Frame::ApprovalRequest { request, saves } => self.approval_request(request, saves),
             Frame::ApprovalResolved { id } => self.resolved(id),
@@ -2329,9 +2998,11 @@ impl App {
                     window: context_window.unwrap_or(0),
                 });
                 self.set_settings(level.as_deref(), mode.as_deref());
+                self.level = level.as_deref().map(Arc::from);
             }
             Frame::Usage {
                 input,
+                cached,
                 output,
                 cost,
             } => {
@@ -2342,7 +3013,11 @@ impl App {
                     self.run_cents = self.run_cents.saturating_add(cents);
                     self.cents = self.cents.saturating_add(cents);
                 }
-                self.panels_update(&Update::Usage { input, output });
+                self.panels_update(&Update::Usage {
+                    input,
+                    cached,
+                    output,
+                });
             }
             Frame::Unknown => {}
         }
@@ -2471,12 +3146,23 @@ impl App {
         }
     }
 
-    /// What a due deadline was: one tick of the panels that want one.
-    fn timer(&mut self) {
+    /// What a due deadline was: one tick of the panels that want one, and the
+    /// images of the pictures that waited out their settle time.
+    async fn timer(&mut self, terminal: &mut impl Terminal) -> io::Result<()> {
         self.deadline = None;
         if self.tick.is_some_and(|at| at <= Instant::now()) {
             self.tick = None;
             self.panels_update(&Update::Tick);
+        }
+        match self.picture_deadline {
+            Some(at) if at <= tokio::time::Instant::now() => self.settle_pictures(terminal).await,
+            Some(at) => {
+                if self.deadline.is_none_or(|deadline| deadline > at) {
+                    self.deadline = Some(at);
+                }
+                Ok(())
+            }
+            None => Ok(()),
         }
     }
 
@@ -2658,6 +3344,7 @@ impl App {
             self.read_checkpoint(fold, from).await;
         }
         self.take_sessions().await;
+        self.read_pictures().await;
         if self.upto <= self.read {
             return;
         }
@@ -2701,6 +3388,7 @@ impl App {
             Client::connect(&options.socket, &options.token, &options.client_name).await?;
         drop(cut);
         self.stale();
+        self.rejoined(&init);
         // The answer to `attach` can name a later record than the handshake, as
         // a record may commit between the two, and it says whether a run is open
         // now.
@@ -2714,6 +3402,12 @@ impl App {
         self.status_dirty = true;
         self.touch();
         Ok(client)
+    }
+
+    /// Takes what a new handshake says: another client may have set the level
+    /// while this one was away.
+    fn rejoined(&mut self, init: &Initialized) {
+        self.level.clone_from(&init.level);
     }
 
     /// Reads the messages the journal recorded after the last record this app
@@ -2733,13 +3427,14 @@ impl App {
         let Some(dir) = self.journal.take() else {
             return;
         };
-        let messages = history::since(dir.clone(), self.read, upto).await;
+        let room = self.room();
+        let mut messages = history::since(dir.clone(), self.read, upto, room).await;
         self.journal = Some(dir);
         match messages {
-            Ok(messages) => {
+            Ok(ref mut messages) => {
                 self.read = upto;
                 self.unfilled = false;
-                self.apply(&messages);
+                self.apply(messages);
             }
             Err(error) => self.note(format!("journal: {error}")),
         }
@@ -2752,58 +3447,186 @@ impl App {
     /// Every message arrives with the record that holds it. A record the app
     /// drew already, or a user message a live frame drew before the record
     /// committed it, is not drawn again: a cut does not repeat the transcript.
-    fn apply(&mut self, messages: &[(u64, Message)]) {
+    fn apply(&mut self, messages: &mut [(u64, Message, Vec<Picture>)]) {
         if messages.is_empty() {
             return;
         }
         // A result whose call is not in the live area takes the name and the
         // target of the call the record of this catch-up holds.
         let mut calls: Vec<&ToolCall> = Vec::new();
-        for (record, message) in messages {
-            if *record <= self.drawn {
+        for (record, message, pictures) in messages.iter_mut() {
+            if *record > self.drawn {
+                self.drawn = *record;
+                match message {
+                    Message::User { content } => {
+                        if !self.already_drawn(content) {
+                            let text = self.user_message(content);
+                            if !text.is_empty() {
+                                self.history.push(text);
+                            }
+                        }
+                    }
+                    Message::Assistant(reply) => {
+                        calls.extend(calls_of(&reply.content));
+                        if self.shows(reply) {
+                            // The record holds what the app drew of that reply, whole:
+                            // the turn is over, so it leaves the live area for the
+                            // transcript instead of being drawn a second time.
+                            self.freeze_text();
+                        } else {
+                            // The reply this client was streaming is the one the
+                            // record finished, so it goes before the finished copy
+                            // is drawn.
+                            self.drop_open_reply();
+                            self.finished(reply);
+                        }
+                        // The reply this client was streaming is finished in the
+                        // journal, so that turn is over. A run that goes on says so
+                        // with its next frame.
+                        self.running = false;
+                        self.status_dirty = true;
+                    }
+                    Message::ToolResult(result) => {
+                        if self.tool(&result.call_id).is_some() {
+                            self.fill(&result.call_id, &result.content);
+                        } else {
+                            let call = calls.iter().find(|call| call.id == result.call_id).copied();
+                            let tool = self.replayed(result, call);
+                            self.pending.push(Item::Tool(Box::new(tool)));
+                        }
+                    }
+                }
+            }
+            // A record the app drew live may still hold an image whose picture
+            // no path drew yet.
+            if *record > self.pictured {
+                self.pictured = *record;
+                self.pictures_of(pictures.drain(..));
+            }
+            // The record was read here, so the pictures read skips it.
+            self.picture_read = self.picture_read.max(*record);
+        }
+        self.dirty = true;
+    }
+
+    /// Reads the record a live frame said holds an image, and puts its pictures
+    /// under the turn or the call that came with it.
+    ///
+    /// A frame carries no image bytes, so the picture of one costs a read of the
+    /// journal, and only a frame that named an image costs that read. The images
+    /// are decoded in the read's own blocking job. The read starts after the last
+    /// record read for its own sake, so a record that holds no image is read once.
+    async fn read_pictures(&mut self) {
+        if !self.pictures_wait || self.upto <= self.picture_read {
+            return;
+        }
+        self.pictures_wait = false;
+        if self.journal.is_none() {
+            self.journal = session_folder(&self.session).await;
+            if self.journal.is_none() {
+                return;
+            }
+        }
+        let Some(dir) = self.journal.take() else {
+            return;
+        };
+        let room = self.room();
+        let messages = history::since(dir.clone(), self.picture_read, self.upto, room).await;
+        self.journal = Some(dir);
+        match messages {
+            Ok(mut messages) => {
+                self.picture_read = self.upto;
+                self.placeholder_pictures(&mut messages).await;
+                if self.pictures_into(&mut messages) {
+                    self.pictures = false;
+                }
+            }
+            Err(error) => self.note(format!("journal: {error}")),
+        }
+    }
+
+    /// Decides the terminal's own image protocol once per run, at the first
+    /// picture of a full-screen one, and gives it to the screen.
+    ///
+    /// Inline mode never asks: its lines are the terminal's scrollback and no
+    /// image sits on them.
+    async fn native_pictures(&mut self) {
+        if self.native_decided || !self.screen.is_full() {
+            return;
+        }
+        self.native_decided = true;
+        let tmux = std::env::var("TMUX").ok().filter(|value| !value.is_empty());
+        let display = match tmux {
+            Some(_) => picture_native::tmux_display().await,
+            None => None,
+        };
+        let native = picture_native::detect(|name| std::env::var(name).ok(), display.as_deref());
+        self.native = native;
+        self.screen.set_native(native);
+    }
+
+    /// The PNG payload of every picture of `messages` whose source the journal
+    /// gave, inside a terminal that draws placeholders: a picture whose image
+    /// makes no PNG keeps its half-block cells.
+    async fn placeholder_pictures(&mut self, messages: &mut [(u64, Message, Vec<Picture>)]) {
+        if messages.iter().all(|(_, _, pictures)| pictures.is_empty()) {
+            return;
+        }
+        self.native_pictures().await;
+        if !self.placeholders() {
+            return;
+        }
+        for (_, _, pictures) in messages.iter_mut() {
+            for picture in pictures.iter_mut() {
+                placeholder_picture(picture).await;
+            }
+        }
+    }
+
+    /// The pictures a resume read from the journal, made ready the same way as
+    /// the ones a live frame names.
+    async fn placeholder_tail(&mut self, tail: &mut history::Tail) {
+        if tail.pictures.iter().all(Vec::is_empty) {
+            return;
+        }
+        self.native_pictures().await;
+        if !self.placeholders() {
+            return;
+        }
+        for pictures in &mut tail.pictures {
+            for picture in pictures.iter_mut() {
+                placeholder_picture(picture).await;
+            }
+        }
+    }
+
+    /// Whether the terminal draws a picture as placeholders.
+    fn placeholders(&self) -> bool {
+        self.native
+            .is_some_and(|native| native.protocol == Protocol::Placeholders)
+    }
+
+    /// Puts the pictures the journal records `messages` hold under the rows the
+    /// app drew for them, answers whether it drew one, and skips a record whose
+    /// pictures it drew already.
+    fn pictures_into(&mut self, messages: &mut [(u64, Message, Vec<Picture>)]) -> bool {
+        let mut drawn = false;
+        for (record, _, pictures) in messages.iter_mut() {
+            if pictures.is_empty() || *record <= self.pictured {
                 continue;
             }
-            self.drawn = *record;
-            match message {
-                Message::User { content } => {
-                    if self.already_drawn(content) {
-                        continue;
-                    }
-                    let text = self.user_message(content);
-                    if !text.is_empty() {
-                        self.history.push(text);
-                    }
-                }
-                Message::Assistant(reply) => {
-                    calls.extend(calls_of(&reply.content));
-                    if self.shows(reply) {
-                        // The record holds what the app drew of that reply, whole:
-                        // the turn is over, so it leaves the live area for the
-                        // transcript instead of being drawn a second time.
-                        self.freeze_text();
-                    } else {
-                        // The reply this client was streaming is the one the
-                        // record finished, so it goes before the finished copy
-                        // is drawn.
-                        self.drop_open_reply();
-                        self.finished(reply);
-                    }
-                    // The reply this client was streaming is finished in the
-                    // journal, so that turn is over. A run that goes on says so
-                    // with its next frame.
-                    self.running = false;
-                    self.status_dirty = true;
-                }
-                Message::ToolResult(result) => {
-                    if self.tool(&result.call_id).is_some() {
-                        self.fill(&result.call_id, &result.content);
-                    } else {
-                        let call = calls.iter().find(|call| call.id == result.call_id).copied();
-                        let tool = self.replayed(result, call);
-                        self.pending.push(Item::Tool(Box::new(tool)));
-                    }
-                }
-            }
+            self.pictured = *record;
+            self.pictures_of(pictures.drain(..));
+            drawn = true;
+        }
+        drawn
+    }
+
+    /// Adds the pictures of one record as finished entries, in the order of its
+    /// images.
+    fn pictures_of(&mut self, pictures: impl Iterator<Item = Picture>) {
+        for picture in pictures {
+            self.pending.push(Item::Picture(Box::new(picture)));
         }
         self.dirty = true;
     }
@@ -2869,6 +3692,23 @@ impl App {
         self.set_sessions();
     }
 
+    /// The sections a key press is read in, for what is on screen now.
+    fn key_chain(&self, overlay: Overlay) -> &'static [Section] {
+        if self.keys.leader_pending() {
+            keyfile::LEADER_CHAIN
+        } else if overlay == Overlay::Approval {
+            keyfile::CARD_CHAIN
+        } else if overlay == Overlay::Sheet {
+            keyfile::SHEET_CHAIN
+        } else if overlay == Overlay::List {
+            keyfile::LIST_CHAIN
+        } else if self.sidebar.active() {
+            keyfile::SIDEBAR_CHAIN
+        } else {
+            keyfile::KEYS_CHAIN
+        }
+    }
+
     /// Takes one key press.
     fn key(&mut self, event: KeyEvent) {
         let now = std::time::Instant::now();
@@ -2891,6 +3731,26 @@ impl App {
             (None, _) if self.sheet.is_some() => Overlay::Sheet,
             (None, _) if self.list.is_some() => Overlay::List,
             (None, _) => Overlay::None,
+        };
+        // A key the file moved reads as the first key of its action, before the
+        // map or any raw reader sees it, and a key it swallowed goes no further.
+        let event = match &self.keyfile {
+            Some(file) => match file.translate(self.key_chain(overlay), event) {
+                Some(event) => event,
+                None => return,
+            },
+            None => event,
+        };
+        // Ctrl+G is the Emacs cancel: it does what Esc does, except that a history
+        // search gives the draft back on it and keeps the match on Esc.
+        let event = if crate::keys::is_ctrl_g(&event) && !self.editor.searching() {
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                ..event
+            }
+        } else {
+            event
         };
         let mut action = self.keys.action(event, overlay, now);
         // Ctrl+D on an empty box is the quit key, as Ctrl+C is: the map does not
@@ -2992,7 +3852,7 @@ impl App {
             Action::Pick => self.pick(),
             Action::Close => self.list = None,
             Action::Edit(key) => self.edit(key),
-            Action::Ignore => {}
+            Action::Delete | Action::Ignore => {}
         }
     }
 
@@ -3019,6 +3879,7 @@ impl App {
     fn leader(&mut self, leader: Leader) {
         match leader {
             Leader::Model => self.open_models(),
+            Leader::Level => self.open_levels(),
             Leader::Sessions => self.open_sessions(),
             Leader::Commands => self.toggle_palette(),
             other => self.sidebar_leader(other),
@@ -3032,19 +3893,132 @@ impl App {
         let Some(open) = self.sheet.as_mut() else {
             return false;
         };
+        // Any key but the delete itself clears what a first Ctrl+D armed, so an
+        // armed row can never turn into another row.
+        let deleting = action == Action::Delete;
+        if !deleting {
+            open.disarm();
+        }
         match action {
-            Action::Edit(EditKey::Insert(c)) => open.sheet.push(c),
-            Action::Edit(EditKey::Backspace) => open.sheet.pop(),
+            Action::Edit(EditKey::Insert(c)) => {
+                open.sheet.push(c);
+                self.sheet_preview();
+            }
+            Action::Edit(EditKey::Backspace) => {
+                open.sheet.pop();
+                self.sheet_preview();
+            }
             Action::Move(delta) => {
                 open.sheet.step(delta);
                 self.sheet_preview();
             }
             Action::Pick => self.pick_sheet(),
             Action::Close => self.sheet = None,
+            Action::Delete => self.delete_session(),
             _ => return false,
         }
         self.dirty = true;
         true
+    }
+
+    /// Ctrl+D in the sessions sheet: the first press arms the row on screen, the
+    /// second deletes the id it armed.
+    fn delete_session(&mut self) {
+        if self.waits.delete.is_some() {
+            return;
+        }
+        // A worker that is starting holds no lock yet, so the store's check
+        // cannot see it.
+        if self.waits.open.is_some() {
+            self.note("wait: a worker is starting".to_owned());
+            return;
+        }
+        let Some(open) = self.sheet.as_mut() else {
+            return;
+        };
+        let SheetKind::Sessions(state) = &mut open.kind else {
+            return;
+        };
+        // The row on screen, found in the rows the sheet was built from: the
+        // folder's list may have moved since.
+        let Some(id) = sessions::picked(&open.sheet, &state.rows) else {
+            return;
+        };
+        let Some(row) = state.rows.iter().find(|row| row.id == id) else {
+            return;
+        };
+        let (current, live) = (row.current, row.live);
+        let title: Arc<str> = Arc::from(sessions::name(row));
+        if state.armed.as_deref() == Some(&*id) {
+            state.armed = None;
+            open.sheet.confirm = None;
+            self.start_delete(id, title);
+            return;
+        }
+        if current {
+            self.note("this is the current session".to_owned());
+            return;
+        }
+        if live {
+            self.note("a worker runs this session".to_owned());
+            return;
+        }
+        // The prompt is built here, once, and drawn every frame until a key
+        // clears it: the key is the one a keys file moved the delete to.
+        let key = match &self.keyfile {
+            Some(file) => file.labels().delete(),
+            None => "ctrl+d",
+        };
+        let confirm: Arc<str> = Arc::from(format!("{key} again deletes \"{title}\""));
+        open.sheet.confirm = Some(confirm);
+        state.armed = Some(id);
+    }
+
+    /// Starts the host's delete of the session the sheet armed.
+    fn start_delete(&mut self, id: Arc<str>, title: Arc<str>) {
+        let Some(host) = self.host.as_ref() else {
+            self.note("no delete without the binary's host".to_owned());
+            return;
+        };
+        self.waits.delete = Some(Deleting {
+            job: host.get().delete(&id),
+            id,
+            title,
+        });
+    }
+
+    /// The host's answer to a delete: the row goes, or the sheet notes why not.
+    /// The answer names the id it started with, whatever the sheet shows now.
+    fn deleted(&mut self, id: Arc<str>, title: Arc<str>, answer: Result<(), String>) {
+        match answer {
+            Ok(()) => {
+                self.forget_session(&id);
+                self.note(format!("deleted \"{title}\""));
+            }
+            Err(text) => self.note(text),
+        }
+        self.dirty = true;
+    }
+
+    /// Takes the session `id` out of the folder's list, and builds the sessions
+    /// sheet again from the rows that are left when it is still open.
+    fn forget_session(&mut self, id: &str) {
+        if let Some(at) = self.sessions.iter().position(|row| &*row.id == id) {
+            self.sessions.remove(at);
+        }
+        self.set_sessions();
+        let Some(open) = self.sheet.as_mut() else {
+            return;
+        };
+        let SheetKind::Sessions(state) = &mut open.kind else {
+            return;
+        };
+        state.rows = self.sessions.clone();
+        state.armed = None;
+        let sheet = sessions::rebuilt(&state.rows, now_seconds(), &open.sheet);
+        open.sheet = sheet;
+        open.name_keys(self.keyfile.as_ref());
+        self.sheet_preview();
     }
 
     /// The keys of the transcript rows: Tab folds or opens the finished block
@@ -3064,8 +4038,9 @@ impl App {
                 true
             }
             (KeyCode::Tab, modifiers) if modifiers.is_empty() => {
-                if self.editor.selected_paste().is_some() {
-                    self.editor.toggle_paste();
+                // The tab of a chip at the edit point opens it or folds it, and
+                // an open chip folds even with the edit point off it.
+                if self.editor.toggle_paste() {
                     self.editor_dirty = true;
                     return true;
                 }
@@ -3076,7 +4051,9 @@ impl App {
                     }
                     return true;
                 }
-                false
+                // With no run a queued message sends at once, and Tab must not
+                // send by accident: only a run leaves Tab to the queue.
+                !self.running
             }
             _ => false,
         }
@@ -3112,14 +4089,101 @@ impl App {
     /// Takes one bracketed paste: the editor keeps the bytes and folds a paste
     /// of more than three lines into one chip at the edit point. The text moves
     /// into the editor, so the paste is held once.
+    ///
+    /// A paste of no text is a copy of an image, and a paste of the path of one
+    /// is a file a terminal dropped: both go to the folder of the session as a
+    /// chip. Every other paste is text and reads no file.
     fn paste(&mut self, text: String) {
         self.deadline = None;
         self.dirty = true;
         // A paste is no key of the search: it ends the search and keeps the
         // match in the box, the way every other key does.
         self.editor.search_end();
+        if text.is_empty() {
+            // The clipboard's image, with nothing to say when it holds none.
+            self.request_image(ImageRequest::clipboard(true));
+            return;
+        }
+        if let Some(path) = image_path(&text) {
+            // A file it cannot read is the paste it would have been: the word is
+            // still the path, and the worker reads it when the message goes.
+            self.request_image(ImageRequest::file(path, text));
+            return;
+        }
         self.editor.paste(text);
         self.editor_dirty = true;
+    }
+
+    /// Ctrl+V: the image the local clipboard holds, as a chip in the box.
+    fn paste_image(&mut self) {
+        self.request_image(ImageRequest::clipboard(false));
+    }
+
+    /// Starts an image paste, or puts it behind the one that runs.
+    fn request_image(&mut self, request: ImageRequest) {
+        if self.image_job.is_some() {
+            self.image_queue.push_back(request);
+            return;
+        }
+        self.spawn_image(request);
+    }
+
+    /// Runs `request` on a blocking job of its own, so no frame waits for a
+    /// pasteboard or a file.
+    fn spawn_image(&mut self, request: ImageRequest) {
+        let Some(folder) = self.journal.clone() else {
+            self.image_pasted(request, Err(IMAGE_NO_FOLDER.to_owned()));
+            return;
+        };
+        let source = request.source.clone();
+        let handle = tokio::task::spawn_blocking(move || save_image(&folder, &source));
+        self.image_job = Some(ImageJob { request, handle });
+    }
+
+    /// Takes what an image job answered: the chip of the image it wrote, the
+    /// note of a clipboard with none, or the paste a dropped path falls back to.
+    fn image_pasted(&mut self, request: ImageRequest, result: Result<Option<Pasted>, String>) {
+        self.image_job = None;
+        match result {
+            Ok(Some(pasted)) => {
+                self.editor.paste_image(&pasted.path, pasted.number);
+                self.editor_dirty = true;
+                self.dirty = true;
+            }
+            Ok(None) => match &request.source {
+                ImageSource::Clipboard if !request.quiet => self.note(IMAGE_NONE.to_owned()),
+                ImageSource::Clipboard => {}
+                ImageSource::File(_) => self.paste_fallback(request.fallback),
+            },
+            Err(message) => match &request.source {
+                // An empty paste only asked: a terminal may send one with no image in mind.
+                ImageSource::Clipboard if request.quiet => {}
+                ImageSource::Clipboard => self.note(format!("image: {message}")),
+                ImageSource::File(_) => self.paste_fallback(request.fallback),
+            },
+        }
+        self.next_image();
+    }
+
+    /// Puts a dropped path's text in the box as the paste it would have been: its
+    /// bytes could not be read, and no note says so.
+    fn paste_fallback(&mut self, text: Option<String>) {
+        let Some(text) = text else {
+            return;
+        };
+        self.editor.paste(text);
+        self.editor_dirty = true;
+        self.dirty = true;
+    }
+
+    /// Starts the image paste that waited behind the one that ended.
+    fn next_image(&mut self) {
+        if self.image_job.is_some() {
+            return;
+        }
+        if let Some(request) = self.image_queue.pop_front() {
+            self.spawn_image(request);
+        }
     }
 
     /// Sends the editor's text: a steer while a run goes, else a queue that
@@ -3153,7 +4217,7 @@ impl App {
     /// Adds the row that holds the message the run takes next: a steer that
     /// lands after the tool now running, or a queued turn.
     fn steer_row(&mut self, text: &str, queued: bool) {
-        let text: Arc<str> = Arc::from(text);
+        let text: Arc<str> = Arc::from(shown_user_text(text).as_ref());
         self.live.retain(|item| !matches!(item, Item::Steer { .. }));
         self.live.push(Item::Steer { text, queued });
     }
@@ -3253,7 +4317,7 @@ impl App {
 
     /// Runs one key of the editor, which may read the argument it was given.
     fn edit_key(&mut self, key: EditKey) {
-        let width = self.text_width();
+        let width = self.editor_columns();
         if self.armed {
             // The hint goes away with the next key, so the status line is
             // rebuilt for it.
@@ -3301,7 +4365,7 @@ impl App {
             EditKey::BackwardWord => self.editor.backward_word(),
             EditKey::DeleteChar => self.editor.delete_char(),
             EditKey::KillWordForward => self.editor.kill_word(),
-            EditKey::KillWordBackward => self.editor.backward_kill_word(),
+            EditKey::KillWordBackward => self.editor.backward_kill_word_at(Instant::now()),
             EditKey::DeleteSpace => self.editor.delete_horizontal_space(),
             EditKey::Transpose => self.editor.transpose_chars(),
             EditKey::TransposeWords => self.editor.transpose_words(),
@@ -3314,6 +4378,7 @@ impl App {
             EditKey::Mark => self.editor.set_mark(),
             EditKey::Exchange => self.editor.exchange_point_and_mark(),
             EditKey::Quote => self.editor.quote_next(),
+            EditKey::PasteImage => self.paste_image(),
             EditKey::CharSearch => self.editor.search_char(true),
             EditKey::CharSearchBackward => self.editor.search_char(false),
             EditKey::Digit(digit) => self.editor.digit(digit),
@@ -3322,12 +4387,6 @@ impl App {
             EditKey::SearchBackward => self.start_search(false),
             EditKey::SearchForward => self.start_search(true),
             EditKey::AbortSearch => self.editor.search_abort(),
-            EditKey::HistoryUp => {
-                self.editor.history_up(&self.history);
-            }
-            EditKey::HistoryDown => {
-                self.editor.history_down(&self.history);
-            }
             EditKey::HistoryOldest => {
                 self.editor.history_oldest(&self.history);
             }
@@ -3403,7 +4462,9 @@ impl App {
             self.list.as_ref().map(List::source),
             Some(Source::Commands(_))
         ) {
-            self.list = Some(List::commands(Arc::clone(&self.slash), false));
+            let mut list = List::commands(Arc::clone(&self.slash), false);
+            list.set_labels(self.labels());
+            self.list = Some(list);
         }
         if let Some(list) = self.list.as_mut() {
             list.set_query(&self.query);
@@ -3427,7 +4488,9 @@ impl App {
         }
         if !matches!(self.list.as_ref().map(List::source), Some(Source::Files(_))) {
             let files = self.files.clone().unwrap_or_default();
-            self.list = Some(List::files(files));
+            let mut list = List::files(files);
+            list.set_labels(self.labels());
+            self.list = Some(list);
         }
         if let Some(list) = self.list.as_mut() {
             list.set_query(&self.query);
@@ -3458,7 +4521,9 @@ impl App {
         if self.list.as_ref().is_some_and(List::is_palette) {
             self.list = None;
         } else {
-            self.list = Some(List::commands(Arc::clone(&self.slash), true));
+            let mut list = List::commands(Arc::clone(&self.slash), true);
+            list.set_labels(self.labels());
+            self.list = Some(list);
         }
         self.dirty = true;
     }
@@ -3470,6 +4535,7 @@ impl App {
         // What the pick is, read off the sheet before any of it changes.
         enum Pick {
             Model(Arc<str>),
+            Level(Arc<str>),
             Session(Arc<str>),
             Login(&'static str),
             None,
@@ -3478,8 +4544,9 @@ impl App {
             None => Pick::None,
             Some(open) => match &open.kind {
                 SheetKind::Model(_) => model::picked(&open.sheet).map_or(Pick::None, Pick::Model),
-                SheetKind::Sessions => {
-                    sessions::picked(&open.sheet, &self.sessions).map_or(Pick::None, Pick::Session)
+                SheetKind::Level => level::picked(&open.sheet).map_or(Pick::None, Pick::Level),
+                SheetKind::Sessions(state) => {
+                    sessions::picked(&open.sheet, &state.rows).map_or(Pick::None, Pick::Session)
                 }
                 SheetKind::Login(login) => {
                     login.picked(&open.sheet).map_or(Pick::None, Pick::Login)
@@ -3506,6 +4573,15 @@ impl App {
                 });
                 self.note(format!("model: {id} from the next turn"));
             }
+            Pick::Level(word) => {
+                self.sheet = None;
+                self.commands.push_back(Command::Set {
+                    model: None,
+                    level: Some(word.to_string()),
+                    mode: None,
+                });
+                self.note(format!("level: {word} from the next turn"));
+            }
             Pick::Session(id) => {
                 if id.as_ref() == self.session {
                     self.sheet = None;
@@ -3530,9 +4606,46 @@ impl App {
         Some(name)
     }
 
+    /// `/level <word>`: a word no model can make known waits for the list when
+    /// this app has not read one, because the plan of the model may name it.
+    fn level_word(&mut self, word: &str) {
+        if !is_level_word(word)
+            && self.models.is_none()
+            && let Some(host) = self.host.as_ref()
+        {
+            if self.waits.models.is_none() {
+                self.waits.models = Some(host.get().models());
+            }
+            self.waits.after_models = AfterModels::LevelWord(word.to_owned());
+            self.dirty = true;
+            return;
+        }
+        self.name_level(word);
+    }
+
+    /// Sends `word` when it is a named level, an off word, or a word the plan of
+    /// the current model lists without a place on the scale, and otherwise
+    /// names the words the command takes.
+    fn name_level(&mut self, word: &str) {
+        let current = self.current_model();
+        let listed = plan_of(self.models.as_ref(), current.as_deref())
+            .is_some_and(|plan| plan.takes_unknown(word));
+        if is_level_word(word) || listed {
+            self.commands.push_back(Command::Set {
+                model: None,
+                level: Some(word.to_owned()),
+                mode: None,
+            });
+        } else {
+            self.note("usage: /level low|medium|high|off".to_owned());
+        }
+        self.dirty = true;
+    }
+
     /// Opens the model sheet, asking the host for the list when this app has
     /// not read one yet.
     fn open_models(&mut self) {
+        self.waits.after_models = AfterModels::ModelSheet;
         if self.models.is_some() {
             self.show_models();
             return;
@@ -3547,10 +4660,45 @@ impl App {
         self.dirty = true;
     }
 
-    /// The model list arrived: the sheet opens on it.
+    /// The model list arrived: the sheet that waited for it opens on it.
     fn models_arrived(&mut self, models: Models) {
         self.models = Some(models);
-        self.show_models();
+        match std::mem::take(&mut self.waits.after_models) {
+            AfterModels::ModelSheet => self.show_models(),
+            AfterModels::LevelSheet => self.show_levels(),
+            AfterModels::LevelWord(word) => self.name_level(&word),
+        }
+    }
+
+    /// Opens the level sheet, asking the host for the model list when this app
+    /// has not read one yet, so the rows are the words of the current model.
+    fn open_levels(&mut self) {
+        if self.models.is_some() || self.host.is_none() {
+            self.show_levels();
+            return;
+        }
+        let Some(host) = self.host.as_ref() else {
+            return;
+        };
+        if self.waits.models.is_none() {
+            self.waits.models = Some(host.get().models());
+        }
+        self.waits.after_models = AfterModels::LevelSheet;
+        self.dirty = true;
+    }
+
+    /// Opens the level sheet over the plan of the model the app holds.
+    fn show_levels(&mut self) {
+        let current = self.current_model();
+        let sheet = {
+            let plan = plan_of(self.models.as_ref(), current.as_deref());
+            level::level_sheet(plan, self.level.as_deref())
+        };
+        self.show_sheet(Open {
+            kind: SheetKind::Level,
+            sheet,
+        });
+        self.dirty = true;
     }
 
     /// Opens the model sheet over the list the app holds.
@@ -3570,8 +4718,15 @@ impl App {
     /// Opens the sessions sheet over the sessions of the folder.
     fn open_sessions(&mut self) {
         let sheet = sessions::sessions_sheet(&self.sessions, now_seconds());
+        // The rows the sheet shows, kept so a delete names a row of the disk
+        // however the folder's list changes under it.
+        let state = Sessions {
+            rows: self.sessions.clone(),
+            armed: None,
+            reads: HashMap::new(),
+        };
         self.show_sheet(Open {
-            kind: SheetKind::Sessions,
+            kind: SheetKind::Sessions(state),
             sheet,
         });
         self.sheet_preview();
@@ -3579,25 +4734,92 @@ impl App {
     }
 
     /// Keeps the sessions sheet's preview on the row it picked, computed only
-    /// where the draw shows it.
+    /// where the draw shows it: the lines and the message rows at once, from
+    /// the messages the sheet already read, and a background read when the row
+    /// has none and no other row's read is in flight.
     fn sheet_preview(&mut self) {
-        if self.text_width() < PREVIEW_COLUMNS {
+        let width = self.text_width();
+        if width < PREVIEW_COLUMNS {
             return;
         }
+        let pane = pane_width(width.min(self.screen.columns()));
+        let theme = self.look.theme;
         let Some(open) = self.sheet.as_mut() else {
             return;
         };
-        if !matches!(open.kind, SheetKind::Sessions) {
+        let Open { sheet, kind } = open;
+        let SheetKind::Sessions(state) = kind else {
             return;
+        };
+        let Some((index, _)) = sheet.selected() else {
+            return;
+        };
+        let Some(row) = state.rows.get(index) else {
+            return;
+        };
+        let id = Arc::clone(&row.id);
+        // The answer to the read in flight draws the row on screen and starts
+        // the next read then, so a key that moves the selection waits for
+        // nothing and reads only the row the user stops on. The read is a job
+        // beside the loop, so it needs the loop's runtime; an app built without
+        // one, as a test builds it, starts no job.
+        if !state.reads.contains_key(&id)
+            && self.preview_job.is_none()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let reading = Arc::clone(&id);
+            let job = runtime.spawn(async move {
+                let Some(dir) = session_folder(&reading).await else {
+                    return Ok(RecentMessages::default());
+                };
+                history::recent_messages(dir).await
+            });
+            self.preview_job = Some((Arc::clone(&id), job));
         }
-        let Some((index, _)) = open.sheet.selected() else {
+        let lines = sessions::preview(row, now_seconds());
+        let rows = preview_rows(state, &id, pane, &theme);
+        sheet.set_preview(lines);
+        sheet.set_preview_rows(rows);
+    }
+
+    /// The answer to the sessions sheet's read of a row's messages: cached for
+    /// the row, then the preview drawn again, which builds its rows and starts
+    /// the read of the row on screen when it has none. A sheet that closed
+    /// meanwhile drops it.
+    fn exchange_arrived(&mut self, id: Arc<str>, answer: io::Result<RecentMessages>) {
+        let Some(open) = self.sheet.as_mut() else {
             return;
         };
-        let Some(row) = self.sessions.get(index) else {
+        let SheetKind::Sessions(state) = &mut open.kind else {
             return;
         };
-        open.sheet
-            .set_preview(sessions::preview(row, now_seconds()));
+        // A folder that is gone, or a journal that does not read, is no
+        // message: the row draws alone and is not read again.
+        let messages = answer.unwrap_or_default();
+        state.reads.insert(
+            id,
+            Preview {
+                messages,
+                built: None,
+            },
+        );
+        self.sheet_preview();
+        self.dirty = true;
+    }
+
+    /// Drops the preview rows built in the old colors and draws the row on
+    /// screen in the new ones.
+    fn preview_restyled(&mut self) {
+        if let Some(Open {
+            kind: SheetKind::Sessions(state),
+            ..
+        }) = self.sheet.as_mut()
+        {
+            for read in state.reads.values_mut() {
+                read.built = None;
+            }
+        }
+        self.sheet_preview();
     }
 
     /// Opens the login sheet over the providers the host can log in to.
@@ -3617,8 +4839,9 @@ impl App {
 
     /// Puts `open` in place of the text box; it takes the keys a focused
     /// sidebar had.
-    fn show_sheet(&mut self, open: Open) {
+    fn show_sheet(&mut self, mut open: Open) {
         self.sidebar.set_active(false);
+        open.name_keys(self.keyfile.as_ref());
         self.sheet = Some(open);
     }
 
@@ -3626,7 +4849,7 @@ impl App {
     fn open_help(&mut self) {
         self.show_sheet(Open {
             kind: SheetKind::Help,
-            sheet: sheet::help::help_sheet(),
+            sheet: sheet::help::help_sheet(self.labels()),
         });
         self.dirty = true;
     }
@@ -3642,6 +4865,7 @@ impl App {
         };
         login.start(provider);
         open.sheet = login.sheet();
+        open.name_keys(self.keyfile.as_ref());
         self.waits.login = self.host.as_ref().map(|host| host.get().login(provider));
     }
 
@@ -3667,6 +4891,7 @@ impl App {
             self.models = None;
             self.waits.login = None;
         }
+        open.name_keys(self.keyfile.as_ref());
         self.dirty = true;
     }
 
@@ -3676,6 +4901,12 @@ impl App {
             self.note("no worker without the binary's host".to_owned());
             return;
         };
+        // The session may be the one that is going away.
+        if self.waits.delete.is_some() {
+            self.note("wait: a session is being deleted".to_owned());
+            self.dirty = true;
+            return;
+        }
         if self.waits.open.is_none() {
             self.waits.open = Some(host.get().open(target));
         } else {
@@ -3810,7 +5041,7 @@ impl App {
         }
     }
 
-    /// Replaces the `@word` at the cursor with `path`.
+    /// Replaces the word after the `@` at the cursor with `path` and one space.
     fn complete_file(&mut self, path: &str) {
         let len = {
             let (before, _) = self.editor.chunks();
@@ -3820,12 +5051,13 @@ impl App {
             if before[start..].strip_prefix('@').is_none() {
                 return;
             }
-            before[start..].chars().count()
+            before[start + 1..].chars().count()
         };
         for _ in 0..len {
             self.editor.backspace();
         }
         self.editor.insert(path);
+        self.editor.insert(" ");
         self.list = None;
         self.editor_dirty = true;
         self.dirty = true;
@@ -3886,14 +5118,8 @@ impl App {
         match name {
             "/quit" => self.quit(),
             "/level" => match arg {
-                Some(level) if LEVELS.contains(&level) => {
-                    self.commands.push_back(Command::Set {
-                        model: None,
-                        level: Some(level.to_owned()),
-                        mode: None,
-                    });
-                }
-                _ => self.note("usage: /level low|medium|high".to_owned()),
+                None => self.open_levels(),
+                Some(word) => self.level_word(word),
             },
             "/mode" => match arg {
                 Some(mode) if MODES.contains(&mode) => {
@@ -3976,6 +5202,8 @@ impl App {
         // The fills the regions sit on go under their text, after the regions
         // drew it: the text box's rows take the input fill.
         self.paint_input_fill();
+        // A box or a panel over the transcript covers the images on it.
+        self.screen.block_pictures(self.covers_transcript());
         self.screen.diff(&mut self.frame);
         // The copy of a release goes out in the same write as the frame that
         // drops its highlight.
@@ -3983,10 +5211,71 @@ impl App {
             self.frame.append(&mut self.clipboard);
         }
         self.arm_tick();
+        self.arm_pictures();
         if self.frame.len() == SYNC_PAIR {
             return Ok(());
         }
         terminal.write_frame(&self.frame).await
+    }
+
+    /// Whether a box or a panel covers the rows of the transcript this frame:
+    /// an image under one of them would show through it.
+    fn covers_transcript(&self) -> bool {
+        self.approval.is_some() || self.sheet.is_some() || self.list.is_some()
+    }
+
+    /// Arms the wait before the images of the pictures go out, when one of them
+    /// waits.
+    ///
+    /// Every frame that still wants an image pushes the wait out again, so a
+    /// scroll draws the half-block cells until it stops.
+    fn arm_pictures(&mut self) {
+        if self.screen.pictures_due() {
+            self.arm_settle(picture_native::MOVE_SETTLE);
+        } else if let Some(at) = self.picture_deadline
+            && self.deadline.is_none_or(|deadline| deadline > at)
+        {
+            // A settle a resize or a focus-in armed survives the frame.
+            self.deadline = Some(at);
+        }
+    }
+
+    /// Arms the settle wait for a terminal that draws images.
+    fn arm_settle(&mut self, wait: Duration) {
+        let due = tokio::time::Instant::now() + wait;
+        self.picture_deadline = Some(due);
+        if self.deadline.is_none_or(|deadline| deadline > due) {
+            self.deadline = Some(due);
+        }
+    }
+
+    /// The terminal reported a focus-in: it drew its window again, so every
+    /// image on the screen is gone and goes out once the wait is over.
+    fn focused(&mut self) {
+        self.screen.pictures_lost();
+        if self.native.is_some() {
+            self.arm_settle(picture_native::SETTLE);
+        } else {
+            self.arm_pictures();
+        }
+    }
+
+    /// Draws the images of the pictures that waited out their settle time and
+    /// writes them.
+    async fn settle_pictures(&mut self, terminal: &mut impl Terminal) -> io::Result<()> {
+        self.picture_deadline = None;
+        if !self.screen.pictures_due() {
+            return Ok(());
+        }
+        let mut images = std::mem::take(&mut self.images);
+        self.screen.draw_pictures(&mut images);
+        let written = if images.is_empty() {
+            Ok(())
+        } else {
+            terminal.write_frame(&images).await
+        };
+        self.images = images;
+        written
     }
 
     /// The width the box, the cards, the lists and the status line lay out in:
@@ -4025,29 +5314,146 @@ impl App {
         }
     }
 
+    /// The columns a picture fits into: the transcript's width without the two
+    /// columns its rows are indented by. Before the first layout has set the
+    /// main area, the screen's own width stands in for it, so the pictures of
+    /// the replay fit the terminal the app was started on.
+    fn room(&self) -> u32 {
+        let width = if self.main.width == 0 {
+            self.screen.columns().saturating_sub(4)
+        } else {
+            self.transcript_width()
+        };
+        u32::from(width.saturating_sub(2)).max(1)
+    }
+
+    /// The interned style of every cell of `picture`, its columns and its rows:
+    /// nothing when its cells are missing, when the terminal draws sixteen
+    /// colors, when the theme draws none, or when the transcript has no color
+    /// pairs left for pictures. A picture with no cells draws only its chip.
+    fn picture_cells(&mut self, picture: &Picture) -> (Vec<u32>, u16, u16) {
+        let Some(cells) = &picture.cells else {
+            return (Vec::new(), 0, 0);
+        };
+        if self.look.depth == Depth::Ansi16 || self.look.mode() == crate::theme::Mode::NoColor {
+            return (Vec::new(), 0, 0);
+        }
+        if !self.budget.take(cells) {
+            return (Vec::new(), 0, 0);
+        }
+        let columns = u16::try_from(cells.columns).unwrap_or(u16::MAX);
+        let rows = u16::try_from(cells.rows).unwrap_or(u16::MAX);
+        let mut ids = Vec::with_capacity(usize::from(columns) * usize::from(rows));
+        for row in 0..cells.rows {
+            for column in 0..cells.columns {
+                let Some((top, low)) = cells.get(column, row) else {
+                    break;
+                };
+                ids.push(self.picture_id(top, low));
+            }
+        }
+        (ids, columns, rows)
+    }
+
+    /// The id of one cell of a picture: `▀` in the top pixel's color over the low
+    /// one's, mapped to the palette the terminal draws.
+    fn picture_id(&mut self, top: [u8; 3], low: [u8; 3]) -> u32 {
+        self.screen.intern(Style {
+            fg: self.look.depth.color(Color::Rgb(top[0], top[1], top[2])),
+            bg: self.look.depth.color(Color::Rgb(low[0], low[1], low[2])),
+            ..Style::default()
+        })
+    }
+
+    /// Sends the image of `picture` to a terminal that draws placeholders, once,
+    /// and answers the style of its rows with the columns and the rows they
+    /// take; `None` for a picture that draws as half-block cells.
+    ///
+    /// The style is the image's own: its foreground is the color that names the
+    /// image, which the palette must not change, and it takes nothing from the
+    /// style budget.
+    fn placeholder_cells(&mut self, picture: &Picture) -> Option<(u32, u16, u16)> {
+        let native = self.native?;
+        if native.protocol != Protocol::Placeholders {
+            return None;
+        }
+        let source = picture.source.as_ref()?;
+        let cells = picture.cells.as_ref()?;
+        let (Ok(columns), Ok(rows)) = (u16::try_from(cells.columns), u16::try_from(cells.rows))
+        else {
+            return None;
+        };
+        let id = self.next_image_id();
+        let mut images = std::mem::take(&mut self.images);
+        images.clear();
+        picture_native::transmit(&mut images, id, columns, rows, &source.data, native.tmux);
+        self.screen.send_images(&images);
+        self.images = images;
+        self.image_ids.push(id);
+        let (r, g, b) = picture_native::id_color(id);
+        let style = self.screen.intern(Style {
+            fg: Color::Rgb(r, g, b),
+            ..Style::default()
+        });
+        Some((style, columns, rows))
+    }
+
+    /// Takes the id of the next image the terminal draws: one of the 24 bits a
+    /// placeholder names, and after zero.
+    fn next_image_id(&mut self) -> u32 {
+        let id = self.image_id;
+        self.image_id = match id.checked_add(1) {
+            Some(next) if next <= 0x00FF_FFFF => next,
+            _ => 1,
+        };
+        id
+    }
+
+    /// Appends the command that frees every image the terminal holds, for the
+    /// exit write that closes the screen.
+    fn delete_images(&mut self) {
+        let tmux = self.native.is_some_and(|native| native.tmux);
+        let mut images = std::mem::take(&mut self.images);
+        images.clear();
+        for id in std::mem::take(&mut self.image_ids) {
+            picture_native::delete(&mut images, id, tmux);
+        }
+        self.screen.send_images(&images);
+        self.images = images;
+    }
+
     /// Takes a new terminal size from the event the terminal sent.
     fn resize(&mut self, columns: u16, rows: u16) {
         let (columns, rows) = (columns.max(1), rows.max(1));
+        // A terminal draws an iTerm2 image at the cells it was told, so the
+        // images go out again once the new layout has settled.
+        if self.native.is_some() {
+            self.arm_settle(picture_native::SETTLE);
+        }
         self.screen.resize(columns, rows);
         self.reflow();
         self.editor_dirty = true;
-        // The sessions sheet shows its preview only where the new width leaves
-        // room for it.
-        self.sheet_preview();
         self.touch();
     }
 
     /// Prints what was left live, leaves the alternate screen when the mode drew
-    /// full screen, and erases the live area.
+    /// full screen, and erases the live area. Both modes leave bracketed paste
+    /// with the extended keys.
     async fn finish(&mut self, terminal: &mut impl Terminal) -> io::Result<()> {
         self.freeze_all();
         self.commit();
+        // A kitty image outlives the screen that named it, so every image the
+        // run sent is freed in the write that closes it.
+        self.delete_images();
         self.screen.close(&mut self.frame);
+        // Focus reports go off on every exit path, full screen or not.
+        self.frame.extend_from_slice(term::FOCUS_OFF);
         if self.screen.is_full() && !self.frame.is_empty() {
             // The mouse capture goes with the exit write, after the print that
             // leaves the alternate screen, so no exit path leaves it on.
             self.frame.extend_from_slice(term::MOUSE_OFF);
         }
+        self.frame.extend_from_slice(term::PASTE_OFF);
         self.frame.extend_from_slice(term::KEYS_OFF);
         terminal.write_frame(&self.frame).await
     }
@@ -4095,6 +5501,32 @@ fn prices_of(models: &Models, id: &str) -> Option<(f64, f64)> {
         .flat_map(|provider| &provider.models)
         .find(|model| &*model.id == id)
         .and_then(|model| model.prices)
+}
+
+/// Whether `word` is a level on any model: a named level or an off word. A
+/// budget is not a level word.
+fn is_level_word(word: &str) -> bool {
+    let off = match reagent_ai::Reasoning::parse(word) {
+        reagent_ai::Reasoning::Budget(_) => false,
+        level => level.is_off(),
+    };
+    off || reagent_ai::levels::Level::parse(word).is_some()
+}
+
+/// The reasoning plan of the model `id` in `models`, from the provider that
+/// lists it, and `None` when no row names that model or its plan is unknown.
+fn plan_of<'a>(
+    models: Option<&'a Models>,
+    id: Option<&str>,
+) -> Option<&'a reagent_ai::levels::Reasoning> {
+    let id = id?;
+    models?
+        .providers
+        .iter()
+        .flat_map(|provider| &provider.models)
+        .find(|model| &*model.id == id)?
+        .reasoning
+        .as_ref()
 }
 
 /// The part of `text` a call keeps: its last [`OUTPUT_KEEP`] bytes from the

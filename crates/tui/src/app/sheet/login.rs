@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use super::{Kind, Line, Mark, Row, Sheet};
 use crate::host::LoginStep;
+use crate::keyfile::Foot;
 
 /// The title of the sheet.
 const TITLE: &str = "Log in";
@@ -15,10 +16,10 @@ const TITLE: &str = "Log in";
 /// The hint at the right edge of the title row.
 const HINT: &str = "enter starts a login";
 
-/// The footer while no login runs.
+/// The footer while no login runs, until a keys file moves a key it names.
 const FOOTER: &str = "\u{2191}\u{2193} choose \u{b7} enter logs in \u{b7} esc back to your draft";
 
-/// The footer while a login runs.
+/// The footer while a login runs, until a keys file moves a key it names.
 const WAITING: &str = "esc stops waiting \u{b7} the login goes on in the browser";
 
 /// The login state: the providers, the one being logged in, and the lines its
@@ -72,6 +73,16 @@ impl Login {
         };
         let count = format!("{} providers", self.providers.len());
         Sheet::new(TITLE, Arc::from(count), HINT, footer, rows)
+    }
+
+    /// The keys the footer row names, which the app writes with the ones a keys
+    /// file moved: the waiting footer while a login runs.
+    pub(crate) fn foot(&self) -> Foot {
+        if self.running.is_some() {
+            Foot::LoginWaiting
+        } else {
+            Foot::Login
+        }
     }
 
     /// The provider of the selected row, which the app starts a login for.
@@ -257,5 +268,18 @@ mod tests {
 
         let empty = Login::new(&[]);
         assert_eq!(empty.picked(&empty.sheet()), None);
+    }
+
+    /// A file that moves nothing prints each word as the table has it.
+    #[test]
+    fn keys_in_force_login_words_match_the_table() {
+        let (file, _) = crate::keyfile::KeyFile::parse("");
+        let labels = file.labels();
+        assert_eq!(labels.foot(crate::keyfile::Foot::Login), super::FOOTER);
+        assert_eq!(
+            labels.foot(crate::keyfile::Foot::LoginWaiting),
+            super::WAITING
+        );
+        assert_eq!(labels.foot(crate::keyfile::Foot::LoginHint), super::HINT);
     }
 }

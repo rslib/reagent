@@ -36,6 +36,8 @@ pub struct Initialized {
     pub model: Option<Arc<str>>,
     /// The context window of the model, when the run knows it.
     pub context_window: Option<u64>,
+    /// The reasoning level the session sends, when it sends one.
+    pub level: Option<Arc<str>>,
 }
 
 /// The worker's answer to `attach`: where the session stands, and whether a run
@@ -94,15 +96,22 @@ pub enum Frame<'a> {
         output: Option<Cow<'a, str>>,
         /// The count of lines before the tail, which the frame leaves out.
         earlier: u64,
+        /// How many images the result produced, whose bytes the journal holds.
+        images: usize,
     },
     /// A provider call ended.
     TurnEnd,
     /// The whole run ended.
-    RunEnd,
+    RunEnd {
+        /// Whether the turn limit ended it, so the task may not be done.
+        at_limit: bool,
+    },
     /// A client sent a message; every attached client hears it.
     UserMessage {
         /// The text of the message.
         text: Cow<'a, str>,
+        /// How many images follow it, such as a pasted one.
+        images: usize,
     },
     /// A provider or tool error.
     Error(Cow<'a, str>),
@@ -141,6 +150,9 @@ pub enum Frame<'a> {
     Usage {
         /// The input tokens the request sent.
         input: u64,
+        /// The tokens the request read from the provider's cache and wrote to
+        /// it, added together.
+        cached: u64,
         /// The output tokens the reply made.
         output: u64,
         /// What the provider says the request cost in USD, when it says.
@@ -526,6 +538,8 @@ fn read_init(line: &[u8], id: u64) -> io::Result<Option<Initialized>> {
         model: Option<Cow<'a, str>>,
         #[serde(default)]
         context_window: Option<u64>,
+        #[serde(borrow, default)]
+        level: Option<Cow<'a, str>>,
     }
     let Ok(answer) = serde_json::from_slice::<Answer<'_>>(line) else {
         return Ok(None);
@@ -540,6 +554,7 @@ fn read_init(line: &[u8], id: u64) -> io::Result<Option<Initialized>> {
             committed: result.committed,
             model: result.model.as_deref().map(Arc::from),
             context_window: result.context_window,
+            level: result.level.as_deref().map(Arc::from),
         })),
         None => Err(io::Error::other("the worker refused the handshake")),
     }
@@ -596,8 +611,11 @@ pub fn decode(line: &[u8]) -> Option<Frame<'_>> {
         after,
         replaced,
         input,
+        cache_read,
+        cache_write,
         output,
         earlier,
+        images,
         cost,
         tool,
         call,
@@ -630,10 +648,16 @@ pub fn decode(line: &[u8]) -> Option<Frame<'_>> {
             error,
             output: output.and_then(Output::text),
             earlier,
+            images: images.len(),
         },
         ("event", "turn_end") => Frame::TurnEnd,
-        ("event", "run_end") => Frame::RunEnd,
-        ("event", "user_message") => Frame::UserMessage { text: text? },
+        ("event", "run_end") => Frame::RunEnd {
+            at_limit: reason.as_deref() == Some("max_turns"),
+        },
+        ("event", "user_message") => Frame::UserMessage {
+            text: text?,
+            images: images.len(),
+        },
         ("event", "error") => Frame::Error(message?),
         ("event", "retry") => Frame::Retry {
             attempt,
@@ -647,6 +671,7 @@ pub fn decode(line: &[u8]) -> Option<Frame<'_>> {
         },
         ("event", "usage") => Frame::Usage {
             input,
+            cached: cache_read.saturating_add(cache_write),
             output: output.map(Output::count).unwrap_or(0),
             cost,
         },
@@ -722,12 +747,22 @@ struct Params<'a> {
     replaced: u32,
     #[serde(default)]
     input: u64,
+    /// The tokens a `usage` frame read from the provider's cache.
+    #[serde(default)]
+    cache_read: u64,
+    /// The tokens a `usage` frame wrote to the provider's cache.
+    #[serde(default)]
+    cache_write: u64,
     /// A token count in `usage`, and the tail of the text in `tool_result`.
     #[serde(default, borrow)]
     output: Option<Output<'a>>,
     /// The lines a `tool_result` frame left out before its tail.
     #[serde(default)]
     earlier: u64,
+    /// The images a `tool_result` frame names, whose bytes it leaves out: the
+    /// count is all the app needs, so each one is skipped as it is read.
+    #[serde(default)]
+    images: Vec<serde::de::IgnoredAny>,
     #[serde(default)]
     cost: Option<f64>,
     #[serde(default, borrow, deserialize_with = "cow")]
@@ -1185,6 +1220,7 @@ mod tests {
                 committed: 42,
                 model: Some(Arc::from(MODEL)),
                 context_window: Some(WINDOW),
+                level: None,
             }
         );
         let attached = client.attach(42).await.expect("attach");
@@ -1344,12 +1380,40 @@ mod tests {
         match next {
             Next::Frame(Frame::Usage {
                 input,
+                cached,
                 output,
                 cost,
             }) => {
                 assert_eq!((input, output), (50_000, 1_200));
+                assert_eq!(cached, 0, "a line without cache tokens reads none");
                 assert_eq!(cost, None);
             }
+            other => panic!("expected the usage, got {other:?}"),
+        }
+    }
+
+    /// A usage event carries the cache tokens of the request: what it read from
+    /// the provider's cache and what it wrote to it, added together.
+    #[tokio::test]
+    async fn stream_tokens_carry_the_cache_of_the_request() {
+        let fake = Fake::start("sess", 0);
+        let (mut client, _) = Client::connect(&fake.socket, "tok", "probe")
+            .await
+            .expect("connect");
+        fake.event(json!({
+            "type": "usage",
+            "input": 1_000,
+            "output": 10,
+            "cache_read": 40,
+            "cache_write": 2,
+            "cost": null,
+        }));
+        let next = timeout(WAIT, client.next_frame())
+            .await
+            .expect("a frame")
+            .expect("the worker stays");
+        match next {
+            Next::Frame(Frame::Usage { cached, .. }) => assert_eq!(cached, 42),
             other => panic!("expected the usage, got {other:?}"),
         }
     }
@@ -1541,7 +1605,13 @@ mod tests {
             frame(
                 r#"{"jsonrpc":"2.0","method":"event","params":{"type":"run_end","reason":"cancelled"}}"#
             ),
-            Some(Frame::RunEnd)
+            Some(Frame::RunEnd { at_limit: false })
+        ));
+        assert!(matches!(
+            frame(
+                r#"{"jsonrpc":"2.0","method":"event","params":{"type":"run_end","reason":"max_turns"}}"#
+            ),
+            Some(Frame::RunEnd { at_limit: true })
         ));
         match frame(
             r#"{"jsonrpc":"2.0","method":"event","params":{"type":"text_delta","text":"hello"}}"#,
@@ -1613,6 +1683,7 @@ mod tests {
                 error,
                 output,
                 earlier,
+                images,
             }) => {
                 assert_eq!(id, "call_3");
                 assert!(failed, "the tool reported a failure");
@@ -1620,13 +1691,34 @@ mod tests {
                 assert_eq!(error.as_deref(), Some("boom"));
                 assert_eq!(output.as_deref(), Some("the last line"));
                 assert_eq!(earlier, 298);
+                assert_eq!(images, 0, "a frame that names no image");
             }
             other => panic!("expected the tool output, got {other:?}"),
+        }
+        // A result that produced images names their number, and no bytes come
+        // over the line.
+        match frame(
+            r#"{"jsonrpc":"2.0","method":"event","params":{"type":"tool_result","id":"call_4","bytes":80,"images":[{"media_type":"image/png","width":64,"height":48,"bytes":700},{"media_type":"image/png","width":8,"height":8,"bytes":90}]}}"#,
+        ) {
+            Some(Frame::ToolResult { id, images, .. }) => {
+                assert_eq!(id, "call_4");
+                assert_eq!(images, 2);
+            }
+            other => panic!("expected the tool result with its images, got {other:?}"),
         }
         match frame(
             r#"{"jsonrpc":"2.0","method":"event","params":{"type":"user_message","client":7,"mode":"steer","text":"hi"}}"#,
         ) {
-            Some(Frame::UserMessage { text }) => assert_eq!(text, "hi"),
+            Some(Frame::UserMessage { text, images }) => {
+                assert_eq!(text, "hi");
+                assert_eq!(images, 0);
+            }
+            other => panic!("expected the message, got {other:?}"),
+        }
+        match frame(
+            r#"{"jsonrpc":"2.0","method":"event","params":{"type":"user_message","client":7,"mode":"steer","text":"[Image #1]","images":[{"media_type":"image/png","width":64,"height":48,"bytes":700}]}}"#,
+        ) {
+            Some(Frame::UserMessage { images, .. }) => assert_eq!(images, 1),
             other => panic!("expected the message, got {other:?}"),
         }
         match frame(
@@ -1655,9 +1747,13 @@ mod tests {
         ) {
             Some(Frame::Usage {
                 input,
+                cached,
                 output,
                 cost,
-            }) => assert_eq!((input, output, cost), (10, 4, Some(0.5))),
+            }) => {
+                assert_eq!((input, output, cost), (10, 4, Some(0.5)));
+                assert_eq!(cached, 0);
+            }
             other => panic!("expected the usage, got {other:?}"),
         }
     }

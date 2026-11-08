@@ -11,12 +11,15 @@
 //! back shares that entry, so the killed bytes are held once; the chips the kill
 //! covered ride on the entry, so a yank of it puts them back whole. A character
 //! typed after another one grows the last undo step in place and allocates
-//! nothing; every other command starts a step of its own. A step keeps the folded
-//! chips the edit covered, so an undo puts a chip back whole and never leaves the
-//! mark that stands for one in the text.
+//! nothing; every other command starts a step of its own, but the steps of a
+//! burst of Alt+Backspace presses are one undo step, which puts every word of
+//! the burst back at once. A step keeps the folded chips the edit covered, so an
+//! undo puts a chip back whole and never leaves the mark that stands for one in
+//! the text.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::{Case, Editor, Paste};
 
@@ -32,6 +35,10 @@ const LIMIT: usize = 128;
 /// same way, so a long run of digits can neither overflow it nor run a command
 /// for ever.
 const ARG_MAX: i32 = 1_000_000;
+
+/// The gap after a press of Alt+Backspace that a press within it still counts
+/// as part of the burst.
+const BURST_GAP: Duration = Duration::from_millis(200);
 
 /// One kill: the bytes it took and the folded chips that stood among them.
 ///
@@ -131,6 +138,16 @@ struct Found {
     at: usize,
 }
 
+/// A run of Alt+Backspace presses: when the last one came and how many it has
+/// had.
+#[derive(Debug, Clone, Copy)]
+struct Burst {
+    /// The instant of the last press.
+    at: Instant,
+    /// The presses of the run, this one counted.
+    presses: u32,
+}
+
 /// One step of the undo log.
 #[derive(Debug)]
 struct Step {
@@ -145,6 +162,8 @@ struct Step {
     /// Where the cursor was before the command, when its undo puts the cursor
     /// back there rather than past the text it puts back.
     point: Option<usize>,
+    /// Whether the step continues the one before it: one undo takes both back.
+    chain: bool,
 }
 
 /// The command the last key ran: it joins the kills in a row and lets a
@@ -192,6 +211,8 @@ pub(super) struct Readline {
     /// The entry the last Alt+. walked to and the bytes it inserted, which the
     /// press after it replaces.
     last_arg: Option<(usize, usize)>,
+    /// The burst of Alt+Backspace presses the last press belonged to.
+    burst: Option<Burst>,
 }
 
 impl Default for Readline {
@@ -210,6 +231,7 @@ impl Default for Readline {
             char_search: None,
             search: None,
             last_arg: None,
+            burst: None,
         }
     }
 }
@@ -217,7 +239,7 @@ impl Default for Readline {
 impl Readline {
     /// Record `len` bytes inserted at `at`, as one step of its own.
     pub(super) fn inserted(&mut self, at: usize, len: usize) {
-        self.push(at, Removed::Text(String::new()), len, Vec::new());
+        self.push(at, Removed::Text(String::new()), len, Vec::new(), false);
         self.last = Last::Other;
         self.last_arg = None;
     }
@@ -235,7 +257,7 @@ impl Readline {
             }
             self.shift(at, 0, len);
         } else {
-            self.push(at, Removed::Text(String::new()), len, Vec::new());
+            self.push(at, Removed::Text(String::new()), len, Vec::new(), false);
         }
         self.last = Last::Type;
         self.last_arg = None;
@@ -271,6 +293,11 @@ impl Readline {
     pub(super) fn room(&mut self) {
         while self.undo.len() >= LIMIT {
             let old = self.undo.remove(0);
+            // The step the log keeps is the first of its group now: the step the
+            // burst went on from is gone, so its undo takes back only it.
+            if let Some(step) = self.undo.first_mut() {
+                step.chain = false;
+            }
             if let Removed::Text(mut text) = old.removed {
                 text.clear();
                 if text.capacity() > self.spare.capacity() {
@@ -281,7 +308,14 @@ impl Readline {
     }
 
     /// One step of the undo log, with the mark moved with the text.
-    fn push(&mut self, at: usize, removed: Removed, added: usize, chips: Vec<(usize, Paste)>) {
+    fn push(
+        &mut self,
+        at: usize,
+        removed: Removed,
+        added: usize,
+        chips: Vec<(usize, Paste)>,
+        chain: bool,
+    ) {
         self.room();
         let taken = removed.len();
         self.shift(at, taken, added);
@@ -291,6 +325,7 @@ impl Readline {
             added,
             chips,
             point: None,
+            chain,
         });
     }
 
@@ -348,6 +383,34 @@ impl Readline {
     /// Whether the last command was a kill, which a kill in a row joins.
     fn killing(&self) -> bool {
         self.last == Last::Kill
+    }
+
+    /// Whether the digit keys typed an argument: a command that reads none reads
+    /// 1, so only a digit or a sign of their own makes one.
+    fn argued(&self) -> bool {
+        self.digits || self.arg != 0
+    }
+
+    /// The words the Alt+Backspace press at `now` kills, and whether the press
+    /// continues a burst: its first eight presses kill one word each, the next
+    /// eight two, and every later press four. A press after the gap, or after
+    /// any other key, begins a burst of one.
+    fn burst_press(&mut self, now: Instant) -> (usize, bool) {
+        let presses = match self.burst {
+            Some(burst)
+                if self.killing() && now.saturating_duration_since(burst.at) <= BURST_GAP =>
+            {
+                burst.presses.saturating_add(1)
+            }
+            _ => 1,
+        };
+        self.burst = Some(Burst { at: now, presses });
+        let words = match presses {
+            1..=8 => 1,
+            9..=16 => 2,
+            _ => 4,
+        };
+        (words, presses > 1)
     }
 
     /// Whether the last command was a yank, which a yank-pop follows.
@@ -551,7 +614,7 @@ impl Editor {
             let to = self.gap.cursor();
             (self.lines_back(to, count.unsigned_abs() as usize), to)
         };
-        self.kill_range(from, to, count < 0, joined);
+        self.kill_range(from, to, count < 0, joined, false);
     }
 
     /// Ctrl+U: kill back to the start of the line, the argument's count of
@@ -569,7 +632,7 @@ impl Editor {
                 self.lines_forward(from, count.unsigned_abs() as usize),
             )
         };
-        self.kill_range(from, to, count >= 0, joined);
+        self.kill_range(from, to, count >= 0, joined, false);
     }
 
     /// Ctrl+W: kill the whitespace and the word before the cursor, the
@@ -582,10 +645,10 @@ impl Editor {
             let cursor = self.gap.cursor();
             if count > 0 {
                 let at = self.space_word_start(cursor);
-                self.kill_range(at, cursor, true, join);
+                self.kill_range(at, cursor, true, join, false);
             } else {
                 let at = self.space_word_end(cursor);
-                self.kill_range(cursor, at, false, join);
+                self.kill_range(cursor, at, false, join, false);
             }
         }
     }
@@ -600,29 +663,50 @@ impl Editor {
             let cursor = self.gap.cursor();
             if count > 0 {
                 let at = self.word_after(cursor).1;
-                self.kill_range(cursor, at, false, join);
+                self.kill_range(cursor, at, false, join, false);
             } else {
                 let at = self.word_before(cursor).0;
-                self.kill_range(at, cursor, true, join);
+                self.kill_range(at, cursor, true, join, false);
             }
         }
     }
 
     /// Alt+Backspace and Alt+Ctrl+H: kill the word before the cursor, the
-    /// argument's count of them; a negative argument kills them forward.
+    /// argument's count of them; a negative argument kills them forward. A
+    /// burst of presses at the same key kills more words each time, and one
+    /// undo takes the whole burst back.
     pub fn backward_kill_word(&mut self) {
+        self.backward_kill_word_at(Instant::now());
+    }
+
+    /// The same kill at the instant the press came, which a burst reads: the
+    /// app reads the clock for this key alone.
+    pub fn backward_kill_word_at(&mut self, now: Instant) {
         let joined = self.readline.killing();
-        let count = self.readline.take();
-        for i in 0..count.unsigned_abs() {
+        if self.readline.argued() {
+            // An argument of its own kills exactly it, and ends the burst.
+            self.readline.burst = None;
+            let count = self.readline.take();
+            for i in 0..count.unsigned_abs() {
+                let join = joined || i > 0;
+                let cursor = self.gap.cursor();
+                if count > 0 {
+                    let at = self.word_before(cursor).0;
+                    self.kill_range(at, cursor, true, join, false);
+                } else {
+                    let at = self.word_after(cursor).1;
+                    self.kill_range(cursor, at, false, join, false);
+                }
+            }
+            return;
+        }
+        let (words, continues) = self.readline.burst_press(now);
+        self.readline.take();
+        for i in 0..words {
             let join = joined || i > 0;
             let cursor = self.gap.cursor();
-            if count > 0 {
-                let at = self.word_before(cursor).0;
-                self.kill_range(at, cursor, true, join);
-            } else {
-                let at = self.word_after(cursor).1;
-                self.kill_range(cursor, at, false, join);
-            }
+            let at = self.word_before(cursor).0;
+            self.kill_range(at, cursor, true, join, continues || i > 0);
         }
     }
 
@@ -729,7 +813,7 @@ impl Editor {
         self.gap.move_to(at);
     }
 
-    /// Ctrl+Q and Ctrl+V: insert the next key as it is.
+    /// Ctrl+Q: insert the next key as it is.
     pub fn quote_next(&mut self) {
         self.readline.take();
         self.readline.quote = true;
@@ -1068,8 +1152,16 @@ impl Editor {
         self.take_step(from, to, text, Removed::Text(removed));
     }
 
-    /// Kill `from..to` into the ring and record the step that takes it back.
-    pub(super) fn kill_range(&mut self, from: usize, to: usize, back: bool, join: bool) {
+    /// Kill `from..to` into the ring and record the step that takes it back,
+    /// which one undo takes back with the step before it when `chain`.
+    pub(super) fn kill_range(
+        &mut self,
+        from: usize,
+        to: usize,
+        back: bool,
+        join: bool,
+        chain: bool,
+    ) {
         if from >= to {
             self.readline.last = Last::Kill;
             return;
@@ -1077,14 +1169,14 @@ impl Editor {
         let text = self.copied(from, to);
         let chips = self.take_chips(from, to);
         let (entry, range) = self.readline.kill(text, &chips, back, join);
-        self.edit_range(from, to, "", Removed::Ring(entry, range), chips);
+        self.edit_range(from, to, "", Removed::Ring(entry, range), chips, chain);
     }
 
     /// Replace the text of `from..to` with `text` and record `removed`: the
     /// chips the range covers go whole into the step.
     pub(super) fn take_step(&mut self, from: usize, to: usize, text: &str, removed: Removed) {
         let chips = self.take_chips(from, to);
-        self.edit_range(from, to, text, removed, chips);
+        self.edit_range(from, to, text, removed, chips, false);
     }
 
     /// Replace the text of `from..to` with `text` and record `removed` with the
@@ -1096,6 +1188,7 @@ impl Editor {
         text: &str,
         removed: Removed,
         chips: Vec<(usize, Paste)>,
+        chain: bool,
     ) {
         self.gap.erase(from, to);
         self.gap.move_to(from);
@@ -1104,7 +1197,7 @@ impl Editor {
         self.moved(from, 0, text.len());
         self.snap();
         self.touch(from);
-        self.readline.push(from, removed, text.len(), chips);
+        self.readline.push(from, removed, text.len(), chips, chain);
     }
 
     /// Put the folded chips `chips` into the text at `at`, each with its mark.
@@ -1118,13 +1211,25 @@ impl Editor {
         }
     }
 
+    /// Take one step of the undo log back, and with it every step the burst the
+    /// step belongs to added after it.
+    pub(super) fn undo_step(&mut self) {
+        loop {
+            let Some(step) = self.readline.undo.pop() else {
+                return;
+            };
+            let chain = step.chain;
+            self.take_back(step);
+            if !chain {
+                return;
+            }
+        }
+    }
+
     /// Take one step of the undo log back: the bytes it added go, what it
     /// removed comes back with the chips it took, and the cursor goes where the
     /// edit started or past the text it put back.
-    pub(super) fn undo_step(&mut self) {
-        let Some(step) = self.readline.undo.pop() else {
-            return;
-        };
+    fn take_back(&mut self, step: Step) {
         let at = step.at;
         let taken = step.removed.len();
         if step.added > 0 {

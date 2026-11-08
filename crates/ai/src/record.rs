@@ -17,9 +17,10 @@
 //! format by accident and old journals read the same.
 
 use std::io;
+use std::path::Path;
 
 use bytes::Bytes;
-use reagent_store::{DecodeError, Decoder, Encoder, Value};
+use reagent_store::{DecodeError, Decoder, Encoder, Entry, Session, Value};
 
 use crate::{
     AssistantMessage, Content, Image, ImageType, Message, StopReason, Text, ToolCall, Usage,
@@ -459,6 +460,44 @@ fn u32_of(value: u64) -> io::Result<u32> {
     u32::try_from(value).map_err(|_| invalid("a count field was past u32"))
 }
 
+/// The first user message of the session in `dir` that has text, joined from
+/// its text blocks. A session that has none answers `None`.
+///
+/// It reads files and blocks, and it stops at that message, which is near the
+/// start of a journal: a compaction restates it first.
+pub fn first_user_text(dir: &Path) -> io::Result<Option<String>> {
+    let session = Session::open(dir)?;
+    for record in session.records() {
+        let record = record?;
+        if record.kind != MESSAGE {
+            continue;
+        }
+        if let Message::User { content } = decode_message(&record.payload)? {
+            let mut text = String::new();
+            for block in &content {
+                if let Content::Text { text: words } = block {
+                    text.push_str(words);
+                }
+            }
+            if !text.trim().is_empty() {
+                return Ok(Some(text));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Gives each entry of `folder` with no title its first user message, cut as a
+/// title. A session that cannot be read keeps its empty title: a list still
+/// shows it, and it blocks as [`first_user_text`] does.
+pub fn fill_titles(folder: &Path, entries: &mut [Entry]) {
+    for entry in entries.iter_mut().filter(|entry| entry.title.is_empty()) {
+        if let Ok(Some(text)) = first_user_text(&folder.join(&entry.session)) {
+            entry.title = reagent_store::list::title(&text);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -634,5 +673,84 @@ mod tests {
             decode_message(&Bytes::from_static(recorded)).expect("decode"),
             message
         );
+    }
+
+    /// A folder with one session of the given messages, under `folder`.
+    fn session_of(folder: &Path, id: &str, messages: &[Message]) {
+        let dir = folder.join(id);
+        let header = reagent_store::Header::new(id.to_owned(), 0, None, Bytes::new());
+        let mut writer = reagent_store::Writer::create(&dir, header).expect("a writer");
+        for message in messages {
+            let mut payload = Vec::new();
+            encode_message(&mut payload, message);
+            writer
+                .append(MESSAGE, Bytes::from(payload), false)
+                .expect("a record");
+        }
+        writer.commit().expect("commit");
+        writer.close().expect("close");
+    }
+
+    /// An entry of `id` with `title`.
+    fn entry_of(id: &str, title: &str) -> Entry {
+        Entry {
+            session: id.to_owned(),
+            updated_ms: 0,
+            turns: 0,
+            title: title.to_owned(),
+            profile: String::new(),
+            provider: String::new(),
+            model: String::new(),
+            part: 0,
+            state: reagent_store::State::Done,
+            headless: false,
+        }
+    }
+
+    /// The first message with words wins, past one that holds only an image.
+    #[test]
+    fn session_title_is_the_first_user_text() {
+        let root = tempfile::tempdir().expect("a temp folder");
+        let image = Content::Image(Image {
+            media_type: ImageType::Png,
+            width: 1,
+            height: 1,
+            data: "AAAA".into(),
+        });
+        session_of(
+            root.path(),
+            "a",
+            &[
+                Message::user_content(vec![image]),
+                Message::user("the first words".to_owned()),
+                Message::user("later words".to_owned()),
+            ],
+        );
+        let text = first_user_text(&root.path().join("a")).expect("the read");
+        assert_eq!(text.as_deref(), Some("the first words"));
+    }
+
+    /// Only a row with no title reads a journal, and a row that has nothing to
+    /// read stays empty.
+    #[test]
+    fn session_title_fills_only_the_empty_entries() {
+        let root = tempfile::tempdir().expect("a temp folder");
+        session_of(
+            root.path(),
+            "empty",
+            &[Message::user("first\nwords".to_owned())],
+        );
+        session_of(root.path(), "silent", &[]);
+        let mut entries = [
+            entry_of("empty", ""),
+            entry_of("silent", ""),
+            entry_of("gone", ""),
+            entry_of("titled-with-no-folder", "kept"),
+        ];
+        fill_titles(root.path(), &mut entries);
+        assert_eq!(entries[0].title, "first words", "cut as a title");
+        assert_eq!(entries[1].title, "", "no words yet");
+        assert_eq!(entries[2].title, "", "no folder");
+        assert_eq!(entries[3].title, "kept");
     }
 }

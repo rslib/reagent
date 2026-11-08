@@ -21,6 +21,9 @@ pub(crate) use self::rows::{LineSink, Sink};
 /// inline mode printed can never change, so its block commits folded.
 const COMMITTED_FOLDED: Folds = Folds::new();
 
+/// The column a picture's first cell sits at in its row.
+const PICTURE_LEFT: u16 = 2;
+
 impl App {
     /// Prints the lines the finished entries added, and the lines the open reply
     /// has finished, into the scrollback or the ring.
@@ -318,7 +321,15 @@ impl App {
             Item::Reply { md, done } => {
                 let finished = md.lines().0.len();
                 md.set_width(width);
+                // The ring stores the batch in order, so the lines of this reply
+                // take the ring lines from here on.
+                let base = self.screen.transcript().len();
+                let mut held: Option<crate::markdown::Origin> = None;
+                let mut from = 0;
                 for index in *done..finished {
+                    if index == *done {
+                        from = sink.line_count();
+                    }
                     let line = &md.lines().0[index];
                     let start = sink.at();
                     sink.margin_start();
@@ -327,6 +338,19 @@ impl App {
                         sink.run(md.piece_text(piece), style);
                     }
                     sink.line_from(start);
+                    let origin = md.origin(index);
+                    if origin != held {
+                        let last = sink.line_count() - 1;
+                        if let Some(origin) = held.take() {
+                            self.keep_source(md, &origin, base + from as u64, last - from);
+                        }
+                        from = last;
+                        held = origin;
+                    }
+                }
+                if let Some(origin) = held {
+                    let last = sink.line_count();
+                    self.keep_source(md, &origin, base + from as u64, last - from);
                 }
                 *done = finished;
             }
@@ -340,6 +364,61 @@ impl App {
                 let role = if *ok { Role::Add } else { Role::Error };
                 let style = self.style(role, Emphasis::Plain);
                 sink.text_line(line, style);
+            }
+            Item::Picture(picture) => {
+                // A terminal that draws placeholders gets the image once and the
+                // rows of cells that name it; another gets the half-block cells.
+                let placed = self.placeholder_cells(picture);
+                let (cells, columns, height) = match placed {
+                    Some((_, columns, height)) => (Vec::new(), columns, height),
+                    None => self.picture_cells(picture),
+                };
+                let base = self.screen.transcript().len();
+                let block = Block::Picture {
+                    cells: &cells,
+                    placeholder: placed.map(|(style, _, _)| style),
+                    columns,
+                    height,
+                    chip: &picture.chip,
+                };
+                let styles = self.entry_styles(&block);
+                let mut drawn = rows_for(0, u16::MAX, 0, width);
+                drawn.blank = blank;
+                // A picture is finished when it is pushed, so it commits folded
+                // whatever the fold state says, as a line of the scrollback does.
+                rows::paint_entry(
+                    &mut drawn,
+                    sink,
+                    &Entry { id: 0, block },
+                    &COMMITTED_FOLDED,
+                    &styles,
+                );
+                sink.end();
+                // The cells of a picture answer a copy with nothing, and the chip
+                // answers with itself: the glyphs of half blocks are no text. The
+                // chip is the item's last line and the cells the lines above it; a
+                // blank row may come before them.
+                let chip = base.saturating_add(sink.line_count().saturating_sub(1) as u64);
+                let first = chip.saturating_sub(u64::from(height));
+                if full
+                    && height > 0
+                    && placed.is_none()
+                    && let Some(source) = picture.source.clone()
+                {
+                    self.screen.add_picture(
+                        first,
+                        height,
+                        columns,
+                        sink.margin().saturating_add(PICTURE_LEFT),
+                        source,
+                    );
+                }
+                for row in 0..u64::from(height) {
+                    self.screen
+                        .set_origin(first.saturating_add(row), 1, "", true, true);
+                }
+                self.screen.set_origin(chip, 1, &picture.chip, false, false);
+                return drawn.blank;
             }
             _ => {
                 let mut spans = scratch();
@@ -374,6 +453,20 @@ impl App {
         }
     }
 
+    /// Give the ring the text of the block that took the batch lines from `line`
+    /// on, as the reply wrote it, so a copy of their rows reads it back.
+    fn keep_source(
+        &mut self,
+        md: &crate::markdown::Markdown,
+        origin: &crate::markdown::Origin,
+        line: u64,
+        lines: usize,
+    ) {
+        let text = md.text().get(origin.bytes.clone()).unwrap_or_default();
+        self.screen
+            .set_origin(line, lines as u64, text, origin.code, origin.label);
+    }
+
     /// The rows the live entries need at the width of the screen.
     pub(crate) fn live_rows(&mut self) -> u16 {
         let mut blank = self.blank;
@@ -389,23 +482,27 @@ impl App {
     }
 
     /// Draws the live entries from row `from` down, its first rows left out when
-    /// they need more than `limit`, and answers the row after them.
+    /// they need more than `limit`, and answers the row after them. The rows it
+    /// leaves out stay in [`App::live_skip`], so a click counts from the rows the
+    /// frame drew.
     pub(crate) fn paint_live(&mut self, from: u16, limit: u16, _dim: u32) -> u16 {
         let width = self.transcript_width();
         let total = self.live_rows();
-        let mut skip = total.saturating_sub(limit);
+        let skip = total.saturating_sub(limit);
+        self.live_skip = skip;
+        let mut left = skip;
         let mut y = from;
         let mut blank = self.blank;
         let mut live = std::mem::take(&mut self.live);
         for item in &mut live {
             let (rows, after) = self.item_rows(item, blank);
-            if skip >= rows {
-                skip -= rows;
+            if left >= rows {
+                left -= rows;
                 blank = after;
                 continue;
             }
-            y += self.paint_item(item, y, skip, width, blank).0;
-            skip = 0;
+            y += self.paint_item(item, y, left, width, blank).0;
+            left = 0;
             blank = after;
         }
         self.live = live;
@@ -571,6 +668,7 @@ fn block_of<'a>(item: &'a Item, spans: &'a mut [Span<'a>; SPANS]) -> Option<Bloc
             queued: *queued,
         },
         Item::Reply { .. } | Item::Plain { .. } | Item::Answer { .. } => return None,
+        Item::Picture(_) => return None,
     })
 }
 
@@ -860,6 +958,7 @@ pub(crate) mod rows {
     use super::{Frozen, Null, rows_for};
     use crate::app::{App, Counted, Tool};
     use crate::highlight::{self, Token};
+    use crate::picture_native;
     use crate::screen::{Color, Run, Style};
     use crate::theme::{Emphasis, Rgb, Role, Theme};
 
@@ -1128,6 +1227,21 @@ pub(crate) mod rows {
         NewLines {
             /// The lines the viewport is behind.
             count: u64,
+        },
+        /// One image: its half-block cells and the chip under them.
+        Picture {
+            /// The style id of every cell, row by row, `columns` of them to a row.
+            /// Empty when the block draws only its chip or placeholder rows.
+            cells: &'a [u32],
+            /// The style id of every placeholder row of the picture, `None` when
+            /// the rows are the half-block cells.
+            placeholder: Option<u32>,
+            /// How many cells a row of the picture holds.
+            columns: u16,
+            /// How many rows of cells it holds.
+            height: u16,
+            /// The dim row under the cells, `▣ image 64x48 · 3 KB`.
+            chip: &'a str,
         },
     }
 
@@ -1974,6 +2088,11 @@ pub(crate) mod rows {
             self.line_from(start);
         }
 
+        /// The columns of the blank margin at the start of every line.
+        pub(crate) fn margin(&self) -> u16 {
+            self.margin
+        }
+
         /// The blank margin at the start of a line a caller pushes whole.
         pub(crate) fn margin_start(&mut self) {
             if self.margin > 0 {
@@ -2214,6 +2333,22 @@ pub(crate) mod rows {
             Block::Compacted(row) => paint_compacted(rows, sink, &row, open, styles),
             Block::Steer { text, queued } => paint_steer(rows, sink, text, queued, styles),
             Block::NewLines { count } => paint_new_lines(rows, sink, count, styles),
+            Block::Picture {
+                cells,
+                placeholder,
+                columns,
+                height,
+                chip,
+            } => paint_picture(
+                rows,
+                sink,
+                cells,
+                placeholder,
+                columns,
+                height,
+                chip,
+                styles,
+            ),
         }
         if tool {
             rows.air(sink);
@@ -2237,6 +2372,69 @@ pub(crate) mod rows {
             first = false;
         }
         rows.air(sink);
+    }
+
+    /// One picture: a row of `▀` cells for every two rows of pixels, each in a
+    /// style that puts the top pixel in its foreground and the low one in its
+    /// background, then the dim chip that names the image.
+    ///
+    /// A picture with a `placeholder` style draws its rows as the placeholder
+    /// cells that name the image the terminal already holds instead: one style
+    /// for every cell, so a scroll of the ring moves them as it moves text.
+    ///
+    /// The rows are finished when they are pushed, so the block has no fold and
+    /// no live state, and every cell's style was interned before its row was
+    /// built. Neighbouring cells of one style share one run, so a gradient of
+    /// few colors costs few runs.
+    #[expect(clippy::too_many_arguments, reason = "one block draws one picture")]
+    fn paint_picture(
+        rows: &mut Rows,
+        sink: &mut dyn Sink,
+        cells: &[u32],
+        placeholder: Option<u32>,
+        columns: u16,
+        height: u16,
+        chip: &str,
+        styles: &Styles,
+    ) {
+        let across = usize::from(columns.min(rows.width.saturating_sub(2)));
+        let stride = usize::from(columns);
+        let mut run = String::new();
+        for row in 0..usize::from(height) {
+            let Some(y) = rows.line(sink) else {
+                continue;
+            };
+            if let Some(style) = placeholder {
+                run.clear();
+                let row = u16::try_from(row).unwrap_or(u16::MAX);
+                let across = u16::try_from(across).unwrap_or(u16::MAX);
+                picture_native::placeholder_row(&mut run, row, across);
+                sink.put(y, super::PICTURE_LEFT, &run, style);
+                continue;
+            }
+            let start = row.saturating_mul(stride);
+            let (mut column, mut x) = (0, super::PICTURE_LEFT);
+            while column < across {
+                let Some(style) = cells.get(start.saturating_add(column)).copied() else {
+                    break;
+                };
+                run.clear();
+                while column < across {
+                    let Some(next) = cells.get(start.saturating_add(column)).copied() else {
+                        break;
+                    };
+                    if next != style {
+                        break;
+                    }
+                    run.push('▀');
+                    column += 1;
+                }
+                x = sink.put(y, x, &run, style);
+            }
+        }
+        if let Some(y) = rows.line(sink) {
+            sink.put(y, 2, chip, styles.paints.dim);
+        }
     }
 
     /// A thinking block between blank rows: one dim italic row with the time and
@@ -3066,7 +3264,7 @@ pub(crate) mod rows {
     /// does not fit. A word longer than a row splits inside it, and the space
     /// a row breaks at is not drawn at the start of the next one. An empty text
     /// is one empty row.
-    struct Wrap<'a> {
+    pub(crate) struct Wrap<'a> {
         text: &'a str,
         at: usize,
         width: usize,
@@ -3075,7 +3273,7 @@ pub(crate) mod rows {
 
     impl<'a> Wrap<'a> {
         /// The rows of `text` at `width` columns.
-        fn new(text: &'a str, width: u16) -> Self {
+        pub(crate) fn new(text: &'a str, width: u16) -> Self {
             Wrap {
                 text,
                 at: 0,
@@ -4709,11 +4907,12 @@ pub(crate) mod rows {
                 }],
             )));
             let mut app = app(true);
-            app.history(&Tail {
+            app.history(&mut Tail {
                 messages,
                 checkpoints: Vec::new(),
                 calls,
                 omitted: 0,
+                pictures: Vec::new(),
             });
             let group = match app.pending.remove(1) {
                 Item::Group(group) => group,
@@ -5147,11 +5346,12 @@ pub(crate) mod rows {
                 }],
             )));
             let mut app = app(true);
-            app.history(&Tail {
+            app.history(&mut Tail {
                 messages,
                 checkpoints: Vec::new(),
                 calls,
                 omitted: 0,
+                pictures: Vec::new(),
             });
             assert!(
                 matches!(app.pending.first(), Some(Item::Reply { .. })),
@@ -5189,6 +5389,7 @@ pub(crate) mod rows {
                 arguments: arguments.into(),
             });
             app.frame(Frame::ToolResult {
+                images: 0,
                 id: id.into(),
                 failed: false,
                 bytes: out.len(),
@@ -5278,7 +5479,7 @@ pub(crate) mod rows {
                 "the summary row comes at the run's end:\n{}",
                 rows.join("\n")
             );
-            app.frame(Frame::RunEnd);
+            app.frame(Frame::RunEnd { at_limit: false });
             app.commit();
             let rows = painted(&mut app);
             assert!(
@@ -5315,7 +5516,7 @@ pub(crate) mod rows {
                 "the thought draws in its order:\n{}",
                 rows.join("\n")
             );
-            app.frame(Frame::RunEnd);
+            app.frame(Frame::RunEnd { at_limit: false });
             app.commit();
             let rows = painted(&mut app);
             assert!(
@@ -5341,10 +5542,11 @@ pub(crate) mod rows {
             turn(&mut app, "1", "bash", r#"{"command":"cargo test"}"#, "ok");
             app.frame(Frame::UserMessage {
                 text: "and the lints".into(),
+                images: 0,
             });
             app.commit();
             turn(&mut app, "2", "bash", r#"{"command":"cargo clippy"}"#, "ok");
-            app.frame(Frame::RunEnd);
+            app.frame(Frame::RunEnd { at_limit: false });
             app.commit();
             let rows = painted(&mut app);
             let user = at(&rows, "and the lints").expect("the message draws");
@@ -5367,7 +5569,7 @@ pub(crate) mod rows {
         fn summary_one_call_run_keeps_its_row() {
             let mut app = app(true);
             turn(&mut app, "1", "bash", r#"{"command":"cargo test"}"#, "ok");
-            app.frame(Frame::RunEnd);
+            app.frame(Frame::RunEnd { at_limit: false });
             app.commit();
             let rows = painted(&mut app);
             assert!(
@@ -5415,11 +5617,12 @@ pub(crate) mod rows {
                 }],
             )));
             let mut app = app(true);
-            app.history(&Tail {
+            app.history(&mut Tail {
                 messages,
                 checkpoints: Vec::new(),
                 calls,
                 omitted: 0,
+                pictures: Vec::new(),
             });
             assert!(
                 matches!(app.pending.first(), Some(Item::Group(group)) if group.calls == 2),

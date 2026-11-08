@@ -152,7 +152,11 @@ impl OpenAiChat {
         bodies.align(request.messages, |message| {
             MessageBody::with_images(message, PROVIDER, images)
         })?;
-        Ok(builder.body_parts(bodies.bodies()))
+        let mut parts = builder.body_parts(bodies.bodies());
+        if request.tool_choice == crate::ToolChoice::Off && !request.tools.is_empty() {
+            parts.lead_with(br#""tool_choice":"none","#);
+        }
+        Ok(parts)
     }
 
     /// The request body as one buffer, for the tests and the cross-provider
@@ -1659,6 +1663,7 @@ mod tests {
             max_tokens: 16,
             system: None,
             tools: &[],
+            tool_choice: crate::ToolChoice::Auto,
             messages: history,
             images: true,
             reasoning: None,
@@ -2046,6 +2051,7 @@ mod tests {
             max_tokens: 128,
             system: None,
             tools: &[],
+            tool_choice: crate::ToolChoice::Auto,
             messages: &history,
             images: true,
             reasoning: None,
@@ -2075,6 +2081,7 @@ mod tests {
             max_tokens: 64,
             system: None,
             tools: &[],
+            tool_choice: crate::ToolChoice::Auto,
             messages: &history,
             images: true,
             reasoning: None,
@@ -2616,6 +2623,7 @@ mod tests {
             max_tokens: 128,
             system: None,
             tools: &[],
+            tool_choice: crate::ToolChoice::Auto,
             messages: &history,
             images: true,
             reasoning: None,
@@ -2681,6 +2689,7 @@ mod tests {
             max_tokens: 16,
             system: None,
             tools: &[],
+            tool_choice: crate::ToolChoice::Auto,
             messages: &[],
             images: true,
             reasoning: None,

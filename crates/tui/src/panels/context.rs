@@ -39,6 +39,10 @@ const SHORT_ID: usize = 8;
 /// What a value reads when the panel does not know it.
 const NONE: &str = "-";
 
+/// The bytes of reply text a token stands for, as the context use counts the
+/// bytes that stream before the usage of their request arrives.
+const BYTES_PER_TOKEN: u64 = 4;
+
 /// The Context panel.
 #[derive(Debug)]
 pub struct ContextPanel {
@@ -47,8 +51,14 @@ pub struct ContextPanel {
     model: Text,
     /// The context window of the model, zero until a `Model` update.
     window: u64,
-    /// The input tokens of the last request, which is the context use.
+    /// The input tokens of the last request.
     input: u64,
+    /// The tokens of the last request that its provider's cache read and wrote.
+    cached: u64,
+    /// The output tokens of the last request.
+    output: u64,
+    /// The bytes of reply text and thinking that came since the last usage.
+    streamed: u64,
     /// The input tokens spent so far, so a late price still prices them.
     input_spent: u64,
     /// The output tokens spent so far.
@@ -64,6 +74,9 @@ pub struct ContextPanel {
     share: Text,
     /// The share in percent, so a draw reads no text to find it.
     percent: u64,
+    /// The context use the tokens row draws, in the value and the unit [`short`]
+    /// gives it, so a streamed byte that does not move it builds no text.
+    drawn: (u64, &'static str),
     /// `high · default mode`, empty until the app says what they are.
     settings: Text,
     /// The short id of the session, empty until the app names it.
@@ -84,6 +97,9 @@ impl ContextPanel {
             model: Text::Static(NONE),
             window: 0,
             input: 0,
+            cached: 0,
+            output: 0,
+            streamed: 0,
             input_spent: 0,
             output_spent: 0,
             prices: None,
@@ -91,6 +107,7 @@ impl ContextPanel {
             cost: Text::Static(NONE),
             share: Text::Static(NONE),
             percent: 0,
+            drawn: (0, ""),
             settings: Text::Empty,
             session: Text::Empty,
             right: Right::default(),
@@ -179,44 +196,76 @@ impl ContextPanel {
         true
     }
 
-    /// Take the token counts of the last request: the input is the context
-    /// use, and both add to the cost.
-    fn usage(&mut self, input: u64, output: u64) -> bool {
-        let moved = input != self.input;
+    /// Take the token counts of the last request: the input, the cache tokens
+    /// and the output are the context use, and the input and the output add to
+    /// the cost. The bytes that streamed before the request are counted in it,
+    /// so the count starts again at zero.
+    fn usage(&mut self, input: u64, cached: u64, output: u64) -> bool {
         // The tokens of every request add to the cost, whatever they repeat.
-        self.input_spent += input;
-        self.output_spent += output;
+        self.input_spent = self.input_spent.saturating_add(input);
+        self.output_spent = self.output_spent.saturating_add(output);
         self.input = input;
+        self.cached = cached;
+        self.output = output;
+        self.streamed = 0;
+        let moved = self.refresh_tokens();
         let priced = self.prices.is_some() && (input > 0 || output > 0);
-        if moved {
-            self.build_tokens();
-        }
         if priced {
             self.build_cost();
         }
         moved || priced
     }
 
+    /// Take the bytes of a reply that streamed since the last update, and say
+    /// whether the panel draws something new.
+    fn streamed(&mut self, bytes: usize) -> bool {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.streamed = self.streamed.saturating_add(bytes);
+        self.refresh_tokens()
+    }
+
+    /// The context the last request and the bytes since it read: the input,
+    /// the cache tokens and the output of the last usage, and a token for every
+    /// [`BYTES_PER_TOKEN`] bytes that streamed after it.
+    fn use_tokens(&self) -> u64 {
+        self.input
+            .saturating_add(self.cached)
+            .saturating_add(self.output)
+            .saturating_add(self.streamed / BYTES_PER_TOKEN)
+    }
+
+    /// Build the tokens row when the use it draws moved, and say whether it
+    /// did: a streamed byte that rounds to the value already on screen builds
+    /// no text.
+    fn refresh_tokens(&mut self) -> bool {
+        let use_tokens = self.use_tokens();
+        let percent = percent(use_tokens, self.window);
+        if rounded(use_tokens) == self.drawn && percent == self.percent {
+            return false;
+        }
+        self.build_tokens();
+        true
+    }
+
     /// Build the tokens row: the context use against the window, and the share
     /// of the window it is, for the bar the header row shows.
     fn build_tokens(&mut self) {
-        self.percent = match self.window {
-            0 => 0,
-            window => (self.input.saturating_mul(100) / window).min(100),
-        };
-        self.share = if self.window == 0 && self.input == 0 {
+        let use_tokens = self.use_tokens();
+        self.drawn = rounded(use_tokens);
+        self.percent = percent(use_tokens, self.window);
+        self.share = if self.window == 0 && use_tokens == 0 {
             Text::Static(NONE)
         } else {
             Text::Shared(Arc::from(format!("{}%", self.percent)))
         };
-        self.tokens = if self.window == 0 && self.input == 0 {
+        self.tokens = if self.window == 0 && use_tokens == 0 {
             Text::Static(NONE)
         } else if self.window == 0 {
-            Text::Shared(Arc::from(short(self.input)))
+            Text::Shared(Arc::from(short(use_tokens)))
         } else {
             Text::Shared(Arc::from(format!(
                 "{} / {}",
-                short(self.input),
+                short(use_tokens),
                 short(self.window)
             )))
         };
@@ -262,7 +311,12 @@ impl Panel for ContextPanel {
     fn update(&mut self, update: &Update<'_>) -> bool {
         match *update {
             Update::Model { name, window } => self.model(name, window),
-            Update::Usage { input, output } => self.usage(input, output),
+            Update::Usage {
+                input,
+                cached,
+                output,
+            } => self.usage(input, cached, output),
+            Update::Streamed { bytes } => self.streamed(bytes),
             _ => false,
         }
     }
@@ -276,7 +330,11 @@ impl Panel for ContextPanel {
             TOKENS,
             self.right.at(TOKENS, &self.tokens, size.width),
         ));
-        out.push(Component::progress(Text::Empty, self.input, self.window));
+        out.push(Component::progress(
+            Text::Empty,
+            self.use_tokens(),
+            self.window,
+        ));
         out.push(Component::row(
             COST,
             self.right_cost.at(COST, &self.cost, size.width),
@@ -296,14 +354,30 @@ impl Panel for ContextPanel {
 /// A token count as a short text: `999`, `1k`, `50k`, `2M`, rounded to the
 /// nearest of the unit.
 fn short(value: u64) -> String {
+    let (number, unit) = rounded(value);
+    format!("{number}{unit}")
+}
+
+/// The value [`short`] draws for a token count, rounded to its unit, and the
+/// unit it draws it with: exact under a thousand, then thousands, then
+/// millions.
+fn rounded(value: u64) -> (u64, &'static str) {
     if value < 1_000 {
-        return value.to_string();
+        return (value, "");
     }
     let thousands = (value + 500) / 1_000;
     if thousands < 1_000 {
-        return format!("{thousands}k");
+        return (thousands, "k");
     }
-    format!("{}M", (value + 500_000) / 1_000_000)
+    ((value + 500_000) / 1_000_000, "M")
+}
+
+/// The share of a `window` that `value` tokens are, in percent.
+fn percent(value: u64, window: u64) -> u64 {
+    match window {
+        0 => 0,
+        window => (value.saturating_mul(100) / window).min(100),
+    }
 }
 
 #[cfg(test)]
@@ -348,6 +422,24 @@ mod tests {
         panic!("no model line in {components:?}");
     }
 
+    /// The context window the streaming tests read the row against.
+    const WINDOW: u64 = 200_000;
+
+    /// A panel on a model whose window is [`WINDOW`].
+    fn window_panel() -> ContextPanel {
+        let mut panel = ContextPanel::new();
+        panel.update(&Update::Model {
+            name: "a-model",
+            window: WINDOW,
+        });
+        panel
+    }
+
+    /// The tokens row of a panel, as it stands.
+    fn tokens_of(panel: &ContextPanel) -> String {
+        value_of(&drawn(panel), TOKENS)
+    }
+
     #[test]
     fn a_turn_shows_the_tokens_against_the_window_and_the_cost() {
         let mut panel = ContextPanel::new();
@@ -358,6 +450,7 @@ mod tests {
         }));
         assert!(panel.update(&Update::Usage {
             input: 50_000,
+            cached: 0,
             output: 0,
         }));
         let out = drawn(&panel);
@@ -398,6 +491,7 @@ mod tests {
         });
         assert!(panel.update(&Update::Usage {
             input: 1_000_000,
+            cached: 0,
             output: 1_000_000,
         }));
         assert!(matches!(
@@ -406,6 +500,7 @@ mod tests {
         ));
         assert!(panel.update(&Update::Usage {
             input: 500_000,
+            cached: 0,
             output: 0,
         }));
         let out = drawn(&panel);
@@ -419,6 +514,7 @@ mod tests {
         assert!(value_of(&drawn(&panel), COST).ends_with(NONE));
         assert!(panel.update(&Update::Usage {
             input: 10,
+            cached: 0,
             output: 20,
         }));
         assert!(value_of(&drawn(&panel), COST).ends_with(NONE));
@@ -483,6 +579,121 @@ mod tests {
         assert_eq!(short(2_000_000), "2M");
     }
 
+    /// The tokens row reads the cache of the last request with its input, and
+    /// the cost still prices the input alone: 1,000 in and 49,000 cached read
+    /// as 50k, and cost a dollar at a thousand dollars a million.
+    #[test]
+    fn stream_tokens_count_the_cache_of_the_last_request() {
+        let mut panel = window_panel();
+        panel.set_prices(1_000.0, 2_000.0);
+        assert!(panel.update(&Update::Usage {
+            input: 1_000,
+            cached: 49_000,
+            output: 0,
+        }));
+        let out = drawn(&panel);
+        let tokens = value_of(&out, TOKENS);
+        assert!(tokens.ends_with("50k / 200k"), "{tokens:?}");
+        let cost = value_of(&out, COST);
+        assert!(
+            cost.ends_with("$1.00"),
+            "the cost prices the input and the output alone: {cost:?}"
+        );
+    }
+
+    /// The row reads the output of the last request too.
+    #[test]
+    fn stream_tokens_count_the_output_of_the_last_request() {
+        let mut panel = window_panel();
+        assert!(panel.update(&Update::Usage {
+            input: 50_000,
+            cached: 0,
+            output: 1_000,
+        }));
+        assert!(tokens_of(&panel).ends_with("51k / 200k"));
+    }
+
+    /// A streamed reply moves the row as its bytes arrive, four bytes to a
+    /// token, and a stream that does not move the drawn value draws nothing.
+    #[test]
+    fn stream_tokens_move_the_row_before_the_usage_arrives() {
+        let mut panel = window_panel();
+        panel.update(&Update::Usage {
+            input: 50_000,
+            cached: 0,
+            output: 0,
+        });
+        assert!(tokens_of(&panel).ends_with("50k / 200k"));
+        assert!(
+            panel.update(&Update::Streamed { bytes: 8_000 }),
+            "8,000 bytes are 2k tokens over the usage"
+        );
+        assert!(tokens_of(&panel).ends_with("52k / 200k"));
+        assert!(
+            !panel.update(&Update::Streamed { bytes: 1 }),
+            "a byte that rounds to the same row draws nothing"
+        );
+        assert!(tokens_of(&panel).ends_with("52k / 200k"));
+    }
+
+    /// Many small streams add up to the row one big one draws.
+    #[test]
+    fn stream_tokens_add_up_the_same_in_many_updates_or_one() {
+        let mut many = window_panel();
+        many.update(&Update::Usage {
+            input: 50_000,
+            cached: 0,
+            output: 0,
+        });
+        for _ in 0..80 {
+            many.update(&Update::Streamed { bytes: 100 });
+        }
+        let mut one = window_panel();
+        one.update(&Update::Usage {
+            input: 50_000,
+            cached: 0,
+            output: 0,
+        });
+        one.update(&Update::Streamed { bytes: 8_000 });
+        assert_eq!(tokens_of(&many), tokens_of(&one), "the same 8,000 bytes");
+        assert!(tokens_of(&many).ends_with("52k / 200k"));
+    }
+
+    /// The usage that follows a stream starts the count again, so the estimate
+    /// of the stream goes and the row reads the request alone.
+    #[test]
+    fn stream_tokens_go_when_the_usage_behind_them_arrives() {
+        let mut panel = window_panel();
+        assert!(panel.update(&Update::Streamed { bytes: 20_000 }));
+        assert!(tokens_of(&panel).ends_with("5k / 200k"), "an estimate");
+        assert!(panel.update(&Update::Usage {
+            input: 53_000,
+            cached: 0,
+            output: 0,
+        }));
+        assert!(
+            tokens_of(&panel).ends_with("53k / 200k"),
+            "the estimate is gone"
+        );
+        assert!(panel.update(&Update::Streamed { bytes: 4_000 }));
+        assert!(tokens_of(&panel).ends_with("54k / 200k"));
+    }
+
+    /// The share of the window the header row draws moves with the stream.
+    #[test]
+    fn stream_tokens_move_the_share_with_them() {
+        let mut panel = window_panel();
+        panel.update(&Update::Usage {
+            input: 50_000,
+            cached: 0,
+            output: 0,
+        });
+        assert_eq!(panel.percent(), 25);
+        assert!(panel.update(&Update::Streamed { bytes: 200_000 }));
+        assert_eq!(panel.percent(), 50, "50k tokens over the 50k of the usage");
+        assert_eq!(panel.share().as_str(), "50%");
+    }
+
     #[test]
     fn an_ignored_update_changes_nothing() {
         let mut panel = ContextPanel::new();
@@ -515,6 +726,7 @@ mod tests {
         });
         panel.update(&Update::Usage {
             input: 50_000,
+            cached: 0,
             output: 1_000,
         });
         let mut out = Vec::new();

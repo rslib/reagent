@@ -60,7 +60,8 @@ use bytes::Bytes;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use dhat::{HeapStats, Profiler};
 use reagent_ai::record::{MESSAGE, encode_message};
-use reagent_ai::{Message, ToolResult};
+use reagent_ai::types::ImageType;
+use reagent_ai::{Content, Image, Message, ToolResult};
 use reagent_protocol::lines::Lines;
 use reagent_protocol::message::{self, Request};
 use reagent_store::{Header, Session, Writer};
@@ -450,18 +451,25 @@ impl Harness {
         running: bool,
         host: Option<HostHandle>,
     ) -> Harness {
-        Harness::build(size, full, look, running, host, 0).await
+        Harness::build(size, full, look, running, host, 0, false).await
     }
 
     /// Starts the app styled on a session whose journal holds the tool result of
     /// each of `records` calls, so a call the worker settles reads the text of
     /// its output from the journal and draws its tail.
     async fn journaled(size: (u16, u16), records: usize) -> Harness {
-        Harness::build(size, true, Look::Styled, false, None, records).await
+        Harness::build(size, true, Look::Styled, false, None, records, false).await
+    }
+
+    /// Starts the app styled on a session whose journal holds a user message
+    /// with one image, and the tool results that push it above the viewport.
+    async fn pictured(size: (u16, u16)) -> Harness {
+        Harness::build(size, true, Look::Styled, false, None, 0, true).await
     }
 
     /// Starts the app the way `with` does, on a session folder whose journal
-    /// holds `records` tool results when they are more than none.
+    /// holds `records` tool results when they are more than none, or the picture
+    /// of `pictured` when `pictured` says so.
     async fn build(
         size: (u16, u16),
         full: bool,
@@ -469,6 +477,7 @@ impl Harness {
         running: bool,
         host: Option<HostHandle>,
         records: usize,
+        pictured: bool,
     ) -> Harness {
         let dir = tempfile::Builder::new()
             .prefix("fa")
@@ -485,7 +494,9 @@ impl Harness {
             drawn,
             size,
         };
-        let session_dir = if records == 0 {
+        let session_dir = if pictured {
+            journal_pictured(dir.path())
+        } else if records == 0 {
             // A folder that holds no session: the history read fails, which
             // costs the app one note, and the harness stays out of the real
             // state folder.
@@ -2424,6 +2435,90 @@ fn output(call: usize) -> String {
 /// record `call + 1`, and each is appended as a base: a point a reader starts
 /// decoding at, so the app reads the result the worker just committed rather than
 /// the calls before it.
+/// The 64 by 48 fixture PNG: the image of the journal [`journal_pictured`]
+/// writes, the one the app draws as a picture.
+const PICTURE: &[u8] = include_bytes!("../../../image/tests/fixtures/gradient-64x48.png");
+
+/// How many tool results [`journal_pictured`] writes after the picture, so the
+/// picture sits above the viewport of a full-screen app from its first frame.
+const PICTURE_RECORDS: usize = 20;
+
+/// The base64 text of `bytes`, as a journal holds an image.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut buffer = [0u8; 3];
+        for (slot, byte) in buffer.iter_mut().zip(chunk) {
+            *slot = *byte;
+        }
+        let value =
+            (u32::from(buffer[0]) << 16) | (u32::from(buffer[1]) << 8) | u32::from(buffer[2]);
+        for index in 0..4 {
+            if index > chunk.len() {
+                out.push('=');
+                continue;
+            }
+            let six = (value >> (18 - 6 * index)) & 0x3F;
+            out.push(char::from(ALPHABET[six as usize]));
+        }
+    }
+    out
+}
+
+/// A session whose journal holds a user message with one image, then
+/// [`PICTURE_RECORDS`] tool results: the picture is in the ring and above the
+/// viewport of the first frame.
+fn journal_pictured(root: &Path) -> PathBuf {
+    let name = "sess-picture";
+    let dir = root.join(name);
+    let header = Header::new(
+        name.to_owned(),
+        reagent_store::paths::now_ms(),
+        None,
+        Bytes::new(),
+    );
+    let mut writer = Writer::create(&dir, header).expect("the writer");
+    let mut payload = Vec::new();
+    encode_message(
+        &mut payload,
+        &Message::User {
+            content: vec![
+                Content::Text {
+                    text: "look at this".into(),
+                },
+                Content::Image(Image {
+                    media_type: ImageType::Png,
+                    width: 64,
+                    height: 48,
+                    data: base64(PICTURE).into(),
+                }),
+            ],
+        },
+    );
+    writer
+        .append(MESSAGE, Bytes::from(payload), true)
+        .expect("append the image");
+    for call in 0..PICTURE_RECORDS {
+        let mut payload = Vec::new();
+        encode_message(
+            &mut payload,
+            &Message::ToolResult(ToolResult {
+                call_id: format!("call_{call}").into(),
+                content: output(call).into(),
+                is_error: false,
+                images: Vec::new(),
+            }),
+        );
+        writer
+            .append(MESSAGE, Bytes::from(payload), true)
+            .expect("append a result");
+    }
+    writer.commit().expect("commit");
+    writer.close().expect("close");
+    dir
+}
+
 fn journal(root: &Path, records: usize) -> PathBuf {
     let name = "sess-output";
     let dir = root.join(name);
@@ -2600,6 +2695,9 @@ async fn output_call_blocks(calls: usize) -> u64 {
         harness.write(&output_call(next)).await;
         next += 1;
         harness.next_frame().await;
+        // The read of the record lands after the first frame or before it, so a
+        // sample that stops here can leave out its blocks (136 against 163).
+        harness.settle().await;
     });
     eprintln!("blocks: {measured} for one more call with output of a run of {calls}");
     drop(harness.out);
@@ -3019,6 +3117,34 @@ fn perf_which_key_frame_allocates_nothing() {
             "the which-key list is not in the frame ctrl+x draws: {shown:?}"
         );
         drop(counts);
+        drop(harness.out);
+    });
+}
+
+/// A full-screen frame with one picture registered above the viewport allocates
+/// nothing: the ring draws the half-block cells it holds, and no image goes out
+/// for a picture the frame does not show whole.
+#[test]
+fn perf_picture_out_of_view_allocates_nothing() {
+    let _serial = serial();
+    runtime().block_on(async {
+        let mut harness = Harness::pictured((SIDEBAR, ROWS)).await;
+        harness.frame().await;
+        harness.settle().await;
+        // The same key and frame once outside the profiler.
+        harness.press('b');
+        harness.next_frame().await;
+        harness.reset();
+
+        let measured = blocks!(async {
+            harness.press('b');
+            harness.next_frame().await;
+        });
+        eprintln!("blocks: {measured} for one frame with a picture out of view");
+        assert_eq!(
+            measured, STEADY_BLOCKS,
+            "{measured} blocks for a frame with a picture out of view"
+        );
         drop(harness.out);
     });
 }

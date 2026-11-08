@@ -34,7 +34,7 @@ tools proc 126
 tools other 341
 tools total 1219
 bash io 210
-bash wait 267
+bash wait 317
 bash fs 232
 bash mem 130
 bash proc 145
@@ -76,14 +76,14 @@ edit proc 115
 edit other 231
 edit total 809
 grep io 177
-grep wait 370
+grep wait 587
 grep fs 326
 grep mem 236
 grep proc 269
 grep other 336
 grep total 1625
 find io 142
-find wait 275
+find wait 337
 find fs 289
 find mem 236
 find proc 269

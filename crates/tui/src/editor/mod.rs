@@ -28,7 +28,7 @@ use crate::slot::Component;
 mod paste;
 mod readline;
 
-pub use paste::{CHIP, CHIP_MORE, MARK, MARK_BYTES, Paste};
+pub use paste::{CHIP, CHIP_MORE, IMAGE_LABEL, IMAGE_LABEL_END, MARK, MARK_BYTES, Paste};
 
 use readline::Readline;
 
@@ -267,7 +267,7 @@ impl Editor {
         }
         let at = {
             let scan = Scan::new(&self.gap);
-            position_at(&scan, self.rows[row - 1], u32::from(col), &self.marks)
+            position_in_row(&scan, &self.rows, row - 1, u32::from(col), &self.marks)
         };
         self.gap.move_to(at);
         true
@@ -287,7 +287,7 @@ impl Editor {
         }
         let at = {
             let scan = Scan::new(&self.gap);
-            position_at(&scan, self.rows[row + 1], u32::from(col), &self.marks)
+            position_in_row(&scan, &self.rows, row + 1, u32::from(col), &self.marks)
         };
         self.gap.move_to(at);
         true
@@ -366,21 +366,21 @@ impl Editor {
     pub fn kill_to_end(&mut self) {
         let cursor = self.gap.cursor();
         let at = self.line_end_of(cursor);
-        self.kill_range(cursor, at, false, false);
+        self.kill_range(cursor, at, false, false, false);
     }
 
     /// Ctrl+U: kill to the start of the line.
     pub fn kill_to_start(&mut self) {
         let cursor = self.gap.cursor();
         let at = self.line_start_of(cursor);
-        self.kill_range(at, cursor, true, false);
+        self.kill_range(at, cursor, true, false, false);
     }
 
     /// Ctrl+W: kill the whitespace and the word before the cursor.
     pub fn kill_space_word(&mut self) {
         let cursor = self.gap.cursor();
         let at = self.space_word_start(cursor);
-        self.kill_range(at, cursor, true, false);
+        self.kill_range(at, cursor, true, false, false);
     }
 
     /// Take the text and empty the editor, keeping the buffers.
@@ -1065,7 +1065,8 @@ fn wrap_rows(
             at += 1;
             start = at;
             col = 0;
-            if start >= upto && start < len {
+            // At `upto` itself the row that holds it is still to build.
+            if start > upto && start < len {
                 return start;
             }
             continue;
@@ -1116,6 +1117,18 @@ fn column_of(scan: &Scan<'_>, row: Row, at: usize, marks: &[Mark]) -> u16 {
         step = next;
     }
     col.min(u32::from(u16::MAX)) as u16
+}
+
+/// The text position that Up or Down lands on in row `index` at column `col`.
+/// The start of a wrapped row draws at the end of the row above, so the cursor
+/// takes the first grapheme too, or the key would not change the drawn row.
+fn position_in_row(scan: &Scan<'_>, rows: &[Row], index: usize, col: u32, marks: &[Mark]) -> usize {
+    let at = position_at(scan, rows[index], col, marks);
+    let wrapped = index > 0 && rows[index - 1].end == at;
+    if wrapped {
+        return grapheme_width(scan, at, marks).0.max(at);
+    }
+    at
 }
 
 /// The text position in `row` that shows at column `col`, or the end of the

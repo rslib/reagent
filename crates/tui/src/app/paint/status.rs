@@ -20,6 +20,7 @@ use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
+use crate::keyfile::Foot;
 use crate::theme::{Emphasis, Role};
 
 use super::super::App;
@@ -62,6 +63,8 @@ const ANSWER_KEY: &str = "←→ enter";
 const ANSWER_WORD: &str = "answer";
 const RESYNCED: &str = "resynced";
 const ARMED: &str = "Ctrl+C again to quit";
+const COPIED_ONE: &str = " line copied";
+const COPIED_MANY: &str = " lines copied";
 
 /// The key hints, with the columns each takes, in the order they drop: off the
 /// right end first, whole, so the left part always shows. They come from the
@@ -121,16 +124,22 @@ impl App {
     pub(crate) fn paint_status(&mut self, y: u16, rows: u16, width: u16, _dim: u32) {
         let y = y.min(rows.saturating_sub(1));
         let width = width.max(1);
+        // The clock is read only while the words show, so an idle frame reads none.
+        if self
+            .copied_until
+            .is_some_and(|until| until <= Instant::now())
+        {
+            self.copied_until = None;
+        }
         let note = std::mem::take(&mut self.status);
         MOTION.with_borrow_mut(|motion| self.draw_status(motion, &note, y, width));
         self.status = note;
-        let Some(due) = self.next_tick() else {
-            return;
-        };
-        let due = tokio::time::Instant::from_std(due);
-        if self.deadline.is_none_or(|deadline| due < deadline) {
-            self.deadline = Some(due);
-            self.dirty = true;
+        for due in [self.next_tick(), self.copied_until].into_iter().flatten() {
+            let due = tokio::time::Instant::from_std(due);
+            if self.deadline.is_none_or(|deadline| due < deadline) {
+                self.deadline = Some(due);
+                self.dirty = true;
+            }
         }
     }
 
@@ -155,7 +164,11 @@ impl App {
                 .screen
                 .put_str_until(x, y, motion.time(now), dim, width);
             x = x.saturating_add(2);
-            x = self.screen.put_str_until(x, y, ANSWER_KEY, plain, width);
+            let answer = match &self.keyfile {
+                Some(file) => file.labels().answer(),
+                None => ANSWER_KEY,
+            };
+            x = self.screen.put_str_until(x, y, answer, plain, width);
             x = x.saturating_add(1);
             x = self.screen.put_str_until(x, y, ANSWER_WORD, dim, width);
         } else if self.running {
@@ -171,13 +184,29 @@ impl App {
                 .screen
                 .put_str_until(x, y, motion.time(now), dim, width);
             x = x.saturating_add(2);
-            x = self.screen.put_str_until(x, y, INTERRUPT, dim, width);
+            let interrupt = match &self.keyfile {
+                Some(file) => file.labels().foot(Foot::Interrupt),
+                None => INTERRUPT,
+            };
+            x = self.screen.put_str_until(x, y, interrupt, dim, width);
         } else {
             x = self.screen.put_str_until(x, y, IDLE, dim, width);
         }
         if !note.is_empty() {
             x = x.saturating_add(2);
             x = self.screen.put_str_until(x, y, note, dim, width);
+        }
+        if self.copied_until.is_some() {
+            let mut digits = [0u8; 20];
+            let count = super::editor::decimal(&mut digits, self.copied);
+            let words = if self.copied == 1 {
+                COPIED_ONE
+            } else {
+                COPIED_MANY
+            };
+            x = x.saturating_add(2);
+            x = self.screen.put_str_until(x, y, count, dim, width);
+            x = self.screen.put_str_until(x, y, words, dim, width);
         }
         if self.armed {
             x = x.saturating_add(2);
@@ -189,8 +218,19 @@ impl App {
     /// Draws the hints that fit, whole, from the right end: the left part always
     /// shows, and the hints drop off the right end first.
     fn draw_hints(&mut self, y: u16, width: u16, left: u16, key: u32, word: u32) {
+        // The labels and the screen are two fields of the app, so the frame
+        // lends them out separately: drawing a hint borrows no key of the app.
+        let Self {
+            screen, keyfile, ..
+        } = self;
+        let labels = keyfile.as_ref().map(crate::keyfile::KeyFile::labels);
         let mut shown = HINTS.len();
-        while shown > 0 && left.saturating_add(1).saturating_add(hints_width(shown)) > width {
+        while shown > 0
+            && left
+                .saturating_add(1)
+                .saturating_add(hints_width(shown, labels))
+                > width
+        {
             shown -= 1;
         }
         if shown == 0 {
@@ -198,29 +238,31 @@ impl App {
         }
         // The hints end one space short of the edge, so the run of blanks in
         // front of them takes whatever the left part leaves.
-        let mut x = width - hints_width(shown);
+        let mut x = width - hints_width(shown, labels);
         for (index, hint) in HINTS[..shown].iter().enumerate() {
             if index > 0 {
                 x = x.saturating_add(HINT_GAP);
             }
-            x = self.screen.put_str_until(x, y, hint.keys, key, width);
-            x = self.screen.put_str_until(x, y, " ", key, width);
-            x = self.screen.put_str_until(x, y, hint.words, word, width);
+            let keys = labels.map_or(hint.keys, |labels| labels.status(index));
+            x = screen.put_str_until(x, y, keys, key, width);
+            x = screen.put_str_until(x, y, " ", key, width);
+            x = screen.put_str_until(x, y, hint.words, word, width);
         }
     }
 }
 
 /// The columns one hint takes: its key, one space and its words.
-fn hint_columns(hint: &crate::keys::Hint) -> u16 {
-    (hint.keys.len() + 1 + hint.words.len()) as u16
+fn hint_columns(keys: &str, hint: &crate::keys::Hint) -> u16 {
+    (keys.len() + 1 + hint.words.len()) as u16
 }
 
 /// The columns the first `shown` hints take: their own, the gap between them and
 /// the space the last one ends on.
-fn hints_width(shown: usize) -> u16 {
+fn hints_width(shown: usize, labels: Option<&crate::keyfile::Labels>) -> u16 {
     let mut width = HINT_TAIL;
     for (index, hint) in HINTS[..shown].iter().enumerate() {
-        width += hint_columns(hint);
+        let keys = labels.map_or(hint.keys, |labels| labels.status(index));
+        width += hint_columns(keys, hint);
         if index > 0 {
             width += HINT_GAP;
         }
@@ -537,6 +579,30 @@ mod tests {
 
     /// A box that waits pauses the line: it names the wait, the time it paused
     /// at and the keys that answer it, and it arms nothing while it waits.
+    /// A moved answer key is the one the waiting line names.
+    #[test]
+    fn keys_in_force_answer_on_the_waiting_line() {
+        let mut app = app(COLUMNS);
+        app.read_keys_text("[card]\nanswer = \"f3\"\n");
+        app.running = true;
+        frame(&mut app);
+        app.approval = Some(ApprovalBox::new(
+            Approval {
+                id: 1,
+                tool: "bash".into(),
+                call: "ls".into(),
+                rule: "outside the project".into(),
+                save: true,
+            },
+            COLUMNS,
+        ));
+        app.status_dirty = true;
+        app.approval_rows();
+        frame(&mut app);
+        let text = row(&app);
+        assert!(text.contains("f3 answer"), "{text:?}");
+    }
+
     #[test]
     fn a_status_line_in_an_approval_waits_for_you() {
         let mut app = app(COLUMNS);
@@ -566,6 +632,20 @@ mod tests {
         assert_eq!(app.deadline, None, "and arms no timer");
     }
 
+    /// A keys file that moves the interrupt to F2 is the key the line names, and
+    /// the one Esc left is gone from it.
+    #[test]
+    fn keys_in_force_cancel_moves_the_interrupt() {
+        let mut app = app(COLUMNS);
+        app.read_keys_text("[keys]\ncancel = \"f2\"\n");
+        app.running = true;
+        MOTION.with_borrow_mut(|motion| motion.moving = Some(true));
+        frame(&mut app);
+        let text = row(&app);
+        assert!(text.contains("f2 interrupt"), "{text:?}");
+        assert!(!text.contains("esc interrupt"), "{text:?}");
+    }
+
     /// On a short row the left part stays and the hints drop off the right end
     /// whole: never half a hint, and never a hint cut over the left part.
     #[test]
@@ -590,7 +670,7 @@ mod tests {
         for hint in HINTS {
             let drawn = UnicodeWidthStr::width(hint.keys) + 1 + UnicodeWidthStr::width(hint.words);
             assert_eq!(
-                usize::from(hint_columns(hint)),
+                usize::from(hint_columns(hint.keys, hint)),
                 drawn,
                 "the width of {} {}",
                 hint.keys,
@@ -641,6 +721,19 @@ mod tests {
         );
     }
 
+    /// A keys file moves the keys the line shows, and the line names them.
+    #[test]
+    fn custom_key_label_status_hint() {
+        let mut app = app(COLUMNS);
+        app.read_keys_text("[keys]\nleader = \"alt+x\"\n[leader]\ncommands = \"c\"\n");
+        frame(&mut app);
+        let text = row(&app);
+        assert!(
+            text.ends_with("alt+x c commands  alt+x more  ? keys"),
+            "the hints name the keys in force: {text:?}"
+        );
+    }
+
     /// The elapsed time reads in seconds under a minute and in minutes and two
     /// digits of seconds past it, into the buffer it is given.
     #[test]
@@ -661,5 +754,17 @@ mod tests {
         let mut motion = Motion::stepping();
         motion.paused = Some(Duration::from_secs(12));
         assert_eq!(motion.time(Instant::now()), "12s, paused");
+    }
+
+    /// A file that moves nothing prints each word as the table has it.
+    #[test]
+    fn keys_in_force_status_words_match_the_table() {
+        let (file, _) = crate::keyfile::KeyFile::parse("");
+        let labels = file.labels();
+        assert_eq!(
+            labels.foot(crate::keyfile::Foot::Interrupt),
+            super::INTERRUPT
+        );
+        assert_eq!(labels.answer(), super::ANSWER_KEY);
     }
 }

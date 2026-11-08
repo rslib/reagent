@@ -210,8 +210,19 @@ impl Selection {
         out: &mut Vec<u8>,
     ) -> bool {
         self.text(row, text);
+        let wrote = Self::copy_text(text, out);
+        if !wrote {
+            text.clear();
+        }
+        wrote
+    }
+
+    /// Writes one OSC 52 sequence holding `text` into `out`, and says whether it
+    /// wrote one: the text a copy made of the rows a drag covers, which is not
+    /// always their cells.
+    pub fn copy_text(text: &str, out: &mut Vec<u8>) -> bool {
         out.clear();
-        if text.is_empty() {
+        if text.trim().is_empty() {
             return false;
         }
         out.extend_from_slice(OSC_52);
@@ -230,7 +241,7 @@ const BEL: u8 = 0x07;
 /// The chars of `line` whose cells the columns `first` and `last` cover, both
 /// included, without the spaces a row padded to the width of the terminal ends
 /// with.
-fn cut(line: &str, first: u16, last: u16) -> &str {
+pub(crate) fn cut(line: &str, first: u16, last: u16) -> &str {
     let (start, end) = cells(line, first, last);
     line.get(start..end)
         .unwrap_or_default()
@@ -422,6 +433,22 @@ mod tests {
         assert_eq!(text, "cdefg\nhijkl");
         Selection::new(Cell::new(9, 0), Cell::new(12, 0)).text(row, &mut text);
         assert_eq!(text, "", "cells past the text of a row are blank");
+    }
+
+    /// Rows of blank cells hold only line ends, and a copy of those would
+    /// replace the user's clipboard with blank text.
+    #[test]
+    fn native_copy_of_blank_rows_writes_nothing() {
+        let lines = ["hi", "    ", "    "];
+        let row = |row: u16| row_of(&lines, row);
+        let mut text = String::new();
+        let mut out = Vec::new();
+        assert!(
+            !Selection::new(Cell::new(0, 1), Cell::new(3, 2)).copy(row, &mut text, &mut out),
+            "two blank rows copy nothing"
+        );
+        assert_eq!(text, "", "the scratch is the empty text");
+        assert!(out.is_empty(), "no sequence, so the clipboard is kept");
     }
 
     /// An empty copy would send OSC 52 with no payload, which clears the user's

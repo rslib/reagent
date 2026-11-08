@@ -91,6 +91,9 @@ enum Line<'a> {
         client: ClientId,
         mode: &'static str,
         text: &'a str,
+        /// The images that follow the text, never their base64 text.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageLine<'a>>,
     },
     Committed {
         record: u64,
@@ -169,6 +172,19 @@ struct ImageLine<'a> {
     height: u32,
     /// The decoded byte count of the image.
     bytes: usize,
+}
+
+/// The lines of `images`: their type, size and decoded bytes.
+fn image_lines(images: &[reagent_ai::Image]) -> Vec<ImageLine<'_>> {
+    images
+        .iter()
+        .map(|image| ImageLine {
+            media_type: image.media_type.mime(),
+            width: image.width,
+            height: image.height,
+            bytes: decoded_len(image.data.as_ref()),
+        })
+        .collect()
 }
 
 /// Appends the `--json` line of one agent event to `buf`.
@@ -251,15 +267,7 @@ fn write(buf: &mut Vec<u8>, event: &Event, tailed: bool) {
                 error: output.as_deref().filter(|_| *is_error),
                 output: tail,
                 earlier,
-                images: images
-                    .iter()
-                    .map(|image| ImageLine {
-                        media_type: image.media_type.mime(),
-                        width: image.width,
-                        height: image.height,
-                        bytes: decoded_len(image.data.as_ref()),
-                    })
-                    .collect(),
+                images: image_lines(images),
             }
         }
         Event::Usage(usage) => Line::Usage {
@@ -298,10 +306,16 @@ fn write(buf: &mut Vec<u8>, event: &Event, tailed: bool) {
             replaced: *replaced,
             bytes: *bytes,
         },
-        Event::UserMessage { client, mode, text } => Line::UserMessage {
+        Event::UserMessage {
+            client,
+            mode,
+            text,
+            images,
+        } => Line::UserMessage {
             client: *client,
             mode: send_mode(*mode),
             text,
+            images: image_lines(images),
         },
         Event::Committed { record } => Line::Committed { record: *record },
         Event::ApprovalRequest(ask) => Line::ApprovalRequest {
@@ -783,6 +797,7 @@ mod tests {
                     client: 7,
                     mode: reagent_agent::live::SendMode::Steer,
                     text: "use cargo nextest".into(),
+                    images: Vec::new(),
                 },
                 json!({ "type": "user_message", "client": 7, "mode": "steer", "text": "use cargo nextest" }),
             ),
@@ -791,8 +806,24 @@ mod tests {
                     client: 3,
                     mode: reagent_agent::live::SendMode::Queue,
                     text: "later".into(),
+                    images: Vec::new(),
                 },
                 json!({ "type": "user_message", "client": 3, "mode": "queue", "text": "later" }),
+            ),
+            (
+                Event::UserMessage {
+                    client: 3,
+                    mode: reagent_agent::live::SendMode::Steer,
+                    text: "[Image #1] what is this".into(),
+                    images: vec![reagent_ai::Image {
+                        media_type: reagent_ai::ImageType::Png,
+                        width: 64,
+                        height: 48,
+                        data: "aGk=".into(),
+                    }],
+                },
+                // A pasted image is named by its size, never by its base64 text.
+                json!({ "type": "user_message", "client": 3, "mode": "steer", "text": "[Image #1] what is this", "images": [{ "media_type": "image/png", "width": 64, "height": 48, "bytes": 2 }] }),
             ),
             (
                 Event::Committed { record: 12 },
@@ -983,6 +1014,7 @@ mod tests {
                 client: 7,
                 mode: reagent_agent::live::SendMode::Steer,
                 text: "use cargo nextest".into(),
+                images: Vec::new(),
             },
             Event::Committed { record: 12 },
             Event::ApprovalRequest(Box::new(reagent_agent::event::ApprovalRequest {

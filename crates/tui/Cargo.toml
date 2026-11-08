@@ -10,6 +10,8 @@ publish.workspace = true
 reagent-protocol.workspace = true
 reagent-store.workspace = true
 reagent-ai.workspace = true
+reagent-image.workspace = true
+base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 crossterm = { version = "0.29", default-features = false, features = ["events", "bracketed-paste"] }
 pulldown-cmark = { version = "0.13.6", default-features = false }
 unicode-width = { version = "0.2.3", default-features = false }
@@ -25,3 +27,22 @@ workspace = true
 dhat = { version = "0.3.3", default-features = false }
 tempfile = "3.27.0"
 vt100 = { version = "0.18.1", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.5", default-features = false, features = ["std"], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString", "alloc"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wl-clipboard-rs = { version = "0.9.5", default-features = false, optional = true }
+x11rb = { version = "0.14", default-features = false, optional = true }
+
+[features]
+default = ["clipboard-native"]
+# A mouse copy also goes to the local system clipboard, beside the OSC 52
+# sequence the terminal gets.
+clipboard-native = [
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:wl-clipboard-rs",
+    "dep:x11rb",
+]

@@ -24,7 +24,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::screen::{Cell, Screen};
 
-use super::super::sheet::{Kind, Mark, Sheet};
+use super::super::sheet::{Kind, Mark, PreviewRow, Sheet};
 
 /// The rows a sheet draws around its rows: the blank above the title, the title,
 /// the filter, the blank under it, the footer and the blank under that.
@@ -65,6 +65,18 @@ const PREVIEW: u16 = RULE + 2;
 
 /// The rule between the rows and the preview.
 const PREVIEW_RULE: &str = "\u{2502}";
+
+/// The columns the preview's rows lay out in for a sheet `width` wide: the
+/// columns right of the rule.
+pub(crate) fn pane_width(width: u16) -> u16 {
+    width.saturating_sub(PREVIEW)
+}
+
+/// The rule under the preview's header.
+const HEADER_RULE: &str = "\u{2500}";
+
+/// The rows between the header and the messages: the rule and one blank row.
+const HEADER_GAP: usize = 2;
 
 /// The columns a sheet needs before it splits the rows and the preview.
 const SPLIT: u16 = 100;
@@ -137,11 +149,11 @@ pub(crate) fn draw_sheet(
 
     // The title row: the title in the accent, the count and then the hint at
     // the right edge.
-    let hint_at = right_start(sheet.hint, width);
+    let hint_at = right_start(&sheet.hint, width);
     let mut x = screen.put_str_until(PAD, title_row, sheet.title, plain.accent, hint_at);
     x = screen.put_str_until(x, title_row, "  ", plain.dim, hint_at);
     screen.put_str_until(x, title_row, &sheet.count, plain.dim, hint_at);
-    screen.put_str_until(hint_at, title_row, sheet.hint, plain.dim, width);
+    screen.put_str_until(hint_at, title_row, &sheet.hint, plain.dim, width);
 
     // The filter row, on its own fill: the arrow, then what the filter holds.
     let query = &inks.query;
@@ -157,8 +169,13 @@ pub(crate) fn draw_sheet(
         draw_rows(screen, sheet, first, slots, width, inks);
     }
 
-    // The footer: two columns in, the keys the sheet answers to.
-    screen.put_str_until(PAD + 1, footer_row, sheet.footer, plain.dim, width);
+    // The footer: two columns in, the keys the sheet answers to, or the row a
+    // delete armed.
+    let (footer, ink) = match &sheet.confirm {
+        Some(confirm) => (&**confirm, plain.warn),
+        None => (&*sheet.footer, plain.dim),
+    };
+    screen.put_str_until(PAD + 1, footer_row, footer, ink, width);
 
     (cursor.min(width.saturating_sub(1)), filter_row)
 }
@@ -193,6 +210,20 @@ fn draw_rows(
     // The column the details of the items line up at: two spaces after the
     // longest name in the window.
     let detail_at = NAME_AT + name_column(sheet, top, slots, width) + 2;
+    // Under the header: a rule, one blank row that never drops, then the message
+    // rows, of which the newest keep the last slots and the oldest drop. The
+    // rows' own first blank row would only double that margin.
+    let header = sheet.preview.len();
+    let built = sheet.preview_rows.as_deref().map_or(&[][..], Vec::as_slice);
+    let built = match built.first() {
+        Some(row) if row.runs.is_empty() => &built[1..],
+        _ => built,
+    };
+    let messages_at = header + HEADER_GAP;
+    let skip = built
+        .len()
+        .saturating_sub(slots.saturating_sub(messages_at));
+    let right = PREVIEW + pane_width(width);
 
     for slot in 0..slots {
         let at = first + slot as u16;
@@ -201,16 +232,29 @@ fn draw_rows(
             let row = &sheet.rows[index as usize];
             row.kind == Kind::Item && top + slot == sheet.selected
         });
+        if split {
+            let plain = &inks.plain;
+            screen.put_str_until(RULE, at, PREVIEW_RULE, plain.line, width);
+            if let Some(line) = sheet.preview.get(slot) {
+                let ink = match (slot, line.dim) {
+                    (0, _) => plain.mark,
+                    (_, true) => plain.dim,
+                    (_, false) => plain.warn,
+                };
+                screen.put_str_until(PREVIEW, at, &line.text, ink, width);
+            } else if header > 0 && slot == header {
+                for x in PREVIEW..right.saturating_sub(1) {
+                    screen.put_str_until(x, at, HEADER_RULE, plain.line, right);
+                }
+            } else if slot >= messages_at
+                && let Some(row) = built.get(slot - messages_at + skip)
+            {
+                draw_preview_row(screen, row, at, right);
+            }
+        }
         let inks = if picked { &inks.picked } else { &inks.plain };
         if picked {
-            fill_row(screen, at, width, inks);
-        }
-        if split {
-            screen.put_str_until(RULE, at, PREVIEW_RULE, inks.line, width);
-            if let Some(line) = sheet.preview.get(top + slot) {
-                let ink = if line.dim { inks.dim } else { inks.text };
-                screen.put_str_until(PREVIEW, at, &line.text, ink, width);
-            }
+            fill_row(screen, at, left, inks);
         }
         let Some(index) = index else {
             continue;
@@ -237,15 +281,18 @@ fn draw_rows(
                 } else {
                     inks.text
                 };
-                let mut x = screen.put_str_until(NAME_AT, at, &row.name, ink, left);
+                // The name and the detail stop a space short of the right-hand
+                // text, so a long name never hides it.
+                let start = (!row.right.is_empty()).then(|| right_start(&row.right, left));
+                let stop = start.map_or(left, |start| start.saturating_sub(1));
+                let mut x = screen.put_str_until(NAME_AT, at, &row.name, ink, stop);
                 if !row.detail.is_empty() {
-                    x = screen.put_str_until(detail_at.max(x), at, &row.detail, inks.dim, left);
+                    x = screen.put_str_until(detail_at.max(x), at, &row.detail, inks.dim, stop);
                 }
-                if !row.right.is_empty() {
-                    let start = right_start(&row.right, left);
-                    if start > x {
-                        screen.put_str_until(start, at, &row.right, inks.dim, left);
-                    }
+                if let Some(start) = start
+                    && start > x
+                {
+                    screen.put_str_until(start, at, &row.right, inks.dim, left);
                 }
             }
             Kind::Group | Kind::Note => {
@@ -254,6 +301,17 @@ fn draw_rows(
             }
             Kind::Blank => {}
         }
+    }
+}
+
+/// Draws one row of the preview's messages: its runs left to right from the
+/// column it starts at, in the inks the row carries over the plain fill, and
+/// nothing at all for a blank row.
+fn draw_preview_row(screen: &mut Screen, row: &PreviewRow, at: u16, right: u16) {
+    let mut x = PREVIEW + u16::from(row.start);
+    for run in &row.runs {
+        let ink = screen.intern(run.style);
+        x = screen.put_str_until(x, at, &run.text, ink, right);
     }
 }
 
@@ -673,14 +731,14 @@ mod tests {
             ]);
             draw_sheet(&mut screen, &sheet, 0, SHEET_ROWS, COLUMNS, &inks);
             for y in 0..SHEET_ROWS {
-                let want = if y == FILTER {
-                    QUERY
-                } else if y == picked {
-                    PICKED
-                } else {
-                    FILL
-                };
                 for x in 0..COLUMNS {
+                    let want = if y == FILTER {
+                        QUERY
+                    } else if y == picked && (!sheet.previews || x < RULE) {
+                        PICKED
+                    } else {
+                        FILL
+                    };
                     assert_eq!(bg(&screen, x, y), want, "the cell at {x},{y}");
                 }
             }
@@ -757,13 +815,13 @@ mod tests {
         let first = text(&screen, BODY);
         assert!(first.contains("fix the start test"), "{first}");
         assert_eq!(screen.back().cell(RULE, BODY).char(), Some('\u{2502}'));
-        assert_eq!(style(&screen, RULE, BODY), inks.picked.line);
+        assert_eq!(style(&screen, RULE, BODY), inks.plain.line);
         assert_eq!(
             column(&first, "steer headless"),
             PREVIEW as usize,
             "{first}"
         );
-        assert_eq!(style(&screen, PREVIEW, BODY), inks.picked.text);
+        assert_eq!(style(&screen, PREVIEW, BODY), inks.plain.mark);
         let second = text(&screen, BODY + 1);
         assert_eq!(
             column(&second, "\u{23f8} waits for an approval"),
@@ -771,6 +829,126 @@ mod tests {
             "{second}"
         );
         assert_eq!(style(&screen, PREVIEW, BODY + 1), inks.plain.dim);
+    }
+
+    /// The preview starts at the top of the body wherever the list has scrolled:
+    /// it belongs to the picked row, not to the rows beside it.
+    #[test]
+    fn session_preview_stays_on_screen_when_the_list_scrolls() {
+        let (mut screen, inks) = screen(COLUMNS);
+        let rows: Vec<Row> = (0..30)
+            .map(|index| row(Kind::Item, &format!("item {index}"), "", ""))
+            .collect();
+        let mut sheet =
+            Sheet::new("Sessions", Arc::from("30"), "", "esc closes", rows).with_previews();
+        sheet.step(30);
+        sheet.set_preview(vec![Line {
+            text: Arc::from("the first preview line"),
+            dim: false,
+        }]);
+        draw_sheet(&mut screen, &sheet, 0, SHEET_ROWS, COLUMNS, &inks);
+        let first = text(&screen, BODY);
+        assert!(first.contains("the first preview line"), "{first}");
+    }
+
+    /// The picked row's fill ends at the rule, so no preview line looks picked.
+    #[test]
+    fn sheet_band_stops_at_the_rule() {
+        let (mut screen, inks) = screen(COLUMNS);
+        let mut sheet = previews();
+        sheet.set_preview(vec![Line {
+            text: Arc::from("a preview line"),
+            dim: false,
+        }]);
+        draw_sheet(&mut screen, &sheet, 0, SHEET_ROWS, COLUMNS, &inks);
+        assert_eq!(bg(&screen, RULE - 1, BODY), PICKED, "the rows' side");
+        assert_eq!(bg(&screen, RULE, BODY), FILL, "the rule");
+        assert_eq!(bg(&screen, PREVIEW, BODY), FILL, "the preview's side");
+    }
+
+    /// A name too long for the column is cut, and the row's age still draws.
+    #[test]
+    fn sheet_row_keeps_its_right_text_under_a_long_name() {
+        let (mut screen, inks) = screen(COLUMNS);
+        let long = "n".repeat(200);
+        let rows = vec![
+            row(Kind::Item, &long, "", "1h"),
+            row(Kind::Item, &long, "", ""),
+        ];
+        let sheet = Sheet::new("Sessions", Arc::from("2"), "", "esc closes", rows).with_previews();
+        draw_sheet(&mut screen, &sheet, 0, SHEET_ROWS, COLUMNS, &inks);
+        let aged = text(&screen, BODY);
+        let side = aged.split('\u{2502}').next().expect("the rows' side");
+        assert!(side.trim_end().ends_with("n 1h"), "{aged}");
+        // A row with no right-hand text keeps the whole column for its name.
+        let plain = text(&screen, BODY + 1);
+        let side = plain.split('\u{2502}').next().expect("the rows' side");
+        assert!(side.ends_with('n'), "{plain}");
+    }
+
+    /// A sheet with header lines and `rows` message rows, drawn wide.
+    fn session_sheet_with(rows: Vec<super::PreviewRow>) -> Sheet {
+        let mut sheet = previews();
+        sheet.set_preview(vec![
+            Line {
+                text: Arc::from("the title"),
+                dim: false,
+            },
+            Line {
+                text: Arc::from("the meta"),
+                dim: true,
+            },
+        ]);
+        sheet.set_preview_rows(Some(Arc::new(rows)));
+        sheet
+    }
+
+    /// One message row of the given words.
+    fn message(text: &str) -> super::PreviewRow {
+        super::PreviewRow {
+            start: 0,
+            runs: vec![super::super::super::sheet::Run {
+                text: Arc::from(text),
+                style: crate::screen::Style::default(),
+            }],
+        }
+    }
+
+    /// The rule follows the header, and one blank row follows the rule.
+    #[test]
+    fn session_preview_draws_a_rule_and_one_blank_row() {
+        let (mut screen, inks) = screen(COLUMNS);
+        let sheet = session_sheet_with(vec![super::PreviewRow::default(), message("the words")]);
+        draw_sheet(&mut screen, &sheet, 0, SHEET_ROWS, COLUMNS, &inks);
+        assert_eq!(style(&screen, PREVIEW, BODY), inks.plain.mark, "the title");
+        assert_eq!(
+            style(&screen, PREVIEW, BODY + 1),
+            inks.plain.dim,
+            "the meta"
+        );
+        assert_eq!(
+            screen.back().cell(PREVIEW, BODY + 2).char(),
+            Some('\u{2500}')
+        );
+        assert!(!text(&screen, BODY + 3).contains("the words"));
+        assert!(text(&screen, BODY + 4).contains("the words"));
+    }
+
+    /// Messages that overflow keep the blank row, and the newest row shows.
+    #[test]
+    fn session_preview_draws_its_margin_when_messages_overflow() {
+        let (mut screen, inks) = screen(COLUMNS);
+        let mut rows = vec![super::PreviewRow::default()];
+        for at in 0..100 {
+            rows.push(message(&format!("row{at}x")));
+        }
+        let sheet = session_sheet_with(rows);
+        draw_sheet(&mut screen, &sheet, 0, SHEET_ROWS, COLUMNS, &inks);
+        let blank = text(&screen, BODY + 3);
+        assert!(!blank.contains("row"), "the margin stays: {blank}");
+        let drawn: Vec<String> = (BODY..SHEET_ROWS).map(|y| text(&screen, y)).collect();
+        assert!(drawn.iter().any(|row| row.contains("row99x")), "{drawn:#?}");
+        assert!(!drawn.iter().any(|row| row.contains("row0x")), "{drawn:#?}");
     }
 
     /// Under a hundred columns the preview is off: no rule draws and the rows

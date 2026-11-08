@@ -172,6 +172,8 @@ pub struct InitializeResult<'a> {
     pub model: &'a str,
     /// The context window of the model, when the run knows it.
     pub context_window: Option<u64>,
+    /// The reasoning level the session sends, when it sends one.
+    pub level: Option<&'a str>,
 }
 
 /// What the `settings` notice tells every client: the model the session took,
@@ -732,13 +734,14 @@ mod tests {
                 committed: 9,
                 model: "fi/m",
                 context_window: Some(200_000),
+                level: None,
             },
         );
         assert_eq!(
             text(&buf),
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"major\":1,\"version\":\"0.1.0\",\
              \"session\":\"s1\",\"client\":2,\"capabilities\":[],\"committed\":9,\
-             \"model\":\"fi/m\",\"context_window\":200000}}\n"
+             \"model\":\"fi/m\",\"context_window\":200000,\"level\":null}}\n"
         );
         let mut buf = Vec::new();
         result(
@@ -753,14 +756,36 @@ mod tests {
                 committed: 0,
                 model: "m",
                 context_window: None,
+                level: None,
             },
         );
         assert_eq!(
             text(&buf),
             "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"major\":1,\"version\":\"0.1.0\",\
              \"session\":\"s1\",\"client\":1,\"capabilities\":[],\"committed\":0,\
-             \"model\":\"m\",\"context_window\":null}}\n"
+             \"model\":\"m\",\"context_window\":null,\"level\":null}}\n"
         );
+    }
+
+    #[test]
+    fn the_initialize_answer_names_the_level() {
+        let mut buf = Vec::new();
+        result(
+            &mut buf,
+            1,
+            &InitializeResult {
+                major: 1,
+                version: "0.1.0",
+                session: "s1",
+                client: 1,
+                capabilities: &[],
+                committed: 0,
+                model: "m",
+                context_window: None,
+                level: Some("high"),
+            },
+        );
+        assert!(text(&buf).contains("\"level\":\"high\""), "{}", text(&buf));
     }
 
     #[test]

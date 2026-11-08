@@ -22,4 +22,10 @@ pub trait Terminal {
     fn next_event(&mut self) -> impl Future<Output = io::Result<Event>> {
         std::future::pending()
     }
+
+    /// Whether [`Terminal::next_event`] answers at once: a whole event is
+    /// already read, so the app handles it before it draws one frame for all.
+    fn input_ready(&mut self) -> bool {
+        false
+    }
 }

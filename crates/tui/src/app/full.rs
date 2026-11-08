@@ -4,7 +4,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::term::{KEYS_ON, MOUSE_ON};
+use super::term::{FOCUS_ON, KEYS_ON, MOUSE_ON, PASTE_ON};
 use super::{App, Block, Entry, Screen, Terminal};
 
 impl App {
@@ -13,10 +13,11 @@ impl App {
     /// terminal refuses the sequence.
     ///
     /// The screen takes the id of this session first, so the line the exit
-    /// leaves names it. The sequence, the mouse capture and the extended keys go
-    /// out in one write, the first frame of the run. Inline mode asks only for
-    /// the extended keys: it draws on the normal screen and keeps the mouse for
-    /// the terminal's own selection.
+    /// leaves names it. The sequence, the mouse capture, the focus reports, the
+    /// extended keys and bracketed paste go out in one write, the first frame of
+    /// the run. Inline mode asks only for the focus reports, the extended keys
+    /// and bracketed paste: it draws on the normal screen and keeps the mouse
+    /// for the terminal's own selection.
     pub(super) async fn enter(&mut self, terminal: &mut impl Terminal) {
         self.screen.set_session(&self.session);
         self.screen.enter(&mut self.frame);
@@ -24,7 +25,9 @@ impl App {
         if full {
             self.frame.extend_from_slice(MOUSE_ON);
         }
+        self.frame.extend_from_slice(FOCUS_ON);
         self.frame.extend_from_slice(KEYS_ON);
+        self.frame.extend_from_slice(PASTE_ON);
         if let Err(error) = terminal.write_frame(&self.frame).await
             && full
         {

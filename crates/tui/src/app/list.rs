@@ -10,9 +10,11 @@
 //! that owns it keeps its query and its matcher between keys, so typing in a
 //! list allocates nothing once the buffers are warm.
 
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::keyfile::{Foot, Labels};
 use crate::keys::{self, Group};
 use crate::pick::Matcher;
 
@@ -40,8 +42,9 @@ pub(crate) struct Command {
     pub name: &'static str,
     /// The words that say what the command does.
     pub words: &'static str,
-    /// The keys that run it elsewhere, as the terminal prints them.
-    pub key: &'static str,
+    /// The keys that run it elsewhere, as the terminal prints them: a `Cow`
+    /// because a keys file may have moved one of them.
+    pub key: Cow<'static, str>,
     /// The heading the palette lists it under.
     pub group: &'static str,
 }
@@ -55,6 +58,20 @@ pub(crate) struct List {
     matcher: Matcher,
     selected: usize,
     top: usize,
+    /// The leader's own key and its grid's, as a keys file printed them; `None`
+    /// for the table's own, which the draw falls back to.
+    keys: Option<LeaderKeys>,
+    /// The words of the footer row, as a keys file printed them; `None` for the
+    /// table's own, which the draw falls back to.
+    foot: Option<Arc<str>>,
+}
+
+/// The keys the which-key list shows: the leader's own first, then one per hint
+/// of `keys::hints(Group::Leader)`, in that order.
+#[derive(Debug, Clone)]
+pub(crate) struct LeaderKeys {
+    pub title: Arc<str>,
+    pub grid: Arc<[Arc<str>]>,
 }
 
 impl List {
@@ -88,7 +105,39 @@ impl List {
             matcher: Matcher::new(),
             selected: 0,
             top: 0,
+            keys: None,
+            foot: None,
         }
+    }
+
+    /// The words of the footer row, from the labels of a keys file: the keys it
+    /// moved are the ones the footer names.
+    pub(crate) fn set_labels(&mut self, labels: Option<&Labels>) {
+        let Some(labels) = labels else {
+            return;
+        };
+        let foot = match self.source {
+            Source::Commands(_) if self.palette => Foot::ListPalette,
+            Source::Commands(_) => Foot::ListCommands,
+            Source::Files(_) => Foot::ListFiles,
+            Source::Leader => Foot::ListLeader,
+        };
+        self.foot = Some(Arc::from(labels.foot(foot)));
+    }
+
+    /// The words of the footer row now, or `None` for the table's.
+    pub(crate) fn foot(&self) -> Option<&str> {
+        self.foot.as_deref()
+    }
+
+    /// The keys the leader's title and grid show, from a keys file.
+    pub(crate) fn set_keys(&mut self, keys: LeaderKeys) {
+        self.keys = Some(keys);
+    }
+
+    /// The keys the leader's title and grid show now, or `None` for the table's.
+    pub(crate) fn keys(&self) -> Option<&LeaderKeys> {
+        self.keys.as_ref()
     }
 
     /// Sets the query, the text box text after `/` or `@`, and matches it
@@ -269,6 +318,7 @@ impl List {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::sync::Arc;
 
     use super::{Command, List};
@@ -289,7 +339,7 @@ mod tests {
         .map(|(name, words, group)| Command {
             name,
             words,
-            key: "",
+            key: Cow::Borrowed(""),
             group,
         })
         .collect::<Vec<_>>()
@@ -408,7 +458,7 @@ mod tests {
     #[test]
     fn the_leader_list_is_its_title_and_the_key_grid() {
         let list = List::leader();
-        assert_eq!(list.total(), 5, "the keys after ctrl+x");
+        assert_eq!(list.total(), 6, "the keys after ctrl+x");
         assert_eq!(
             list.height(),
             5,

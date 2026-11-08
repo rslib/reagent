@@ -2,16 +2,20 @@
 
 pub mod app;
 pub mod client;
+pub mod clipboard;
 pub mod editor;
 pub mod highlight;
 pub mod history;
 pub mod host;
+pub mod keyfile;
 pub mod keys;
 pub mod layout;
 pub mod markdown;
 pub mod mouse;
 pub mod panels;
 pub mod pick;
+pub mod picture;
+pub mod picture_native;
 pub mod screen;
 pub mod slot;
 pub mod theme;

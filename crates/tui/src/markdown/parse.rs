@@ -24,8 +24,6 @@ pub(super) struct Draft<'a> {
     pub styles: &'a mut StyleTable,
     /// The styles of the blocks that have a role of their own.
     pub roles: Roles,
-    /// The interned styles of inline code.
-    pub codes: &'a mut Vec<u32>,
     /// Set when a span had to be cut at the end of the message.
     pub clamped: bool,
 }
@@ -145,7 +143,7 @@ impl Parse<'_, '_> {
                     Some(range) => self.literal_styled(&text, range, style),
                     None => self.owned(&text, style),
                 };
-                self.push(piece);
+                self.push(piece.inline_code());
             }
             Event::Html(text) | Event::InlineHtml(text) => {
                 let piece = self.literal(&text, start..end);
@@ -371,6 +369,8 @@ impl Parse<'_, '_> {
             links: std::mem::take(&mut self.links),
             fence: self.fence,
             list: self.list,
+            line: 0,
+            rows: 0,
         };
         self.blocks.push(block);
     }
@@ -432,11 +432,7 @@ impl Parse<'_, '_> {
     fn code_style(&mut self) -> u32 {
         let bits = self.bits | CODE | if self.head { BOLD } else { 0 };
         let style = self.draft.roles.style(bits, self.level, false);
-        let id = self.draft.styles.intern(style);
-        if !self.draft.codes.contains(&id) {
-            self.draft.codes.push(id);
-        }
-        id
+        self.draft.styles.intern(style)
     }
 
     /// A piece for parser text that is a slice of the message when it is one.

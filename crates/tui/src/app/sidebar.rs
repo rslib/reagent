@@ -25,6 +25,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use reagent_store::list::{Entry, SessionList, State};
 use unicode_width::UnicodeWidthStr;
 
+use crate::keyfile::Foot;
 use crate::keys::Leader;
 use crate::layout::{self, DOCK_COLUMNS, Rect, SIDEBAR_MAX};
 use crate::panels::{self, ChangesPanel, ClientsPanel, ContextPanel, SessionRow, SessionsPanel};
@@ -123,6 +124,8 @@ impl App {
             self.touch();
         }
         self.set_session();
+        // The pane the preview wrapped for may have changed with the layout.
+        self.sheet_preview();
     }
 
     /// The header row above the main area: the top rows of a full-screen frame,
@@ -155,7 +158,7 @@ impl App {
                     .set_active(active && self.aside.rect().is_some());
                 self.touch();
             }
-            Leader::Model | Leader::Sessions | Leader::Commands => {}
+            Leader::Model | Leader::Sessions | Leader::Level | Leader::Commands => {}
         }
     }
 
@@ -569,11 +572,15 @@ impl App {
         } else {
             columns(WAITS) + 1 + columns(counts.waits.as_str())
         };
+        let hint = match &self.keyfile {
+            Some(file) => file.labels().foot(Foot::SidebarHint),
+            None => HINT,
+        };
         let parts = [
             files,
             waits,
             columns(counts.clients.as_str()),
-            columns(HINT),
+            columns(hint),
         ];
         let left = 1
             + columns(NAME)
@@ -628,7 +635,7 @@ impl App {
                     put(screen, &mut x, y, counts.waits.as_str(), text, limit);
                 }
                 2 => put(screen, &mut x, y, counts.clients.as_str(), text, limit),
-                _ => put(screen, &mut x, y, HINT, dim, limit),
+                _ => put(screen, &mut x, y, hint, dim, limit),
             }
         }
     }
@@ -783,7 +790,11 @@ fn list_folder(folder: &std::path::Path) -> Vec<Entry> {
         headless: marked_headless(header),
     });
     match list {
-        Ok(list) => list.all().to_vec(),
+        Ok(list) => {
+            let mut entries = list.all().to_vec();
+            reagent_ai::record::fill_titles(folder, &mut entries);
+            entries
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -827,6 +838,7 @@ mod tests {
         app.set_prices((3.0, 15.0));
         app.panels_update(&Update::Usage {
             input: 50_000,
+            cached: 0,
             output: 1_000,
         });
         app.panels_update(&Update::ToolCall {
@@ -900,7 +912,7 @@ mod tests {
         for wanted in [
             "Context",
             "deepseek/deepseek-flash",
-            "50k / 200k",
+            "51k / 200k",
             "$0.16",
             "01M68HGZ",
             "Changes",
@@ -975,6 +987,19 @@ mod tests {
             "left: {rows:#?}"
         );
         assert!(rows.iter().any(|row| row.contains("this terminal")), "you");
+    }
+
+    /// A moved leader and a moved sidebar key reach the folded row's hint.
+    #[test]
+    fn keys_in_force_the_folded_row_names_the_moved_keys() {
+        let mut app = app(100, 30);
+        app.read_keys_text("[keys]\nleader = \"alt+x\"\n[leader]\nsidebar = \"s\"\n");
+        let rows = drawn(&mut app);
+        assert!(
+            rows[0].trim_end().ends_with("alt+x s panels"),
+            "{:?}",
+            rows[0]
+        );
     }
 
     #[test]
@@ -1212,5 +1237,13 @@ mod tests {
         assert_eq!(app.panel_at(changes as u16), Some(1));
         let clients = row_of(&rows, "Clients").expect("the clients title");
         assert_eq!(app.panel_at(clients as u16), Some(3));
+    }
+
+    /// A file that moves nothing prints each word as the table has it.
+    #[test]
+    fn keys_in_force_sidebar_hint_matches_the_table() {
+        let (file, _) = crate::keyfile::KeyFile::parse("");
+        let labels = file.labels();
+        assert_eq!(labels.foot(crate::keyfile::Foot::SidebarHint), super::HINT);
     }
 }

@@ -232,6 +232,16 @@ impl BodyParts {
         self.parts.push(Bytes::from_static(bytes));
     }
 
+    /// Makes `member`, written as `"name":value,`, the first member of the
+    /// JSON object this body holds. The head stays shared with its cache.
+    pub(crate) fn lead_with(&mut self, member: &'static [u8]) {
+        let head = self.parts[0].slice(1..);
+        self.parts[0] = Bytes::from_static(b"{");
+        self.parts.insert(1, Bytes::from_static(member));
+        self.parts.insert(2, head);
+        self.len += member.len();
+    }
+
     /// The length of the body: the sum of its pieces.
     pub fn len(&self) -> usize {
         self.len

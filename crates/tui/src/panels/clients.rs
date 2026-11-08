@@ -235,8 +235,10 @@ mod tests {
         for update in [
             Update::Usage {
                 input: 1,
+                cached: 0,
                 output: 2,
             },
+            Update::Streamed { bytes: 8 },
             Update::Busy(true),
             Update::Tick,
         ] {

@@ -120,18 +120,34 @@ const HTTP_REPLY: &str = concat!(
     "data: {\"type\":\"message_stop\"}\n\n"
 );
 
-/// A reply that calls `read` on `path` and ends the turn with the tool use.
-fn read_reply(path: &str) -> String {
-    let arguments = serde_json::json!({ "path": path }).to_string();
+/// A reply that calls the tool `name` with the JSON `arguments` and ends the
+/// turn with the tool use.
+fn call_reply(name: &str, arguments: &str) -> String {
     format!(
         concat!(
-            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"read\"}}}}\n\n",
+            "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"{}\"}}}}\n\n",
             "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":{}}}}}\n\n",
             "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n",
             "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n",
             "data: {{\"type\":\"message_stop\"}}\n\n"
         ),
-        serde_json::to_string(&arguments).expect("a JSON string")
+        name,
+        serde_json::to_string(arguments).expect("a JSON string")
+    )
+}
+
+/// A reply that calls `read` on `path` and ends the turn with the tool use.
+fn read_reply(path: &str) -> String {
+    let arguments = serde_json::json!({ "path": path }).to_string();
+    call_reply("read", &arguments)
+}
+
+/// A reply that calls `bash` with `command` and ends the turn with the tool
+/// use, which waits for an approval in a folder that asks for one.
+fn bash_reply(command: &str) -> String {
+    call_reply(
+        "bash",
+        &serde_json::json!({ "command": command }).to_string(),
     )
 }
 
@@ -733,6 +749,40 @@ async fn two_clients_get_one_user_message_and_the_same_events() {
     );
     let mut worker = worker;
     worker.kill().await;
+}
+
+/// A session a client started has no task, so its first message names it.
+#[tokio::test]
+async fn session_title_is_the_first_message_a_client_sends() {
+    let state = state();
+    let (worker, _) = worker(&state, r#"{"replies":[{"text":"done"}]}"#).await;
+    let token = worker.entry().await.token;
+    let mut client = Client::initialize(&worker, &token, "a").await;
+    client.attach(client.committed).await;
+    let sent = client
+        .request("send", r#"{"text":"name this session","mode":"queue"}"#)
+        .await;
+    client.answer(sent).await;
+    client.until(|frame| is_event(frame, "run_end")).await;
+
+    let root = state.path().join("reagent/sessions");
+    let mut found = false;
+    for _ in 0..500 {
+        let mut folders = tokio::fs::read_dir(&root).await.expect("the sessions");
+        while let Some(folder) = folders.next_entry().await.expect("a folder") {
+            let list = tokio::fs::read(folder.path().join("sessions.list"))
+                .await
+                .unwrap_or_default();
+            found |= list
+                .windows(b"name this session".len())
+                .any(|part| part == b"name this session");
+        }
+        if found {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(found, "the list entry takes the first message as its title");
 }
 
 #[tokio::test]
@@ -2090,6 +2140,21 @@ fn first_user_text(body: &Value, block: usize) -> String {
         .to_owned()
 }
 
+/// The content blocks of the message of `body` at `at`.
+fn message_blocks(body: &Value, at: usize) -> Vec<Value> {
+    let content = body["messages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no messages: {body}"))
+        .get(at)
+        .unwrap_or_else(|| panic!("no message {at}: {body}"))["content"]
+        .clone();
+    match content {
+        Value::Array(blocks) => blocks,
+        Value::String(text) => vec![serde_json::json!({ "type": "text", "text": text })],
+        other => panic!("no content of message {at}: {other}"),
+    }
+}
+
 /// Sends the first message and three of 40 KB, so the oldest turns lie
 /// before the tail a compaction keeps.
 async fn long_session(a: &mut Client) {
@@ -2150,6 +2215,52 @@ async fn compact_request_puts_the_note_in_the_next_request() {
     assert!(
         checkpoint.ends_with("\n\nNote from the user: keep the API notes"),
         "{checkpoint}"
+    );
+}
+
+/// `committed` means the records are in the part file, so a SIGKILL right after
+/// it keeps the compaction it names.
+#[tokio::test]
+async fn a_kill_after_committed_keeps_the_compaction() {
+    let state = state();
+    let cwd = state.path().join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    let mut server = serve(vec![HTTP_REPLY.to_string(); 5]).await;
+    let config = anthropic_config(state.path(), &server.base).await;
+    let mut worker =
+        Worker::start_with(state.path(), &cwd, &config, &["--model", "one/model-a"]).await;
+    let token = worker.entry().await.token;
+    let mut a = Client::initialize(&worker, &token, "a").await;
+    a.attach(a.committed).await;
+
+    long_session(&mut a).await;
+    for _ in 0..4 {
+        let _ = server.body().await;
+    }
+    let asked = a
+        .request("compact", r#"{"note":"keep the API notes"}"#)
+        .await;
+    assert!(a.answer(asked).await["result"].is_object());
+    a.until(|frame| is_event(frame, "compacted")).await;
+    a.until(|frame| is_event(frame, "committed")).await;
+    worker.kill().await;
+
+    let worker = Worker::start_with(
+        state.path(),
+        &cwd,
+        &config,
+        &["-c", "--model", "one/model-a"],
+    )
+    .await;
+    let token = worker.entry().await.token;
+    let mut b = Client::initialize(&worker, &token, "b").await;
+    b.attach(b.committed).await;
+    send_and_wait(&mut b, "after the kill").await;
+    let body = server.body().await;
+    let checkpoint = first_user_text(&body, 1);
+    assert!(
+        checkpoint.contains("## Checkpoint 1") && checkpoint.contains("keep the API notes"),
+        "the resume starts from the compaction: {checkpoint}"
     );
 }
 
@@ -2232,6 +2343,261 @@ async fn compact_request_with_one_turn_says_nothing_to_compact() {
         line["params"]["message"], "nothing to compact",
         "the client hears why nothing happened: {line}"
     );
+    let mut worker = worker;
+    worker.kill().await;
+}
+
+/// The nine PNGs a message over the limit names, written in `cwd`, and the
+/// text that names them.
+async fn nine_images(cwd: &Path, png: &[u8]) -> String {
+    let mut text = String::from("look at");
+    for index in 0..9 {
+        tokio::fs::write(cwd.join(format!("{index}.png")), png)
+            .await
+            .expect("an image");
+        text.push_str(&format!(" @{index}.png"));
+    }
+    text
+}
+
+#[tokio::test]
+async fn a_worker_image_from_a_client_reaches_the_request_and_resumes() {
+    let state = state();
+    let cwd = state.path().join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    let png = shot_png();
+    tokio::fs::write(cwd.join("shot.png"), &png)
+        .await
+        .expect("the image");
+    let mut server = serve(vec![HTTP_REPLY.to_string()]).await;
+    let config = anthropic_config(state.path(), &server.base).await;
+    let worker = Worker::start_with(state.path(), &cwd, &config, &["--model", "one/model-a"]).await;
+    let token = worker.entry().await.token;
+    let mut a = Client::initialize(&worker, &token, "a").await;
+    a.attach(a.committed).await;
+
+    let sent = a
+        .request("send", r#"{"text":"look at @shot.png","mode":"queue"}"#)
+        .await;
+    assert!(a.answer(sent).await["result"].is_object());
+    let body = server.body().await;
+    let blocks = message_blocks(&body, 0);
+    assert_eq!(blocks[0]["text"], "look at @shot.png", "{blocks:?}");
+    assert_eq!(blocks[1]["text"], "[image 64x48]", "{blocks:?}");
+    assert_eq!(blocks[2]["type"], "image", "{blocks:?}");
+    assert_eq!(
+        blocks[2]["source"]["data"],
+        STANDARD.encode(&png),
+        "the image is the file the message named"
+    );
+    a.until(|frame| is_event(frame, "run_end")).await;
+
+    // The journal holds the message, so a session that continues from it sends
+    // the same image again.
+    assert!(a.detach().await["result"].is_object());
+    let mut worker = worker;
+    tokio::time::timeout(WAIT, worker.child.wait())
+        .await
+        .expect("the worker stops")
+        .expect("the worker ended");
+    let mut next = serve(vec![HTTP_REPLY.to_string()]).await;
+    let out = Command::new(BIN)
+        .args([
+            "-c",
+            "--provider",
+            "anthropic",
+            "--base-url",
+            &next.base,
+            "-p",
+            "next",
+        ])
+        .current_dir(&cwd)
+        .env("XDG_CONFIG_HOME", state.path().join("none"))
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_CACHE_HOME", state.path().join("none"))
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .expect("runs reagent");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = next.body().await;
+    let blocks = message_blocks(&body, 0);
+    assert_eq!(blocks[1]["text"], "[image 64x48]", "{blocks:?}");
+    assert_eq!(blocks[2]["source"]["data"], STANDARD.encode(&png));
+}
+
+#[tokio::test]
+async fn a_worker_image_in_a_steered_message_reaches_the_next_request() {
+    let state = state();
+    let cwd = state.path().join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    ask_folder(&cwd).await;
+    let png = shot_png();
+    tokio::fs::write(cwd.join("shot.png"), &png)
+        .await
+        .expect("the image");
+    let mut server = serve(vec![bash_reply("echo hi"), HTTP_REPLY.to_string()]).await;
+    let config = anthropic_config(state.path(), &server.base).await;
+    let worker = Worker::start_with(state.path(), &cwd, &config, &["--model", "one/model-a"]).await;
+    let token = worker.entry().await.token;
+    let mut a = Client::initialize(&worker, &token, "a").await;
+    a.attach(a.committed).await;
+
+    let sent = a
+        .request("send", r#"{"text":"run it","mode":"queue"}"#)
+        .await;
+    assert!(a.answer(sent).await["result"].is_object());
+    // The run waits for the approval of the call, so it is still open.
+    let asked = a.until(|frame| frame["method"] == "approval_request").await;
+    let id = asked.last().expect("an approval")["params"]["id"]
+        .as_u64()
+        .expect("an approval id");
+    let steer = a
+        .request("send", r#"{"text":"look at @shot.png","mode":"steer"}"#)
+        .await;
+    assert!(a.answer(steer).await["result"].is_object());
+    a.until(|frame| is_event(frame, "user_message")).await;
+    let once = a
+        .request("approve", &format!("{{\"id\":{id},\"answer\":\"once\"}}"))
+        .await;
+    assert!(a.answer(once).await["result"].is_object());
+    a.until(|frame| is_event(frame, "run_end")).await;
+
+    let _tool_use = server.body().await;
+    let body = server.body().await;
+    let messages = body["messages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no messages: {body}"))
+        .len();
+    let blocks = message_blocks(&body, messages - 1);
+    // The wire puts the tool result and the user message that follows it in
+    // one message, so the text is found where it stands.
+    let at = blocks
+        .iter()
+        .position(|block| block["text"] == "look at @shot.png")
+        .unwrap_or_else(|| panic!("no steered text in {blocks:?}"));
+    assert_eq!(blocks[at + 1]["text"], "[image 64x48]", "{blocks:?}");
+    assert_eq!(blocks[at + 2]["type"], "image", "{blocks:?}");
+    assert_eq!(blocks[at + 2]["source"]["data"], STANDARD.encode(&png));
+    let mut worker = worker;
+    worker.kill().await;
+}
+
+#[tokio::test]
+async fn a_worker_image_in_the_task_of_a_worker_reaches_the_first_request() {
+    let state = state();
+    let cwd = state.path().join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    let png = shot_png();
+    tokio::fs::write(cwd.join("shot.png"), &png)
+        .await
+        .expect("the image");
+    let mut server = serve(vec![HTTP_REPLY.to_string()]).await;
+    let config = anthropic_config(state.path(), &server.base).await;
+    let mut worker = Worker::start_with(
+        state.path(),
+        &cwd,
+        &config,
+        &["-p", "look at @shot.png", "--model", "one/model-a"],
+    )
+    .await;
+
+    let body = server.body().await;
+    let blocks = message_blocks(&body, 0);
+    assert!(
+        blocks[0]["text"]
+            .as_str()
+            .expect("text")
+            .starts_with("look at @shot.png"),
+        "the task text goes as it was written: {}",
+        blocks[0]["text"]
+    );
+    assert_eq!(blocks[1]["text"], "[image 64x48]", "{blocks:?}");
+    assert_eq!(blocks[2]["type"], "image", "{blocks:?}");
+    assert_eq!(blocks[2]["source"]["data"], STANDARD.encode(&png));
+    worker.kill().await;
+}
+
+#[tokio::test]
+async fn a_worker_image_over_the_limit_is_an_error_and_the_worker_serves_on() {
+    let state = state();
+    let cwd = state.path().join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    let png = shot_png();
+    let text = nine_images(&cwd, &png).await;
+    let mut server = serve(vec![HTTP_REPLY.to_string(), HTTP_REPLY.to_string()]).await;
+    let config = anthropic_config(state.path(), &server.base).await;
+    let worker = Worker::start_with(state.path(), &cwd, &config, &["--model", "one/model-a"]).await;
+    let token = worker.entry().await.token;
+    let mut a = Client::initialize(&worker, &token, "a").await;
+    a.attach(a.committed).await;
+
+    let params = serde_json::json!({ "text": text, "mode": "queue" }).to_string();
+    let sent = a.request("send", &params).await;
+    assert!(
+        a.answer(sent).await["result"].is_object(),
+        "the text is still taken: {text}"
+    );
+    let seen = a.until(|frame| is_event(frame, "error")).await;
+    let message = seen.last().expect("an error line")["params"]["message"]
+        .as_str()
+        .expect("a message")
+        .to_string();
+    assert!(message.contains("at most 8 images"), "{message}");
+    assert!(message.contains("the image was not attached"), "{message}");
+    let body = server.body().await;
+    assert!(
+        !body.to_string().contains(&STANDARD.encode(&png)),
+        "no image reaches the request: {body}"
+    );
+    let blocks = message_blocks(&body, 0);
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert_eq!(blocks[0]["text"], text, "the text goes as it was written");
+    a.until(|frame| is_event(frame, "run_end")).await;
+
+    // The worker still serves the client that read the error.
+    send_and_wait(&mut a, "again").await;
+    let mut worker = worker;
+    worker.kill().await;
+}
+
+#[tokio::test]
+async fn a_worker_image_word_on_a_text_file_sends_no_image() {
+    let state = state();
+    let cwd = state.path().join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    tokio::fs::write(cwd.join("notes.txt"), b"notes\n")
+        .await
+        .expect("the notes");
+    let mut server = serve(vec![HTTP_REPLY.to_string()]).await;
+    let config = anthropic_config(state.path(), &server.base).await;
+    let worker = Worker::start_with(state.path(), &cwd, &config, &["--model", "one/model-a"]).await;
+    let token = worker.entry().await.token;
+    let mut a = Client::initialize(&worker, &token, "a").await;
+    a.attach(a.committed).await;
+
+    let sent = a
+        .request(
+            "send",
+            r#"{"text":"mail me@host.com about @notes.txt","mode":"queue"}"#,
+        )
+        .await;
+    assert!(a.answer(sent).await["result"].is_object());
+    let frames = a.until(|frame| is_event(frame, "run_end")).await;
+    assert!(
+        events(frames).iter().all(|event| event["type"] != "error"),
+        "the text file raises no error"
+    );
+    let body = server.body().await;
+    let blocks = message_blocks(&body, 0);
+    assert_eq!(blocks.len(), 1, "{blocks:?}");
+    assert_eq!(blocks[0]["text"], "mail me@host.com about @notes.txt");
     let mut worker = worker;
     worker.kill().await;
 }

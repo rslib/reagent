@@ -106,6 +106,15 @@ impl Home {
         std::fs::write(dir.join("config.toml"), body).expect("the global config");
     }
 
+    /// Writes the keys file of this home's config folder, which
+    /// `XDG_CONFIG_HOME` points at.
+    #[expect(clippy::disallowed_methods, reason = "a test writes its own keys file")]
+    fn keys_toml(&self, body: &str) {
+        let dir = self.root.path().join("config/reagent");
+        std::fs::create_dir_all(&dir).expect("the config folder");
+        std::fs::write(dir.join("keys.toml"), body).expect("the keys file");
+    }
+
     /// The binary, set up the way this home runs it.
     fn command(&self) -> Command {
         let mut command = Command::new(BIN);
@@ -119,6 +128,27 @@ impl Home {
         command
     }
 
+    /// The binary in a terminal that calls itself `program`, with no multiplexer
+    /// and no other terminal's host variable around it: the image protocol it
+    /// reads is the one the test names.
+    fn terminal(&self, program: &str) -> Command {
+        let mut command = self.command();
+        command.env("TERM_PROGRAM", program);
+        for name in [
+            "TMUX",
+            "TMUX_PANE",
+            "ZELLIJ",
+            "ZELLIJ_SESSION_NAME",
+            "STY",
+            "HERDR_PANE_ID",
+            "RMAESTRO_PANE",
+            "KITTY_WINDOW_ID",
+        ] {
+            command.env_remove(name);
+        }
+        command
+    }
+
     /// Runs the binary headless and returns what it printed.
     async fn headless(&self, args: &[&str]) -> std::process::Output {
         self.command()
@@ -127,6 +157,18 @@ impl Home {
             .output()
             .await
             .expect("the binary runs")
+    }
+
+    /// The session folders of the project folder, sorted by id.
+    async fn sessions(&self) -> Vec<PathBuf> {
+        let cwd = tokio::fs::canonicalize(self.cwd())
+            .await
+            .expect("the project folder");
+        let folder = self
+            .state()
+            .join("reagent/sessions")
+            .join(reagent_store::paths::cwd_key(&cwd));
+        reagent_store::paths::session_dirs(&folder).unwrap_or_default()
     }
 
     /// The workers still running for this home.
@@ -313,6 +355,15 @@ impl Tui {
         bytes
             .windows(sequence.len())
             .any(|window| window == sequence.as_bytes())
+    }
+
+    /// How many times the bytes the binary wrote carry `sequence`.
+    fn count(&self, sequence: &str) -> usize {
+        let bytes = self.bytes.lock().expect("the bytes lock");
+        bytes
+            .windows(sequence.len())
+            .filter(|window| *window == sequence.as_bytes())
+            .count()
     }
 
     /// The start of what the binary wrote, for a test that says what it got
@@ -603,6 +654,144 @@ async fn new_command_starts_an_empty_session() {
         tui.text()
     );
 
+    assert_eq!(tui.quit().await, 0, "a normal quit");
+}
+
+/// The id of a session folder: its name.
+fn id_of(dir: &Path) -> String {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .expect("a session folder named by its id")
+        .to_owned()
+}
+
+/// Opens the sessions sheet with Ctrl+X l and waits for its footer.
+///
+/// A key typed while the UI joins its worker can be lost, so the sheet is
+/// asked for again from a screen that shows none.
+async fn open_sessions(tui: &mut Tui) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        tui.keys("\u{18}l");
+        let tried = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < tried {
+            if tui.text().contains("ctrl+d deletes") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sessions sheet never opened:\n{}",
+            tui.text()
+        );
+        tui.keys("\u{1b}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The sessions sheet deletes a session of the folder: the first Ctrl+D asks
+/// again, and the second takes the folder off the disk.
+#[tokio::test]
+async fn the_sessions_sheet_deletes_a_session() {
+    let home = Home::new();
+    let provider = home.script("delete", r#"{"replies": [{"text": "an old reply"}]}"#);
+    let run = home
+        .headless(&["-p", "an old turn", "--provider", &provider])
+        .await;
+    assert!(
+        run.status.success(),
+        "exit {} stderr {}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let saved = home.sessions().await;
+    assert_eq!(saved.len(), 1, "the run saved one session");
+    let old = saved.into_iter().next().expect("the saved session");
+    let old_id = id_of(&old);
+
+    let mut tui = Tui::start(&home, &["--provider", &provider]);
+    tui.until("idle").await;
+    open_sessions(&mut tui).await;
+    // The rows read newest first, so the old session is the last one, however
+    // many rows this run's own session adds above it.
+    tui.keys("\u{1b}[B\u{1b}[B\u{1b}[B");
+    tui.keys("\u{4}");
+    tui.until("again deletes").await;
+    tui.keys("\u{4}");
+    tui.until("deleted").await;
+
+    assert!(
+        !old.exists(),
+        "the folder of {old_id} is gone: {}",
+        old.display()
+    );
+    let left: Vec<String> = home.sessions().await.iter().map(|dir| id_of(dir)).collect();
+    assert!(
+        !left.contains(&old_id),
+        "the list names {old_id} no more: {left:?}"
+    );
+
+    // Esc and Ctrl+C in one read are Alt+Ctrl+C, which does not arm the quit.
+    tui.keys("\u{1b}");
+    tui.until_gone("ctrl+d deletes").await;
+    assert_eq!(tui.quit().await, 0, "a normal quit");
+}
+
+/// The sessions sheet keeps a session a fork reads: the host's refusal is a
+/// note, and the parent's folder stays.
+#[tokio::test]
+async fn the_sessions_sheet_keeps_a_fork_parent() {
+    let home = Home::new();
+    let provider = home.script("fork", r#"{"replies": [{"text": "one"}, {"text": "two"}]}"#);
+    let run = home.headless(&["-p", "one", "--provider", &provider]).await;
+    assert!(
+        run.status.success(),
+        "exit {} stderr {}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let saved = home.sessions().await;
+    assert_eq!(saved.len(), 1, "the run saved the parent");
+    let parent = saved.into_iter().next().expect("the parent's folder");
+    let reference = format!("{}@1", id_of(&parent));
+    let run = home
+        .headless(&["--fork", &reference, "-p", "two", "--provider", &provider])
+        .await;
+    assert!(
+        run.status.success(),
+        "exit {} stderr {}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let saved = home.sessions().await;
+    assert_eq!(saved.len(), 2, "the parent and its fork");
+    let fork = saved
+        .into_iter()
+        .find(|dir| *dir != parent)
+        .expect("the fork's folder");
+
+    let mut tui = Tui::start(&home, &["--provider", &provider]);
+    tui.until("idle").await;
+    open_sessions(&mut tui).await;
+    // The rows read newest first: the fork is above its parent, which is the
+    // last row.
+    tui.keys("\u{1b}[B\u{1b}[B\u{1b}[B");
+    tui.keys("\u{4}");
+    tui.until("again deletes").await;
+    tui.keys("\u{4}");
+    tui.until("a fork reads it").await;
+
+    assert!(
+        parent.exists(),
+        "the parent's folder stays: {}",
+        parent.display()
+    );
+    assert!(fork.exists(), "the fork's folder stays: {}", fork.display());
+
+    // Esc and Ctrl+C in one read are Alt+Ctrl+C, which does not arm the quit.
+    tui.keys("\u{1b}");
+    tui.until_gone("ctrl+d deletes").await;
     assert_eq!(tui.quit().await, 0, "a normal quit");
 }
 
@@ -982,6 +1171,35 @@ async fn ctrl_x_shows_the_leader_keys() {
     assert_eq!(tui.quit().await, 0, "a normal quit");
 }
 
+/// The keys file of the config folder moves a key of the real UI: the leader
+/// leaves Ctrl+X, and the key after it opens the sessions sheet.
+#[tokio::test]
+async fn keys_file_moves_a_key_of_the_real_ui() {
+    let home = Home::new();
+    home.keys_toml("[keys]\nleader = \"ctrl+z\"\n[leader]\nsessions = \"s\"\n");
+    let provider = home.script("keys", r#"{"replies": [{"text": "unused"}]}"#);
+    let mut tui = Tui::start(&home, &["--provider", &provider]);
+    tui.until("idle").await;
+
+    // Ctrl+X is the leader it moved away from: the file frees it, so the key
+    // after it opens nothing.
+    tui.keys("\u{18}s");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !tui.text().contains("Sessions"),
+        "the old leader key opened the sheet:\n{}",
+        tui.text()
+    );
+
+    // Ctrl+Z is the leader now, and s is the sessions key.
+    tui.keys("\u{1a}s");
+    tui.until("Sessions").await;
+    tui.keys("\u{1b}");
+    tui.until_gone("Sessions").await;
+
+    assert_eq!(tui.quit().await, 0, "a normal quit");
+}
+
 /// `?` on an empty box opens the key sheet, Esc gives the box back, and a `?`
 /// typed after a draft is a `?` in the box.
 #[tokio::test]
@@ -1070,6 +1288,86 @@ async fn level_command_reaches_the_worker() {
     // Context panel names the settings the worker applied.
     tui.keys("\u{18}b");
     tui.until("low · default").await;
+
+    assert_eq!(tui.quit().await, 0, "a normal quit");
+}
+
+/// Ctrl+X t lists the words the plan of the model takes, and a pick reaches the
+/// worker, whose settings notice draws the level in the Context panel.
+#[tokio::test]
+async fn the_level_sheet_lists_and_sets_the_levels_of_the_model() {
+    let home = Home::new();
+    home.config(
+        "[providers.mine]\nwire = \"openai-chat\"\nbase_url = \"http://127.0.0.1:1\"\n\
+         api_key = \"sk-mine-test\"\n",
+    );
+    tokio::fs::set_permissions(
+        home.root.path().join("config/reagent/config.toml"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .await
+    .expect("the config is private");
+    let cache = home.root.path().join("cache/reagent/models");
+    tokio::fs::create_dir_all(&cache)
+        .await
+        .expect("the cache folder");
+    // The window is unique to this model: the Context panel reading it is how
+    // the test knows the session runs `mine/fast`, whose plan the sheet reads.
+    tokio::fs::write(
+        cache.join("mine.json"),
+        r#"{"fetched_at":1,"models":[{"id":"fast","context_window":111000,"max_output":null,
+            "reasoning":{"levels":["low","high"],"off":true,"default":"high"}}]}"#,
+    )
+    .await
+    .expect("the cache file");
+
+    let provider = home.script("levels", r#"{"replies": [{"text": "unused"}]}"#);
+    let mut command = home.command();
+    command.env("XDG_CACHE_HOME", home.root.path().join("cache"));
+    command.args(["--provider", provider.as_str()]);
+    let mut tui = Tui::spawn(&mut command);
+    tui.until("idle").await;
+
+    // A pick of `mine/fast` in the model sheet makes it the model the session
+    // runs, so the level sheet has a plan to read.
+    tui.keys("\u{18}m");
+    tui.until("mine/fast").await;
+    tui.keys("\r");
+    panels_show(&mut tui, "0 / 111k").await;
+
+    tui.keys("\u{18}t");
+    tui.until("3 levels").await;
+    let text = tui.text();
+    for word in ["Level", "off", "low", "high"] {
+        assert!(text.contains(word), "the sheet lists {word:?}:\n{text}");
+    }
+
+    // The selection starts on the row of the level in use, which is no row of
+    // the sheet yet, so it starts on `off` and one Down lands on `low`.
+    tui.keys("\u{1b}[B");
+    tui.keys("\r");
+    panels_show(&mut tui, "low · default").await;
+
+    assert_eq!(tui.quit().await, 0, "a normal quit");
+}
+
+/// A session started with `--reasoning high` marks that level in the sheet,
+/// though no `settings` notice has named it yet.
+#[tokio::test]
+async fn the_level_sheet_marks_the_level_the_session_started_with() {
+    let home = Home::new();
+    let provider = home.script("level", r#"{"replies": [{"text": "unused"}]}"#);
+    let mut tui = Tui::start(&home, &["--provider", &provider, "--reasoning", "high"]);
+    tui.until("idle").await;
+
+    tui.keys("/level\r");
+    tui.until("3 levels").await;
+    let text = tui.text();
+    assert!(
+        text.lines()
+            .any(|line| line.contains("high") && line.contains("now")),
+        "the high row is marked:\n{text}"
+    );
 
     assert_eq!(tui.quit().await, 0, "a normal quit");
 }
@@ -1163,4 +1461,172 @@ async fn readline_ctrl_q_and_ctrl_s_reach_the_app() {
     tui.until_gone("(failed i-search)").await;
 
     assert_eq!(tui.quit().await, 0, "a normal quit");
+}
+
+/// A `read` of an image shows the picture in the transcript, with the chip row
+/// that names its size under it, and the call's own row above that.
+#[tokio::test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test copies the picture into its own project folder"
+)]
+async fn picture_of_a_read_shows_in_the_transcript() {
+    let home = Home::new();
+    let provider = home.script(
+        "picture",
+        r#"{"replies": [
+            {"text": "reading the picture", "calls": [
+                {"name": "read", "arguments": {"path": "picture.png"}}
+            ]},
+            {"text": "the picture is on the screen"}
+        ]}"#,
+    );
+    // The image crate's fixture: a gradient of 64 by 48 pixels.
+    let png = include_bytes!("../../../image/tests/fixtures/gradient-64x48.png");
+    std::fs::write(home.cwd().join("picture.png"), png).expect("the picture");
+
+    let mut tui = Tui::spawn(
+        home.terminal("Apple_Terminal")
+            .args(["--provider", &provider]),
+    );
+    tui.until("idle").await;
+    tui.keys("read the picture\r");
+    tui.until("64x48").await;
+    tui.until("the picture is on the screen").await;
+    let screen = tui.text();
+    assert!(
+        screen.contains("▣ image 64x48"),
+        "the chip row of the picture:\n{screen}"
+    );
+    assert!(
+        screen.contains('\u{2580}'),
+        "the picture draws its cells:\n{screen}"
+    );
+
+    assert_eq!(tui.quit().await, 0, "a normal quit");
+}
+
+/// In a terminal that takes the iTerm2 protocol, the image of a read goes out
+/// over the picture's own cells: every half-block cell goes blank under it, and
+/// no row of text around it does.
+#[tokio::test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test copies the picture into its own project folder"
+)]
+async fn picture_native_image_covers_its_cells() {
+    let home = Home::new();
+    let provider = home.script(
+        "picture",
+        r#"{"replies": [
+            {"text": "reading the picture", "calls": [
+                {"name": "read", "arguments": {"path": "picture.png"}}
+            ]},
+            {"text": "the picture is on the screen"}
+        ]}"#,
+    );
+    // A 16 by 8 gradient, so the whole picture fits the test's terminal.
+    let png: &[u8] = b"\
+        \x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52\x00\x00\x00\
+        \x10\x00\x00\x00\x08\x08\x02\x00\x00\x00\x7f\x14\xe8\xc0\x00\x00\x00\xd5\x49\
+        \x44\x41\x54\x78\xda\x15\xcf\x51\x01\x00\x21\x08\x04\x51\x22\x18\x81\x08\x46\
+        \x20\x82\x11\x88\x60\x84\x89\x60\x04\x22\x18\x81\x08\x46\x20\x82\x11\xee\xe4\
+        \x7b\xdf\x02\x22\x42\x13\x54\xe8\x82\x09\x43\x70\x61\x0a\x08\x4b\x08\x61\x0b\
+        \x29\x1c\xa1\x84\x2b\x88\x28\x4d\x51\xa5\x2b\xa6\x0c\xc5\x95\xa9\xa0\x2c\x25\
+        \x94\xad\xa4\x72\x94\x52\xae\xfe\xc0\x68\x86\x1a\xdd\x30\x63\x18\x6e\x4c\x03\
+        \x63\x19\x61\x6c\x23\x8d\x63\x94\x71\xed\x07\x4e\x73\xd4\xe9\x8e\x39\xc3\x71\
+        \x67\x3a\x38\xcb\x09\x67\x3b\xe9\x1c\xa7\x9c\xeb\x3f\x80\xf6\xf6\xd3\x5f\x29\
+        \xe3\x25\x99\xbc\x59\x10\xb0\x21\xe1\x40\xc1\xfd\x5f\x93\xa0\x05\x1a\xf4\xc0\
+        \x82\x11\x78\x30\xe3\x65\x57\x10\xc1\x0e\x32\x38\x41\x05\x37\x7e\x90\xb4\x44\
+        \x93\x9e\x58\x32\x12\x4f\x66\xbe\xda\x95\x44\xb2\x93\x4c\x4e\x52\xc9\xcd\x1f\
+        \x14\xad\xd0\xa2\x17\x56\x8c\xc2\x8b\x59\xef\x82\x55\x44\xb1\x8b\x2c\x4e\x51\
+        \xc5\x2d\x3e\xc2\x81\xb4\x01\xff\x25\xbb\xd8\x00\x00\x00\x00\x49\x45\x4e\x44\
+        \xae\x42\x60\x82";
+    std::fs::write(home.cwd().join("picture.png"), png).expect("the picture");
+
+    let mut tui = Tui::spawn(home.terminal("WezTerm").args(["--provider", &provider]));
+    tui.until("idle").await;
+    tui.keys("read the picture\r");
+    tui.until("the picture is on the screen").await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let drawn = tui.bytes.lock().expect("the bytes lock").clone();
+        if drawn.windows(6).any(|window| window == b"]1337;") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no image went out:\n{}",
+            tui.text()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let screen = tui.text();
+    assert!(
+        !screen.contains('\u{2580}'),
+        "every cell under the image went blank:\n{screen}"
+    );
+    for text in [
+        "reading the picture",
+        "image 16x8",
+        "the picture is on the screen",
+    ] {
+        assert!(screen.contains(text), "{text} stays whole:\n{screen}");
+    }
+    assert_eq!(tui.quit().await, 0, "a normal quit");
+}
+
+/// In a terminal that takes kitty's placeholders, the image of a read goes out
+/// once and the picture's rows in the ring are placeholder cells, so the
+/// terminal scrolls and repaints them as it does any other text.
+#[tokio::test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test copies the picture into its own project folder"
+)]
+async fn picture_placeholders_send_the_image_once() {
+    let home = Home::new();
+    let provider = home.script(
+        "picture",
+        r#"{"replies": [
+            {"text": "reading the picture", "calls": [
+                {"name": "read", "arguments": {"path": "picture.png"}}
+            ]},
+            {"text": "the picture is on the screen"}
+        ]}"#,
+    );
+    let png = include_bytes!("../../../image/tests/fixtures/gradient-64x48.png");
+    std::fs::write(home.cwd().join("picture.png"), png).expect("the picture");
+
+    let mut tui = Tui::spawn(home.terminal("rio").args(["--provider", &provider]));
+    tui.until("idle").await;
+    tui.keys("read the picture\r");
+    tui.until("the picture is on the screen").await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !tui.drew("\x1b_Ga=T,f=100,") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no image went out:\n{}",
+            tui.text()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        tui.count("\x1b_Ga=T,f=100,"),
+        1,
+        "the terminal gets the image once"
+    );
+    let screen = tui.text();
+    assert!(
+        screen.contains('\u{10EEEE}'),
+        "the picture's rows are placeholder cells:\n{screen}"
+    );
+    assert!(
+        !screen.contains('\u{2580}'),
+        "no half-block cells under them:\n{screen}"
+    );
+    assert_eq!(tui.quit().await, 0, "a normal quit");
+    assert!(tui.drew("\x1b_Ga=d,d=I,"), "the image goes with the screen");
 }

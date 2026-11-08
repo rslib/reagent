@@ -26,6 +26,8 @@ mod status;
 mod theme;
 mod transcript;
 
+pub(crate) use self::sheet::pane_width;
+pub(crate) use self::transcript::rows::Wrap;
 pub(crate) use self::transcript::rows::{
     Block, CompactedRow, Diff, DiffKind, Entry, GroupRow, Span, SpanRole, State, ToolRow, Usage,
 };

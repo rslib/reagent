@@ -94,6 +94,7 @@ mod tests {
         });
         sidebar.update(&Update::Usage {
             input: 50_000,
+            cached: 0,
             output: 1_000,
         });
         sidebar.update(&Update::ToolCall {
@@ -107,7 +108,7 @@ mod tests {
         for wanted in [
             "Context",
             "a-model",
-            "50k / 200k",
+            "51k / 200k",
             "Changes",
             "a.rs",
             "+2",

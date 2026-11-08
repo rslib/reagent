@@ -52,6 +52,7 @@ mod tests {
             max_tokens: 128,
             system: None,
             tools: &[],
+            tool_choice: crate::ToolChoice::Auto,
             messages,
             images: true,
             reasoning,
@@ -69,6 +70,74 @@ mod tests {
             name: "read".into(),
             arguments: "{}".into(),
         })
+    }
+
+    fn banned<'a>(
+        tools: &'a [crate::ToolSpec],
+        choice: crate::ToolChoice,
+        messages: &'a [Message],
+    ) -> Request<'a> {
+        Request {
+            tools,
+            tool_choice: choice,
+            ..request(None, messages)
+        }
+    }
+
+    fn one_tool() -> Vec<crate::ToolSpec> {
+        vec![crate::ToolSpec {
+            name: "read".into(),
+            description: "Read a file.".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }]
+    }
+
+    #[test]
+    fn tool_ban_has_the_form_of_each_wire_and_keeps_the_tools() {
+        let tools = one_tool();
+        let history = [Message::user("hi")];
+        let off = banned(&tools, crate::ToolChoice::Off, &history);
+        let json = |bytes: bytes::Bytes| -> serde_json::Value {
+            serde_json::from_slice(&bytes).expect("the body is JSON")
+        };
+        let anthropic = json(
+            Anthropic::new("k", "http://localhost")
+                .request_body(&off)
+                .unwrap(),
+        );
+        assert_eq!(
+            anthropic["tool_choice"],
+            serde_json::json!({"type": "none"})
+        );
+        assert_eq!(anthropic["tools"][0]["name"], "read");
+        let chat = json(
+            OpenAiChat::new("k", "http://localhost")
+                .request_body(&off)
+                .unwrap(),
+        );
+        assert_eq!(chat["tool_choice"], "none");
+        assert_eq!(chat["tools"][0]["function"]["name"], "read");
+        let responses = json(
+            OpenAiResponses::new("k", "http://localhost")
+                .request_body(&off)
+                .unwrap(),
+        );
+        assert_eq!(responses["tool_choice"], "none");
+        assert_eq!(responses["tools"][0]["name"], "read");
+    }
+
+    #[test]
+    fn tool_ban_is_absent_without_tools_and_by_default() {
+        let tools = one_tool();
+        let history = [Message::user("hi")];
+        for (wire, body) in every_wire() {
+            let no_tools = body(&banned(&[], crate::ToolChoice::Off, &history));
+            let no_tools = std::str::from_utf8(&no_tools).unwrap();
+            assert!(!no_tools.contains("tool_choice"), "{wire}: {no_tools}");
+            let auto = body(&banned(&tools, crate::ToolChoice::Auto, &history));
+            let auto = std::str::from_utf8(&auto).unwrap();
+            assert!(!auto.contains("tool_choice"), "{wire}: {auto}");
+        }
     }
 
     #[test]

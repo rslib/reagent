@@ -17,7 +17,7 @@ const TITLE: &str = "Model";
 /// The hint at the right edge of the title row.
 const HINT: &str = "context \u{b7} $ in/out per M";
 
-/// The keys of the footer row.
+/// The keys of the footer row, until a keys file moves one.
 const FOOTER: &str =
     "\u{2191}\u{2193} choose \u{b7} enter switches the next turn \u{b7} esc back to your draft";
 
@@ -181,6 +181,7 @@ mod tests {
             id: Arc::from(id),
             window,
             prices,
+            reasoning: None,
         }
     }
 
@@ -342,5 +343,13 @@ mod tests {
         assert_eq!(kinds(&sheet)[0], Kind::Group);
         assert_eq!(&*sheet.count, "3 models \u{b7} 2 providers");
         assert_eq!(picked(&sheet).as_deref(), Some("anthropic/opus"));
+    }
+
+    /// A file that moves nothing prints each word as the table has it.
+    #[test]
+    fn keys_in_force_model_foot_matches_the_table() {
+        let (file, _) = crate::keyfile::KeyFile::parse("");
+        let labels = file.labels();
+        assert_eq!(labels.foot(crate::keyfile::Foot::Model), super::FOOTER);
     }
 }

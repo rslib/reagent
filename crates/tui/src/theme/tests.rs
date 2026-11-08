@@ -22,6 +22,28 @@ fn theme(mode: Mode) -> Theme {
     Theme::resolve(mode, Depth::TrueColor, &Overrides::default())
 }
 
+/// The sum of the channel gaps between two fills.
+fn gap(a: Color, b: Color) -> u32 {
+    let (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) = (a, b) else {
+        panic!("two rich fills: {a:?} and {b:?}");
+    };
+    u32::from(ar.abs_diff(br)) + u32::from(ag.abs_diff(bg)) + u32::from(ab.abs_diff(bb))
+}
+
+/// The picked row stands clear of both fills it sits on, in both modes.
+#[test]
+fn picked_fill_stands_clear_of_the_lists_and_sheets() {
+    for mode in [dark(), light()] {
+        let theme = theme(mode);
+        let picked = theme.fill(Role::PickedFill);
+        for around in [Role::InputFill, Role::SurfaceFill] {
+            let gap = gap(picked, theme.fill(around));
+            assert!(gap >= 40, "{gap} from {around:?} in {mode:?}: {picked:?}");
+        }
+        assert_ne!(picked, theme.fill(Role::CardAccent), "a card keeps its own");
+    }
+}
+
 #[test]
 fn dark_fills_mix_toward_white() {
     let theme = theme(dark());

@@ -1,4 +1,4 @@
-//! A sheet in place of the text box: the model, sessions, login and key
+//! A sheet in place of the text box: the model, level, sessions, login and key
 //! help views.
 //!
 //! A sheet takes the place of the text box, so it is drawn with the box's own
@@ -9,14 +9,18 @@
 //! [`crate::app::paint::sheet`] draws the sheet and reads the fields here.
 
 pub(crate) mod help;
+pub(crate) mod level;
 pub(crate) mod login;
 pub(crate) mod model;
 pub(crate) mod sessions;
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::sync::Arc;
 
+use crate::keyfile::{Foot, KeyFile};
 use crate::pick::Matcher;
+use crate::screen::Style;
 
 /// The shortest a sheet gets: a blank, the title, the filter, a blank, a row,
 /// the footer and the blank under it.
@@ -79,16 +83,37 @@ pub(crate) struct Line {
     pub(crate) dim: bool,
 }
 
+/// One run of a preview row: its text and the style it draws in.
+#[derive(Debug, Clone)]
+pub(crate) struct Run {
+    /// The text, over the sheet's own fill.
+    pub(crate) text: Arc<str>,
+    /// The style of its cells.
+    pub(crate) style: Style,
+}
+
+/// One row of a preview drawn as the transcript draws it: a blank row, a user
+/// turn or a line of a reply.
+#[derive(Debug, Default)]
+pub(crate) struct PreviewRow {
+    /// The pane column the first run draws at: the two columns under the `›` of
+    /// a user turn's later rows.
+    pub(crate) start: u8,
+    /// The runs, left to right.
+    pub(crate) runs: Vec<Run>,
+}
+
 /// A sheet's rows, its filter and its place in them.
 pub(crate) struct Sheet {
     /// The word of the title row, in the accent.
     pub(crate) title: &'static str,
     /// The count after the title, in dim.
     pub(crate) count: Arc<str>,
-    /// The hint at the right edge of the title row, in dim.
-    pub(crate) hint: &'static str,
-    /// The keys of the footer row, in dim.
-    pub(crate) footer: &'static str,
+    /// The hint at the right edge of the title row, in dim: a `Cow` because a
+    /// keys file may have moved a key it names.
+    pub(crate) hint: Cow<'static, str>,
+    /// The keys of the footer row, in dim: a `Cow` for the same reason.
+    pub(crate) footer: Cow<'static, str>,
     /// Every row, in the order the sheet was built with.
     pub(crate) rows: Vec<Row>,
     /// Whether the groups flow side by side, as the help sheet's do.
@@ -107,8 +132,14 @@ pub(crate) struct Sheet {
     pub(crate) top: Cell<usize>,
     /// The preview lines beside the rows.
     pub(crate) preview: Vec<Line>,
+    /// The rows under those lines, drawn as the transcript draws them, as wide
+    /// as the pane they were built for.
+    pub(crate) preview_rows: Option<Arc<Vec<PreviewRow>>>,
     /// Whether the sheet shows the preview when it is wide enough.
     pub(crate) previews: bool,
+    /// What the footer row says instead of its keys, built when a delete armed
+    /// a row.
+    pub(crate) confirm: Option<Arc<str>>,
 }
 
 impl Sheet {
@@ -125,8 +156,8 @@ impl Sheet {
         let mut sheet = Sheet {
             title,
             count,
-            hint,
-            footer,
+            hint: Cow::Borrowed(hint),
+            footer: Cow::Borrowed(footer),
             rows,
             columns: false,
             filter: String::new(),
@@ -135,10 +166,24 @@ impl Sheet {
             selected: 0,
             top: Cell::new(0),
             preview: Vec::new(),
+            preview_rows: None,
             previews: false,
+            confirm: None,
         };
         sheet.refresh();
         sheet
+    }
+
+    /// Names the keys a keys file moved in the hint and the footer, from the
+    /// words the file printed once when it was read, so a frame builds nothing.
+    pub(crate) fn moved(&mut self, file: Option<&KeyFile>, hint: Option<Foot>, footer: Foot) {
+        let Some(labels) = file.map(KeyFile::labels) else {
+            return;
+        };
+        if let Some(hint) = hint {
+            self.hint = Cow::Owned(labels.foot(hint).to_owned());
+        }
+        self.footer = Cow::Owned(labels.foot(footer).to_owned());
     }
 
     /// The sheet the groups of which flow side by side: the help sheet.
@@ -202,6 +247,17 @@ impl Sheet {
         self.selected = at;
     }
 
+    /// Puts the selection on the row named `word`, ignoring ASCII case, and
+    /// leaves it on the first item when no row is named that.
+    pub(crate) fn select(&mut self, word: &str) {
+        self.selected = self
+            .shown
+            .iter()
+            .position(|&index| self.rows[index as usize].name.eq_ignore_ascii_case(word))
+            .unwrap_or(self.selected);
+        self.top.set(0);
+    }
+
     /// The selected row and its index in the rows given to [`Sheet::new`].
     pub(crate) fn selected(&self) -> Option<(usize, &Row)> {
         let index = *self.shown.get(self.selected)? as usize;
@@ -211,6 +267,25 @@ impl Sheet {
     /// Replaces the preview lines beside the rows.
     pub(crate) fn set_preview(&mut self, lines: Vec<Line>) {
         self.preview = lines;
+    }
+
+    /// Replaces the message rows under those lines.
+    pub(crate) fn set_preview_rows(&mut self, rows: Option<Arc<Vec<PreviewRow>>>) {
+        self.preview_rows = rows;
+    }
+
+    /// Puts `filter` on the sheet and refilters, for a sheet built again.
+    pub(crate) fn filter_to(&mut self, filter: &str) {
+        self.filter.clear();
+        self.filter.push_str(filter);
+        self.refresh();
+    }
+
+    /// Puts the selection on the row at `at` of the rows on screen, or on the
+    /// last row when the list got shorter.
+    pub(crate) fn select_at(&mut self, at: usize) {
+        self.selected = at.min(self.shown.len().saturating_sub(1));
+        self.top.set(0);
     }
 
     /// How many rows the sheet takes of a main area `main_rows` tall: 60% of

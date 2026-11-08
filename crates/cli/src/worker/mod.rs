@@ -176,6 +176,7 @@ pub(crate) async fn start(
     );
     Ok(Some(Worker {
         session,
+        cwd: cwd.to_path_buf(),
         saved,
         _files: files,
         _lock: lock,
@@ -272,6 +273,9 @@ impl Drop for Files {
 pub(crate) struct Worker {
     /// The session this worker serves.
     session: String,
+    /// The folder its run works in, where an `@path` word of a message
+    /// resolves.
+    cwd: PathBuf,
     /// The file the rules a client saves go to, when the state folder has a
     /// path.
     saved: Option<PathBuf>,
@@ -316,10 +320,18 @@ impl Worker {
         let Some(sender) = self.sender.as_ref() else {
             return;
         };
+        let blocks = match crate::attach::blocks(&self.cwd, &text).await {
+            Ok(blocks) => blocks,
+            Err(message) => {
+                eprintln!("reagent: {message}");
+                Vec::new()
+            }
+        };
         self.shared.queued();
         let command = live::Command::Send {
             client: WORKER,
             text: Text::from(text),
+            blocks,
             mode: SendMode::Queue,
         };
         let _ = sender.send(command).await;
@@ -352,8 +364,9 @@ impl Worker {
         let token = Arc::clone(&self.token);
         let sender = self.sender.clone();
         let session: Arc<str> = Arc::from(self.session.as_str());
+        let cwd = self.cwd.clone();
         self.acceptor = Some(tokio::spawn(async move {
-            accept(listener, shared, token, sender, session).await;
+            accept(listener, shared, token, sender, session, cwd).await;
             let _ = leaving.send(());
         }));
     }
@@ -844,6 +857,7 @@ async fn accept(
     token: Arc<str>,
     sender: Option<Sender>,
     session: Arc<str>,
+    cwd: PathBuf,
 ) {
     let mut changed = shared.changed();
     let mut joins = tokio::task::JoinSet::new();
@@ -876,6 +890,7 @@ async fn accept(
                             Arc::clone(&token),
                             sender.clone(),
                             Arc::clone(&session),
+                            cwd.clone(),
                         ));
                     }
                     // A client that left before its connection was accepted is
@@ -910,6 +925,7 @@ async fn join(
     token: Arc<str>,
     sender: Option<Sender>,
     session: Arc<str>,
+    cwd: PathBuf,
 ) {
     let mut stream = stream;
     // Only a process of this user may join a session.
@@ -973,9 +989,9 @@ async fn join(
     shared.listen(client, Text::from(name), queue, closing);
     let (mut read, write) = stream.into_split();
     let mut writer = tokio::spawn(hub::write(write, frames, cut));
-    let (model, context_window) = {
+    let (model, context_window, level) = {
         let model = shared.model();
-        (Arc::clone(&model.text), model.window)
+        (Arc::clone(&model.text), model.window, model.level.clone())
     };
     let body = InitializeResult {
         major: MAJOR,
@@ -986,6 +1002,7 @@ async fn join(
         committed: shared.committed(),
         model: &model,
         context_window,
+        level: level.as_deref(),
     };
     message::result(&mut out, id, &body);
     shared.reply(client, &out);
@@ -1024,9 +1041,22 @@ async fn join(
             // all a client needs on top of that read.
             Request::Attach { .. } => shared.attach(client, id),
             Request::Send { text, mode } => {
+                // The image files the message names by `@path` go with it. A
+                // file that cannot be prepared is told to the client that named
+                // it, and the text goes as it was written.
+                let blocks = match crate::attach::blocks(&cwd, text.as_ref()).await {
+                    Ok(blocks) => blocks,
+                    Err(message) => {
+                        let message = format!("{message}: the image was not attached");
+                        let frame = Encoder::default().frame(&Event::Error(Text::from(message)));
+                        shared.reply(client, &frame);
+                        Vec::new()
+                    }
+                };
                 let send = live::Command::Send {
                     client,
                     text: Text::from(text.as_ref()),
+                    blocks,
                     mode: send_mode(mode),
                 };
                 deliver(&shared, sender.as_ref(), client, id, &mut out, send).await;
@@ -1592,6 +1622,7 @@ mod tests {
             client: 1,
             mode: SendMode::Queue,
             text: Text::from("hi"),
+            images: Vec::new(),
         });
         assert!(state.running, "a queued message is work in progress");
     }

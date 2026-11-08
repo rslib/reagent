@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::host::Target;
 use crate::layout::Rect;
-use crate::mouse::{Cell, MouseAction};
+use crate::mouse::{Cell, MouseAction, Selection};
 use crate::screen::Color;
 use crate::slot::Clicked;
 use crate::theme;
@@ -82,6 +82,11 @@ impl App {
     /// is the panel's to answer, as a session row that opens that session.
     fn click(&mut self, at: Cell) {
         self.mouse.clear();
+        // A press in the transcript held a selection: the click drops it, and the
+        // frame that draws over its highlight is due even when nothing folds.
+        if std::mem::replace(&mut self.selecting, false) {
+            self.touch();
+        }
         if self.transcript(at) {
             // A click on a folded paste chip opens it, as Tab on it does.
             if self.click_paste(at) {
@@ -92,7 +97,6 @@ impl App {
             if self.click_block(at) {
                 return;
             }
-            self.selecting = false;
             return;
         }
         let Some(panel) = self.panel_at(at.row) else {
@@ -239,6 +243,7 @@ impl App {
         let transcript = self.screen.transcript();
         let offset = row.saturating_sub(self.main.y);
         if transcript.follow()
+            && transcript.fills()
             && let Some(line) = self.line_from_bottom(transcript.height(), offset)
         {
             return line;
@@ -304,15 +309,16 @@ impl App {
     }
 
     /// The fold of the live block whose row holds the screen row `row`, with the
-    /// rows its first row is above `row`, while the live entries fit the rows
-    /// under the viewport: a live area that had to cut them off names none.
+    /// rows its first row is above `row`, while a frame drew the live entries:
+    /// the count starts at the row the frame started the entries on, and skips
+    /// the rows the last frame cut from their top.
     fn live_block(&mut self, row: u16) -> Option<(u64, u16)> {
         let height = self.screen.transcript().height();
         let start = self.main.y.saturating_add(height);
-        if height == 0 || row < start {
+        if row < start {
             return None;
         }
-        let mut offset = row - start;
+        let mut offset = row - start + self.live_skip;
         for index in 0..self.live.len() {
             let rows = self.live_item_rows(index);
             if offset < rows {
@@ -341,6 +347,9 @@ impl App {
     /// Writes the OSC 52 sequence of the selection into the copy the next frame
     /// carries, and drops the highlight.
     ///
+    /// A block a reply wrote is copied as the reply wrote it: a selection that
+    /// touches two blocks, or covers one whole, takes the source bytes of the
+    /// blocks it touches, and only a copy of part of one block takes its cells.
     /// The rows are cut at the main area's right edge, so a drag that runs into
     /// a docked sidebar copies the transcript's text beside it and none of the
     /// sidebar's cells.
@@ -350,29 +359,224 @@ impl App {
             self.mouse.clear();
             return;
         };
-        let first = selection.start().row;
-        let width = usize::from(self.main.right());
-        self.picked.clear();
-        for row in selection.start().row..=selection.end().row {
-            let mut text = self.screen.row_text(row);
-            super::cut_in_place(&mut text, width);
-            self.picked.push(text);
-        }
-        let picked = &self.picked;
-        let wrote = selection.copy(
-            |row| {
-                picked
-                    .get(usize::from(row.saturating_sub(first)))
-                    .map_or("", String::as_str)
-            },
-            &mut self.clip,
-            &mut self.clipboard,
-        );
+        let mut text = std::mem::take(&mut self.clip);
+        self.pick_text(&selection, &mut text);
+        let wrote = Selection::copy_text(&text, &mut self.clipboard);
         if !wrote {
+            text.clear();
             self.clipboard.clear();
+        } else {
+            // The text the copy left in `clip` goes to the local clipboard too:
+            // the terminal's OSC 52 sequence is for the terminal only.
+            if let Some(host) = self.host.as_ref() {
+                host.get().copy(&text);
+            }
+            self.copied = text.lines().count();
+            self.copied_until = Some(std::time::Instant::now() + super::COPIED_FOR);
         }
+        self.clip = text;
         self.mouse.clear();
         self.touch();
+    }
+
+    /// Writes the text a release copies into `out`: the source of each block the
+    /// selection touches, as the reply wrote it, and the screen text of the rows
+    /// a block does not answer for.
+    fn pick_text(&self, selection: &Selection, out: &mut String) {
+        out.clear();
+        let (start, end) = (selection.start(), selection.end());
+        let top = self.main.y;
+        let bottom = top.saturating_add(self.screen.transcript().height());
+        let left = self.main.x.saturating_add(self.margin());
+        let stop = self.main.right().saturating_sub(1);
+        let several = self.touches_several(start, end, top, bottom);
+        // The source the piece before came from, while no row stands between
+        // them: they join with a blank line.
+        let mut previous: Option<crate::screen::Origin> = None;
+        // Whether a row went into the copy, whose separator comes before it.
+        let mut wrote = false;
+        let mut row = start.row;
+        while row <= end.row {
+            let line = (top..bottom).contains(&row).then(|| self.line_at(row));
+            let Some(origin) = line.and_then(|line| self.screen.origin(line)) else {
+                let text = self.cells(row, start, end, left, stop);
+                if wrote {
+                    out.push('\n');
+                }
+                out.push_str(&text);
+                wrote = true;
+                previous = None;
+                row += 1;
+                continue;
+            };
+            // The rows this block took, which the selection may hold a part of.
+            let mut last = row;
+            while last < end.row {
+                let next = last + 1;
+                let line = (top..bottom).contains(&next).then(|| self.line_at(next));
+                let held = line.is_some_and(|line| {
+                    (origin.line..origin.line.saturating_add(origin.lines)).contains(&line)
+                });
+                if !held {
+                    break;
+                }
+                last = next;
+            }
+            if several || self.whole(&origin, top, bottom, row, last, start, end, left) {
+                let text = self.screen.origin_text(&origin);
+                let text = text.trim_end_matches('\n');
+                if wrote {
+                    out.push_str(if previous.is_some() { "\n\n" } else { "\n" });
+                }
+                out.push_str(text);
+                previous = Some(origin);
+            } else {
+                self.block_rows(&origin, row, last, start, end, left, stop, out, wrote);
+                previous = None;
+            }
+            wrote = true;
+            row = last + 1;
+        }
+        out.truncate(out.trim_end().len());
+    }
+
+    /// Whether the rows of the selection hold lines of two or more blocks.
+    fn touches_several(&self, start: Cell, end: Cell, top: u16, bottom: u16) -> bool {
+        let mut first = None;
+        for row in start.row..=end.row {
+            if !(top..bottom).contains(&row) {
+                continue;
+            }
+            let Some(origin) = self.screen.origin(self.line_at(row)) else {
+                continue;
+            };
+            match first {
+                None => first = Some(origin.line),
+                Some(line) if line != origin.line => return true,
+                Some(_) => {}
+            }
+        }
+        false
+    }
+
+    /// Whether the rows from `row` to `last` cover the whole of `origin`: every
+    /// row of every line it took, from before the first text cell of the first
+    /// row to after the last text cell of the last row.
+    #[expect(clippy::too_many_arguments, reason = "one selection, one block")]
+    fn whole(
+        &self,
+        origin: &crate::screen::Origin,
+        top: u16,
+        bottom: u16,
+        row: u16,
+        last: u16,
+        start: Cell,
+        end: Cell,
+        left: u16,
+    ) -> bool {
+        let lines = origin.line.saturating_add(origin.lines);
+        let viewport = |row: u16| (top..bottom).contains(&row);
+        let above = row > top && viewport(row - 1) && self.line_at(row - 1) >= origin.line;
+        let below = last < end.row && viewport(last + 1) && self.line_at(last + 1) < lines;
+        if above || below || self.line_at(row) > origin.line || self.line_at(last) + 1 < lines {
+            // The selection starts or ends inside a line the block wraps over,
+            // or leaves out the block's first or last line, which may be
+            // scrolled out of the view.
+            return false;
+        }
+        let first = start.column.max(left);
+        let stop = self.main.right().saturating_sub(1);
+        let last_column = end.column.min(stop);
+        let from = self.text_span(row, stop);
+        if from.is_some_and(|(first_cell, _)| first > first_cell) {
+            return false;
+        }
+        match (self.text_span(last, stop), last == end.row) {
+            // A row of the block the selection starts past is not the whole one.
+            (Some((_, last_cell)), true) => last_column >= last_cell,
+            _ => true,
+        }
+    }
+
+    /// The first and last screen column of the text of row `row`, while it has
+    /// any: the first cell after the blank columns before it, and the last cell
+    /// of its last glyph.
+    fn text_span(&self, row: u16, stop: u16) -> Option<(u16, u16)> {
+        let text = self.screen.row_text(row);
+        let text = crate::mouse::cut(&text, 0, stop);
+        let trimmed = text.trim_end();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let lead = text.len() - text.trim_start().len();
+        let first = usize::from(self.main.x) + super::columns(&text[..lead]);
+        let last = first + super::columns(trimmed.trim_start());
+        Some((
+            u16::try_from(first).unwrap_or(u16::MAX),
+            u16::try_from(last.saturating_sub(1)).unwrap_or(u16::MAX),
+        ))
+    }
+
+    /// Writes the cells of the rows of one block into `out`: the rows of a code
+    /// block keep their line breaks and lose its padding and its tag, and the
+    /// wrapped rows of anything else join with one space.
+    #[expect(clippy::too_many_arguments, reason = "one block, one selection")]
+    fn block_rows(
+        &self,
+        origin: &crate::screen::Origin,
+        row: u16,
+        last: u16,
+        start: Cell,
+        end: Cell,
+        left: u16,
+        stop: u16,
+        out: &mut String,
+        mut wrote: bool,
+    ) {
+        let mut first = true;
+        for row in row..=last {
+            if origin.label && origin.code && self.line_at(row) == origin.line {
+                // The fence's tag row holds none of the block's text.
+                continue;
+            }
+            let text = self.cells(row, start, end, left, stop);
+            let text = text.trim();
+            if text.is_empty() && origin.code {
+                continue;
+            }
+            if wrote {
+                // The rows of one block keep its line breaks, and the rows a
+                // wrap made of one line of anything else join with a space.
+                out.push(if origin.code || first { '\n' } else { ' ' });
+            }
+            if origin.code {
+                out.push_str(text);
+            } else {
+                squeeze(out, text);
+            }
+            first = false;
+            wrote = true;
+        }
+    }
+
+    /// The cells of row `row` the selection covers, the margin left out, and no
+    /// cell of a sidebar beside the main area.
+    fn cells(&self, row: u16, start: Cell, end: Cell, left: u16, stop: u16) -> String {
+        let from = if row == start.row {
+            start.column.max(left)
+        } else {
+            left
+        };
+        let to = if row == end.row {
+            end.column.min(stop)
+        } else {
+            stop
+        };
+        let text = self.screen.row_text(row);
+        if to < from {
+            return String::new();
+        }
+        crate::mouse::cut(&text, from, to.max(from)).to_string()
     }
 
     /// Draws the cells a drag selects reversed, over everything else, so the
@@ -406,4 +610,21 @@ impl App {
 /// Whether the block `rect` holds the cell `at`.
 fn holds(rect: Rect, at: Cell) -> bool {
     (rect.x..rect.right()).contains(&at.column) && (rect.y..rect.bottom()).contains(&at.row)
+}
+
+/// Pushes the words of `text` into `out`: one space where it holds a run of
+/// them, which is the fill a layout puts around inline code.
+fn squeeze(out: &mut String, text: &str) {
+    let mut space = false;
+    for ch in text.chars() {
+        if ch == ' ' {
+            if space {
+                continue;
+            }
+            space = true;
+        } else {
+            space = false;
+        }
+        out.push(ch);
+    }
 }

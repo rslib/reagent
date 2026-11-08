@@ -13,5 +13,6 @@ static SERIAL: Mutex<()> = Mutex::new(());
 mod decode;
 mod frame;
 mod highlight;
+mod keyfile;
 mod markdown;
 mod readline;

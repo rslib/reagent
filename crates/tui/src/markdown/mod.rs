@@ -200,10 +200,13 @@ pub enum Source {
 }
 
 /// A styled run of a rendered line: a byte range into the message, the literal
-/// or the layout text, and an interned style id.
+/// or the layout text, and an interned style id. A piece of an inline code span
+/// says so itself: a theme with no fill interns the code style as the body's, so
+/// the style id cannot tell them apart.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Piece {
     source: Source,
+    code: bool,
     start: u32,
     end: u32,
     style: u32,
@@ -213,10 +216,23 @@ impl Piece {
     pub(crate) fn new(source: Source, start: usize, end: usize, style: u32) -> Self {
         Piece {
             source,
+            code: false,
             start: start as u32,
             end: end as u32,
             style,
         }
+    }
+
+    /// The same run, marked as text of an inline code span.
+    pub(super) fn inline_code(mut self) -> Piece {
+        self.code = true;
+        self
+    }
+
+    /// Whether the run is text of an inline code span, which a layout fills a
+    /// space on each side of.
+    pub(crate) fn is_code(&self) -> bool {
+        self.code
     }
 
     /// Where the text lives.
@@ -248,6 +264,7 @@ impl Piece {
     pub(crate) fn slice(&self, off: usize, len: usize) -> Piece {
         Piece {
             source: self.source,
+            code: self.code,
             start: (self.start() + off) as u32,
             end: (self.start() + off + len) as u32,
             style: self.style,
@@ -340,6 +357,18 @@ enum Body {
     Table(Table),
 }
 
+/// Where a committed line's top-level block sits in the message, and what kind
+/// of block it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Origin {
+    /// The bytes of the block in the message.
+    pub bytes: Range<usize>,
+    /// Whether the block draws as a code block.
+    pub code: bool,
+    /// Whether its first row is its fence's tag, which holds none of its text.
+    pub label: bool,
+}
+
 /// One top-level block of the message.
 #[derive(Clone, Debug)]
 struct Block {
@@ -350,6 +379,11 @@ struct Block {
     links: Vec<Link>,
     fence: Option<u8>,
     list: bool,
+    /// The committed line its first row was drawn at, the blank row above it
+    /// left out.
+    line: u32,
+    /// How many committed lines it drew.
+    rows: u32,
 }
 
 impl Block {
@@ -359,6 +393,31 @@ impl Block {
             Body::Flow(lines) => lines.last(),
             Body::Table(_) => None,
         }
+    }
+
+    /// Whether the block draws as a code block: a fenced block, whose first line
+    /// carries the fence's tag, or an indented one, whose lines are all code.
+    fn is_code(&self) -> bool {
+        let Body::Flow(lines) = &self.body else {
+            return false;
+        };
+        let mut rest = lines.iter();
+        match rest.next().map(|line| line.kind) {
+            // A fenced block's tag line, then the code lines under it.
+            Some(Kind::Text) if self.fence.is_some() => rest.all(|line| line.kind == Kind::Code),
+            // An indented block: every line of it is code.
+            Some(Kind::Code) => rest.all(|line| line.kind == Kind::Code),
+            _ => false,
+        }
+    }
+
+    /// Whether the block's first row is its fence's tag: the one row of a code
+    /// block that holds none of its text.
+    fn tag(&self) -> bool {
+        let Body::Flow(lines) = &self.body else {
+            return false;
+        };
+        self.fence.is_some() && lines.first().is_some_and(|line| line.kind == Kind::Text)
     }
 }
 
@@ -453,9 +512,6 @@ pub struct Markdown {
     pad: String,
     styles: StyleTable,
     roles: Roles,
-    /// The interned styles of inline code: a layout fills a space on each side
-    /// of a span that carries one.
-    codes: Vec<u32>,
     width: u16,
     osc8: bool,
     blocks: Vec<Block>,
@@ -488,7 +544,6 @@ impl Markdown {
             pad: String::new(),
             styles: StyleTable::new(),
             roles: Roles::default(),
-            codes: Vec::new(),
             width: width.max(1),
             osc8: false,
             blocks: Vec::new(),
@@ -607,6 +662,19 @@ impl Markdown {
         (self.committed.drawn(), self.live.drawn())
     }
 
+    /// Where the top-level block that drew committed line `line` sits in the
+    /// message, and what kind of block it is.
+    pub fn origin(&self, line: usize) -> Option<Origin> {
+        let block = self.blocks.iter().rev().find(|block| {
+            (block.line as usize..block.line as usize + block.rows as usize).contains(&line)
+        })?;
+        Some(Origin {
+            bytes: block.start..block.end,
+            code: block.is_code(),
+            label: block.tag(),
+        })
+    }
+
     /// The text of one piece.
     pub fn piece_text(&self, piece: &Piece) -> &str {
         let text = match piece.source() {
@@ -658,7 +726,6 @@ impl Markdown {
     /// message: the styles are interned with the spans a parse makes.
     fn restyle(&mut self) {
         self.styles = StyleTable::new();
-        self.codes.clear();
         self.blocks.clear();
         self.committed.reset();
         self.open.clear();
@@ -697,7 +764,6 @@ impl Markdown {
                 lit,
                 styles,
                 roles,
-                codes,
                 ..
             } = self;
             let tail: &str = if closers.is_empty() {
@@ -712,7 +778,6 @@ impl Markdown {
                 lit,
                 styles,
                 roles: *roles,
-                codes,
                 clamped: false,
             };
             let blocks = parse::parse(tail, start, real, &mut draft);
@@ -760,11 +825,16 @@ impl Markdown {
         close_markers(tail)
     }
 
-    fn freeze(&mut self, block: Block) {
+    fn freeze(&mut self, mut block: Block) {
+        let before = self.committed.count();
         self.frozen_to = block.end;
         self.lit_frozen = block.lit.end;
         let gap = !self.blocks.is_empty();
         self.lay_block(&block, layout::Hold::default(), false, gap);
+        let drawn = self.committed.count() - before;
+        let gap = usize::from(gap && drawn > 0);
+        block.line = (before + gap) as u32;
+        block.rows = (drawn - gap) as u32;
         self.pad_frozen = self.pad.len();
         self.blocks.push(block);
     }
@@ -776,7 +846,6 @@ impl Markdown {
             pad,
             styles,
             roles,
-            codes,
             osc8,
             width,
             committed,
@@ -796,7 +865,6 @@ impl Markdown {
             src: &src,
             styles,
             roles: *roles,
-            codes: &*codes,
             pad,
             highlight,
             gap,
@@ -814,7 +882,6 @@ impl Markdown {
             pad,
             styles,
             roles,
-            codes,
             osc8,
             width,
             live,
@@ -836,7 +903,6 @@ impl Markdown {
             src: &src,
             styles,
             roles: *roles,
-            codes: &*codes,
             pad,
             highlight,
             gap: false,
@@ -867,7 +933,6 @@ impl Markdown {
             pad,
             styles,
             roles,
-            codes,
             osc8,
             width,
             live,
@@ -887,7 +952,6 @@ impl Markdown {
             src: &src,
             styles,
             roles: *roles,
-            codes: &*codes,
             pad,
             highlight,
             gap: false,
@@ -910,7 +974,6 @@ impl Markdown {
                 pad,
                 styles,
                 roles,
-                codes,
                 osc8,
                 width,
                 blocks,
@@ -929,14 +992,19 @@ impl Markdown {
                 src: &src,
                 styles,
                 roles: *roles,
-                codes: &*codes,
                 pad,
                 highlight,
                 gap: false,
             };
-            for (i, block) in blocks.iter().enumerate() {
-                lay.gap = i > 0;
+            for (i, block) in blocks.iter_mut().enumerate() {
+                let before = committed.count();
+                let gap = i > 0;
+                lay.gap = gap;
                 lay.block(block, committed, scratch, layout::Hold::default());
+                let drawn = committed.count() - before;
+                let gap = usize::from(gap && drawn > 0);
+                block.line = (before + gap) as u32;
+                block.rows = (drawn - gap) as u32;
             }
         }
         self.pad_frozen = self.pad.len();

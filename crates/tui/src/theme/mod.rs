@@ -65,6 +65,8 @@ pub enum Role {
     CardWarn,
     /// The tint of the question card.
     CardAccent,
+    /// The tint under the picked row of a list or a sheet.
+    PickedFill,
     /// A reversed selection.
     Selection,
     /// A rule or the `│` beside the sidebar.
@@ -93,7 +95,7 @@ pub enum Role {
 
 impl Role {
     /// Every role, in the order [`Ids`] holds them.
-    pub const ALL: [Role; 28] = [
+    pub const ALL: [Role; 29] = [
         Role::Text,
         Role::Dim,
         Role::Accent,
@@ -110,6 +112,7 @@ impl Role {
         Role::ErrFill,
         Role::CardWarn,
         Role::CardAccent,
+        Role::PickedFill,
         Role::Selection,
         Role::Line,
         Role::CodeKeyword,
@@ -160,6 +163,7 @@ impl Role {
             Role::ErrFill => "err-fill",
             Role::CardWarn => "card-warn",
             Role::CardAccent => "card-accent",
+            Role::PickedFill => "picked-fill",
             Role::Selection => "selection",
             Role::Line => "line",
             Role::CodeKeyword => "code-keyword",
@@ -201,6 +205,7 @@ impl Role {
                 | Role::ErrFill
                 | Role::CardWarn
                 | Role::CardAccent
+                | Role::PickedFill
         )
     }
 
@@ -433,10 +438,10 @@ impl Theme {
         // the punctuation a step quieter than the text around it.
         let fg = if dark { Rgb::WHITE } else { Rgb::BLACK };
         self.fg(Role::CodePunct, fg.mix(background, 35));
-        let (input, panel, surface, code, card, muted) = if dark {
-            (13, 5, 9, 30, 4, 9)
+        let (input, panel, surface, code, card, muted, picked) = if dark {
+            (13, 5, 9, 30, 4, 9, 22)
         } else {
-            (8, 3, 5, 70, 5, 7)
+            (8, 3, 5, 70, 5, 7, 18)
         };
         // The code fill leaves the input fill for the background's own side:
         // darker than the input on a dark terminal, lighter on a light one.
@@ -451,6 +456,9 @@ impl Theme {
         self.bg(Role::ErrFill, background.mix(DELETE, muted * 16 / 10));
         self.bg(Role::CardWarn, background.mix(WARN, card));
         self.bg(Role::CardAccent, background.mix(accent, card));
+        // Over the input fill, the lighter of the two fills a picked row sits on
+        // in dark mode: a mix over the background would read darker than its list.
+        self.bg(Role::PickedFill, input.mix(accent, picked));
     }
 
     /// Terminal mode: the 16 colors and no fill but the selection.

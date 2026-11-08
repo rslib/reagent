@@ -839,6 +839,105 @@ async fn rm_removes_a_session() {
     assert!(home.ids(&cwd).is_empty());
 }
 
+/// A folder that holds one session and a fork of it, with the ids of the parent
+/// and of the fork.
+async fn parent_and_fork(home: &Home) -> (String, String) {
+    let script = home.script("script.json", json!([{ "text": "one" }, { "text": "two" }]));
+    let script = script.to_string_lossy().into_owned();
+    let provider = format!("fake:{script}");
+    let cwd = home.cwd();
+    assert!(
+        home.run(&["-p", "one", "--provider", &provider])
+            .await
+            .status
+            .success()
+    );
+    let parent = home.ids(&cwd).remove(0);
+    let reference = format!("{parent}@1");
+    let output = home
+        .run(&["--fork", &reference, "-p", "two", "--provider", &provider])
+        .await;
+    assert!(output.status.success(), "{}", err(&output));
+    let fork = home
+        .ids(&cwd)
+        .into_iter()
+        .find(|id| id != &parent)
+        .expect("the fork is a second session folder");
+    (parent, fork)
+}
+
+/// A fork reads the parts of its parent, so `session rm` keeps the parent while
+/// the fork is there, and both sessions stay readable.
+#[tokio::test]
+async fn session_rm_refuses_a_session_a_fork_reads() {
+    let home = Home::new();
+    let (parent, fork) = parent_and_fork(&home).await;
+    let cwd = home.cwd();
+    let output = home.run(&["session", "rm", &parent]).await;
+    assert_eq!(output.status.code(), Some(1), "{}", err(&output));
+    let message = err(&output);
+    assert!(message.contains("a fork reads it"), "{message}");
+    assert_eq!(home.ids(&cwd).len(), 2, "both sessions stay");
+    for id in [&parent, &fork] {
+        let output = home.run(&["session", "cat", id]).await;
+        assert!(output.status.success(), "{}", err(&output));
+        assert!(!out(&output).is_empty(), "session {id} still reads");
+    }
+}
+
+/// A session that cannot be read may be a fork, so `session rm` keeps the other
+/// one rather than guess.
+#[tokio::test]
+async fn session_rm_refuses_when_a_fork_check_cannot_read_a_session() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = Home::new();
+    let (parent, fork) = parent_and_fork(&home).await;
+    let cwd = home.cwd();
+    let fork_dir = home.folder(&cwd).join(&fork);
+    tokio::fs::set_permissions(&fork_dir, std::fs::Permissions::from_mode(0o000))
+        .await
+        .expect("close the fork's folder");
+    // Root reads a closed folder, and then the check has nothing to report.
+    let closed = tokio::fs::read_dir(&fork_dir).await.is_err();
+    let output = home.run(&["session", "rm", &parent]).await;
+    tokio::fs::set_permissions(&fork_dir, std::fs::Permissions::from_mode(0o755))
+        .await
+        .expect("open the fork's folder");
+    if !closed {
+        return;
+    }
+    assert_eq!(output.status.code(), Some(1), "{}", err(&output));
+    assert_eq!(home.ids(&cwd).len(), 2, "both sessions stay");
+}
+
+/// Once the fork is gone nothing reads the parent, so `session rm` takes it.
+#[tokio::test]
+async fn session_rm_removes_a_parent_after_its_fork_is_gone() {
+    let home = Home::new();
+    let (parent, fork) = parent_and_fork(&home).await;
+    let cwd = home.cwd();
+    let output = home.run(&["session", "rm", &fork]).await;
+    assert!(output.status.success(), "{}", err(&output));
+    let output = home.run(&["session", "rm", &parent]).await;
+    assert!(output.status.success(), "{}", err(&output));
+    assert!(home.ids(&cwd).is_empty());
+}
+
+/// A fork reads its parent's parts and none of its own, so `session rm` takes
+/// the fork and leaves the parent.
+#[tokio::test]
+async fn session_rm_removes_a_fork_and_keeps_its_parent() {
+    let home = Home::new();
+    let (parent, fork) = parent_and_fork(&home).await;
+    let cwd = home.cwd();
+    let output = home.run(&["session", "rm", &fork]).await;
+    assert!(output.status.success(), "{}", err(&output));
+    assert_eq!(home.ids(&cwd), vec![parent.clone()]);
+    let output = home.run(&["session", "cat", &parent]).await;
+    assert!(output.status.success(), "{}", err(&output));
+}
+
 /// `session ls` in a folder with no sessions prints nothing and exits 0.
 #[tokio::test]
 async fn ls_with_no_sessions_prints_nothing() {

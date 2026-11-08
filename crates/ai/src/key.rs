@@ -152,6 +152,7 @@ mod tests {
             max_tokens: 1,
             system: None,
             tools: &[],
+            tool_choice: crate::ToolChoice::Auto,
             messages: &[],
             images: true,
             reasoning: None,

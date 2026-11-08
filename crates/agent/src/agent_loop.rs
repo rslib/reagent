@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use reagent_ai::{
     AssistantMessage, Content, Error, Image, Message, Provider, Request, StopReason, StreamEvent,
-    Text, ToolCall, ToolResult, Usage,
+    Text, ToolCall, ToolChoice, ToolResult, Usage,
 };
 
 use crate::archive::Archive;
@@ -20,7 +20,7 @@ use crate::journal::Journal;
 use crate::journal::record::ApprovalKind;
 use crate::journal::resume::PendingCall;
 use crate::journal::state::State;
-use crate::live::{ClientId, Command, Inbox, SendMode, Settings};
+use crate::live::{ClientId, Command, Inbox, SendMode, Settings, Waiting};
 use crate::mask::Mask;
 use crate::policy::{PolicyRun, TurnPolicy, TurnView};
 use crate::reread::Ledger;
@@ -58,6 +58,16 @@ const MAX_TOKENS_NOTE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../prompts/max_tokens.md"
 ));
+
+/// What the last allowed turn asks of the model, baked in at build time from
+/// `prompts/turn_limit.md`.
+const TURN_LIMIT_NOTE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../prompts/turn_limit.md"
+));
+
+/// The result of a call in the reply of the last allowed turn or its retry.
+const NOT_RUN: &str = "not run: the turn limit is reached; reply with the handoff in text";
 
 /// How many max_tokens stops in a row the loop recovers from before it stops.
 const MAX_TOKENS_RECOVERIES: u32 = 3;
@@ -115,6 +125,12 @@ pub struct Agent<'a> {
     compactions: u32,
     /// The turns the last run of this loop made.
     completed: u32,
+    /// Whether the next request lets the model call tools.
+    tool_choice: ToolChoice,
+    /// Whether this turn is the last allowed one or its retry, so no tool runs.
+    closing: bool,
+    /// Whether the reply of this turn called a tool that did not run.
+    refused: bool,
     /// The number this run gives its first turn: a run that continues a
     /// session numbers its turns after the ones the session already has.
     first_turn: u64,
@@ -146,6 +162,9 @@ impl<'a> Agent<'a> {
             policies: Vec::new(),
             mask: None,
             archive: None,
+            tool_choice: ToolChoice::Auto,
+            closing: false,
+            refused: false,
             compact: None,
             requested: None,
             guard: None,
@@ -184,6 +203,9 @@ impl<'a> Agent<'a> {
             policies,
             mask: None,
             archive: None,
+            tool_choice: ToolChoice::Auto,
+            closing: false,
+            refused: false,
             compact: None,
             requested: None,
             guard: None,
@@ -332,6 +354,8 @@ impl<'a> Agent<'a> {
         let started = std::time::Instant::now();
         let mut turns: u32 = 0;
         let mut max_tokens_streak: u32 = 0;
+        // The last allowed turn called a tool, so one retry forbids tools.
+        let mut handoff_refused = false;
         // A run with an inbox answers the clients of a live session: only it
         // names the record it commits and records a call that waits.
         self.live = inbox.is_some();
@@ -375,7 +399,8 @@ impl<'a> Agent<'a> {
                     break TurnEndReason::Error;
                 }
             }
-            if self.config.max_turns.is_some_and(|cap| turns >= cap) {
+            let forced = std::mem::take(&mut handoff_refused);
+            if !forced && self.config.max_turns.is_some_and(|cap| turns >= cap) {
                 break TurnEndReason::MaxTurns;
             }
             if self.token.is_cancelled() || emit(events, &self.token, Event::TurnStart).await {
@@ -401,6 +426,19 @@ impl<'a> Agent<'a> {
                 && mask.apply(history, archive) > 0
             {
                 archive.flush().await;
+            }
+            let last_turn = self.config.max_turns == Some(turns);
+            // The ban waits for a model that ignored the note: some hosts send a
+            // shorter prompt under it, which misses the cache, and some reject it.
+            self.tool_choice = if forced {
+                ToolChoice::Off
+            } else {
+                ToolChoice::Auto
+            };
+            self.closing = last_turn || forced;
+            if last_turn && let Some(reason) = self.ask_handoff(history, &mut journal, events).await
+            {
+                break reason;
             }
             let before = history.len();
             let mut outcome = self
@@ -446,9 +484,26 @@ impl<'a> Agent<'a> {
                 _ => {}
             }
 
-            let (turn_reason, mut run_end) = self
-                .after_turn(outcome, turns, started, history, &mut journal, events)
-                .await;
+            let refused = std::mem::take(&mut self.refused);
+            handoff_refused = last_turn && refused;
+            // The handoff is the end of the run, so no policy may ask for more.
+            // The check at the top of the loop then ends it at the limit, and a
+            // retry that fails still ends there: the handoff is all it could add.
+            let (turn_reason, mut run_end) = match outcome {
+                TurnOutcome::Continue | TurnOutcome::Finish if self.closing => {
+                    (TurnEndReason::EndTurn, None)
+                }
+                TurnOutcome::NoHandoff(error) => {
+                    let note = Text::from(format!("no handoff: {error}"));
+                    emit(events, &self.token, Event::PolicyNote(note)).await;
+                    (TurnEndReason::EndTurn, None)
+                }
+                TurnOutcome::Stopped(_) if forced => (TurnEndReason::EndTurn, None),
+                outcome => {
+                    self.after_turn(outcome, turns, started, history, &mut journal, events)
+                        .await
+                }
+            };
             // A steer text that arrived while the model wrote a reply with no
             // tool call keeps the run going: the reply, then the text, then the
             // next request.
@@ -498,12 +553,15 @@ impl<'a> Agent<'a> {
     ) -> Drained {
         let mut drained = Drained::default();
         let mut pending = inbox.take_pending().into_iter();
-        while let Some((client, text)) = pending.next() {
-            if let Err(error) = record(Message::user(text.clone()), history, journal) {
-                inbox.restore((client, text), pending);
+        while let Some(waiting) = pending.next() {
+            let client = waiting.client;
+            let message = waiting.message();
+            if let Err(error) = write(journal, &message) {
+                inbox.restore(Waiting::restored(client, message), pending);
                 drained.error = Some(error);
                 break;
             }
+            history.push(message);
             drained.steered = true;
         }
         self.apply_held(inbox, events).await;
@@ -558,8 +616,14 @@ impl<'a> Agent<'a> {
     ) -> bool {
         while let Some(command) = inbox.ready() {
             match command {
-                Command::Send { client, text, mode } => {
-                    self.accept(client, text, mode, inbox, events).await;
+                Command::Send {
+                    client,
+                    text,
+                    blocks,
+                    mode,
+                } => {
+                    self.accept(Waiting::new(client, text, blocks), mode, inbox, events)
+                        .await;
                 }
                 Command::Cancel { .. } => {
                     inbox.clear_waiting();
@@ -710,8 +774,14 @@ impl<'a> Agent<'a> {
         events: &mpsc::Sender<Event>,
     ) {
         match command {
-            Command::Send { client, text, mode } => {
-                self.accept(client, text, mode, inbox, events).await;
+            Command::Send {
+                client,
+                text,
+                blocks,
+                mode,
+            } => {
+                self.accept(Waiting::new(client, text, blocks), mode, inbox, events)
+                    .await;
             }
             Command::Set { settings, .. } => self.set(settings, events).await,
             // No run is open to compact before a request, so it runs at once.
@@ -747,22 +817,29 @@ impl<'a> Agent<'a> {
     /// copied.
     pub(crate) async fn accept(
         &self,
-        client: ClientId,
-        text: Text,
+        waiting: Waiting,
         mode: SendMode,
         inbox: &mut Inbox,
         events: &mpsc::Sender<Event>,
     ) {
         let event = Event::UserMessage {
-            client,
+            client: waiting.client,
             mode,
-            text: text.clone(),
+            text: waiting.text.clone(),
+            images: waiting
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    Content::Image(image) => Some(image.clone()),
+                    _ => None,
+                })
+                .collect(),
         };
         // A closed channel ends the run at its next event, as it always has.
         let _ = emit(events, &self.token, event).await;
         match mode {
-            SendMode::Steer => inbox.steer(client, text),
-            SendMode::Queue => inbox.queue(client, text),
+            SendMode::Steer => inbox.steer(waiting),
+            SendMode::Queue => inbox.queue(waiting),
         }
     }
 
@@ -879,8 +956,14 @@ impl<'a> Agent<'a> {
     /// change under it.
     async fn take_stream(&self, command: Command, inbox: &mut Inbox, events: &mpsc::Sender<Event>) {
         match command {
-            Command::Send { client, text, mode } => {
-                self.accept(client, text, mode, inbox, events).await;
+            Command::Send {
+                client,
+                text,
+                blocks,
+                mode,
+            } => {
+                self.accept(Waiting::new(client, text, blocks), mode, inbox, events)
+                    .await;
             }
             Command::Cancel { .. } => {
                 inbox.clear_waiting();
@@ -1124,7 +1207,7 @@ impl<'a> Agent<'a> {
             ),
             TurnOutcome::Recovered => (TurnEndReason::Stopped(StopReason::MaxTokens), None),
             TurnOutcome::Cancelled => (TurnEndReason::Cancelled, Some(TurnEndReason::Cancelled)),
-            TurnOutcome::Error(message) => {
+            TurnOutcome::Error(message) | TurnOutcome::NoHandoff(message) => {
                 emit(events, &self.token, Event::Error(message)).await;
                 (TurnEndReason::Error, Some(TurnEndReason::Error))
             }
@@ -1158,6 +1241,66 @@ impl<'a> Agent<'a> {
             return TurnOutcome::Cancelled;
         }
         TurnOutcome::Recovered
+    }
+
+    /// Adds the turn limit note as a new user message before the last request.
+    ///
+    /// Returns the run-end reason when the note cannot be recorded or the
+    /// client is gone.
+    async fn ask_handoff(
+        &mut self,
+        history: &mut Vec<Message>,
+        journal: &mut Option<&mut Journal>,
+        events: &mpsc::Sender<Event>,
+    ) -> Option<TurnEndReason> {
+        let message = Message::user(TURN_LIMIT_NOTE);
+        if let Some(journal) = journal.as_mut()
+            && let Err(error) = journal.message(&message)
+        {
+            emit(events, &self.token, Event::Error(journal_error(&error))).await;
+            return Some(TurnEndReason::Error);
+        }
+        history.push(message);
+        emit(
+            events,
+            &self.token,
+            Event::PolicyNote(Text::from(TURN_LIMIT_NOTE)),
+        )
+        .await
+        .then_some(TurnEndReason::Cancelled)
+    }
+
+    /// Answers each call of the last allowed turn or its retry with an error
+    /// and runs none. Every call still gets a result, so the retry and a resumed
+    /// session stay valid.
+    async fn refuse_calls(
+        &self,
+        calls: &[ToolCall],
+        history: &mut Vec<Message>,
+        journal: &mut Option<&mut Journal>,
+        events: &mpsc::Sender<Event>,
+    ) -> TurnOutcome {
+        let mut failure = None;
+        for call in calls {
+            let message = Message::tool_result(call.id.clone(), NOT_RUN, true);
+            failure = failure.or(record_result(message, history, journal));
+        }
+        if let Some(error) = failure {
+            return TurnOutcome::Error(error);
+        }
+        for call in calls {
+            let event = Event::ToolResult {
+                id: call.id.clone(),
+                is_error: true,
+                bytes: NOT_RUN.len(),
+                output: Some(Text::from(NOT_RUN)),
+                images: Vec::new(),
+            };
+            if emit(events, &self.token, event).await {
+                return TurnOutcome::Cancelled;
+            }
+        }
+        TurnOutcome::Finish
     }
 
     /// Runs the policies after one normal turn and applies what they asked.
@@ -1293,7 +1436,12 @@ impl<'a> Agent<'a> {
                 }
             }
             if let Some(error) = stop_error {
-                return TurnOutcome::Error(Text::from(error.to_string()));
+                let text = Text::from(error.to_string());
+                return if self.tool_choice == ToolChoice::Off {
+                    TurnOutcome::NoHandoff(text)
+                } else {
+                    TurnOutcome::Error(text)
+                };
             }
 
             let broken = std::mem::take(&mut assembler.broken);
@@ -1362,6 +1510,10 @@ impl<'a> Agent<'a> {
                     Some(Message::Assistant(assistant)) => tool_calls(assistant),
                     _ => Vec::new(),
                 };
+                if self.closing {
+                    self.refused = true;
+                    return self.refuse_calls(&calls, history, journal, events).await;
+                }
                 // A broken call runs on what the model sent, so its error
                 // says what went wrong.
                 for (at, sent) in broken {
@@ -1649,6 +1801,7 @@ impl<'a> Agent<'a> {
             max_tokens: self.config.max_tokens,
             system: self.config.system.as_ref(),
             tools: self.registry.specs(),
+            tool_choice: self.tool_choice,
             messages: history,
             images: self.config.images,
             reasoning: self.config.reasoning.as_deref(),
@@ -1829,6 +1982,10 @@ fn write_settings(
 /// Tells the clients of a live session the number of the record the journal
 /// committed last, so a client can resume its view from it.
 ///
+/// A client reads the journal up to this number and takes the rest as read, so
+/// the event waits for the writer thread. A write that failed sends nothing, and
+/// the next journal call reports the error.
+///
 /// A run with no inbox, and a run with no journal, sends nothing.
 async fn committed(
     journal: &Option<&mut Journal>,
@@ -1842,6 +1999,9 @@ async fn committed(
     let Some(journal) = journal.as_ref() else {
         return false;
     };
+    if journal.written().await.is_err() {
+        return false;
+    }
     emit(
         events,
         token,
@@ -2102,6 +2262,9 @@ enum TurnOutcome {
     Cancelled,
     /// The provider, a tool or the session reported an error.
     Error(Text),
+    /// The provider failed the request that forbids tools. Only the handoff is
+    /// lost, so the run still ends at its limit.
+    NoHandoff(Text),
 }
 
 /// Sends one event, waiting on the cancellation token; a closed receiver
@@ -3661,6 +3824,168 @@ mod tests {
         assert_eq!(history, vec![Message::user(MAX_TOKENS_NOTE); 3]);
     }
 
+    fn notes_in(history: &[Message]) -> usize {
+        history
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::User { .. })
+                    && format!("{message:?}").contains("The turn limit is reached")
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn last_turn_asks_for_a_handoff_in_the_normal_form() {
+        let call = || tool_reply("call_1", "echo", r#"{"message":"hi"}"#);
+        let provider = FakeProvider::new(vec![call(), call(), text_reply("handoff")]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+        let mut config = config();
+        config.max_turns = Some(3);
+
+        Agent::new(&provider, &registry, config, CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        let seen = provider.seen();
+        let choices: Vec<_> = seen.iter().map(|request| request.tool_choice).collect();
+        assert_eq!(
+            choices,
+            [ToolChoice::Auto, ToolChoice::Auto, ToolChoice::Auto]
+        );
+        assert_eq!(notes_in(&history), 1);
+        let at = history.len() - 2;
+        assert_eq!(notes_in(&history[at..at + 1]), 1, "the note is last sent");
+        assert_eq!(seen[2].messages, history.len() - 1);
+        assert!(matches!(history[at - 1], Message::ToolResult(_)));
+        let events = drain(tx, &mut rx);
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::MaxTurns)));
+    }
+
+    #[tokio::test]
+    async fn last_turn_note_stays_out_of_a_run_that_ends_early() {
+        let provider = FakeProvider::new(vec![text_reply("done")]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+        let mut config = config();
+        config.max_turns = Some(3);
+
+        Agent::new(&provider, &registry, config, CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(notes_in(&history), 0);
+        assert_eq!(provider.seen()[0].tool_choice, ToolChoice::Auto);
+        let events = drain(tx, &mut rx);
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
+    }
+
+    async fn run_at_one_turn(provider: &FakeProvider) -> (Vec<Message>, Vec<Event>) {
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+        let mut config = config();
+        config.max_turns = Some(1);
+        Agent::new(provider, &registry, config, CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+        let events = drain(tx, &mut rx);
+        (history, events)
+    }
+
+    fn call() -> Vec<StreamEvent> {
+        tool_reply("call_1", "echo", r#"{"message":"hi"}"#)
+    }
+
+    fn refused_results(history: &[Message]) -> usize {
+        history
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::ToolResult(result)
+                    if result.is_error && format!("{result:?}").contains(NOT_RUN))
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn last_turn_call_runs_nothing_and_one_retry_forbids_tools() {
+        let provider = FakeProvider::new(vec![call(), text_reply("handoff")]);
+        let (history, events) = run_at_one_turn(&provider).await;
+
+        let choices: Vec<_> = provider
+            .seen()
+            .iter()
+            .map(|seen| seen.tool_choice)
+            .collect();
+        assert_eq!(choices, [ToolChoice::Auto, ToolChoice::Off]);
+        assert_eq!(refused_results(&history), 1);
+        assert!(matches!(history.last(), Some(Message::Assistant(_))));
+        assert_eq!(notes_in(&history), 1, "the retry sends no second note");
+        assert!(events.iter().any(
+            |event| matches!(event, Event::ToolResult { id, is_error, .. } if id.as_ref() == "call_1" && *is_error)
+        ));
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::MaxTurns)));
+    }
+
+    #[tokio::test]
+    async fn last_turn_refusal_does_not_carry_into_the_next_run() {
+        let provider = FakeProvider::new(vec![
+            call(),
+            call(),
+            text_reply("first run ends"),
+            text_reply("second run ends"),
+        ]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+        let mut config = config();
+        config.max_turns = Some(1);
+        let mut agent = Agent::new(&provider, &registry, config, CancellationToken::new());
+        agent.run(&mut history, None, &tx).await;
+        history.push(Message::user("again"));
+        agent.run(&mut history, None, &tx).await;
+
+        let choices: Vec<_> = provider
+            .seen()
+            .iter()
+            .map(|seen| seen.tool_choice)
+            .collect();
+        assert_eq!(
+            choices,
+            [ToolChoice::Auto, ToolChoice::Off, ToolChoice::Auto],
+            "the second run answers with text and needs no retry"
+        );
+        let events = drain(tx, &mut rx);
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::MaxTurns)));
+    }
+
+    #[tokio::test]
+    async fn last_turn_retry_happens_once() {
+        let provider = FakeProvider::new(vec![call(), call(), call()]);
+        let (history, events) = run_at_one_turn(&provider).await;
+
+        assert_eq!(provider.seen().len(), 2);
+        assert_eq!(refused_results(&history), 2);
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::MaxTurns)));
+    }
+
+    #[tokio::test]
+    async fn last_turn_retry_that_fails_still_ends_at_the_limit() {
+        let provider = FakeProvider::new(vec![call()]);
+        provider.push_error(Error::Protocol("only auto is supported".into()));
+        let (history, events) = run_at_one_turn(&provider).await;
+
+        assert_eq!(provider.seen().len(), 2);
+        assert_eq!(refused_results(&history), 1);
+        assert!(!events.iter().any(|event| matches!(event, Event::Error(_))));
+        assert!(events.iter().any(
+            |event| matches!(event, Event::PolicyNote(note) if note.contains("only auto is supported"))
+        ));
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::MaxTurns)));
+    }
+
     #[tokio::test]
     async fn max_turns_stops_the_run_with_valid_history() {
         let provider = FakeProvider::new(vec![
@@ -3677,8 +4002,8 @@ mod tests {
             .run(&mut history, None, &tx)
             .await;
 
-        // Only one provider call happened; its tool call got a result.
-        assert_eq!(provider.seen().len(), 1);
+        // The last turn and its retry; the tool call got a result.
+        assert_eq!(provider.seen().len(), 2);
         let calls = history
             .iter()
             .filter(|message| {
@@ -5505,6 +5830,7 @@ mod tests {
                 Command::Send {
                     client: 1,
                     text: Text::from("say more"),
+                    blocks: Vec::new(),
                     mode: SendMode::Steer,
                 },
             ]),

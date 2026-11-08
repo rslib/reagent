@@ -75,8 +75,6 @@ pub(super) struct Lay<'a, 'b> {
     pub src: &'a Src<'a>,
     pub styles: &'b mut StyleTable,
     pub roles: Roles,
-    /// The interned styles of inline code.
-    pub codes: &'b [u32],
     pub pad: &'b mut String,
     /// The tokenizer of the code blocks.
     pub highlight: &'b mut Highlighter,
@@ -158,7 +156,7 @@ impl Lay<'_, '_> {
                 return self.table(table, out, scratch);
             }
         };
-        if self.is_code(block) {
+        if block.is_code() {
             return self.code(block, from, out, scratch, hold, tail);
         }
         let count = lines.len();
@@ -228,7 +226,7 @@ impl Lay<'_, '_> {
             // A table depends on every row, so it is laid out whole.
             return self.lines(block, 0, out, scratch, hold, Some(mark));
         };
-        if self.is_code(block) {
+        if block.is_code() {
             return self.code_tail(block, mark, out, scratch, hold);
         }
         let count = lines.len();
@@ -258,22 +256,6 @@ impl Lay<'_, '_> {
         self.pieces_of(line, &block.links, scratch);
         let resume = mark.resume;
         self.draw_from(line, scratch, out, hold.visible_end, resume, Some(mark));
-    }
-
-    /// Whether a block draws as a code block: a fenced block, whose first line
-    /// carries the fence's tag, or an indented one, whose lines are all code.
-    fn is_code(&self, block: &Block) -> bool {
-        let Body::Flow(lines) = &block.body else {
-            return false;
-        };
-        let mut rest = lines.iter();
-        match rest.next().map(|line| line.kind) {
-            // A fenced block's tag line, then the code lines under it.
-            Some(Kind::Text) if block.fence.is_some() => rest.all(|line| line.kind == Kind::Code),
-            // An indented block: every line of it is code.
-            Some(Kind::Code) => rest.all(|line| line.kind == Kind::Code),
-            _ => false,
-        }
     }
 
     /// Append the rows of a code block: the fence's tag above the code, the
@@ -584,7 +566,7 @@ impl Lay<'_, '_> {
             // A code line is drawn by the block's own layout, so it takes no
             // inline code fill here: a fence inside a list or a quote still
             // wraps at the column and keeps its own indent.
-            let code = line.kind != Kind::Code && self.codes.contains(&piece.style());
+            let code = line.kind != Kind::Code && piece.is_code();
             if code {
                 out.push(text_pad(self.pad, " ", piece.style()));
             }

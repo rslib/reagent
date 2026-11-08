@@ -290,7 +290,9 @@ pub fn list(cwd: &Path) -> Result<Vec<Entry>, String> {
         return Ok(Vec::new());
     }
     let list = SessionList::open(&folder, entry_of).map_err(|error| error.to_string())?;
-    Ok(list.all().to_vec())
+    let mut entries = list.all().to_vec();
+    reagent_ai::record::fill_titles(&folder, &mut entries);
+    Ok(entries)
 }
 
 /// The entry a rebuilt list shows for one part.
@@ -575,11 +577,22 @@ pub fn finish(plan: &Plan, state: State, turns: u64) -> io::Result<()> {
 /// The list entry of a part.
 fn entry(plan: &Plan, state: State, turns: u64) -> Entry {
     let meta = plan.meta();
+    // A session a client started has no task, so its first message names it. The
+    // part's header is already on disk, so the title lives in the list entry.
+    let title = if meta.title.is_empty() {
+        reagent_ai::record::first_user_text(&plan.dir)
+            .ok()
+            .flatten()
+            .map(|text| title(&text))
+            .unwrap_or_default()
+    } else {
+        meta.title
+    };
     Entry {
         session: plan.id.clone(),
         updated_ms: paths::now_ms(),
         turns,
-        title: meta.title,
+        title,
         profile: meta.profile,
         provider: meta.provider,
         model: meta.model,
@@ -688,12 +701,20 @@ fn class_name(class: reagent_agent::tool::EffectClass) -> &'static str {
 
 /// The session folder `reference` names, for a command that changes it.
 pub fn locate(cwd: &Path, reference: &str) -> Result<(PathBuf, PathBuf), String> {
-    let folder = folder_of(cwd).ok_or_else(|| "no state folder".to_string())?;
+    let state = state_home().ok_or_else(|| "no state folder".to_string())?;
+    locate_in(&state, cwd, reference)
+}
+
+/// The sessions folder of `cwd` under `state`, and the session folder
+/// `reference` names in it.
+pub fn locate_in(state: &Path, cwd: &Path, reference: &str) -> Result<(PathBuf, PathBuf), String> {
+    let folder = paths::sessions_root(state).join(paths::cwd_key(cwd));
     let dir = resolve(&folder, reference)?;
     Ok((folder, dir))
 }
 
-/// Removes a session, unless a writer holds its newest part.
+/// Removes a session, unless a writer holds its newest part or a fork of it
+/// reads one of its parts.
 ///
 /// Taking the lock blocks, so a caller runs this in `spawn_blocking`.
 #[expect(
@@ -710,6 +731,11 @@ pub fn remove(folder: &Path, dir: &Path) -> Result<(), String> {
         .any(|&part| locked(&paths::part_path(dir, part)))
     {
         return Err(format!("session {id} is in use"));
+    }
+    match crate::gc::forked_from(folder, dir, &parts) {
+        Ok(false) => {}
+        Ok(true) => return Err(format!("session {id} is in use: a fork reads it")),
+        Err(error) => return Err(format!("session {id}: cannot check its forks: {error}")),
     }
     std::fs::remove_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     SessionList::open(folder, entry_of)

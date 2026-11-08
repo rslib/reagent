@@ -52,9 +52,24 @@ pub(super) const KEYS_ON: &[u8] = b"\x1b[>4;1m\x1b[>5u";
 /// The extended keys off: pop the kitty flags and reset modifyOtherKeys.
 pub(super) const KEYS_OFF: &[u8] = b"\x1b[<u\x1b[>4;0m";
 
-/// Leaving the alternate screen, the mouse capture and the extended keys, for
-/// a panic: no exit path of a run leaves any of them on.
-const LEAVE: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[<u\x1b[>4;0m";
+/// Bracketed paste on: a paste arrives as one `Event::Paste`, not as its keys.
+pub(super) const PASTE_ON: &[u8] = b"\x1b[?2004h";
+
+/// Bracketed paste off: the terminal's own paste handling is back.
+pub(super) const PASTE_OFF: &[u8] = b"\x1b[?2004l";
+
+/// Focus reporting on: the terminal says when its window comes back, which is
+/// when it drew its pane again and the images on it are gone.
+pub(super) const FOCUS_ON: &[u8] = b"\x1b[?1004h";
+
+/// Focus reporting off: the terminal sends no more focus reports.
+pub(super) const FOCUS_OFF: &[u8] = b"\x1b[?1004l";
+
+/// Leaving the alternate screen, the mouse capture, the focus reports, the
+/// extended keys and bracketed paste, for a panic: no exit path of a run leaves
+/// any of them on.
+pub(super) const LEAVE: &[u8] =
+    b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?1004l\x1b[<u\x1b[>4;0m\x1b[?2004l";
 
 /// The terminal of a real process: the window in raw mode, its keys and its
 /// output.
@@ -119,6 +134,10 @@ impl Terminal for Real {
 
     async fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
         write_frame(&mut self.out, frame).await
+    }
+
+    fn input_ready(&mut self) -> bool {
+        self.input.as_mut().is_some_and(Input::ready)
     }
 
     async fn next_event(&mut self) -> io::Result<Event> {

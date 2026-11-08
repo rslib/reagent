@@ -1,6 +1,9 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use super::{Editor, Row};
+use unicode_width::UnicodeWidthStr;
+
+use super::{Editor, MARK, MARK_BYTES, Row};
 
 fn text(editor: &Editor) -> String {
     let (first, second) = editor.chunks();
@@ -831,6 +834,147 @@ fn a_folded_chip_is_measured_at_the_width_it_draws() {
     );
 }
 
+/// A paste whose first line is 300 columns of `x` and whose six other lines are
+/// 120 columns of `y`: the first line is far wider than a chip's label may be.
+fn long_first_line() -> String {
+    let mut text = "x".repeat(300);
+    for _ in 0..6 {
+        text.push('\n');
+        text.push_str(&"y".repeat(120));
+    }
+    text
+}
+
+/// A paste of `lines` lines whose lines are short and distinct.
+fn long_rows(lines: usize) -> String {
+    let mut text = String::from("line 1");
+    for line in 2..=lines {
+        text.push_str("\nline ");
+        text.push_str(&line.to_string());
+    }
+    text
+}
+
+/// A chip's label is its first line cut to forty columns, so a first line wider
+/// than the row cannot hide the count of the lines the chip holds back.
+#[test]
+fn a_chip_label_cuts_a_very_long_first_line() {
+    let mut editor = Editor::new();
+    let text = long_first_line();
+    editor.paste(text.clone());
+    let chip = &editor.pastes()[0];
+    assert_eq!(chip.other(), 6, "six lines behind the first");
+    assert!(
+        chip.width() <= 49,
+        "the label stays narrow enough to show its count: {}",
+        chip.width()
+    );
+    assert_eq!(
+        UnicodeWidthStr::width(chip.first_line()),
+        40,
+        "the first line is cut at forty columns"
+    );
+    assert_eq!(editor.take(), text, "the send path still gets every byte");
+}
+
+/// A cut of the first line lands on a char boundary: a wide character is never
+/// left in half.
+#[test]
+fn a_chip_label_never_cuts_a_wide_char_in_half() {
+    let mut editor = Editor::new();
+    let text = format!("{}\n2\n3\n4", "界".repeat(300));
+    editor.paste(text);
+    let chip = &editor.pastes()[0];
+    let first = chip.first_line();
+    assert!(
+        first.chars().all(|c| c == '界'),
+        "the cut leaves whole characters: {first:?}"
+    );
+    assert_eq!(
+        UnicodeWidthStr::width(first),
+        40,
+        "forty columns of a two-column character"
+    );
+}
+
+/// A fold cuts the first line again: an edit that widened it cannot hide the
+/// count either, and the chip keeps the whole text.
+#[test]
+fn a_chip_label_cuts_the_first_line_when_it_folds() {
+    let mut editor = Editor::new();
+    editor.paste(format!("{}\n2\n3\n4", "z".repeat(60)));
+    assert_eq!(
+        UnicodeWidthStr::width(editor.pastes()[0].first_line()),
+        40,
+        "the paste cut the first line"
+    );
+    assert!(editor.toggle_paste(), "tab opens the chip");
+    editor.right();
+    editor.insert(&"w".repeat(20));
+    assert!(editor.toggle_paste(), "tab folds it back");
+    assert_eq!(
+        UnicodeWidthStr::width(editor.pastes()[0].first_line()),
+        40,
+        "the fold cut the wider first line"
+    );
+    assert_eq!(
+        editor.pastes()[0].text().len(),
+        20 + 60 + 6,
+        "the chip still holds the whole paste"
+    );
+}
+
+/// Tab after the chip, on other text, folds the open chip back: the edit point
+/// moves with the text that follows the mark, so the next key lands there.
+#[test]
+fn a_chip_folds_from_the_cursor_after_it() {
+    let mut editor = Editor::new();
+    let pasted = long_rows(4);
+    editor.insert("head ");
+    editor.paste(pasted.clone());
+    editor.insert(" tail");
+    let (_, end) = editor.pastes()[0].range();
+    while editor.cursor() > end {
+        editor.left();
+    }
+    assert_eq!(editor.cursor(), end, "the edit point is at the chip's end");
+    assert!(editor.toggle_paste(), "tab opens the chip");
+    let (_, end) = editor.pastes()[0].range();
+    while editor.cursor() < end {
+        editor.right();
+    }
+    editor.right();
+    assert_eq!(editor.cursor(), end + 1, "the edit point is past the chip");
+    assert!(
+        editor.toggle_paste(),
+        "tab with the edit point off the chip folds it"
+    );
+    assert!(!editor.pastes()[0].is_open(), "the chip is folded");
+    editor.insert("!");
+    assert_eq!(
+        editor.take(),
+        format!("head {} !tail", pasted),
+        "the key after the fold lands after the mark"
+    );
+}
+
+/// A chip folds at its index, as a click on one of its rows does, and its text
+/// is the same afterwards.
+#[test]
+fn a_chip_folds_at_any_index_of_an_open_one() {
+    let mut editor = Editor::new();
+    let pasted = long_rows(4);
+    editor.paste(pasted.clone());
+    assert!(editor.toggle_paste(), "tab opens the chip");
+    assert!(editor.pastes()[0].is_open(), "the chip is open");
+    assert!(editor.fold_paste(0), "the chip at index zero folds");
+    assert!(!editor.pastes()[0].is_open(), "the chip is folded");
+    assert!(!editor.fold_paste(0), "a folded chip folds no more");
+    assert!(!editor.fold_paste(3), "no chip is at that index");
+    assert_eq!(editor.pastes()[0].text(), pasted, "the text is the same");
+    assert_eq!(editor.take(), pasted, "and the send path gets it whole");
+}
+
 /// The text with `|` at the cursor, as the probe of a real readline prints it.
 fn marked(editor: &Editor) -> String {
     let (before, after) = editor.chunks();
@@ -846,6 +990,20 @@ fn type_text(editor: &mut Editor, text: &str) {
     for c in text.chars() {
         editor.type_char(c);
     }
+}
+
+/// `count` words, `w1` up to `w<count>`, spaced by one blank.
+fn numbered_words(count: usize) -> Vec<String> {
+    (1..=count).map(|n| format!("w{n}")).collect()
+}
+
+/// Alt+Backspace pressed `presses` times, one hundred milliseconds apart from
+/// `start`; answers the instant of the last press.
+fn alt_backspace(editor: &mut Editor, start: Instant, presses: u32) -> Instant {
+    for press in 0..presses {
+        editor.backward_kill_word_at(start + Duration::from_millis(100 * u64::from(press)));
+    }
+    start + Duration::from_millis(100 * u64::from(presses.saturating_sub(1)))
 }
 
 #[test]
@@ -1155,6 +1313,175 @@ fn readline_kill_backward_takes_the_alphanumeric_run() {
     type_text(&mut editor, "foo-bar");
     editor.backward_kill_word();
     assert_eq!(marked(&editor), "foo-|", "the run, not the whitespace");
+}
+
+#[test]
+fn readline_kill_burst_eighteen_presses_take_thirty_two_words() {
+    let mut editor = Editor::new();
+    let words = numbered_words(40);
+    type_text(&mut editor, &words.join(" "));
+    alt_backspace(&mut editor, Instant::now(), 18);
+    assert_eq!(
+        text(&editor).trim_end(),
+        words[..8].join(" "),
+        "the first eight presses kill a word each, the next eight two, the last two four"
+    );
+}
+
+#[test]
+fn readline_kill_burst_a_gap_over_the_limit_starts_a_new_burst() {
+    let mut editor = Editor::new();
+    let words = numbered_words(40);
+    type_text(&mut editor, &words.join(" "));
+    let last = alt_backspace(&mut editor, Instant::now(), 17);
+    assert_eq!(
+        text(&editor).trim_end(),
+        words[..12].join(" "),
+        "sixteen presses kill twenty four words and the seventeenth four"
+    );
+    editor.backward_kill_word_at(last + Duration::from_millis(201));
+    assert_eq!(
+        text(&editor).trim_end(),
+        words[..11].join(" "),
+        "a gap over the limit makes the press the first of a burst"
+    );
+}
+
+#[test]
+fn readline_kill_burst_a_gap_of_the_limit_continues_the_burst() {
+    let mut editor = Editor::new();
+    let words = numbered_words(40);
+    type_text(&mut editor, &words.join(" "));
+    let last = alt_backspace(&mut editor, Instant::now(), 17);
+    editor.backward_kill_word_at(last + Duration::from_millis(200));
+    assert_eq!(
+        text(&editor).trim_end(),
+        words[..8].join(" "),
+        "a press on the limit is the eighteenth of the burst, and kills four"
+    );
+}
+
+#[test]
+fn readline_kill_burst_another_key_ends_it() {
+    let mut editor = Editor::new();
+    let words = numbered_words(40);
+    type_text(&mut editor, &words.join(" "));
+    let last = alt_backspace(&mut editor, Instant::now(), 17);
+    editor.set_mark();
+    editor.backward_kill_word_at(last + Duration::from_millis(100));
+    assert_eq!(
+        text(&editor).trim_end(),
+        words[..11].join(" "),
+        "a key between the presses, even one that moves nothing, kills one word next"
+    );
+}
+
+#[test]
+fn readline_kill_burst_an_argument_kills_its_count_and_ends_the_burst() {
+    let mut editor = Editor::new();
+    let words = numbered_words(40);
+    type_text(&mut editor, &words.join(" "));
+    let last = alt_backspace(&mut editor, Instant::now(), 17);
+    editor.digit(3);
+    editor.backward_kill_word_at(last + Duration::from_millis(100));
+    assert_eq!(
+        text(&editor).trim_end(),
+        words[..9].join(" "),
+        "the digit key makes the press kill its own count"
+    );
+    editor.backward_kill_word_at(last + Duration::from_millis(200));
+    assert_eq!(
+        text(&editor).trim_end(),
+        words[..8].join(" "),
+        "the press after the argument starts a burst"
+    );
+}
+
+#[test]
+fn readline_kill_burst_one_undo_puts_the_burst_back() {
+    let mut editor = Editor::new();
+    let words = numbered_words(40);
+    type_text(&mut editor, &words.join(" "));
+    let before = marked(&editor);
+    alt_backspace(&mut editor, Instant::now(), 18);
+    assert_eq!(text(&editor).trim_end(), words[..8].join(" "));
+    editor.undo();
+    assert_eq!(
+        marked(&editor),
+        before,
+        "one undo puts the thirty two words back with the cursor where it was"
+    );
+}
+
+#[test]
+fn readline_kill_burst_a_yank_puts_every_word_back() {
+    let mut editor = Editor::new();
+    let words = numbered_words(40);
+    type_text(&mut editor, &words.join(" "));
+    alt_backspace(&mut editor, Instant::now(), 18);
+    editor.yank();
+    assert_eq!(
+        text(&editor),
+        words.join(" "),
+        "all thirty two words come back in order, as one kill"
+    );
+    // A kill after a pause in the same run of kills still joins the entry.
+    let mut editor = Editor::new();
+    type_text(&mut editor, &words.join(" "));
+    let last = alt_backspace(&mut editor, Instant::now(), 2);
+    editor.backward_kill_word_at(last + Duration::from_millis(500));
+    editor.yank();
+    assert_eq!(
+        text(&editor),
+        words.join(" "),
+        "the kill after the pause joins the two before it"
+    );
+}
+
+#[test]
+fn readline_kill_burst_a_press_past_the_last_word_empties_the_box() {
+    let mut editor = Editor::new();
+    let words = numbered_words(29);
+    type_text(&mut editor, &words.join(" "));
+    alt_backspace(&mut editor, Instant::now(), 18);
+    assert_eq!(
+        text(&editor).trim(),
+        "",
+        "the eighteenth press may kill four words and three are left"
+    );
+    assert_eq!(editor.cursor(), 0);
+}
+
+#[test]
+fn readline_kill_burst_on_an_empty_box_does_nothing() {
+    let mut editor = Editor::new();
+    alt_backspace(&mut editor, Instant::now(), 18);
+    assert!(editor.is_empty());
+    assert_eq!(editor.cursor(), 0);
+    editor.yank();
+    assert!(editor.is_empty(), "no kill went onto the ring");
+    editor.undo();
+    assert!(editor.is_empty(), "no step went into the undo log");
+}
+
+#[test]
+fn readline_kill_burst_takes_a_folded_chip_whole_and_one_undo_puts_it_back() {
+    let mut editor = Editor::new();
+    let log = log(142);
+    type_text(&mut editor, "one two ");
+    editor.paste(log.clone());
+    let before = marked(&editor);
+    alt_backspace(&mut editor, Instant::now(), 8);
+    assert!(editor.pastes().is_empty(), "the kill covered the mark");
+    assert_eq!(text(&editor).trim(), "", "the words and the chip went");
+    editor.undo();
+    assert_eq!(
+        marked(&editor),
+        before,
+        "one undo puts the chip and its words back"
+    );
+    assert_eq!(editor.pastes().len(), 1, "the chip is whole");
+    assert_eq!(editor.take(), format!("one two {log}"), "with its bytes");
 }
 
 #[test]
@@ -1647,4 +1974,198 @@ fn readline_history_search_forward_walks_the_matches_of_one_entry() {
     assert_eq!(editor.cursor(), 3, "the match after it");
     editor.search_history(true, &history);
     assert_eq!(editor.cursor(), 6, "and the one after that");
+}
+
+#[test]
+fn chip_folds_two_chips_keep_their_text() {
+    let mut editor = Editor::new();
+    editor.paste("a1\na2\na3\na4\na5".to_owned());
+    editor.insert(" mid ");
+    editor.paste("b1\nb2\nb3\nb4\nb5".to_owned());
+    let want = "a1\na2\na3\na4\na5 mid b1\nb2\nb3\nb4\nb5";
+    while editor.cursor() > editor.pastes()[0].range().0 {
+        editor.left();
+    }
+    assert!(editor.toggle_paste());
+    let mut out = String::new();
+    editor.write_text(&mut out);
+    assert_eq!(out, want, "after open");
+    assert!(editor.toggle_paste());
+    out.clear();
+    editor.write_text(&mut out);
+    assert_eq!(out, want, "after fold");
+}
+
+#[test]
+fn drawn_row_down_leaves_a_blank_row_when_the_rows_are_rebuilt() {
+    let mut editor = Editor::new();
+    editor.insert("a\n\nb");
+    assert!(editor.up(8));
+    assert_eq!(editor.cursor(), 2);
+    assert!(editor.down(9), "a new width rebuilds the rows");
+    assert_eq!(editor.cursor(), 3);
+}
+
+#[test]
+fn drawn_row_up_and_down_move_one_row_from_column_zero() {
+    let mut editor = Editor::new();
+    editor.insert("aaaaaaaaaa\n\nbbbbbbbbbb");
+    while editor.up(4) {}
+    editor.line_start();
+    assert_eq!(editor.layout(4, 100).cursor_row(), 0);
+    for row in 1..=6 {
+        assert!(editor.down(4), "row {row}");
+        assert_eq!(editor.layout(4, 100).cursor_row(), row);
+    }
+    assert!(!editor.down(4), "the last row is for the history");
+    for row in (0..=5).rev() {
+        assert!(editor.up(4), "row {row}");
+        assert_eq!(editor.layout(4, 100).cursor_row(), row);
+    }
+    assert!(!editor.up(4), "the first row is for the history");
+}
+
+/// An image chip is a label of its number: `[Image #1]` columns, no first line
+/// and no count of the lines a paste holds back.
+#[test]
+fn image_paste_chip_draws_its_label_and_its_width() {
+    let mut editor = Editor::new();
+    editor.paste_image("/p/image-1.png", 1);
+    let chip = &editor.pastes()[0];
+    assert_eq!(chip.image(), Some(1), "the chip holds its number");
+    assert_eq!(
+        chip.width(),
+        UnicodeWidthStr::width("[Image #1]") as u16,
+        "the label is the whole chip"
+    );
+    assert_eq!(chip.width(), 10, "ten columns");
+    assert!(!chip.is_open(), "an image chip starts folded");
+    assert_eq!(
+        chip.text(),
+        " @\"/p/image-1.png\"",
+        "the word the worker reads"
+    );
+    assert_eq!(
+        text(&editor),
+        format!("{MARK} "),
+        "the mark, and the space after it for the next key"
+    );
+    assert_eq!(
+        editor.cursor(),
+        MARK_BYTES + 1,
+        "past the mark and the space"
+    );
+
+    let mut wide = Editor::new();
+    wide.paste_image("/p/image-12.png", 12);
+    assert_eq!(
+        wide.pastes()[0].width(),
+        UnicodeWidthStr::width("[Image #12]") as u16,
+        "a second digit widens the label"
+    );
+}
+
+/// The layout measures the mark as the label's columns, so the text before the
+/// chip and the text after it stand where the box draws them.
+#[test]
+fn image_paste_chip_keeps_the_row_layout_around_it() {
+    let mut editor = Editor::new();
+    editor.insert("look ");
+    editor.paste_image("/p/image-1.png", 1);
+    editor.insert("now");
+    let layout = editor.layout(80, 4);
+    assert_eq!(layout.total(), 1, "the three parts share one row");
+    assert_eq!(
+        layout.cursor_col(),
+        5 + 10 + 1 + 3,
+        "the text before, the label, the space after it, and the text after"
+    );
+    let rows = layout.rows().to_vec();
+    assert_eq!(
+        (rows[0].start(), rows[0].end()),
+        (0, 5 + MARK_BYTES + 1 + 3)
+    );
+}
+
+/// The send path writes the chip's word where its mark stands, with the space
+/// in front of it, so the word counts after text that ends in no space.
+#[test]
+fn image_paste_chip_sends_its_word_with_the_leading_space() {
+    let mut editor = Editor::new();
+    type_text(&mut editor, "look");
+    editor.paste_image("/p/image-1.png", 1);
+    assert_eq!(
+        editor.take(),
+        "look @\"/p/image-1.png\" ",
+        "the chip's word and the space after it"
+    );
+}
+
+/// An image chip never opens: Tab and a click leave it folded.
+#[test]
+fn image_paste_chip_never_opens() {
+    let mut editor = Editor::new();
+    editor.paste_image("/p/image-1.png", 1);
+    editor.left();
+    assert_eq!(
+        editor.selected_paste(),
+        Some(0),
+        "the edit point is on the chip"
+    );
+    assert!(!editor.toggle_paste(), "an image chip answers no");
+    assert!(!editor.pastes()[0].is_open(), "and stays folded");
+    assert!(!editor.fold_paste(0), "a folded image chip folds no more");
+    assert_eq!(text(&editor), format!("{MARK} "), "the text is the same");
+}
+
+/// A backspace on the mark takes the chip whole, and one undo brings it back
+/// with its number.
+#[test]
+fn image_paste_chip_goes_whole_on_backspace_and_one_undo_brings_it_back() {
+    let mut editor = Editor::new();
+    type_text(&mut editor, "look");
+    editor.paste_image("/p/image-1.png", 1);
+    editor.left();
+    editor.backspace();
+    assert_eq!(
+        marked(&editor),
+        "look| ",
+        "the chip went whole and the space after it stayed"
+    );
+    assert!(editor.pastes().is_empty(), "and left nothing behind");
+    editor.undo();
+    assert_eq!(editor.pastes().len(), 1, "one undo puts it back");
+    assert_eq!(editor.pastes()[0].image(), Some(1), "with its number");
+    assert_eq!(editor.take(), "look @\"/p/image-1.png\" ", "and its word");
+}
+
+/// A kill takes the image chip into the ring whole, and the yank puts it back
+/// with the number its label draws.
+#[test]
+fn image_paste_chip_keeps_its_number_through_kill_and_yank() {
+    let mut editor = Editor::new();
+    type_text(&mut editor, "look");
+    editor.paste_image("/p/image-3.png", 3);
+    editor.insert(" now");
+    editor.line_start();
+    editor.kill_line();
+    assert!(editor.pastes().is_empty(), "the kill takes the chip whole");
+    editor.yank();
+    assert_eq!(editor.pastes().len(), 1, "the yank puts it back");
+    assert_eq!(editor.pastes()[0].image(), Some(3), "with its number");
+    assert_eq!(
+        editor.take(),
+        "look @\"/p/image-3.png\"  now",
+        "and its word in place"
+    );
+}
+
+#[test]
+fn image_paste_one_undo_takes_the_chip_and_its_space() {
+    let mut editor = Editor::new();
+    editor.insert("look ");
+    editor.paste_image("/p/image-1.png", 1);
+    editor.undo();
+    assert_eq!(text(&editor), "look ");
+    assert!(editor.pastes().is_empty());
 }

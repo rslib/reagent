@@ -28,10 +28,11 @@ use unicode_width::UnicodeWidthStr;
 use super::sheet::Mark;
 use super::{App, Exit, HostHandle, Options, run};
 use crate::client::{Frame, Initialized};
+use crate::history::{Recent, RecentMessages};
 use crate::host::{
     FakeHost, Files, Host, HostFuture, LoginStep, Model, Models, Opened, Provider, Target,
 };
-use crate::mouse::{Cell, Selection};
+use crate::mouse::Selection;
 use crate::panels::{ContextPanel, SessionRow};
 use crate::screen::Terminal;
 
@@ -41,6 +42,9 @@ const WAIT: Duration = Duration::from_secs(10);
 const ROWS: u16 = 24;
 /// The columns of the test terminal.
 const COLUMNS: u16 = 80;
+/// The columns of the terminal a burst test types on: wide enough that its 400
+/// keys fill one row of the box.
+const BURST_COLUMNS: u16 = 500;
 /// How many rows the `vt100` parser keeps behind the screen.
 const SCROLLBACK: usize = 500;
 /// The join token the fake worker takes.
@@ -486,6 +490,8 @@ struct TestTerminal {
     size: (u16, u16),
     /// How many times the app asked for the size.
     sizes: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many frames the app wrote.
+    frames: Arc<AtomicUsize>,
 }
 
 impl Terminal for TestTerminal {
@@ -496,11 +502,16 @@ impl Terminal for TestTerminal {
     }
 
     async fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
+        self.frames.fetch_add(1, Ordering::Relaxed);
         self.bytes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .extend_from_slice(frame);
         Ok(())
+    }
+
+    fn input_ready(&mut self) -> bool {
+        !self.keys.is_empty()
     }
 
     async fn next_event(&mut self) -> io::Result<Event> {
@@ -518,6 +529,8 @@ struct Harness {
     keys: mpsc::UnboundedSender<Event>,
     /// How many times the app asked the terminal for its size.
     sizes: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many frames the app wrote.
+    frames: Arc<AtomicUsize>,
     handle: JoinHandle<io::Result<Exit>>,
 }
 
@@ -534,17 +547,20 @@ impl Harness {
         let (keys, events) = mpsc::unbounded_channel();
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let sizes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let frames = Arc::new(AtomicUsize::new(0));
         let terminal = TestTerminal {
             bytes: Arc::clone(&bytes),
             keys: events,
             size: (columns, rows),
             sizes: Arc::clone(&sizes),
+            frames: Arc::clone(&frames),
         };
         Harness {
             fake,
             bytes,
             keys,
             sizes,
+            frames,
             handle: tokio::spawn(run(options, terminal)),
         }
     }
@@ -584,6 +600,11 @@ impl Harness {
     /// Sends one bracketed paste of `text`.
     fn paste(&self, text: &str) {
         let _ = self.keys.send(Event::Paste(text.to_owned()));
+    }
+
+    /// How many frames the app wrote so far.
+    fn frames(&self) -> usize {
+        self.frames.load(Ordering::Relaxed)
     }
 }
 
@@ -953,6 +974,62 @@ async fn a_long_paste_folds_to_a_chip_that_tab_opens_and_enter_sends() {
     assert_eq!(mode, Mode::Queue);
 }
 
+/// With no run, Tab on plain text sends nothing and leaves the text as it was.
+#[tokio::test]
+async fn tab_no_send_of_plain_text_with_no_run() {
+    let mut harness = Harness::new_session(Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.type_text("hello");
+    wait_text(&harness.bytes, "hello").await;
+    harness.press(KeyCode::Tab);
+    harness.type_text(" world");
+    harness.press(KeyCode::Enter);
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, "hello world", "the Tab sent nothing of its own");
+}
+
+/// One space past a folded chip, Tab sends nothing and leaves the chip folded.
+#[tokio::test]
+async fn tab_no_send_one_space_past_a_chip_leaves_it_folded() {
+    let mut harness = Harness::new_session(Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    let pasted: String = (1..=142)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    harness.paste(&pasted);
+    wait_text(&harness.bytes, "≡ line 1").await;
+    harness.type_text(" ");
+    harness.press(KeyCode::Tab);
+    harness.type_text("zqxafter");
+    wait_text(&harness.bytes, "zqxafter").await;
+    let screen = text(&harness.bytes);
+    assert!(
+        screen.contains("≡ line 1"),
+        "the chip stays folded:\n{screen}"
+    );
+    assert!(!screen.contains("line 2"), "no line of it shows:\n{screen}");
+    harness.press(KeyCode::Enter);
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, format!("{pasted} zqxafter"));
+}
+
+/// During a run Tab is still the queue key.
+#[tokio::test]
+async fn tab_no_send_rule_leaves_the_queue_of_a_run() {
+    let mut harness = Harness::new_session(Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.type_text("start");
+    harness.press(KeyCode::Enter);
+    harness.fake.expect_send().await;
+    wait_text(&harness.bytes, "working").await;
+    harness.type_text("later");
+    harness.press(KeyCode::Tab);
+    let (sent, mode) = harness.fake.expect_send().await;
+    assert_eq!(sent, "later");
+    assert_eq!(mode, Mode::Queue);
+}
+
 /// A click on a folded paste chip selects it and opens it, the same as Tab.
 #[tokio::test]
 async fn a_click_on_a_paste_chip_opens_it() {
@@ -969,6 +1046,67 @@ async fn a_click_on_a_paste_chip_opens_it() {
     harness.mouse(MouseEventKind::Up(MouseButton::Left), column, row);
     wait_gone(&harness.bytes, "≡ line 1").await;
     wait_text(&harness.bytes, "line 2").await;
+}
+
+/// A click on any row of an open chip folds it back, and the paste still holds
+/// every byte it took.
+#[tokio::test]
+async fn a_chip_folds_from_a_click_on_an_open_row() {
+    let mut harness = Harness::start(full(), Fake::start("sess-chip-click", 0));
+    wait_text(&harness.bytes, "idle").await;
+    let pasted: String = (1..=142)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    harness.paste(&pasted);
+    wait_text(&harness.bytes, "≡ line 1").await;
+    let (row, column) = chip_cell(&text(&harness.bytes));
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), column, row);
+    wait_text(&harness.bytes, "line 2").await;
+    // The hint says what a click or a tab does with the open chip.
+    wait_text(&harness.bytes, "tab or a click folds the paste").await;
+    // A click on the open chip's second row folds it.
+    let (row, column) = cell_of(&text(&harness.bytes), "line 2");
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), column, row);
+    wait_gone(&harness.bytes, "line 2").await;
+    wait_text(&harness.bytes, "≡ line 1").await;
+    // Enter sends all 142 lines: the chip kept every byte.
+    harness.press(KeyCode::Enter);
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, pasted);
+}
+
+/// Tab with the edit point past the chip, on the text after it, folds the open
+/// chip back, and the next key lands after the mark.
+#[tokio::test]
+async fn a_chip_folds_from_tab_on_the_text_after_it() {
+    let mut harness = Harness::start(full(), Fake::start("sess-chip-tab", 0));
+    wait_text(&harness.bytes, "idle").await;
+    let pasted = numbered(4);
+    harness.type_text("head tail");
+    for _ in 0..5 {
+        harness.press(KeyCode::Left);
+    }
+    harness.paste(&pasted);
+    wait_text(&harness.bytes, "≡ line 1").await;
+    harness.press(KeyCode::Tab);
+    wait_gone(&harness.bytes, "≡ line 1").await;
+    // One right past the chip's last byte puts the edit point on ` tail`.
+    for _ in 0..=pasted.len() {
+        harness.press(KeyCode::Right);
+    }
+    harness.press(KeyCode::Tab);
+    wait_text(&harness.bytes, "≡ line 1").await;
+    harness.type_text("!");
+    harness.press(KeyCode::Enter);
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(
+        sent,
+        format!("head{pasted} !tail"),
+        "the key after the fold lands after the mark"
+    );
 }
 
 /// A click on a finished tool's row opens it, and a second click folds it.
@@ -1041,6 +1179,205 @@ async fn click_folds_a_tool_row_open_and_shut() {
     harness.mouse(MouseEventKind::Down(MouseButton::Left), column, row);
     harness.mouse(MouseEventKind::Up(MouseButton::Left), column, row);
     wait_at(&harness.bytes, from, ROWS, 60, "line 8").await;
+}
+
+/// Ten rows named `row<N>`, each padded with `y` to `wide` columns.
+fn wide_rows(wide: usize) -> String {
+    (1..=10)
+        .map(|n| {
+            let mut row = format!("row{n}");
+            row.push_str(&"y".repeat(wide.saturating_sub(row.len())));
+            row
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One edit call of `wide`-column rows, as the worker sends it.
+fn live_edit_call(harness: &Harness, id: &str, wide: usize) {
+    harness
+        .fake
+        .event(json!({ "type": "tool_start", "id": id, "name": "edit" }));
+    harness.fake.event(json!({
+        "type": "tool_call_ready",
+        "id": id,
+        "name": "edit",
+        "arguments": json!({
+            "path": "src/live.rs",
+            "old_string": "",
+            "new_string": wide_rows(wide),
+        })
+        .to_string(),
+    }));
+    harness.fake.event(json!({
+        "type": "tool_result",
+        "id": id,
+        "is_error": false,
+        "bytes": 10,
+    }));
+}
+
+/// A turn with one edit call and no run end, so its card stays live.
+fn live_edit(harness: &Harness, wide: usize) {
+    harness.fake.event(json!({ "type": "turn_start" }));
+    live_edit_call(harness, "call-1", wide);
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+}
+
+/// A press and a release on one cell.
+fn click_at(harness: &Harness, row: u16, column: u16) {
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), column, row);
+}
+
+/// A click on a live card's header opens it and a click on a row of it folds it
+/// back, while the run still goes and the card fills the live rows.
+#[tokio::test]
+async fn a_live_card_click_opens_and_folds_a_running_card() {
+    let harness = Harness::start(full(), Fake::start("sess-live", 0));
+    wait_text(&harness.bytes, "idle").await;
+    live_edit(&harness, 5);
+    wait_text(&harness.bytes, "src/live.rs").await;
+    let screen = text(&harness.bytes);
+    assert!(
+        !screen.contains("row8"),
+        "the live card starts folded:\n{screen}"
+    );
+    let (row, column) = cell_of(&screen, "src/live.rs");
+    click_at(&harness, row, column);
+    wait_text(&harness.bytes, "row8").await;
+    let (row, column) = cell_of(&text(&harness.bytes), "row7");
+    click_at(&harness, row, column);
+    wait_gone(&harness.bytes, "row8").await;
+}
+
+/// The same with rows of 500 columns: the card fills the rows and the click
+/// still reaches it.
+#[tokio::test]
+async fn a_live_card_click_folds_a_card_of_wide_rows() {
+    let harness = Harness::start(full(), Fake::start("sess-live-wide", 0));
+    wait_text(&harness.bytes, "idle").await;
+    live_edit(&harness, 500);
+    wait_text(&harness.bytes, "src/live.rs").await;
+    let screen = text(&harness.bytes);
+    assert!(
+        !screen.contains("row8"),
+        "the live card starts folded:\n{screen}"
+    );
+    let (row, column) = cell_of(&screen, "src/live.rs");
+    click_at(&harness, row, column);
+    wait_text(&harness.bytes, "row8").await;
+    let (row, column) = cell_of(&text(&harness.bytes), "row7");
+    click_at(&harness, row, column);
+    wait_gone(&harness.bytes, "row8").await;
+}
+
+/// A click on the header of an open live card folds it, as it opened it.
+#[tokio::test]
+async fn a_live_card_click_on_the_header_folds_it() {
+    let harness = Harness::start(full(), Fake::start("sess-live-head", 0));
+    wait_text(&harness.bytes, "idle").await;
+    live_edit(&harness, 5);
+    wait_text(&harness.bytes, "src/live.rs").await;
+    let (row, column) = cell_of(&text(&harness.bytes), "src/live.rs");
+    click_at(&harness, row, column);
+    wait_text(&harness.bytes, "row8").await;
+    let (row, column) = cell_of(&text(&harness.bytes), "src/live.rs");
+    click_at(&harness, row, column);
+    wait_gone(&harness.bytes, "row8").await;
+}
+
+/// A live entry above the card cuts the top of the live rows: a click on the
+/// card's header still folds the card, not the entry above it.
+#[tokio::test]
+async fn a_live_card_click_below_a_cut_entry_finds_the_card() {
+    let harness = Harness::start(full(), Fake::start("sess-live-cut", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    // A read that never answers stays live above the card.
+    harness
+        .fake
+        .event(json!({ "type": "tool_start", "id": "call-0", "name": "read" }));
+    harness.fake.event(json!({
+        "type": "tool_call_ready",
+        "id": "call-0",
+        "name": "read",
+        "arguments": json!({ "path": "src/above.rs" }).to_string(),
+    }));
+    live_edit_call(&harness, "call-1", 5);
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    wait_text(&harness.bytes, "src/live.rs").await;
+    // The folded card and the entry above it fit, so the click opens the card.
+    let (row, column) = cell_of(&text(&harness.bytes), "src/live.rs");
+    click_at(&harness, row, column);
+    wait_text(&harness.bytes, "row8").await;
+    // The open card pushes the top rows of the live area away.
+    wait_gone(&harness.bytes, "src/above.rs").await;
+    let (row, column) = cell_of(&text(&harness.bytes), "row7");
+    click_at(&harness, row, column);
+    wait_gone(&harness.bytes, "row8").await;
+}
+
+/// A click below the live rows names no block, and the box's rows still take
+/// their chip first.
+#[tokio::test]
+async fn a_live_card_click_below_the_live_rows_names_no_block() {
+    let harness = Harness::start(full(), Fake::start("sess-live-below", 0));
+    wait_text(&harness.bytes, "idle").await;
+    live_edit(&harness, 500);
+    wait_text(&harness.bytes, "src/live.rs").await;
+    let (row, column) = cell_of(&text(&harness.bytes), "src/live.rs");
+    click_at(&harness, row, column);
+    wait_text(&harness.bytes, "row8").await;
+    // The live card fills the rows above the box: a click on the box's footer
+    // row is the box's own, and folds nothing.
+    let screen = text(&harness.bytes);
+    let footer = screen
+        .lines()
+        .position(|line| line.contains("reagent ") && line.contains(" enter "))
+        .unwrap_or_else(|| panic!("a footer row on:\n{screen}")) as u16;
+    click_at(&harness, footer, 4);
+    harness.type_text("z");
+    wait_text(&harness.bytes, "\u{258e}  z").await;
+    let screen = text(&harness.bytes);
+    assert!(
+        screen.contains("row8"),
+        "a click below the live rows folds no block:\n{screen}"
+    );
+    // The box comes before the live rows: a click on a paste chip opens it.
+    harness.paste("chip line\n2\n3\n4");
+    wait_text(&harness.bytes, "≡ chip line").await;
+    let (row, column) = chip_cell(&text(&harness.bytes));
+    click_at(&harness, row, column);
+    wait_gone(&harness.bytes, "≡ chip line").await;
+}
+
+/// A drag back to the cell it pressed on is a click: it drops the highlight, asks
+/// for the frame that draws over it and copies nothing.
+#[test]
+fn a_drag_back_to_its_press_cell_asks_for_a_frame() {
+    let mut app = bare();
+    let event = |kind, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.paint();
+    app.mouse(event(MouseEventKind::Down(MouseButton::Left), 4, 3));
+    app.mouse(event(MouseEventKind::Drag(MouseButton::Left), 12, 5));
+    assert!(app.selecting, "the drag holds a selection");
+    app.mouse(event(MouseEventKind::Drag(MouseButton::Left), 4, 3));
+    app.dirty = false;
+    app.mouse(event(MouseEventKind::Up(MouseButton::Left), 4, 3));
+    assert!(!app.selecting, "the click drops the highlight");
+    assert!(app.dirty, "and asks for the frame that draws over it");
+    assert!(app.clipboard.is_empty(), "and copies no OSC 52 sequence");
+    assert!(app.clip.is_empty(), "and picks no text");
 }
 
 /// A click on reply text folds no block, and the drag selection still works
@@ -2658,13 +2995,14 @@ fn the_start_of_a_long_history_stays_quick() {
     let mut app = super::App::new(&super::Initialized::default(), (COLUMNS, ROWS), false);
 
     let started = std::time::Instant::now();
-    let all = super::Tail {
+    let mut all = super::Tail {
         messages: messages.iter().cloned().collect(),
         checkpoints: Vec::new(),
         calls: Vec::new(),
         omitted: 0,
+        pictures: Vec::new(),
     };
-    app.history(&all);
+    app.history(&mut all);
     eprintln!(
         "history before the ring: {:?} for {} messages",
         started.elapsed(),
@@ -2673,7 +3011,7 @@ fn the_start_of_a_long_history_stays_quick() {
 
     let mut app = super::App::new(&super::Initialized::default(), (COLUMNS, ROWS), false);
     let started = std::time::Instant::now();
-    let tail = super::Tail {
+    let mut tail = super::Tail {
         messages: messages
             .into_iter()
             .skip(5_000 - crate::history::KEEP)
@@ -2681,8 +3019,9 @@ fn the_start_of_a_long_history_stays_quick() {
         checkpoints: Vec::new(),
         calls: Vec::new(),
         omitted: 5_000 - crate::history::KEEP,
+        pictures: Vec::new(),
     };
-    app.history(&tail);
+    app.history(&mut tail);
     eprintln!(
         "history with the ring: {:?} for {} messages",
         started.elapsed(),
@@ -2711,7 +3050,7 @@ async fn the_terminal_size_is_read_once_not_per_draw() {
 #[test]
 fn a_history_that_left_messages_out_shows_one_dim_line() {
     let mut app = super::App::new(&super::Initialized::default(), (COLUMNS, ROWS), false);
-    let tail = super::Tail {
+    let mut tail = super::Tail {
         messages: std::collections::VecDeque::from([
             Message::user("the last question"),
             Message::assistant(AssistantMessage::new(
@@ -2725,8 +3064,9 @@ fn a_history_that_left_messages_out_shows_one_dim_line() {
         checkpoints: Vec::new(),
         calls: Vec::new(),
         omitted: 50,
+        pictures: Vec::new(),
     };
-    app.history(&tail);
+    app.history(&mut tail);
     app.commit();
     let mut out = Vec::new();
     app.screen.diff(&mut out);
@@ -2774,13 +3114,14 @@ fn edit_tail(is_error: bool) -> super::Tail {
         checkpoints: Vec::new(),
         calls: vec![call],
         omitted: 0,
+        pictures: Vec::new(),
     }
 }
 
 #[test]
 fn history_tool_row_has_its_name_and_target() {
     let mut app = super::App::new(&super::Initialized::default(), (COLUMNS, ROWS), true);
-    app.history(&edit_tail(false));
+    app.history(&mut edit_tail(false));
     app.commit();
     let screen = painted(&mut app);
     assert!(
@@ -2796,7 +3137,7 @@ fn history_tool_row_has_its_name_and_target() {
 #[test]
 fn history_tool_row_failed_only_on_an_error_result() {
     let mut app = super::App::new(&super::Initialized::default(), (COLUMNS, ROWS), true);
-    app.history(&edit_tail(false));
+    app.history(&mut edit_tail(false));
     app.commit();
     let screen = painted(&mut app);
     assert!(
@@ -2805,7 +3146,7 @@ fn history_tool_row_failed_only_on_an_error_result() {
     );
 
     let mut app = super::App::new(&super::Initialized::default(), (COLUMNS, ROWS), true);
-    app.history(&edit_tail(true));
+    app.history(&mut edit_tail(true));
     app.commit();
     let screen = painted(&mut app);
     assert!(
@@ -3276,6 +3617,78 @@ async fn a_run_asks_for_the_extended_keys_and_gives_them_back() {
     }
 }
 
+/// The bytes of the first write of a run: everything before the first frame,
+/// which opens with the sync block.
+fn first_write(bytes: &Arc<Mutex<Vec<u8>>>) -> String {
+    let drawn = raw(bytes);
+    let end = drawn.find("\u{1b}[?2026h").unwrap_or(drawn.len());
+    drawn[..end].to_owned()
+}
+
+/// Full screen turns bracketed paste on in the write that enters the alternate
+/// screen, so a paste arrives as one event and not as its keys.
+#[tokio::test]
+async fn full_screen_bracketed_paste_mode_is_on_in_the_first_write() {
+    let harness = Harness::start(full(), Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    let first = first_write(&harness.bytes);
+    assert!(
+        first.starts_with("\u{1b}[?1049h"),
+        "the first write enters the alternate screen: {first:?}"
+    );
+    assert!(
+        first.contains("\u{1b}[?2004h"),
+        "the same write asks for bracketed paste: {first:?}"
+    );
+}
+
+/// Inline mode turns bracketed paste on too: it draws on the normal screen and
+/// still takes a paste as one event.
+#[tokio::test]
+async fn inline_bracketed_paste_mode_is_on_in_the_first_write() {
+    let harness = Harness::new_session(Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    let first = first_write(&harness.bytes);
+    assert!(
+        first.contains("\u{1b}[?2004h"),
+        "the first write asks for bracketed paste: {first:?}"
+    );
+}
+
+/// A quit turns bracketed paste off in both modes, after the write that turned
+/// it on.
+#[tokio::test]
+async fn a_quit_bracketed_paste_mode_is_off() {
+    for options in [options(), full()] {
+        let full = options.full;
+        let harness = Harness::start(options, Fake::start("sess", 0));
+        wait_text(&harness.bytes, "idle").await;
+        harness.send(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        harness.send(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        timeout(WAIT, harness.handle)
+            .await
+            .expect("the app ends")
+            .expect("the app does not panic")
+            .expect("the app does not fail");
+        let drawn = raw(&harness.bytes);
+        let on = drawn.rfind("\u{1b}[?2004h").expect("paste mode went on");
+        assert!(
+            drawn[on..].contains("\u{1b}[?2004l"),
+            "full {full}: the exit leaves bracketed paste"
+        );
+    }
+}
+
+/// The panic bytes leave bracketed paste, as they leave the alternate screen.
+#[test]
+fn term_leave_bracketed_paste_mode_is_off() {
+    let leave = String::from_utf8_lossy(super::term::LEAVE).into_owned();
+    assert!(
+        leave.contains("\u{1b}[?2004l"),
+        "the panic bytes leave bracketed paste: {leave:?}"
+    );
+}
+
 /// A quit leaves the alternate screen and the mouse behind, and prints one
 /// line that names the session instead of the transcript.
 #[tokio::test]
@@ -3321,6 +3734,44 @@ async fn quit_leaves_the_alternate_screen_with_one_line() {
         !print.contains("line 60") && !print.contains("line 1\r"),
         "no transcript is printed: {print:?}"
     );
+}
+
+/// 400 keys that are all ready when the first one is taken draw one frame for
+/// the burst, not one each.
+#[tokio::test]
+async fn a_key_burst_of_400_keys_takes_one_frame() {
+    let columns = BURST_COLUMNS;
+    let harness = Harness::sized(options(), Fake::start("sess-burst", 0), (columns, ROWS));
+    wait_at(&harness.bytes, 0, ROWS, columns, "idle").await;
+    // The start settles before the count is taken, so the frames it drew are
+    // not the burst's.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let before = harness.frames();
+    let typed: String = "0123456789".repeat(40);
+    // Every key is queued before the app's loop takes one, so all 400 are ready
+    // at once.
+    for c in typed.chars() {
+        harness.press(KeyCode::Char(c));
+    }
+    wait_at(&harness.bytes, 0, ROWS, columns, &typed).await;
+    let frames = harness.frames() - before;
+    assert!(
+        frames <= 2,
+        "400 ready keys drew {frames} frames beyond the ones before them"
+    );
+}
+
+/// One key with nothing else ready draws a frame that shows it.
+#[tokio::test]
+async fn a_key_burst_of_one_key_draws_its_frame() {
+    let harness = Harness::new_session(Fake::start("sess-one-key", 0));
+    wait_text(&harness.bytes, "idle").await;
+    let before = harness.frames();
+    harness.press(KeyCode::Char('z'));
+    // The bar and the padding the box draws before the text, so no other row of
+    // the screen can hold it.
+    wait_text(&harness.bytes, "\u{258e}  z").await;
+    assert!(harness.frames() > before, "the key drew a frame of its own");
 }
 
 /// A resize lays the transcript out again on the new terminal, and no line of it
@@ -3779,8 +4230,8 @@ async fn a_drag_into_the_sidebar_copies_only_the_transcript() {
     }
     assert_eq!(
         copied(&raw(&harness.bytes)),
-        "  alpha\n\n  bravo\n\n  charlie",
-        "the copy holds the transcript's three lines, the blank rows between them and no sidebar text"
+        "alpha\n\nbravo\n\ncharlie",
+        "the copy holds the three blocks as the reply wrote them, and no sidebar text"
     );
 }
 
@@ -3864,15 +4315,14 @@ async fn a_drag_over_two_lines_then_release_writes_one_osc_52_sequence() {
         .expect("the second line") as u16;
     assert_eq!(second, first + 1, "the second line follows it:\n{screen}");
 
+    // The reply is one block, and the drag covers it whole: the copy is its
+    // source, with the hard line break and the spaces before it.
     let mut want = Vec::new();
-    let mut scratch = String::new();
-    let lines = ["  alpha bravo", "  charlie delta"];
-    Selection::new(Cell::new(0, first), Cell::new(20, second)).copy(
-        |row| lines[usize::from(row - first)],
-        &mut scratch,
-        &mut want,
+    let scratch = "alpha bravo  \ncharlie delta";
+    assert!(
+        Selection::copy_text(scratch, &mut want),
+        "the copy of the block's source writes a sequence"
     );
-    assert_eq!(scratch, "  alpha bravo\n  charlie delta");
 
     harness.mouse(MouseEventKind::Down(MouseButton::Left), 0, first);
     harness.mouse(MouseEventKind::Drag(MouseButton::Left), 20, second);
@@ -3899,6 +4349,116 @@ async fn a_drag_over_two_lines_then_release_writes_one_osc_52_sequence() {
     );
 }
 
+/// The native copy takes the same text as the OSC 52 sequence of the release.
+#[tokio::test]
+async fn native_copy_gets_the_text_of_a_release() {
+    let host = Arc::new(FakeHost::new());
+    let options = Options {
+        host: Some(HostHandle::new(host.clone())),
+        ..full()
+    };
+    let harness = Harness::start(options, Fake::start("sess-native", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness.fake.event(json!({
+        "type": "text_delta",
+        "text": "alpha bravo  \ncharlie delta"
+    }));
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    harness
+        .fake
+        .event(json!({ "type": "run_end", "reason": "end_turn" }));
+    wait_row(&harness.bytes, "charlie delta").await;
+    wait_row(&harness.bytes, "alpha bravo").await;
+
+    let screen = text(&harness.bytes);
+    let rows: Vec<&str> = screen.lines().collect();
+    let first = rows
+        .iter()
+        .position(|row| row.trim() == "alpha bravo")
+        .expect("the first line") as u16;
+    let second = rows
+        .iter()
+        .position(|row| row.trim() == "charlie delta")
+        .expect("the second line") as u16;
+
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 0, first);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), 20, second);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 20, second);
+
+    let start = tokio::time::Instant::now();
+    while !raw(&harness.bytes).contains("\u{1b}]52;c;") {
+        assert!(
+            start.elapsed() < WAIT,
+            "waited {WAIT:?} for the copy of the selection"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        host.copied(),
+        ["alpha bravo  \ncharlie delta"],
+        "the local clipboard gets the text of the copy, once"
+    );
+    let drawn = raw(&harness.bytes);
+    assert_eq!(
+        drawn.matches("\u{1b}]52;c;").count(),
+        1,
+        "the release writes one copy"
+    );
+}
+
+/// A release over blank rows puts nothing in the local clipboard.
+#[tokio::test]
+async fn native_copy_skips_a_blank_selection() {
+    let host = Arc::new(FakeHost::new());
+    let options = Options {
+        host: Some(HostHandle::new(host.clone())),
+        ..full()
+    };
+    let harness = Harness::start(options, Fake::start("sess-native-blank", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness
+        .fake
+        .event(json!({ "type": "text_delta", "text": "alpha bravo" }));
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    harness
+        .fake
+        .event(json!({ "type": "run_end", "reason": "end_turn" }));
+    wait_row(&harness.bytes, "alpha bravo").await;
+
+    let screen = text(&harness.bytes);
+    let rows: Vec<&str> = screen.lines().collect();
+    let text_row = rows
+        .iter()
+        .position(|row| row.trim() == "alpha bravo")
+        .expect("the line");
+    let blank = rows
+        .iter()
+        .skip(text_row + 1)
+        .position(|line| line.trim().is_empty())
+        .map(|row| row + text_row + 1)
+        .expect("a blank row under the line");
+    let blank = blank as u16;
+
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 0, blank);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), 20, blank);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 20, blank);
+    // A key the app takes after the release proves the release was handled.
+    harness.type_text("zz");
+    wait_text(&harness.bytes, "zz").await;
+
+    assert!(
+        !raw(&harness.bytes).contains("\u{1b}]52;c;"),
+        "a blank selection writes no sequence"
+    );
+    assert!(host.copied().is_empty(), "and it copies nothing");
+}
+
 /// The window of the `initialize` answer and the usage of the last request show
 /// in the context panel.
 #[tokio::test]
@@ -3911,11 +4471,48 @@ async fn the_window_and_the_usage_show_in_the_context_panel() {
     harness
         .fake
         .event(json!({ "type": "usage", "input": 50_000, "output": 1_000 }));
-    let screen = wait_at(&harness.bytes, 0, ROWS, 160, "50k / 200k").await;
+    let screen = wait_at(&harness.bytes, 0, ROWS, 160, "51k / 200k").await;
     assert!(
-        column_of(&screen, "50k / 200k").is_some_and(|at| at >= 120),
+        column_of(&screen, "51k / 200k").is_some_and(|at| at >= 120),
         "the tokens show in the sidebar:\n{screen}"
     );
+}
+
+/// A usage event of the cache of a request and the bytes of the reply that
+/// stream after it move the context panel's tokens row as they arrive, and the
+/// usage of the next request starts the count again.
+#[tokio::test]
+async fn stream_tokens_move_the_sidebar_row_as_the_reply_comes() {
+    let harness = Harness::sized(
+        full(),
+        Fake::naming("sess-ctx-stream", "a-model", 200_000),
+        (160, ROWS),
+    );
+    harness.fake.event(json!({
+        "type": "usage",
+        "input": 1_000,
+        "output": 0,
+        "cache_read": 49_000,
+        "cache_write": 0,
+    }));
+    wait_at(&harness.bytes, 0, ROWS, 160, "50k / 200k").await;
+    harness.fake.event(json!({
+        "type": "text_delta",
+        "text": "x".repeat(8_000),
+    }));
+    let screen = wait_at(&harness.bytes, 0, ROWS, 160, "52k / 200k").await;
+    assert!(
+        column_of(&screen, "52k / 200k").is_some_and(|at| at >= 120),
+        "the streamed row shows in the sidebar:\n{screen}"
+    );
+    harness.fake.event(json!({
+        "type": "usage",
+        "input": 60_000,
+        "output": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+    }));
+    wait_at(&harness.bytes, 0, ROWS, 160, "60k / 200k").await;
 }
 
 /// A `write` tool call shows the path it wrote in the changes panel.
@@ -4041,6 +4638,14 @@ impl Host for CountingHost {
     fn open(&self, target: Target) -> HostFuture<Result<Opened, String>> {
         self.inner.open(target)
     }
+
+    fn delete(&self, session: &str) -> HostFuture<Result<(), String>> {
+        self.inner.delete(session)
+    }
+
+    fn copy(&self, text: &str) {
+        self.inner.copy(text)
+    }
 }
 
 /// `/mo` opens the command list with `/model` above `/mode`, both above the
@@ -4119,6 +4724,7 @@ fn command_cost_writes_one_line() {
     let mut app = bare();
     app.frame(Frame::Usage {
         input: 1_000,
+        cached: 0,
         output: 500,
         cost: Some(0.42),
     });
@@ -4153,6 +4759,7 @@ fn one_rule_per_run_after_three_steps() {
         app.frame(Frame::TurnStart);
         app.frame(Frame::Usage {
             input: 1_000,
+            cached: 0,
             output: 100,
             cost: Some(0.01),
         });
@@ -4162,7 +4769,7 @@ fn one_rule_per_run_after_three_steps() {
             "the step {step} of the run ended, and no rule came with it"
         );
     }
-    app.frame(Frame::RunEnd);
+    app.frame(Frame::RunEnd { at_limit: false });
     let rules = rules(&app);
     assert_eq!(rules.len(), 1, "the run draws one rule");
     assert_eq!(rules[0].tokens, 3_300, "the rule sums the run's tokens");
@@ -4178,12 +4785,13 @@ fn one_rule_per_run_on_a_cancelled_run() {
     app.frame(Frame::ThinkingDelta(Cow::Borrowed("checking the tree")));
     app.frame(Frame::Usage {
         input: 200,
+        cached: 0,
         output: 50,
         cost: Some(0.02),
     });
     // A run the user cancels stops mid-thought: the worker ends it with its
     // `run_end` and no turn end of its own.
-    app.frame(Frame::RunEnd);
+    app.frame(Frame::RunEnd { at_limit: false });
     let rules = rules(&app);
     assert_eq!(rules.len(), 1, "a cancelled run draws one rule");
     assert_eq!(rules[0].tokens, 250, "with the tokens of the call it made");
@@ -4300,7 +4908,28 @@ fn which_key_shows_on_ctrl_x_and_arms_no_timer() {
     assert!(!screen.contains("b sidebar"), "the list is gone:\n{screen}");
 }
 
-/// Tab on a file row inserts the path in place of the `@word`.
+/// A picked file keeps its `@` and takes one space, so the next word goes on
+/// after it and the list stays closed.
+#[tokio::test]
+async fn at_file_keeps_its_at_and_a_space() {
+    let host = FakeHost::new().with_files(vec!["crates/tui/src/app/sidebar.rs", "README.md"]);
+    let options = Options {
+        host: Some(HostHandle::new(Arc::new(host))),
+        ..options()
+    };
+    let mut harness = Harness::start(options, Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.type_text("look at @app/sid");
+    wait_text(&harness.bytes, "sidebar.rs").await;
+    harness.press(KeyCode::Tab);
+    wait_text(&harness.bytes, "look at @crates/tui/src/app/sidebar.rs").await;
+    harness.type_text("next");
+    harness.press(KeyCode::Enter);
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, "look at @crates/tui/src/app/sidebar.rs next");
+}
+
+/// Tab on a file row inserts the path after the `@` of the word.
 #[tokio::test]
 async fn file_list_inserts_the_path() {
     let host = FakeHost::new().with_files(vec![
@@ -4317,7 +4946,7 @@ async fn file_list_inserts_the_path() {
     harness.type_text("look at @app/sid");
     wait_text(&harness.bytes, "sidebar.rs").await;
     harness.press(KeyCode::Tab);
-    wait_text(&harness.bytes, "look at crates/tui/src/app/sidebar.rs").await;
+    wait_text(&harness.bytes, "look at @crates/tui/src/app/sidebar.rs").await;
 }
 
 /// A host whose paths arrive only when the test opens the gate, so the keys of
@@ -4352,6 +4981,14 @@ impl Host for GatedHost {
     fn open(&self, target: Target) -> HostFuture<Result<Opened, String>> {
         self.inner.open(target)
     }
+
+    fn delete(&self, session: &str) -> HostFuture<Result<(), String>> {
+        self.inner.delete(session)
+    }
+
+    fn copy(&self, text: &str) {
+        self.inner.copy(text)
+    }
 }
 
 /// Paths that arrive after the `@` word was typed fill the list that waited
@@ -4374,7 +5011,7 @@ async fn file_list_fills_when_the_paths_arrive_after_the_keys() {
     gate.notify_one();
     wait_text(&harness.bytes, "sidebar.rs").await;
     harness.press(KeyCode::Tab);
-    wait_text(&harness.bytes, "look at crates/tui/src/app/sidebar.rs").await;
+    wait_text(&harness.bytes, "look at @crates/tui/src/app/sidebar.rs").await;
 }
 
 /// The host reads the paths once, however many `@` words a draft holds.
@@ -4411,11 +5048,13 @@ fn two_models() -> Models {
                     id: Arc::from("anthropic/opus"),
                     window: Some(200_000),
                     prices: Some((15.0, 75.0)),
+                    reasoning: None,
                 },
                 Model {
                     id: Arc::from("anthropic/sonnet"),
                     window: Some(200_000),
                     prices: Some((3.0, 15.0)),
+                    reasoning: None,
                 },
             ],
         }],
@@ -4518,6 +5157,7 @@ fn model_sheet_pick_takes_the_new_prices() {
     app.pick_sheet();
     app.frame(Frame::Usage {
         input: 1_000_000,
+        cached: 0,
         output: 0,
         cost: None,
     });
@@ -4537,6 +5177,7 @@ fn model_sheet_pick_without_prices_keeps_the_old_ones() {
     app.pick_sheet();
     app.frame(Frame::Usage {
         input: 1_000_000,
+        cached: 0,
         output: 0,
         cost: None,
     });
@@ -4566,6 +5207,388 @@ fn model_sheet_marks_the_model_the_settings_notice_names() {
     assert_eq!(&*row.right, "now");
 }
 
+/// A model list whose current model takes `off`, low and high, with high as the
+/// level it starts at.
+fn level_models() -> Models {
+    let mut models = two_models();
+    let mut levels = reagent_ai::levels::Levels::default();
+    levels.insert(reagent_ai::levels::Level::Low);
+    levels.insert(reagent_ai::levels::Level::High);
+    models.providers[0].models[0].reasoning = Some(reagent_ai::levels::Reasoning {
+        levels,
+        off: Some(true),
+        mandatory: false,
+        default: Some(reagent_ai::levels::Level::High),
+        unknown: Vec::new(),
+    });
+    models
+}
+
+/// The options of a full-screen app whose host answers `models`.
+fn hosted(models: Models) -> Options {
+    let host = FakeHost::new().with_models(models);
+    Options {
+        host: Some(HostHandle::new(Arc::new(host))),
+        ..full()
+    }
+}
+
+/// A host that answers the model list once and then never again, so a sheet
+/// that still shows the plan of the first answer held the list.
+struct OnceHost {
+    inner: FakeHost,
+    reads: Arc<AtomicUsize>,
+}
+
+impl Host for OnceHost {
+    fn models(&self) -> HostFuture<Models> {
+        if self.reads.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Box::pin(std::future::pending());
+        }
+        self.inner.models()
+    }
+
+    fn files(&self) -> HostFuture<Files> {
+        self.inner.files()
+    }
+
+    fn logins(&self) -> &[&'static str] {
+        self.inner.logins()
+    }
+
+    fn login(&self, provider: &str) -> mpsc::Receiver<LoginStep> {
+        self.inner.login(provider)
+    }
+
+    fn open(&self, target: Target) -> HostFuture<Result<Opened, String>> {
+        self.inner.open(target)
+    }
+
+    fn delete(&self, session: &str) -> HostFuture<Result<(), String>> {
+        self.inner.delete(session)
+    }
+
+    fn copy(&self, text: &str) {
+        self.inner.copy(text)
+    }
+}
+
+/// Ctrl+X t lists the words of the plan of the model the session runs.
+#[tokio::test]
+async fn level_picker_ctrl_x_t_shows_the_words_and_the_marks() {
+    let harness = Harness::start(
+        hosted(level_models()),
+        Fake::naming("sess-level", "anthropic/opus", 200_000),
+    );
+    wait_text(&harness.bytes, "idle").await;
+    harness.send(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    harness.press(KeyCode::Char('t'));
+    wait_text(&harness.bytes, "3 levels").await;
+    let screen = text(&harness.bytes);
+    for word in ["Level", "off", "low", "high", "default"] {
+        assert!(screen.contains(word), "{word:?} draws:\n{screen}");
+    }
+}
+
+/// Enter on a level row sends the word as the level of the next turn, and the
+/// sheet gives the text box back.
+#[tokio::test]
+async fn level_picker_enter_sets_the_level() {
+    let mut harness = Harness::start(
+        hosted(level_models()),
+        Fake::naming("sess-level", "anthropic/opus", 200_000),
+    );
+    wait_text(&harness.bytes, "idle").await;
+    harness.send(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    harness.press(KeyCode::Char('t'));
+    wait_text(&harness.bytes, "3 levels").await;
+    // The sheet opens on its first row, `off`, so one Down lands on `low`.
+    harness.press(KeyCode::Down);
+    harness.press(KeyCode::Enter);
+    let (model, level, mode) = harness.fake.expect_set().await;
+    assert_eq!(model, None);
+    assert_eq!(level.as_deref(), Some("low"));
+    assert_eq!(mode, None);
+    wait_text(&harness.bytes, "level: low from the next turn").await;
+    assert!(!text(&harness.bytes).contains("levels"), "the sheet closed");
+}
+
+/// A model whose plan is not known lists low, medium and high.
+#[tokio::test]
+async fn level_picker_without_a_plan_lists_low_medium_high() {
+    let harness = Harness::start(
+        hosted(two_models()),
+        Fake::naming("sess-level", "anthropic/opus", 200_000),
+    );
+    wait_text(&harness.bytes, "idle").await;
+    harness.send(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    harness.press(KeyCode::Char('t'));
+    wait_text(&harness.bytes, "3 levels").await;
+    let screen = text(&harness.bytes);
+    for word in ["low", "medium", "high"] {
+        assert!(screen.contains(word), "{word:?} draws:\n{screen}");
+    }
+    assert!(!screen.contains("off"), "no plan has no off:\n{screen}");
+}
+
+/// The sheet marks the level the worker's `settings` notice names, and the
+/// level the plan says the model starts at.
+#[test]
+fn level_picker_marks_the_level_the_settings_notice_names() {
+    let mut app = bare();
+    app.frame(Frame::Settings {
+        model: "anthropic/opus".into(),
+        context_window: Some(200_000),
+        level: Some("low".into()),
+        mode: None,
+    });
+    app.models = Some(level_models());
+    app.open_levels();
+    let sheet = &app.sheet.as_ref().expect("the level sheet").sheet;
+    let names: Vec<&str> = sheet.rows.iter().map(|row| &*row.name).collect();
+    assert_eq!(names, ["off", "low", "high"]);
+    let low = sheet
+        .rows
+        .iter()
+        .find(|row| &*row.name == "low")
+        .expect("the low row");
+    assert_eq!(low.mark, Mark::Current);
+    assert_eq!(&*low.right, "now");
+    let high = sheet
+        .rows
+        .iter()
+        .find(|row| &*row.name == "high")
+        .expect("the high row");
+    assert_eq!(&*high.detail, "default");
+    assert_eq!(
+        sheet.selected().map(|(_, row)| &*row.name),
+        Some("low"),
+        "the selection starts on the current row"
+    );
+}
+
+/// A session that started at a level marks it before any `settings` notice.
+#[test]
+fn level_picker_marks_the_level_the_initialize_answer_names() {
+    let init = Initialized {
+        level: Some(Arc::from("high")),
+        ..Initialized::default()
+    };
+    let mut app = App::new(&init, (COLUMNS, ROWS), true);
+    app.open_levels();
+    let sheet = &app.sheet.as_ref().expect("the level sheet").sheet;
+    assert_eq!(
+        sheet.selected().map(|(_, row)| (&*row.name, row.mark)),
+        Some(("high", Mark::Current))
+    );
+}
+
+/// Ctrl+X m pressed while the level sheet waits for the list opens the model
+/// sheet: the last key wins.
+#[tokio::test]
+async fn level_picker_the_model_key_during_the_wait_wins() {
+    let (mut app, _host) = paged(FakeHost::new());
+    app.open_levels();
+    assert!(
+        matches!(app.waits.after_models, crate::app::AfterModels::LevelSheet),
+        "the level sheet waits for the list"
+    );
+    app.open_models();
+    app.models_arrived(level_models());
+    assert!(
+        matches!(
+            app.sheet.as_ref().map(|open| &open.kind),
+            Some(crate::app::SheetKind::Model(_))
+        ),
+        "the model sheet opens"
+    );
+}
+
+/// A bare `/level` opens the sheet, with the words of no plan when this app has
+/// no host to ask.
+#[tokio::test]
+async fn level_command_bare_opens_the_sheet() {
+    let harness = Harness::new_session(Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.type_text("/level");
+    harness.press(KeyCode::Enter);
+    wait_text(&harness.bytes, "3 levels").await;
+    let screen = text(&harness.bytes);
+    assert!(screen.contains("Level"), "the sheet is open:\n{screen}");
+    assert!(
+        screen.contains("medium"),
+        "no plan lists the usual words:\n{screen}"
+    );
+}
+
+/// Esc sends nothing, and the model list the sheet read stays for the next
+/// opening.
+#[tokio::test]
+async fn level_picker_esc_sends_nothing() {
+    let host = OnceHost {
+        inner: FakeHost::new().with_models(level_models()),
+        reads: Arc::new(AtomicUsize::new(0)),
+    };
+    let options = Options {
+        host: Some(HostHandle::new(Arc::new(host))),
+        ..full()
+    };
+    let mut harness = Harness::start(
+        options,
+        Fake::naming("sess-level", "anthropic/opus", 200_000),
+    );
+    wait_text(&harness.bytes, "idle").await;
+    assert_eq!(harness.fake.expect_method().await, "initialize");
+    assert_eq!(harness.fake.expect_method().await, "attach");
+    harness.send(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    harness.press(KeyCode::Char('t'));
+    wait_text(&harness.bytes, "3 levels").await;
+    harness.press(KeyCode::Esc);
+    wait_gone(&harness.bytes, "back to your draft").await;
+    assert!(
+        timeout(Duration::from_millis(100), harness.fake.sent.recv())
+            .await
+            .is_err(),
+        "Esc sends nothing"
+    );
+    // The list is still held: the sheet reopens on the plan of the first answer
+    // without asking the host again, which would never answer a second time.
+    harness.send(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    harness.press(KeyCode::Char('t'));
+    wait_text(&harness.bytes, "3 levels").await;
+    let screen = text(&harness.bytes);
+    assert!(screen.contains("off"), "the plan of the model:\n{screen}");
+}
+
+/// `/level xhigh` sends a word above high that reagent names.
+#[test]
+fn level_command_xhigh_sends_the_word() {
+    let mut app = bare();
+    app.editor.insert("/level xhigh");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    match app.commands.pop_front() {
+        Some(super::Command::Set { model, level, mode }) => {
+            assert_eq!(model, None);
+            assert_eq!(level.as_deref(), Some("xhigh"));
+            assert_eq!(mode, None);
+        }
+        other => panic!("expected a level request, got {other:?}"),
+    }
+}
+
+/// `/level off` sends the word that turns thinking off.
+#[test]
+fn level_command_off_sends_the_word() {
+    let mut app = bare();
+    app.editor.insert("/level off");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    match app.commands.pop_front() {
+        Some(super::Command::Set { model, level, mode }) => {
+            assert_eq!(model, None);
+            assert_eq!(level.as_deref(), Some("off"));
+            assert_eq!(mode, None);
+        }
+        other => panic!("expected a level request, got {other:?}"),
+    }
+}
+
+/// `/level` sends a word the plan of the current model lists, though reagent
+/// cannot place it on its scale.
+#[test]
+fn level_command_an_unknown_word_of_the_plan_sends() {
+    let mut app = bare();
+    let mut models = level_models();
+    models.providers[0].models[0]
+        .reasoning
+        .as_mut()
+        .expect("the plan of the model")
+        .unknown = vec!["ultra".to_owned()];
+    app.models = Some(models);
+    app.frame(Frame::Settings {
+        model: "anthropic/opus".into(),
+        context_window: Some(200_000),
+        level: None,
+        mode: None,
+    });
+    app.editor.insert("/level ultra");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    match app.commands.pop_front() {
+        Some(super::Command::Set { level, .. }) => {
+            assert_eq!(level.as_deref(), Some("ultra"));
+        }
+        other => panic!("expected a level request, got {other:?}"),
+    }
+}
+
+/// A word only the plan names reads the list first when the app holds none.
+#[tokio::test]
+async fn level_command_a_word_of_the_plan_reads_the_list_first() {
+    let mut models = level_models();
+    models.providers[0].models[0]
+        .reasoning
+        .as_mut()
+        .expect("the plan of the model")
+        .unknown = vec!["ultra".to_owned()];
+    let mut harness = Harness::start(
+        hosted(models),
+        Fake::naming("sess-word", "anthropic/opus", 200_000),
+    );
+    wait_text(&harness.bytes, "idle").await;
+    harness.type_text("/level ultra");
+    harness.press(KeyCode::Enter);
+    let (model, level, mode) = harness.fake.expect_set().await;
+    assert_eq!((model, mode), (None, None));
+    assert_eq!(level.as_deref(), Some("ultra"));
+}
+
+/// A word the list does not name gets the usage note once the list is read.
+#[tokio::test]
+async fn level_command_a_word_no_plan_names_gets_the_usage_with_a_host() {
+    let harness = Harness::start(
+        hosted(level_models()),
+        Fake::naming("sess-word", "anthropic/opus", 200_000),
+    );
+    wait_text(&harness.bytes, "idle").await;
+    harness.type_text("/level nonsense");
+    harness.press(KeyCode::Enter);
+    wait_text(&harness.bytes, "usage: /level").await;
+}
+
+/// A new handshake replaces the level, which may have changed while away.
+#[test]
+fn level_picker_a_reconnect_takes_the_level_of_the_handshake() {
+    let mut app = bare();
+    app.level = Some(Arc::from("low"));
+    app.rejoined(&Initialized {
+        level: Some(Arc::from("high")),
+        ..Initialized::default()
+    });
+    assert_eq!(app.level.as_deref(), Some("high"));
+}
+
+/// `/level nonsense` sends nothing and names the words the line takes.
+#[test]
+fn level_command_nonsense_sends_nothing() {
+    let mut app = bare();
+    app.editor.insert("/level nonsense");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.commands.is_empty(), "no level reached the worker");
+    let rows = note_rows(&app);
+    assert!(
+        rows.iter().any(|row| row.contains("low|medium|high|off")),
+        "the usage names the words: {rows:?}"
+    );
+}
+
+/// A budget is not a level word: `/level 4096` sends nothing.
+#[test]
+fn level_command_a_budget_sends_nothing() {
+    let mut app = bare();
+    app.editor.insert("/level 4096");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.commands.is_empty(), "a budget is not a level");
+}
+
 /// The sessions sheet shows the preview beside its rows only where the width
 /// leaves room for it.
 #[test]
@@ -4593,11 +5616,872 @@ fn sessions_sheet_shows_a_preview_at_120_columns_and_none_at_80() {
         assert!(screen.contains("Sessions"), "the sheet draws:\n{screen}");
         assert!(screen.contains("first"), "the rows draw:\n{screen}");
         assert_eq!(
-            screen.contains("enter starts it"),
+            screen.contains("not running"),
             preview,
             "the preview at {columns} columns:\n{screen}"
         );
     }
+}
+
+/// A session row of the delete tests, current or live as asked.
+fn session_row(id: &str, title: &str, current: bool, live: bool) -> SessionRow {
+    SessionRow {
+        id: Arc::from(id),
+        title: Arc::from(title),
+        updated: 1_000,
+        live,
+        waiting: false,
+        current,
+        headless: false,
+    }
+}
+
+/// An app whose host is `host`, with the sessions sheet open on `rows` in the
+/// order the folder listed them.
+fn sessions_sheet_on(host: FakeHost, rows: Vec<SessionRow>) -> (App, Arc<FakeHost>) {
+    let mut app = bare();
+    let host = Arc::new(host);
+    let handle: Arc<dyn Host> = Arc::clone(&host) as Arc<dyn Host>;
+    app.host = Some(HostHandle::new(handle));
+    app.sessions = rows;
+    app.set_sessions();
+    app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    app.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+    assert!(app.sheet.is_some(), "Ctrl+X l opens the sessions sheet");
+    (app, host)
+}
+
+/// An app with the sessions sheet open on `rows`, in a terminal wide enough
+/// for the preview beside them.
+fn preview_sheet_on(rows: Vec<SessionRow>) -> App {
+    let mut app = App::new(&Initialized::default(), (140, ROWS), true);
+    app.sessions = rows;
+    app.set_sessions();
+    // The preview needs a wide main area, so the panels fold into the header
+    // first.
+    app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    app.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+    app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    app.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+    assert!(app.sheet.is_some(), "Ctrl+X l opens the sessions sheet");
+    app
+}
+
+/// The text of every line of the sessions sheet's preview.
+fn preview_lines(app: &App) -> Vec<&str> {
+    app.sheet
+        .as_ref()
+        .expect("the sessions sheet is open")
+        .sheet
+        .preview
+        .iter()
+        .map(|line| &*line.text)
+        .collect()
+}
+
+/// The id of the preview read in flight.
+fn preview_reading(app: &App) -> Option<&str> {
+    app.preview_job.as_ref().map(|(id, _)| &**id)
+}
+
+/// The text of every message row of the sessions sheet's preview.
+fn preview_rows_text(app: &App) -> Vec<String> {
+    let sheet = &app
+        .sheet
+        .as_ref()
+        .expect("the sessions sheet is open")
+        .sheet;
+    sheet
+        .preview_rows
+        .as_deref()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .map(|row| row.runs.iter().map(|run| &*run.text).collect())
+        .collect()
+}
+
+/// The messages the tests read into the cache: a question and its answer.
+fn exchange(user: &str, reply: &str) -> RecentMessages {
+    RecentMessages {
+        messages: vec![
+            Recent::User(Arc::from(user)),
+            Recent::Reply(Arc::from(reply)),
+        ],
+    }
+}
+
+/// The theme of a rich frame: the fills the preview draws on.
+fn rich() -> crate::theme::Theme {
+    crate::theme::Theme::resolve(
+        crate::theme::Mode::Rich {
+            background: crate::theme::Rgb::new(30, 30, 30),
+            dark: true,
+        },
+        crate::theme::Depth::TrueColor,
+        &crate::theme::Overrides::default(),
+    )
+}
+
+/// The column and the row of the first cell of `needle` on the screen.
+fn found(app: &App, needle: &str) -> (u16, u16) {
+    let grid = app.screen.back();
+    for y in 0..app.screen.rows() {
+        let mut row = String::new();
+        for x in 0..grid.width() {
+            match grid.cell(x, y).char() {
+                Some(c) => row.push(c),
+                None => row.push(' '),
+            }
+        }
+        if let Some(byte) = row.find(needle) {
+            return (row[..byte].chars().count() as u16, y);
+        }
+    }
+    panic!("no {needle:?} on screen:\n{}", screen_text(app));
+}
+
+/// The style of the cell at a column and a row of the screen.
+fn cell_style(app: &App, x: u16, y: u16) -> crate::screen::Style {
+    app.screen.style_of(app.screen.back().cell(x, y).style())
+}
+
+/// A session whose folder is gone draws its title, its id and its age and no
+/// exchange, and the empty answer is cached: the row is not read again.
+#[tokio::test]
+async fn session_preview_of_a_missing_folder_shows_the_row_alone() {
+    let mut app = preview_sheet_on(vec![session_row("aaaa1111", "gone", false, false)]);
+    let (id, job) = app.preview_job.take().expect("the row on screen is read");
+    assert_eq!(&*id, "aaaa1111");
+    let answer = job.await.expect("the job answers");
+    assert!(
+        answer.is_ok(),
+        "a folder that is gone reads as no exchange, not as an error to show"
+    );
+    app.exchange_arrived(id, answer);
+
+    let lines = preview_lines(&app);
+    assert_eq!(lines.len(), 2, "the row's own lines: {lines:?}");
+    assert_eq!(lines[0], "gone");
+    assert!(lines[1].contains("not running"), "{lines:?}");
+    assert!(lines[1].contains("changed "), "{lines:?}");
+    assert_eq!(preview_reading(&app), None, "the empty answer is cached");
+}
+
+/// A key that moves the selection draws the new row at once and starts no
+/// read of its own while another row's read is in flight; the answer starts
+/// the read of the row the selection stands on then.
+#[tokio::test]
+async fn session_preview_moves_at_once_while_a_read_runs() {
+    let mut app = preview_sheet_on(vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+    ]);
+    assert_eq!(
+        preview_reading(&app),
+        Some("aaaa1111"),
+        "the first row reads"
+    );
+
+    app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(
+        preview_lines(&app)[0],
+        "beta",
+        "the selection moved at once"
+    );
+    assert_eq!(
+        preview_reading(&app),
+        Some("aaaa1111"),
+        "the read in flight is the only one"
+    );
+
+    // The answer caches the row it read, then the row on screen is read.
+    let (id, job) = app.preview_job.take().expect("the read in flight");
+    app.exchange_arrived(id, job.await.expect("the job answers"));
+    assert_eq!(preview_lines(&app)[0], "beta", "the row on screen stays");
+    assert_eq!(
+        preview_reading(&app),
+        Some("bbbb2222"),
+        "the row on screen reads next"
+    );
+}
+
+/// A row whose messages are cached draws them and starts no read, even when a
+/// key comes back to it past a row whose read runs.
+#[tokio::test]
+async fn session_preview_of_a_cached_row_starts_no_read() {
+    let mut app = preview_sheet_on(vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+    ]);
+    let (id, _job) = app.preview_job.take().expect("the first row is read");
+    app.exchange_arrived(id, Ok(exchange("the question", "the answer")));
+    assert_eq!(preview_reading(&app), None, "the row on screen is cached");
+    let rows = preview_rows_text(&app);
+    assert!(
+        rows.iter().any(|row| row.contains("the question")),
+        "{rows:?}"
+    );
+    assert!(rows.iter().any(|row| row == "the answer"), "{rows:?}");
+
+    // Down reads the row it lands on, and Up draws the cached row again out of
+    // the only read still in flight.
+    app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(preview_reading(&app), Some("bbbb2222"));
+    app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert!(
+        preview_rows_text(&app)
+            .iter()
+            .any(|row| row.contains("the question")),
+        "the cache draws the row"
+    );
+    assert_eq!(
+        preview_reading(&app),
+        Some("bbbb2222"),
+        "a cached row starts no read"
+    );
+}
+
+/// A delete builds the sheet again and the preview still uses the cache.
+#[tokio::test]
+async fn session_preview_keeps_the_cache_when_a_delete_rebuilds_the_sheet() {
+    let mut app = preview_sheet_on(vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+    ]);
+    let (id, _job) = app.preview_job.take().expect("the first row is read");
+    let question = RecentMessages {
+        messages: vec![Recent::User(Arc::from("the question"))],
+    };
+    app.exchange_arrived(id, Ok(question));
+
+    app.deleted(Arc::from("bbbb2222"), Arc::from("beta"), Ok(()));
+    assert_eq!(preview_reading(&app), None, "the row on screen is cached");
+    assert!(
+        preview_rows_text(&app)
+            .iter()
+            .any(|row| row.contains("the question")),
+        "the rebuilt sheet draws the cache"
+    );
+}
+
+/// A reply draws as the transcript draws it right of the rule: its markdown
+/// rendered, with no stars and no label above it.
+#[tokio::test]
+async fn session_preview_draws_a_reply_as_markdown() {
+    let mut app = preview_sheet_on(vec![session_row("aaaa1111", "alpha", false, false)]);
+    let (id, _job) = app.preview_job.take().expect("the row on screen is read");
+    app.exchange_arrived(id, Ok(exchange("the question", "say **bold** here")));
+    app.paint();
+
+    let screen = screen_text(&app);
+    assert!(screen.contains("say bold here"), "{screen}");
+    assert!(!screen.contains('*'), "no stars in the pane: {screen}");
+    for label in ["you", "reply"] {
+        assert!(
+            !screen.lines().any(|line| line.trim_end().ends_with(label)),
+            "no {label} label: {screen}"
+        );
+    }
+    let (x, y) = found(&app, "bold");
+    assert!(cell_style(&app, x, y).bold, "the words the reply bolds");
+}
+
+/// A reply's cells carry the pane's plain fill, and a code block keeps its own,
+/// so no cell of the pane is left without a fill.
+#[tokio::test]
+async fn session_preview_draws_rich_cells_on_the_fills_it_names() {
+    let mut app = preview_sheet_on(vec![session_row("aaaa1111", "alpha", false, false)]);
+    app.look.theme = rich();
+    let (id, _job) = app.preview_job.take().expect("the row on screen is read");
+    app.exchange_arrived(
+        id,
+        Ok(RecentMessages {
+            messages: vec![Recent::Reply(Arc::from("the words `let x = 1;`"))],
+        }),
+    );
+    app.paint();
+
+    let theme = app.look.theme;
+    let (x, y) = found(&app, "the words");
+    assert_eq!(
+        cell_style(&app, x, y).bg,
+        theme.fill(crate::theme::Role::InputFill),
+        "the plain row's fill"
+    );
+    let (x, y) = found(&app, "let x = 1;");
+    assert_eq!(
+        cell_style(&app, x, y).bg,
+        theme.fill(crate::theme::Role::CodeFill),
+        "the code block's own fill"
+    );
+}
+
+/// A user turn starts with its `›` at the left of the pane and wraps its words
+/// under column 2, the mark on the first row alone.
+#[tokio::test]
+async fn session_preview_draws_a_user_turn_under_its_mark() {
+    let mut app = preview_sheet_on(vec![session_row("aaaa1111", "alpha", false, false)]);
+    let (id, _job) = app.preview_job.take().expect("the row on screen is read");
+    let long = "this question is long enough to need a second row of the pane and to keep wrapping past it and on";
+    app.exchange_arrived(
+        id,
+        Ok(RecentMessages {
+            messages: vec![Recent::User(Arc::from(long))],
+        }),
+    );
+    app.paint();
+
+    let drawn: Vec<String> = screen_text(&app).lines().map(str::to_owned).collect();
+    let (mark, y) = found(&app, "\u{203a} this question");
+    let rule = drawn[y as usize]
+        .chars()
+        .position(|c| c == '\u{2502}')
+        .expect("the rule beside the rows");
+    assert_eq!(mark as usize, rule + 2, "the mark at the left of the pane");
+
+    // The rows under the first one keep the two columns of the mark.
+    let pane = rule + 2;
+    let under: Vec<char> = drawn[y as usize + 1].chars().skip(pane).collect();
+    assert_eq!(under[0], ' ', "a column under the mark");
+    assert_eq!(under[1], ' ', "the second column under it too");
+    assert_ne!(under[2], ' ', "the wrapped words start two columns in");
+    assert!(
+        !drawn[y as usize + 1].contains('\u{203a}'),
+        "`\u{203a}` draws on the first row alone"
+    );
+}
+
+/// More message rows than the pane holds draw their newest rows: the last row
+/// of the newest message shows and the first row of the oldest does not.
+#[tokio::test]
+async fn session_preview_draws_the_last_rows_when_the_messages_overflow() {
+    let mut app = preview_sheet_on(vec![session_row("aaaa1111", "alpha", false, false)]);
+    let (id, _job) = app.preview_job.take().expect("the row on screen is read");
+    // Six messages of a few rows each, under a blank row each, out of the
+    // slots the preview has left under the row's own lines.
+    let mut messages = Vec::new();
+    for at in 0..3 {
+        let question = format!("OLDEST{at} {}", "q".repeat(120));
+        let reply = format!("{} NEWEST{at}", "r".repeat(120));
+        messages.push(Recent::User(Arc::from(question.as_str())));
+        messages.push(Recent::Reply(Arc::from(reply.as_str())));
+    }
+    app.exchange_arrived(id, Ok(RecentMessages { messages }));
+    app.paint();
+
+    let screen = screen_text(&app);
+    assert!(
+        screen.contains("NEWEST2"),
+        "the newest words show: {screen}"
+    );
+    assert!(
+        !screen.contains("OLDEST0"),
+        "the oldest rows drop: {screen}"
+    );
+}
+
+/// A width change builds the rows again at the new pane width, so a longer
+/// pane wraps the same words into fewer rows.
+#[tokio::test]
+async fn session_preview_draws_its_rows_at_the_new_width() {
+    let mut app = preview_sheet_on(vec![session_row("aaaa1111", "alpha", false, false)]);
+    let (id, _job) = app.preview_job.take().expect("the row on screen is read");
+    let long = "w".repeat(133);
+    app.exchange_arrived(
+        id,
+        Ok(RecentMessages {
+            messages: vec![Recent::User(Arc::from(long.as_str()))],
+        }),
+    );
+    let narrow = preview_rows_text(&app).len();
+    assert_eq!(narrow, 3, "a blank row and two wrapped rows");
+
+    app.resize(200, ROWS);
+    let wide = preview_rows_text(&app).len();
+    assert_eq!(wide, 2, "a blank row and one row the longer pane holds");
+}
+
+/// Docking the sidebar narrows the pane with no resize, and the rows wrap again.
+#[tokio::test]
+async fn session_preview_draws_again_when_the_sidebar_moves() {
+    let mut app = preview_sheet_on(vec![session_row("aaaa1111", "alpha", false, false)]);
+    let (id, _job) = app.preview_job.take().expect("the row on screen is read");
+    let long = "w".repeat(150);
+    app.exchange_arrived(
+        id,
+        Ok(RecentMessages {
+            messages: vec![Recent::User(Arc::from(long.as_str()))],
+        }),
+    );
+    let wide = preview_rows_text(&app).len();
+    app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    app.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+    let narrow = preview_rows_text(&app).len();
+    assert!(narrow > wide, "{wide} rows, then {narrow}");
+}
+
+/// A filter that moves the pick moves the preview with it.
+#[tokio::test]
+async fn session_preview_draws_the_row_a_filter_picks() {
+    let mut app = preview_sheet_on(vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+    ]);
+    let (id, _job) = app.preview_job.take().expect("the row on screen is read");
+    app.exchange_arrived(
+        id,
+        Ok(RecentMessages {
+            messages: vec![Recent::User(Arc::from("the words of alpha"))],
+        }),
+    );
+    assert!(
+        preview_rows_text(&app)
+            .iter()
+            .any(|row| row.contains("alpha"))
+    );
+    app.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+    assert_eq!(preview_lines(&app)[0], "beta", "the row the filter picked");
+    assert!(
+        !preview_rows_text(&app)
+            .iter()
+            .any(|row| row.contains("alpha")),
+        "no words of the row it left"
+    );
+}
+
+/// A new theme draws the rows already built in its own fill.
+#[tokio::test]
+async fn session_preview_draws_again_in_a_new_theme() {
+    let mut app = preview_sheet_on(vec![session_row("aaaa1111", "alpha", false, false)]);
+    let (id, _job) = app.preview_job.take().expect("the row on screen is read");
+    app.exchange_arrived(
+        id,
+        Ok(RecentMessages {
+            messages: vec![Recent::Reply(Arc::from("the words"))],
+        }),
+    );
+    app.restyle(crate::theme::Mode::Rich {
+        background: crate::theme::Rgb::new(10, 20, 30),
+        dark: true,
+    });
+    let fill = app.look.theme.fill(crate::theme::Role::InputFill);
+    let open = app.sheet.as_ref().expect("the sheet");
+    let rows = open.sheet.preview_rows.as_ref().expect("the rows");
+    let run = rows
+        .iter()
+        .flat_map(|row| &row.runs)
+        .next()
+        .expect("a run of the reply");
+    assert_eq!(run.style.bg, fill);
+}
+
+/// A delete waits for a worker that is starting: it holds no lock yet.
+#[tokio::test]
+async fn session_delete_waits_for_a_worker_that_starts() {
+    let rows = vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+    ];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+    app.waits.open = Some(Box::pin(std::future::pending()));
+    press_ctrl_d(&mut app);
+    press_ctrl_d(&mut app);
+    assert!(host.deleted().is_empty(), "nothing is deleted");
+    assert!(
+        note_rows(&app)
+            .iter()
+            .any(|row| row.contains("a worker is starting")),
+        "the note says why"
+    );
+}
+
+/// An open waits for a delete: the session may be the one that is going away.
+#[tokio::test]
+async fn session_delete_an_open_waits_for_the_delete() {
+    let rows = vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+    ];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+    press_ctrl_d(&mut app);
+    press_ctrl_d(&mut app);
+    assert_eq!(host.deleted(), ["aaaa1111"]);
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.waits.open.is_none(), "no worker starts");
+    assert!(host.opened().is_empty(), "the host opens nothing");
+    assert!(
+        note_rows(&app)
+            .iter()
+            .any(|row| row.contains("being deleted")),
+        "the note says why"
+    );
+}
+
+/// A Ctrl+D in the open sheet.
+fn press_ctrl_d(app: &mut App) {
+    app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+}
+
+/// What the sheet's footer says in place of its keys while a row is armed.
+fn confirm_text(app: &App) -> Option<&str> {
+    app.sheet
+        .as_ref()
+        .expect("the sessions sheet is open")
+        .sheet
+        .confirm
+        .as_deref()
+}
+
+/// The names of the rows the open sheet shows, in the order it draws them.
+fn shown_names(app: &App) -> Vec<String> {
+    let sheet = &app
+        .sheet
+        .as_ref()
+        .expect("the sessions sheet is open")
+        .sheet;
+    sheet
+        .shown
+        .iter()
+        .map(|&index| sheet.rows[index as usize].name.to_string())
+        .collect()
+}
+
+/// Answers the delete in flight the way the loop does: the host's answer, with
+/// the id and the title the delete started with.
+async fn answer_delete(app: &mut App) {
+    let deleting = app.waits.delete.take().expect("the delete is in flight");
+    let answer = deleting.job.await;
+    app.deleted(deleting.id, deleting.title, answer);
+}
+
+/// The first Ctrl+D names the row it armed and deletes nothing: the second
+/// press is the one that runs.
+#[test]
+fn session_delete_the_first_press_asks_again() {
+    let rows = vec![session_row("aaaa1111", "alpha", false, false)];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+
+    press_ctrl_d(&mut app);
+
+    assert_eq!(confirm_text(&app), Some("ctrl+d again deletes \"alpha\""));
+    assert!(host.deleted().is_empty(), "the first press deletes nothing");
+    assert!(app.waits.delete.is_none(), "no delete is in flight");
+    assert_eq!(app.sessions.len(), 1, "the row stays");
+}
+
+/// The second Ctrl+D deletes the row it stands on: the host gets that id, and
+/// the answer takes the row out of the list and out of the sheet.
+#[tokio::test]
+async fn session_delete_the_second_press_deletes_the_selected_row() {
+    let rows = vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+        session_row("cccc3333", "gamma", false, false),
+    ];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+    app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+    press_ctrl_d(&mut app);
+    assert_eq!(confirm_text(&app), Some("ctrl+d again deletes \"beta\""));
+    press_ctrl_d(&mut app);
+
+    assert_eq!(host.deleted(), ["bbbb2222"], "the host deletes that one id");
+    assert_eq!(confirm_text(&app), None, "the prompt goes with the press");
+    answer_delete(&mut app).await;
+
+    let ids: Vec<&str> = app.sessions.iter().map(|row| &*row.id).collect();
+    assert_eq!(ids, ["aaaa1111", "cccc3333"], "the row goes, the rest stay");
+    assert_eq!(
+        shown_names(&app),
+        ["alpha", "gamma"],
+        "the sheet lost it too"
+    );
+    assert_eq!(
+        note_rows(&app),
+        ["deleted \"beta\""],
+        "the answer is a note"
+    );
+}
+
+/// Down after the first Ctrl+D disarms: the next press only arms the row the
+/// selection reached.
+#[test]
+fn session_delete_down_after_the_first_press_disarms() {
+    let rows = vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+    ];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+    press_ctrl_d(&mut app);
+    assert!(confirm_text(&app).is_some(), "the first press armed alpha");
+
+    app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(confirm_text(&app), None, "a key of the sheet disarms");
+
+    press_ctrl_d(&mut app);
+    assert!(host.deleted().is_empty(), "the row was only armed again");
+    assert!(app.waits.delete.is_none(), "no delete is in flight");
+    assert_eq!(
+        confirm_text(&app),
+        Some("ctrl+d again deletes \"beta\""),
+        "the press arms the row it stands on"
+    );
+}
+
+/// Esc after the first Ctrl+D closes the sheet and deletes nothing.
+#[test]
+fn session_delete_esc_after_the_first_press_deletes_nothing() {
+    let rows = vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+    ];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+    press_ctrl_d(&mut app);
+
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert!(
+        app.sheet.is_none(),
+        "Esc gives the text box and its draft back"
+    );
+    assert!(host.deleted().is_empty(), "no session was deleted");
+    assert!(app.waits.delete.is_none(), "no delete is in flight");
+    assert_eq!(app.sessions.len(), 2, "the rows stay");
+}
+
+/// A typed filter char after the first Ctrl+D disarms it and deletes nothing.
+#[test]
+fn session_delete_a_filter_char_after_the_first_press_disarms() {
+    let rows = vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+    ];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+    press_ctrl_d(&mut app);
+
+    app.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+
+    assert_eq!(confirm_text(&app), None, "typing disarms");
+    assert!(host.deleted().is_empty(), "no session was deleted");
+    assert!(app.waits.delete.is_none(), "no delete is in flight");
+    assert_eq!(
+        app.sheet.as_ref().expect("the sheet").sheet.filter(),
+        "b",
+        "the char is the filter's"
+    );
+}
+
+/// Two Ctrl+D on the current session delete nothing and say why, and the
+/// second one arms nothing.
+#[test]
+fn session_delete_the_current_session_is_kept() {
+    let rows = vec![session_row("aaaa1111", "alpha", true, true)];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+
+    press_ctrl_d(&mut app);
+    assert_eq!(confirm_text(&app), None, "nothing is armed for it");
+    press_ctrl_d(&mut app);
+
+    assert!(host.deleted().is_empty(), "the current session stays");
+    assert!(app.waits.delete.is_none(), "no delete is in flight");
+    assert_eq!(
+        note_rows(&app),
+        ["this is the current session", "this is the current session"],
+        "both presses say why"
+    );
+}
+
+/// Two Ctrl+D on a session a worker runs delete nothing and say why.
+#[test]
+fn session_delete_a_live_session_is_kept() {
+    let rows = vec![session_row("aaaa1111", "alpha", false, true)];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+
+    press_ctrl_d(&mut app);
+    assert_eq!(confirm_text(&app), None, "nothing is armed for it");
+    press_ctrl_d(&mut app);
+
+    assert!(host.deleted().is_empty(), "a live session stays");
+    assert!(app.waits.delete.is_none(), "no delete is in flight");
+    assert_eq!(
+        note_rows(&app),
+        ["a worker runs this session", "a worker runs this session"]
+    );
+}
+
+/// A list read again while the sheet is up moves the folder's rows, and the
+/// delete still names the row the sheet draws: the session ids, not an index
+/// into a list that changed under it.
+#[test]
+fn session_delete_after_a_refresh_deletes_the_row_on_screen() {
+    let rows = vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+        session_row("cccc3333", "gamma", false, false),
+    ];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+    // The folder's newest-first list comes back the other way round.
+    app.sessions = vec![
+        session_row("cccc3333", "gamma", false, false),
+        session_row("bbbb2222", "beta", false, false),
+        session_row("aaaa1111", "alpha", false, false),
+    ];
+    app.set_sessions();
+    assert_eq!(
+        shown_names(&app),
+        ["alpha", "beta", "gamma"],
+        "the sheet keeps its rows"
+    );
+
+    press_ctrl_d(&mut app);
+    assert_eq!(
+        confirm_text(&app),
+        Some("ctrl+d again deletes \"alpha\""),
+        "the row on screen is armed"
+    );
+    // A second read lands between the presses, so the arm is a session id and
+    // not a place in the folder's list either.
+    app.sessions = vec![
+        session_row("bbbb2222", "beta", false, false),
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("cccc3333", "gamma", false, false),
+    ];
+    app.set_sessions();
+    press_ctrl_d(&mut app);
+
+    assert_eq!(
+        host.deleted(),
+        ["aaaa1111"],
+        "the row on screen, not the first row of the folder's list"
+    );
+}
+
+/// An answer that fails is a note and the row stays.
+#[tokio::test]
+async fn session_delete_a_failed_answer_is_a_note_and_keeps_the_row() {
+    let rows = vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+    ];
+    let host = FakeHost::new().with_delete(Err("a fork reads it".to_owned()));
+    let (mut app, host) = sessions_sheet_on(host, rows);
+    app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+    press_ctrl_d(&mut app);
+    press_ctrl_d(&mut app);
+    assert_eq!(host.deleted(), ["bbbb2222"]);
+    answer_delete(&mut app).await;
+
+    assert_eq!(note_rows(&app), ["a fork reads it"], "the reason is a note");
+    let ids: Vec<&str> = app.sessions.iter().map(|row| &*row.id).collect();
+    assert_eq!(ids, ["aaaa1111", "bbbb2222"], "the row stays");
+    assert_eq!(shown_names(&app), ["alpha", "beta"]);
+}
+
+/// A delete under a filter takes the row the filter left, and the filter is
+/// still on the sheet after the answer.
+#[tokio::test]
+async fn session_delete_under_a_filter_keeps_the_filter() {
+    let rows = vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+        session_row("cccc3333", "gamma", false, false),
+    ];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+    app.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+    assert_eq!(shown_names(&app), ["beta"], "the filter leaves beta");
+
+    press_ctrl_d(&mut app);
+    assert_eq!(confirm_text(&app), Some("ctrl+d again deletes \"beta\""));
+    press_ctrl_d(&mut app);
+    assert_eq!(host.deleted(), ["bbbb2222"]);
+    answer_delete(&mut app).await;
+
+    let ids: Vec<&str> = app.sessions.iter().map(|row| &*row.id).collect();
+    assert_eq!(ids, ["aaaa1111", "cccc3333"]);
+    let sheet = &app.sheet.as_ref().expect("the sheet is still open").sheet;
+    assert_eq!(sheet.filter(), "b", "the filter stays");
+    assert!(
+        shown_names(&app).is_empty(),
+        "the filter is on, and no row left matches it: {:?}",
+        shown_names(&app)
+    );
+}
+
+/// Deleting the last row of the list leaves the selection on the new last row.
+#[tokio::test]
+async fn session_delete_the_last_row_leaves_the_selection_on_the_new_last_row() {
+    let rows = vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+        session_row("cccc3333", "gamma", false, false),
+    ];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+    for _ in 0..2 {
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    }
+
+    press_ctrl_d(&mut app);
+    assert_eq!(confirm_text(&app), Some("ctrl+d again deletes \"gamma\""));
+    press_ctrl_d(&mut app);
+    assert_eq!(host.deleted(), ["cccc3333"]);
+    answer_delete(&mut app).await;
+
+    let ids: Vec<&str> = app.sessions.iter().map(|row| &*row.id).collect();
+    assert_eq!(ids, ["aaaa1111", "bbbb2222"]);
+    let sheet = &app.sheet.as_ref().expect("the sheet is still open").sheet;
+    let (index, row) = sheet.selected().expect("a selected row");
+    assert_eq!((index, &*row.name), (1, "beta"), "the new last row");
+}
+
+/// A sheet closed before the answer still lets the session leave the list.
+#[tokio::test]
+async fn session_delete_after_the_sheet_is_closed_still_leaves_the_list() {
+    let rows = vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+        session_row("cccc3333", "gamma", false, false),
+    ];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+    app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    press_ctrl_d(&mut app);
+    press_ctrl_d(&mut app);
+    assert_eq!(host.deleted(), ["bbbb2222"]);
+
+    app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.sheet.is_none(), "Esc closed the sheet");
+    answer_delete(&mut app).await;
+
+    let ids: Vec<&str> = app.sessions.iter().map(|row| &*row.id).collect();
+    assert_eq!(ids, ["aaaa1111", "cccc3333"], "the row goes from the list");
+    assert_eq!(note_rows(&app), ["deleted \"beta\""]);
+}
+
+/// A Ctrl+D while a delete is in flight does nothing: the host is asked once.
+#[test]
+fn session_delete_while_one_is_in_flight_does_nothing() {
+    let rows = vec![
+        session_row("aaaa1111", "alpha", false, false),
+        session_row("bbbb2222", "beta", false, false),
+    ];
+    let (mut app, host) = sessions_sheet_on(FakeHost::new(), rows);
+    press_ctrl_d(&mut app);
+    press_ctrl_d(&mut app);
+    assert_eq!(host.deleted(), ["aaaa1111"]);
+
+    press_ctrl_d(&mut app);
+
+    assert_eq!(
+        host.deleted(),
+        ["aaaa1111"],
+        "the delete in flight is the one that runs"
+    );
+    assert!(app.waits.delete.is_some(), "it is still in flight");
+    assert_eq!(
+        confirm_text(&app),
+        None,
+        "no row is armed for a later press"
+    );
 }
 
 /// Enter on another session asks the host for its worker, and the app ends its
@@ -5194,13 +7078,13 @@ fn readline_move_the_mark_through_the_leader() {
 #[test]
 fn readline_arg_quoted_insert_takes_a_tab_and_a_newline() {
     let mut app = bare();
-    app.key(chord('v', KeyModifiers::CONTROL));
+    app.key(chord('q', KeyModifiers::CONTROL));
     app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     assert_eq!(box_text(&app), "\t|", "a quoted Tab is a tab");
     app.key(chord('q', KeyModifiers::CONTROL));
     app.key(chord('j', KeyModifiers::CONTROL));
     assert_eq!(box_text(&app), "\t\n|", "a quoted Ctrl+J is a line break");
-    app.key(chord('v', KeyModifiers::CONTROL));
+    app.key(chord('q', KeyModifiers::CONTROL));
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(box_text(&app), "\t\n\n|", "a quoted Enter is a line break");
 }
@@ -5217,6 +7101,26 @@ fn readline_kill_the_keys_kill_and_yank() {
     assert_eq!(box_text(&app), "one two |", "Alt+Backspace kills a word");
     app.key(chord('a', KeyModifiers::CONTROL));
     assert_eq!(box_text(&app), "|one two ", "Ctrl+A takes the start");
+}
+
+#[test]
+fn readline_kill_burst_alt_backspace_keys_speed_up_through_the_app() {
+    let mut app = bare();
+    type_keys(&mut app, "a b c d e f g h i j k l");
+    for _ in 0..9 {
+        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+    }
+    assert_eq!(
+        box_text(&app).replace('|', "").split_whitespace().count(),
+        2,
+        "eight presses kill a word each and the ninth two"
+    );
+    app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+    assert_eq!(
+        box_text(&app).replace('|', "").trim(),
+        "",
+        "the tenth press may kill four words and two are left"
+    );
 }
 
 #[test]
@@ -5299,6 +7203,18 @@ fn readline_history_ctrl_p_and_ctrl_n_walk_the_sent_messages() {
     assert_eq!(box_text(&app), "git status|");
     app.key(chord('n', KeyModifiers::CONTROL));
     assert_eq!(box_text(&app), "wip|", "Ctrl+N gives the draft back");
+}
+
+#[test]
+fn drawn_row_keys_wrap_at_the_columns_the_box_draws() {
+    let mut app = bare();
+    let columns = usize::from(app.editor_columns());
+    let last_row = columns - 5;
+    app.editor.insert(&"a".repeat(columns + last_row));
+    app.key(chord('p', KeyModifiers::CONTROL));
+    assert_eq!(app.editor.cursor(), last_row, "the column stays");
+    app.key(chord('n', KeyModifiers::CONTROL));
+    assert_eq!(app.editor.cursor(), columns + last_row);
 }
 
 #[test]
@@ -5649,5 +7565,2131 @@ fn compact_command_with_nothing_to_compact_notes_it() {
     assert!(
         rows.iter().any(|row| row.starts_with("nothing to compact")),
         "the note is the session's own words: {rows:?}"
+    );
+}
+
+/// A reply replayed from the journal's history reaches the ring with the text
+/// the journal wrote, so a copy of its rows reads that back.
+#[test]
+fn a_resume_keeps_block_source() {
+    let mut app = bare();
+    let mut tail = super::Tail {
+        messages: std::collections::VecDeque::from([Message::assistant(AssistantMessage::new(
+            "fake",
+            "fake-model",
+            vec![Content::Text {
+                text: Text::from("# Title\n\nSome **bold** text."),
+            }],
+        ))]),
+        checkpoints: Vec::new(),
+        calls: Vec::new(),
+        omitted: 0,
+        pictures: Vec::new(),
+    };
+    app.history(&mut tail);
+    app.paint();
+    app.commit();
+    let transcript = app.screen.transcript();
+    let mut sources: Vec<&str> = Vec::new();
+    for line in 0..transcript.ring_len() as u64 {
+        if let Some(origin) = transcript.source_at(line) {
+            let text = transcript.source_text(&origin);
+            if sources.last() != Some(&text) {
+                sources.push(text);
+            }
+        }
+    }
+    assert_eq!(
+        sources,
+        ["# Title\n", "Some **bold** text."],
+        "the replayed reply keeps the source of its blocks"
+    );
+}
+
+/// Drags from the cell at `from` to the cell at `to`, releases there, and
+/// answers the text of the OSC 52 sequence the release writes.
+async fn drag_copy(harness: &Harness, from: (u16, u16), to: (u16, u16)) -> String {
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), from.0, from.1);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), to.0, to.1);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), to.0, to.1);
+    let start = tokio::time::Instant::now();
+    while !raw(&harness.bytes).contains("\u{1b}]52;c;") {
+        assert!(
+            start.elapsed() < WAIT,
+            "waited {WAIT:?} for the copy of the selection"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    copied(&raw(&harness.bytes))
+}
+
+/// One row of a `columns` wide screen as a drag of the transcript copies it as
+/// other text: the blank margin at each side left out, and no trailing spaces.
+fn row_text(screen: &str, row: u16, columns: u16) -> String {
+    let line = screen.lines().nth(usize::from(row)).unwrap_or_default();
+    let cut: String = line
+        .chars()
+        .skip(2)
+        .take(usize::from(columns).saturating_sub(2))
+        .collect();
+    cut.trim_end().to_string()
+}
+
+/// The reply of the copy tests, one block of every kind.
+const COPY_REPLY: &str = "# Title\n\nSome **bold** text.\n\n- one\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```rust\nfn main() {}\n```\n";
+
+/// A drag that covers the whole of a reply copies the source the reply wrote,
+/// without the line break the text ends with.
+#[tokio::test]
+async fn copy_source_of_a_whole_reply() {
+    let harness = Harness::sized(full(), Fake::start("sess-copy-source", 0), (100, ROWS));
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness
+        .fake
+        .event(json!({ "type": "text_delta", "text": COPY_REPLY }));
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    wait_text(&harness.bytes, "fn main() {}").await;
+
+    let screen = text(&harness.bytes);
+    let (first, _) = cell_of(&screen, "Title");
+    let (code, _) = cell_of(&screen, "fn main() {}");
+    assert!(
+        screen
+            .lines()
+            .nth(usize::from(code) + 1)
+            .is_some_and(|row| row.trim().is_empty()),
+        "the fill row under the code is the block's last row:\n{screen}"
+    );
+    let copied = drag_copy(&harness, (0, first), (90, code + 1)).await;
+    assert_eq!(
+        copied,
+        COPY_REPLY
+            .strip_suffix('\n')
+            .expect("the reply ends with it"),
+        "the copy is the reply's source, its blank lines and all"
+    );
+}
+
+/// A drag from the middle of one block into the next touches two blocks: the
+/// copy is the source of both.
+#[tokio::test]
+async fn copy_source_of_two_blocks_started_midway() {
+    let harness = Harness::sized(full(), Fake::start("sess-copy-mid", 0), (100, ROWS));
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness.fake.event(
+        json!({ "type": "text_delta", "text": "first **paragraph** words\n\nsecond paragraph words\n\nzqxend\n" }),
+    );
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    wait_text(&harness.bytes, "zqxend").await;
+    let screen = text(&harness.bytes);
+    let (top, from) = cell_of(&screen, "paragraph words");
+    let (bottom, to) = cell_of(&screen, "second");
+    let copied = drag_copy(&harness, (from, top), (to + 2, bottom)).await;
+    assert_eq!(
+        copied,
+        "first **paragraph** words\n\nsecond paragraph words"
+    );
+}
+
+/// A block taller than the view shows only its last rows: a drag over them is a
+/// part of it, so the copy leaves out what the view does not show.
+#[tokio::test]
+async fn copy_source_of_a_block_cut_by_the_view_is_its_shown_words() {
+    let harness = Harness::sized(full(), Fake::start("sess-copy-cut", 0), (100, ROWS));
+    wait_text(&harness.bytes, "idle").await;
+    let words: Vec<String> = (0..900).map(|n| format!("word{n}")).collect();
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness
+        .fake
+        .event(json!({ "type": "text_delta", "text": format!("{}\n", words.join(" ")) }));
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    wait_text(&harness.bytes, "word899").await;
+    let screen = text(&harness.bytes);
+    let (bottom, to) = cell_of(&screen, "word899");
+    let copied = drag_copy(&harness, (0, 2), (to + 8, bottom)).await;
+    assert!(copied.ends_with("word899"), "the last word: {copied}");
+    assert!(
+        !copied.contains("word0 "),
+        "no word above the view: {copied}"
+    );
+}
+
+/// Two replies with a tool card between them: each block comes back as its
+/// source, and the card's rows as the screen draws them.
+#[tokio::test]
+async fn copy_source_joins_replies_across_a_tool_card() {
+    let harness = Harness::start(full(), Fake::start("sess-copy-card", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness
+        .fake
+        .event(json!({ "type": "text_delta", "text": "first reply" }));
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness
+        .fake
+        .event(json!({ "type": "tool_start", "id": "call-1", "name": "write" }));
+    harness.fake.event(json!({
+        "type": "tool_call_ready",
+        "id": "call-1",
+        "name": "write",
+        "arguments": json!({ "path": "src/paint.rs", "content": "one\ntwo" }).to_string(),
+    }));
+    harness.fake.event(json!({
+        "type": "tool_result",
+        "id": "call-1",
+        "is_error": false,
+        "bytes": 2,
+        "output": "one\ntwo\n",
+        "earlier": 0,
+    }));
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness
+        .fake
+        .event(json!({ "type": "text_delta", "text": "second reply" }));
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    harness
+        .fake
+        .event(json!({ "type": "run_end", "reason": "end_turn" }));
+    wait_text(&harness.bytes, "second reply").await;
+
+    let screen = text(&harness.bytes);
+    let (first, _) = cell_of(&screen, "first reply");
+    let (second, _) = cell_of(&screen, "second reply");
+    assert!(
+        second > first + 1,
+        "the card's rows are between them:\n{screen}"
+    );
+    let between: Vec<String> = (first + 1..second)
+        .map(|row| row_text(&screen, row, COLUMNS))
+        .collect();
+    let copied = drag_copy(&harness, (0, first), (90, second)).await;
+    assert_eq!(
+        copied,
+        format!("first reply\n{}\nsecond reply", between.join("\n")),
+        "the two sources are the reply's, and the card is the screen's"
+    );
+    assert_eq!(
+        copied.matches("reply").count(),
+        2,
+        "no row of a block comes back twice: {copied:?}"
+    );
+}
+
+/// A drag inside one paragraph copies its words: the rows the wrap made of it
+/// join with one space, and the margin is left out.
+#[tokio::test]
+async fn copy_source_of_the_words_of_a_wrapped_paragraph() {
+    let harness = Harness::sized(full(), Fake::start("sess-copy-words", 0), (60, ROWS));
+    wait_text(&harness.bytes, "idle").await;
+    let reply = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima \
+                 mike november oscar papa quebec romeo sierra tango uniform victor whiskey";
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness
+        .fake
+        .event(json!({ "type": "text_delta", "text": reply }));
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    wait_text(&harness.bytes, "alpha bravo").await;
+
+    let screen = text(&harness.bytes);
+    let (first, _) = cell_of(&screen, "alpha bravo");
+    let (last, _) = cell_of(&screen, "whiskey");
+    assert!(
+        last >= first + 2,
+        "the paragraph wraps over rows:\n{screen}"
+    );
+    let rows: Vec<String> = (first..=last)
+        .map(|row| row_text(&screen, row, 60))
+        .collect();
+    // The drag starts at column 10 of the first row and ends at column 12 of
+    // the last, which are the chars 8 and 10 of the rows without their margin.
+    let head = rows[0].get(8..).unwrap_or_default().trim_end();
+    let tail: String = rows[rows.len() - 1].chars().take(11).collect();
+    let middle = rows[1..rows.len() - 1].join(" ");
+    let want = format!("{head} {middle} {}", tail.trim_end());
+    let copied = drag_copy(&harness, (10, first), (12, last)).await;
+    assert!(
+        !copied.contains('\n'),
+        "the rows of one paragraph join with a space: {copied:?}"
+    );
+    assert_eq!(copied, want, "the copy holds the words the drag covers");
+}
+
+/// A drag over the rows of one code block copies them as lines of code: the
+/// block's padding and its fence's tag are left out.
+#[tokio::test]
+async fn copy_source_keeps_the_lines_of_a_code_block() {
+    let harness = Harness::sized(full(), Fake::start("sess-copy-code", 0), (60, ROWS));
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness.fake.event(json!({
+        "type": "text_delta",
+        "text": "```rust\nfn one() {}\nfn two() {}\n```\n"
+    }));
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    wait_text(&harness.bytes, "fn two() {}").await;
+
+    let screen = text(&harness.bytes);
+    let (tag, _) = cell_of(&screen, "rust");
+    let (last, _) = cell_of(&screen, "fn two() {}");
+    let copied = drag_copy(&harness, (0, tag), (40, last)).await;
+    assert_eq!(
+        copied, "fn one() {}\nfn two() {}",
+        "the code rows keep their breaks, and the tag row and the padding go"
+    );
+}
+
+/// A block that is still streaming is in no block of the ring: a drag over it
+/// copies the rows the screen draws.
+#[tokio::test]
+async fn copy_source_of_an_open_block_is_its_screen_text() {
+    let harness = Harness::sized(full(), Fake::start("sess-copy-open", 0), (60, ROWS));
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness.fake.event(json!({
+        "type": "text_delta",
+        "text": "open words that the wrap lays out over more than one row of the screen"
+    }));
+    wait_text(&harness.bytes, "open words").await;
+
+    let screen = text(&harness.bytes);
+    let (first, _) = cell_of(&screen, "open words");
+    let (last, _) = cell_of(&screen, "screen");
+    let between: Vec<String> = (first..=last)
+        .map(|row| row_text(&screen, row, 60))
+        .collect();
+    let copied = drag_copy(&harness, (0, first), (40, last)).await;
+    assert_eq!(
+        copied,
+        between.join("\n"),
+        "an open block copies the screen's rows, line breaks and all"
+    );
+}
+
+/// A drag over blank rows copies nothing: no OSC 52 sequence and no local
+/// clipboard.
+#[tokio::test]
+async fn copy_source_of_a_blank_selection_is_nothing() {
+    let harness = Harness::sized(full(), Fake::start("sess-copy-blank", 0), (60, ROWS));
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness
+        .fake
+        .event(json!({ "type": "text_delta", "text": "alpha bravo" }));
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    wait_text(&harness.bytes, "alpha bravo").await;
+
+    let screen = text(&harness.bytes);
+    let (line, _) = cell_of(&screen, "alpha bravo");
+    let blank = (line + 1..ROWS)
+        .find(|row| {
+            screen
+                .lines()
+                .nth(usize::from(*row))
+                .is_some_and(|text| text.trim().is_empty())
+        })
+        .expect("a blank row under the text");
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), 0, blank);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), 20, blank);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), 20, blank);
+    // A key the app takes after the release proves the release was handled.
+    harness.type_text("zz");
+    wait_text(&harness.bytes, "zz").await;
+    assert!(
+        !raw(&harness.bytes).contains("\u{1b}]52;c;"),
+        "a blank selection writes no sequence"
+    );
+}
+
+/// A reply that streams a block at a time keeps one entry of each block's
+/// source, however many frames the text arrives over.
+#[test]
+fn block_source_of_a_streamed_reply_has_one_entry_per_block() {
+    let mut app = bare();
+    for delta in [
+        "# Title\n\n",
+        "Some **bold** text.\n\n",
+        "```rust\nfn main() {}\n```\n",
+    ] {
+        app.text(delta);
+        app.paint();
+        app.commit();
+    }
+    app.freeze_all();
+    app.commit();
+    // The source of a block reads back by the lines it took, and the entries
+    // start where a block does.
+    let transcript = app.screen.transcript();
+    let mut starts: Vec<(u64, String)> = Vec::new();
+    for line in 0..transcript.ring_len() as u64 {
+        let Some(origin) = transcript.source_at(line) else {
+            continue;
+        };
+        if starts.last().is_none_or(|(start, _)| *start != origin.line) {
+            starts.push((origin.line, transcript.source_text(&origin).to_string()));
+        }
+    }
+    assert_eq!(
+        starts,
+        vec![
+            (0, "# Title\n".to_string()),
+            (2, "Some **bold** text.\n".to_string()),
+            (4, "```rust\nfn main() {}\n```".to_string()),
+        ],
+        "one entry per block, at the line it starts on"
+    );
+}
+
+/// A reply of a two-line list on the screen of a harness.
+async fn copy_note_harness(reply: &str, mark: &str) -> Harness {
+    let harness = Harness::sized(full(), Fake::start("sess-copy-note", 0), (100, ROWS));
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness
+        .fake
+        .event(json!({ "type": "text_delta", "text": reply }));
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    wait_text(&harness.bytes, mark).await;
+    harness
+}
+
+#[tokio::test]
+async fn copy_note_counts_the_lines_and_leaves_after_its_time() {
+    let harness = copy_note_harness("- zqxone\n- zqxtwo\n", "zqxtwo").await;
+    let screen = text(&harness.bytes);
+    let (first, _) = cell_of(&screen, "zqxone");
+    let (second, _) = cell_of(&screen, "zqxtwo");
+    let copied = drag_copy(&harness, (0, first), (90, second)).await;
+    assert_eq!(copied, "- zqxone\n- zqxtwo");
+    wait_text(&harness.bytes, "2 lines copied").await;
+    wait_gone(&harness.bytes, "2 lines copied").await;
+}
+
+#[tokio::test]
+async fn copy_note_of_one_line_says_line() {
+    let harness = copy_note_harness("zqxone two three\n", "zqxone").await;
+    let (row, column) = cell_of(&text(&harness.bytes), "zqxone");
+    let copied = drag_copy(&harness, (column, row), (column + 5, row)).await;
+    assert_eq!(copied, "zqxone");
+    wait_text(&harness.bytes, "1 line copied").await;
+}
+
+#[test]
+fn copy_note_of_no_text_is_nothing() {
+    let mut app = App::new(&Initialized::default(), (COLUMNS, ROWS), true);
+    let shown = painted(&mut app);
+    let (row, _) = cell_of(&shown, "idle");
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+    ] {
+        app.mouse(MouseEvent {
+            kind,
+            column: 2,
+            row: row.saturating_sub(12),
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+    app.mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: 40,
+        row: row.saturating_sub(10),
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(!painted(&mut app).contains("copied"));
+}
+
+#[test]
+fn copy_note_past_its_time_arms_no_wakeup() {
+    let mut app = App::new(&Initialized::default(), (COLUMNS, ROWS), true);
+    app.copied = 2;
+    app.copied_until = Some(std::time::Instant::now() - Duration::from_secs(1));
+    app.deadline = None;
+    assert!(!painted(&mut app).contains("copied"), "the time ended");
+    assert_eq!(app.copied_until, None);
+    assert_eq!(app.deadline, None, "an idle app arms no wakeup");
+}
+
+/// In text of two lines Ctrl+P moves the cursor up a line and keeps the text.
+#[tokio::test]
+async fn ctrl_p_moves_a_line_of_two_lines_of_text() {
+    let mut harness = Harness::new_session(Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.type_text("aa");
+    harness.send(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+    harness.type_text("bb");
+    harness.send(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    harness.type_text("X");
+    harness.press(KeyCode::Enter);
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, "aaX\nbb");
+}
+
+/// A PNG's first bytes: the app copies them and never reads them.
+const IMAGE_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// A session folder for the image pastes of a test.
+fn image_folder() -> tempfile::TempDir {
+    tempfile::tempdir().expect("a temp folder")
+}
+
+/// The permission bits of the file at `path`.
+async fn image_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = tokio::fs::metadata(path)
+        .await
+        .expect("the file")
+        .permissions()
+        .mode();
+    mode & 0o777
+}
+
+/// Drives one image job of `app` to its answer, as the loop's arm does.
+async fn image_job(app: &mut App) -> (super::ImageRequest, Result<Option<super::Pasted>, String>) {
+    let handle = app.image_job.take().expect("an image job");
+    let result = handle.handle.await.expect("the job runs to its answer");
+    (handle.request, result)
+}
+
+#[test]
+fn image_paste_path_takes_a_plain_path() {
+    assert_eq!(
+        super::image_path("/p/shot.png"),
+        Some(PathBuf::from("/p/shot.png"))
+    );
+}
+
+#[test]
+fn image_paste_path_takes_a_single_quoted_path() {
+    assert_eq!(
+        super::image_path("'/p/my shot.png'"),
+        Some(PathBuf::from("/p/my shot.png"))
+    );
+}
+
+#[test]
+fn image_paste_path_takes_a_double_quoted_path() {
+    assert_eq!(
+        super::image_path("\"/p/my shot.png\""),
+        Some(PathBuf::from("/p/my shot.png"))
+    );
+}
+
+#[test]
+fn image_paste_path_takes_an_escaped_space() {
+    assert_eq!(
+        super::image_path("/p/my\\ shot.png"),
+        Some(PathBuf::from("/p/my shot.png"))
+    );
+}
+
+#[test]
+fn image_paste_path_expands_a_home_folder() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    assert_eq!(
+        super::image_path("~/shot.jpeg"),
+        Some(PathBuf::from(home).join("shot.jpeg"))
+    );
+}
+
+#[test]
+fn image_paste_path_takes_an_upper_case_extension() {
+    assert_eq!(
+        super::image_path("/p/shot.PNG"),
+        Some(PathBuf::from("/p/shot.PNG")),
+        "the kind is checked whatever its case, and the path keeps it"
+    );
+}
+
+#[test]
+fn image_paste_path_ignores_a_trailing_newline_and_spaces() {
+    assert_eq!(
+        super::image_path("/p/shot.png\n"),
+        Some(PathBuf::from("/p/shot.png"))
+    );
+    assert_eq!(
+        super::image_path("  /p/shot.png  "),
+        Some(PathBuf::from("/p/shot.png"))
+    );
+}
+
+#[test]
+fn image_paste_path_refuses_two_paths() {
+    assert_eq!(super::image_path("/p/one.png /p/two.png"), None);
+    assert_eq!(super::image_path("/p/one.png\n/p/two.png"), None);
+}
+
+#[test]
+fn image_paste_path_refuses_a_relative_path() {
+    assert_eq!(super::image_path("p/shot.png"), None);
+    assert_eq!(super::image_path("./shot.png"), None);
+}
+
+#[test]
+fn image_paste_path_refuses_another_file_kind() {
+    assert_eq!(super::image_path("/a/b.txt"), None);
+}
+
+#[test]
+fn image_paste_path_refuses_a_quote_in_the_path() {
+    assert_eq!(super::image_path("/p/\"shot\".png"), None);
+}
+
+#[test]
+fn image_paste_shown_text_borrows_a_text_with_no_chip() {
+    for text in ["look at the test", "see @\"/p/other.png\"", ""] {
+        let shown = super::shown_user_text(text);
+        assert!(
+            matches!(shown, Cow::Borrowed(_)),
+            "no copy of {text:?}: {shown:?}"
+        );
+        assert_eq!(shown, text);
+    }
+}
+
+#[test]
+fn image_paste_shown_text_names_one_chip() {
+    assert_eq!(
+        super::shown_user_text("look @\"/s/pasted/image-1.png\""),
+        "look [Image #1]"
+    );
+    assert_eq!(
+        super::shown_user_text("look  @\"/s/pasted/image-1.png\""),
+        "look [Image #1]",
+        "a space already there keeps the chip's own out"
+    );
+}
+
+#[test]
+fn image_paste_shown_text_names_two_chips() {
+    assert_eq!(
+        super::shown_user_text("a @\"/s/pasted/image-1.png\" b @\"/s/pasted/image-2.png\""),
+        "a [Image #1] b [Image #2]"
+    );
+}
+
+#[test]
+fn image_paste_shown_text_names_a_chip_at_the_start() {
+    assert_eq!(
+        super::shown_user_text(" @\"/s/pasted/image-7.png\" now"),
+        "[Image #7] now"
+    );
+}
+
+/// The image the app wrote for a test: the path of its chip and the number.
+fn pasted(number: u32) -> super::Pasted {
+    super::Pasted {
+        path: format!("/s/pasted/image-{number}.png"),
+        number,
+    }
+}
+
+#[test]
+fn image_paste_of_an_ok_answer_puts_the_chip_in_the_box() {
+    let mut app = bare();
+    app.image_pasted(super::ImageRequest::clipboard(false), Ok(Some(pasted(1))));
+    assert_eq!(app.editor.pastes().len(), 1, "one chip");
+    assert_eq!(app.editor.pastes()[0].image(), Some(1), "numbered");
+    assert!(app.editor_dirty, "the box is measured again");
+    assert!(app.dirty, "and drawn");
+    assert!(app.pending.is_empty(), "and no note");
+    assert_eq!(
+        box_text(&app),
+        format!("{} |", crate::editor::MARK),
+        "the mark on screen"
+    );
+}
+
+#[test]
+fn image_paste_of_no_clipboard_image_is_a_note() {
+    let mut app = bare();
+    app.image_pasted(super::ImageRequest::clipboard(false), Ok(None));
+    assert_eq!(
+        note_rows(&app),
+        ["no image in the clipboard".to_owned()],
+        "the clipboard held no image"
+    );
+    assert!(app.editor.is_empty(), "and the box is as it was");
+}
+
+#[test]
+fn image_paste_of_an_empty_paste_says_nothing() {
+    let mut app = bare();
+    app.image_pasted(super::ImageRequest::clipboard(true), Ok(None));
+    assert!(app.pending.is_empty(), "an empty paste is silent");
+}
+
+#[test]
+fn image_paste_of_an_error_is_a_note() {
+    let mut app = bare();
+    app.image_pasted(
+        super::ImageRequest::clipboard(false),
+        Err("the clipboard is not local".to_owned()),
+    );
+    assert_eq!(
+        note_rows(&app),
+        ["image: the clipboard is not local".to_owned()],
+        "the error names the image"
+    );
+}
+
+#[test]
+fn image_paste_ctrl_v_asks_for_the_clipboard_image_and_ctrl_q_still_quotes() {
+    let mut app = bare();
+    app.key(chord('v', KeyModifiers::CONTROL));
+    assert_eq!(
+        note_rows(&app),
+        ["image: this session has no folder for images".to_owned()],
+        "Ctrl+V is the image paste now"
+    );
+    app.key(chord('q', KeyModifiers::CONTROL));
+    app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(box_text(&app), "\t|", "Ctrl+Q quotes the next key");
+}
+
+#[test]
+fn image_paste_of_ordinary_text_is_the_paste_it_was() {
+    let mut app = bare();
+    app.paste(" --all".to_owned());
+    assert_eq!(box_text(&app), " --all|", "the text lands in the box");
+    assert!(app.image_job.is_none(), "and no file is read");
+    assert!(app.pending.is_empty(), "and no note comes with it");
+}
+
+#[tokio::test]
+async fn image_paste_writes_the_file_it_copied_with_mode_0600() {
+    let folder = image_folder();
+    let mut app = bare();
+    app.journal = Some(folder.path().to_path_buf());
+    let source = folder.path().join("shot.png");
+    tokio::fs::write(&source, IMAGE_BYTES)
+        .await
+        .expect("the image file");
+
+    app.paste(source.display().to_string());
+    let (request, result) = image_job(&mut app).await;
+    app.image_pasted(request, result);
+    let first = folder.path().join("pasted/image-1.png");
+    assert_eq!(
+        tokio::fs::read(&first).await.expect("the first image"),
+        IMAGE_BYTES,
+        "the bytes went to the folder of the session"
+    );
+    assert_eq!(
+        image_mode(&first).await,
+        0o600,
+        "the file is the user's own"
+    );
+    assert_eq!(
+        app.editor.pastes().first().and_then(|chip| chip.image()),
+        Some(1),
+        "the chip is numbered one"
+    );
+    assert_eq!(
+        app.editor.take(),
+        format!(" @\"{}\" ", first.display()),
+        "and quotes the file it wrote"
+    );
+
+    app.paste(source.display().to_string());
+    let (request, result) = image_job(&mut app).await;
+    app.image_pasted(request, result);
+    let second = folder.path().join("pasted/image-2.png");
+    assert!(
+        tokio::fs::metadata(&second).await.is_ok(),
+        "the second image takes the next number"
+    );
+    assert_eq!(
+        image_mode(&second).await,
+        0o600,
+        "and is the user's own too"
+    );
+    assert_eq!(
+        app.editor.pastes().first().and_then(|chip| chip.image()),
+        Some(2),
+        "the second chip is numbered two"
+    );
+}
+
+#[tokio::test]
+async fn image_paste_of_a_missing_file_leaves_the_text_in_the_box() {
+    let folder = image_folder();
+    let mut app = bare();
+    app.journal = Some(folder.path().to_path_buf());
+    let text = folder.path().join("gone.png").display().to_string();
+
+    app.paste(text.clone());
+    let (request, result) = image_job(&mut app).await;
+    app.image_pasted(request, result);
+
+    assert_eq!(box_text(&app), format!("{text}|"), "the text is a paste");
+    assert!(app.editor.pastes().is_empty(), "with no chip");
+    assert!(app.pending.is_empty(), "and no note");
+}
+
+#[tokio::test]
+async fn image_paste_of_a_dropped_path_names_the_chip_on_the_screen() {
+    let folder = image_folder();
+    let source = folder.path().join("shot.png");
+    tokio::fs::write(&source, IMAGE_BYTES)
+        .await
+        .expect("the image file");
+    let mut options = options();
+    options.session_dir = Some(folder.path().to_path_buf());
+    let mut harness = Harness::start(options, Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+
+    harness.paste(&source.display().to_string());
+
+    wait_text(&harness.bytes, "[Image #1]").await;
+    let written = folder.path().join("pasted/image-1.png");
+    assert!(
+        tokio::fs::metadata(&written).await.is_ok(),
+        "the paste wrote the file the chip names"
+    );
+
+    harness.press(KeyCode::Enter);
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(
+        sent,
+        format!(" @\"{}\" ", written.display()),
+        "the message holds the word the worker reads"
+    );
+}
+
+/// A user message that names a chip draws its label on the row, and the message
+/// the worker gets keeps the word.
+#[test]
+fn image_paste_user_message_row_shows_the_label() {
+    let mut app = bare();
+    let text = app.user_message(&[Content::Text {
+        text: "see @\"/s/pasted/image-3.png\"".into(),
+    }]);
+    assert_eq!(
+        text, "see @\"/s/pasted/image-3.png\"",
+        "the message keeps the word the worker reads"
+    );
+    match app.pending.first() {
+        Some(super::Item::User { text }) => assert_eq!(text.as_ref(), "see [Image #3]"),
+        other => panic!("a user row: {other:?}"),
+    }
+}
+
+/// A steer that names a chip draws its label on the row above the box.
+#[test]
+fn image_paste_steer_row_shows_the_label() {
+    let mut app = bare();
+    app.steer_row("go @\"/s/pasted/image-2.png\"", false);
+    match app.live.first() {
+        Some(super::Item::Steer { text, .. }) => assert_eq!(text.as_ref(), "go [Image #2]"),
+        other => panic!("a steer row: {other:?}"),
+    }
+}
+
+#[test]
+fn image_paste_path_takes_an_escaped_bracket() {
+    assert_eq!(
+        super::image_path("/p/shot\\ \\(1\\).png"),
+        Some(std::path::PathBuf::from("/p/shot (1).png"))
+    );
+}
+
+#[test]
+fn image_paste_an_empty_paste_says_nothing_on_a_clipboard_error() {
+    let mut app = bare();
+    app.image_pasted(
+        super::ImageRequest::clipboard(true),
+        Err("the clipboard is not local".to_owned()),
+    );
+    assert!(note_rows(&app).is_empty());
+}
+
+/// The path of a keys file holding `text`, with the folder that holds it.
+async fn keys_file(text: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("a folder for the keys file");
+    let path = dir.path().join("keys.toml");
+    tokio::fs::write(&path, text)
+        .await
+        .expect("the keys file is written");
+    (dir, path)
+}
+
+/// Whether no send arrives within a while, which is how a test says a key no
+/// longer sends.
+async fn no_send(harness: &mut Harness) -> bool {
+    timeout(Duration::from_millis(300), harness.fake.expect_send())
+        .await
+        .is_err()
+}
+
+/// Enter no longer sends, and Ctrl+S does.
+#[tokio::test]
+async fn custom_keys_send_moves_and_enter_stops() {
+    // Ctrl+S is the search's own key, so the file moves that one too.
+    let (_dir, path) = keys_file("[keys]\nsend = \"ctrl+s\"\nsearch-forward = \"alt+s\"\n").await;
+    let mut harness = Harness::start(
+        Options {
+            keys: Some(path),
+            ..options()
+        },
+        Fake::start("sess-keys", 0),
+    );
+    wait_text(&harness.bytes, "idle").await;
+    harness.type_text("hi");
+    harness.press(KeyCode::Enter);
+    assert!(no_send(&mut harness).await, "Enter sent");
+    harness.send(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, "hi", "Ctrl+S sent the box Enter left alone");
+}
+
+/// Ctrl+G with Control held, as a terminal reports it.
+fn ctrl_g() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)
+}
+
+/// Ctrl+G closes a sheet as Esc does: the next text goes to the box.
+#[tokio::test]
+async fn ctrl_g_closes_a_sheet() {
+    let mut harness = Harness::start(options(), Fake::start("sess-g", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.press(KeyCode::Char('?'));
+    wait_text(&harness.bytes, "send or steer").await;
+    harness.send(ctrl_g());
+    harness.type_text("hi");
+    harness.press(KeyCode::Enter);
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, "hi", "the sheet closed and the box took the text");
+}
+
+/// Ctrl+G closes the leader as Esc does: the next key is no leader key.
+#[tokio::test]
+async fn ctrl_g_closes_the_leader() {
+    let mut harness = Harness::start(options(), Fake::start("sess-g", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.send(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    harness.send(ctrl_g());
+    harness.type_text("m");
+    harness.press(KeyCode::Enter);
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, "m", "m is text and opened no model sheet");
+}
+
+/// Ctrl+G refuses the approval card as Esc does.
+#[tokio::test]
+async fn ctrl_g_refuses_the_card() {
+    let harness = Harness::start(options(), Fake::start("sess-g", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.notify(
+        "approval_request",
+        &json!({
+            "id": 5,
+            "tool": "Bash",
+            "call": "cargo test --all",
+            "rule": "default",
+        }),
+    );
+    wait_text(&harness.bytes, "Allow once").await;
+    armed().await;
+    harness.send(ctrl_g());
+    wait_text(&harness.bytes, "denied").await;
+}
+
+/// In a history search Ctrl+G gives the draft back, and Esc would keep the match.
+#[tokio::test]
+async fn ctrl_g_gives_the_draft_back_in_a_search() {
+    let mut harness = Harness::start(options(), Fake::start("sess-g", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.type_text("first");
+    harness.press(KeyCode::Enter);
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, "first");
+    harness.type_text("draft");
+    harness.send(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    harness.type_text("fir");
+    wait_text(&harness.bytes, "reverse-i-search").await;
+    harness.send(ctrl_g());
+    harness.press(KeyCode::Enter);
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, "draft", "the search gave the draft back");
+}
+
+/// A keys file that gives Ctrl+G another job wins, and the moved search key
+/// cancels as Ctrl+G did.
+#[tokio::test]
+async fn ctrl_g_keys_file_job_wins() {
+    let (_dir, path) = keys_file("[keys]\nsend = \"ctrl+g\"\nabort-search = \"alt+g\"\n").await;
+    let mut harness = Harness::start(
+        Options {
+            keys: Some(path),
+            ..options()
+        },
+        Fake::start("sess-g", 0),
+    );
+    wait_text(&harness.bytes, "idle").await;
+    harness.press(KeyCode::Char('?'));
+    wait_text(&harness.bytes, "send or steer").await;
+    harness.send(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT));
+    harness.type_text("hi");
+    harness.send(ctrl_g());
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, "hi", "Ctrl+G sends under this file");
+}
+
+/// The queue moves off Tab, and Tab still folds the block under the box.
+#[tokio::test]
+async fn custom_keys_tab_folds_while_the_queue_moved() {
+    let (_dir, path) = keys_file("[keys]\nqueue = \"alt+enter\"\n").await;
+    let mut harness = Harness::start(
+        Options {
+            keys: Some(path),
+            ..options()
+        },
+        Fake::start("sess-keys", 0),
+    );
+    wait_text(&harness.bytes, "idle").await;
+    let pasted: String = (1..=142)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    harness.paste(&pasted);
+    wait_text(&harness.bytes, "≡ line 1").await;
+    // Tab is the fold's key as much as the queue's, and the fold still has it.
+    harness.press(KeyCode::Tab);
+    wait_gone(&harness.bytes, "≡ line 1").await;
+    wait_text(&harness.bytes, "line 2").await;
+    harness.press(KeyCode::Tab);
+    wait_text(&harness.bytes, "≡ line 1").await;
+    // The queue key the file names queues a message behind the run.
+    harness.type_text("hi");
+    harness.send(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+    let (sent, mode) = harness.fake.expect_send().await;
+    assert_eq!(mode, Mode::Queue, "the key still queues");
+    assert!(
+        sent.starts_with("hi") && sent.contains("line 142"),
+        "the box and the paste are both in the message"
+    );
+}
+
+/// The card's once answer moves to o, and y answers nothing.
+#[tokio::test]
+async fn custom_keys_card_once_moves_and_y_stops() {
+    let (_dir, path) = keys_file("[card]\nonce = \"o\"\n").await;
+    let mut harness = Harness::start(
+        Options {
+            keys: Some(path),
+            ..options()
+        },
+        Fake::start("sess-keys", 0),
+    );
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.notify(
+        "approval_request",
+        &json!({
+            "id": 5,
+            "tool": "Bash",
+            "call": "cargo test --all",
+            "rule": "default",
+        }),
+    );
+    wait_text(&harness.bytes, "Allow once").await;
+    armed().await;
+    harness.press(KeyCode::Char('y'));
+    assert!(
+        timeout(Duration::from_millis(300), harness.fake.expect_approve())
+            .await
+            .is_err(),
+        "y answered the card"
+    );
+    assert!(
+        text(&harness.bytes).contains("Allow once"),
+        "the card is still up"
+    );
+    harness.press(KeyCode::Char('o'));
+    let (id, answer, reason) = harness.fake.expect_approve().await;
+    assert_eq!((id, answer, reason), (5, AnswerKind::Once, None));
+    wait_gone(&harness.bytes, "Allow once").await;
+}
+
+/// The sheet's pick moves to Ctrl+O, and Enter still sends with no sheet open.
+#[tokio::test]
+async fn custom_keys_sheet_pick_moves() {
+    let state = tempfile::tempdir().expect("a state folder");
+    let mut second = Fake::start("other", 0);
+    let host = FakeHost::new().with_open(Ok(Opened {
+        socket: second.socket.clone(),
+        token: TOKEN.to_owned(),
+        session_dir: None,
+    }));
+    let (_dir, path) = keys_file("[sheet]\npick = \"ctrl+o\"\n").await;
+    let mut options = with_other_session(state.path(), host);
+    options.keys = Some(path);
+    let harness = Harness::start(options, Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    open_the_other_session(&harness).await;
+    harness.send(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    assert_eq!(second.expect_method().await, "initialize");
+    assert_eq!(second.expect_method().await, "attach");
+    // A switch of its own, and Enter sends in the session it opened.
+    harness.type_text("hi");
+    harness.press(KeyCode::Enter);
+    let (sent, _) = second.expect_send().await;
+    assert_eq!(sent, "hi", "Enter still sends with no sheet open");
+}
+
+/// A quoted insert takes the key the file moved as the raw character.
+#[tokio::test]
+async fn custom_keys_quoted_insert_takes_the_raw_key() {
+    let (_dir, path) = keys_file("[keys]\nsend = \"ctrl+s\"\nsearch-forward = \"alt+s\"\n").await;
+    let mut harness = Harness::start(
+        Options {
+            keys: Some(path),
+            ..options()
+        },
+        Fake::start("sess-keys", 0),
+    );
+    wait_text(&harness.bytes, "idle").await;
+    harness.type_text("a");
+    // Ctrl+Q then Ctrl+S: the quote takes the key as it is, so nothing sends.
+    harness.send(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+    harness.send(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert!(no_send(&mut harness).await, "the quoted key sent");
+    // The unquoted key sends the box with the character the quote put in it.
+    harness.send(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, "a\u{13}", "the quoted key went in the box");
+}
+
+/// The table a session read is the one the session it switches to reads.
+#[tokio::test]
+async fn custom_keys_survive_a_session_switch() {
+    let state = tempfile::tempdir().expect("a state folder");
+    let mut second = Fake::start("other", 0);
+    let host = FakeHost::new().with_open(Ok(Opened {
+        socket: second.socket.clone(),
+        token: TOKEN.to_owned(),
+        session_dir: None,
+    }));
+    let (_dir, path) = keys_file("[keys]\nsend = \"ctrl+s\"\nsearch-forward = \"alt+s\"\n").await;
+    let mut options = with_other_session(state.path(), host);
+    options.keys = Some(path);
+    let harness = Harness::start(options, Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    open_the_other_session(&harness).await;
+    harness.press(KeyCode::Enter);
+    assert_eq!(second.expect_method().await, "initialize");
+    assert_eq!(second.expect_method().await, "attach");
+    // The key the file moved still sends, and Enter still does not.
+    harness.type_text("hi");
+    harness.press(KeyCode::Enter);
+    harness.send(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    let (sent, _) = second.expect_send().await;
+    assert_eq!(sent, "hi", "the switched session reads the same table");
+}
+
+/// The list of the keys after the leader keeps the file's keys after a switch.
+#[tokio::test]
+async fn custom_keys_which_key_list_survives_a_session_switch() {
+    let state = tempfile::tempdir().expect("a state folder");
+    let mut second = Fake::start("other", 0);
+    let host = FakeHost::new().with_open(Ok(Opened {
+        socket: second.socket.clone(),
+        token: TOKEN.to_owned(),
+        session_dir: None,
+    }));
+    let (_dir, path) = keys_file("[leader]\nmodel = \"q\"\n").await;
+    let mut options = with_other_session(state.path(), host);
+    options.keys = Some(path);
+    let harness = Harness::start(options, Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    open_the_other_session(&harness).await;
+    harness.press(KeyCode::Enter);
+    assert_eq!(second.expect_method().await, "initialize");
+    assert_eq!(second.expect_method().await, "attach");
+    harness.send(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    wait_text(&harness.bytes, "q model").await;
+}
+
+/// No file is no table: the keys are the ones the app always had, and no note
+/// says otherwise.
+#[tokio::test]
+async fn custom_keys_no_file_behaves_as_before() {
+    let mut harness = Harness::new_session(Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.type_text("hi");
+    harness.press(KeyCode::Enter);
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, "hi", "Enter sends");
+    let screen = text(&harness.bytes);
+    assert!(!screen.contains("keys:"), "no note:\n{screen}");
+}
+
+/// A line that names no action is one note, and the keys the app had stay.
+#[tokio::test]
+async fn custom_keys_a_bad_line_gives_one_note() {
+    let (_dir, path) = keys_file("[keys]\nsnd = \"ctrl+s\"\n").await;
+    let mut harness = Harness::start(
+        Options {
+            keys: Some(path),
+            ..options()
+        },
+        Fake::start("sess-keys", 0),
+    );
+    wait_text(&harness.bytes, "idle").await;
+    wait_text(&harness.bytes, "line 2").await;
+    let screen = text(&harness.bytes);
+    assert_eq!(screen.matches("line 2").count(), 1, "one note:\n{screen}");
+    assert!(screen.contains("keys:"), "the note says keys:\n{screen}");
+    // The action the line got wrong keeps its own key.
+    harness.type_text("hi");
+    harness.press(KeyCode::Enter);
+    let (sent, _) = harness.fake.expect_send().await;
+    assert_eq!(sent, "hi");
+}
+
+/// The words a frame draws, as the key table names them: what every frame shows
+/// with no keys file read.
+#[test]
+fn keys_in_force_no_file_keeps_every_word() {
+    let mut app = bare();
+    assert!(app.labels().is_none(), "no file, no words of one");
+    app.open_commands();
+    app.paint();
+    let screen = screen_text(&app);
+    let model = screen
+        .lines()
+        .find(|line| line.contains("/model"))
+        .expect("the model row");
+    assert!(model.ends_with("ctrl+x m"), "the model key: {model:?}");
+    assert!(
+        screen.contains(
+            "\u{2191}\u{2193} choose \u{b7} tab completes \u{b7} enter runs \u{b7} esc closes"
+        ),
+        "the `/` list footer:\n{screen}"
+    );
+
+    let mut app = bare();
+    app.models = Some(two_models());
+    app.open_models();
+    assert_eq!(
+        app.sheet.as_ref().expect("the model sheet").sheet.footer,
+        "\u{2191}\u{2193} choose \u{b7} enter switches the next turn \u{b7} esc back to your draft"
+    );
+
+    let rows = vec![session_row("aaaa1111", "alpha", false, false)];
+    let (mut app, _host) = sessions_sheet_on(FakeHost::new(), rows);
+    let sheet = &app.sheet.as_ref().expect("the sessions sheet").sheet;
+    assert_eq!(sheet.hint, "enter opens");
+    assert_eq!(
+        sheet.footer,
+        "\u{2191}\u{2193} choose \u{b7} enter opens \u{b7} ctrl+d deletes \u{b7} esc back to your draft"
+    );
+    press_ctrl_d(&mut app);
+    assert_eq!(confirm_text(&app), Some("ctrl+d again deletes \"alpha\""));
+}
+
+/// A keys file that moves no key the words name leaves every one of them as the
+/// table prints it.
+#[test]
+fn keys_in_force_a_file_that_moves_nothing_keeps_every_word() {
+    let mut app = bare();
+    app.read_keys_text("[keys]\nsend = \"ctrl+s\"\n");
+    assert!(app.labels().is_some(), "the file printed its words");
+    app.open_commands();
+    app.paint();
+    let screen = screen_text(&app);
+    let model = screen
+        .lines()
+        .find(|line| line.contains("/model"))
+        .expect("the model row");
+    assert!(model.ends_with("ctrl+x m"), "the model key: {model:?}");
+    assert!(
+        screen.contains("enter runs \u{b7} esc closes"),
+        "the `/` list footer:\n{screen}"
+    );
+
+    let mut app = bare();
+    app.read_keys_text("[keys]\nsend = \"ctrl+s\"\n");
+    app.models = Some(two_models());
+    app.open_models();
+    assert_eq!(
+        app.sheet.as_ref().expect("the model sheet").sheet.footer,
+        "\u{2191}\u{2193} choose \u{b7} enter switches the next turn \u{b7} esc back to your draft"
+    );
+
+    let mut app = bare();
+    app.read_keys_text("[keys]\nsend = \"ctrl+s\"\n");
+    app.sessions = vec![session_row("aaaa1111", "alpha", false, false)];
+    app.set_sessions();
+    app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    app.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+    let sheet = &app.sheet.as_ref().expect("the sessions sheet").sheet;
+    assert_eq!(sheet.hint, "enter opens");
+    assert_eq!(
+        sheet.footer,
+        "\u{2191}\u{2193} choose \u{b7} enter opens \u{b7} ctrl+d deletes \u{b7} esc back to your draft"
+    );
+}
+
+/// A sheet's close moved to Ctrl+G is the key the model sheet's footer names.
+#[test]
+fn keys_in_force_sheet_close_moves_the_model_footer() {
+    let mut app = bare();
+    app.read_keys_text("[sheet]\nclose = \"ctrl+g\"\n");
+    app.models = Some(two_models());
+    app.open_models();
+    assert_eq!(
+        app.sheet.as_ref().expect("the model sheet").sheet.footer,
+        "\u{2191}\u{2193} choose \u{b7} enter switches the next turn \u{b7} ctrl+g back to your draft"
+    );
+}
+
+/// A list's close moved to Ctrl+G is the key the `/` list footer names.
+#[test]
+fn keys_in_force_list_close_moves_the_slash_footer() {
+    let mut app = bare();
+    app.read_keys_text("[list]\nclose = \"ctrl+g\"\n");
+    app.open_commands();
+    app.paint();
+    let screen = screen_text(&app);
+    assert!(screen.contains("ctrl+g closes"), "the footer:\n{screen}");
+    assert!(
+        !screen.contains("esc closes"),
+        "the key it left is gone:\n{screen}"
+    );
+}
+
+/// The leader moved to Alt+X is the first key the `/model` row names.
+#[test]
+fn keys_in_force_leader_moves_the_model_row_key() {
+    let mut app = bare();
+    app.read_keys_text("[keys]\nleader = \"alt+x\"\n");
+    app.open_commands();
+    app.paint();
+    let screen = screen_text(&app);
+    let model = screen
+        .lines()
+        .find(|line| line.contains("/model"))
+        .expect("the model row");
+    assert!(model.ends_with("alt+x m"), "the moved key: {model:?}");
+    assert!(
+        !screen.contains("ctrl+x m"),
+        "the leader it left is gone:\n{screen}"
+    );
+    let quit = app
+        .slash
+        .iter()
+        .find(|row| row.name == "/quit")
+        .expect("the quit row");
+    assert_eq!(&*quit.key, "ctrl+c ctrl+c", "the quit key");
+}
+
+/// The sheet's delete moved to Ctrl+G is the key the confirmation and the
+/// sessions sheet's own words name.
+#[test]
+fn keys_in_force_sheet_delete_moves_the_confirmation() {
+    let mut app = bare();
+    app.read_keys_text("[sheet]\ndelete = \"ctrl+g\"\n");
+    app.sessions = vec![session_row("aaaa1111", "alpha", false, false)];
+    app.set_sessions();
+    app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    app.key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+    let sheet = &app.sheet.as_ref().expect("the sessions sheet").sheet;
+    assert_eq!(
+        sheet.footer,
+        "\u{2191}\u{2193} choose \u{b7} enter opens \u{b7} ctrl+g deletes \u{b7} esc back to your draft"
+    );
+
+    app.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+    assert_eq!(confirm_text(&app), Some("ctrl+g again deletes \"alpha\""));
+}
+
+/// The palette, the which-key list and the key help name the keys a file moved,
+/// too.
+#[test]
+fn keys_in_force_other_words_name_the_moved_keys() {
+    let mut app = bare();
+    app.read_keys_text("[keys]\nleader = \"alt+x\"\n");
+    app.toggle_palette();
+    app.paint();
+    let screen = screen_text(&app);
+    assert!(
+        screen.contains("alt+x / closes \u{b7} your draft stays in the box"),
+        "the palette footer:\n{screen}"
+    );
+
+    let mut app = bare();
+    app.read_keys_text("[keys]\nleader = \"alt+x\"\n[leader]\nclose = \"ctrl+g\"\n");
+    app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+    assert!(app.keys.leader_pending(), "Alt+X is the leader");
+    app.paint();
+    let screen = screen_text(&app);
+    assert!(screen.contains("alt+x then"), "the title:\n{screen}");
+    assert!(
+        screen.contains("ctrl+g cancels \u{b7} ? shows every key"),
+        "the which-key footer:\n{screen}"
+    );
+
+    let mut app = bare();
+    app.read_keys_text("[keys]\nleader = \"alt+x\"\n[sheet]\nclose = \"ctrl+g\"\n");
+    app.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+    app.paint();
+    let screen = screen_text(&app);
+    assert!(
+        screen.contains("ctrl+g closes \u{b7} alt+x / runs any command by name"),
+        "the key help footer:\n{screen}"
+    );
+}
+
+/// A run stopped by the turn limit says so, and a normal end says nothing.
+#[test]
+fn turn_limit_stop_shows_a_line_only_at_the_limit() {
+    let notes = |app: &App| format!("{:?}", app.pending);
+    let mut app = bare();
+    app.frame(Frame::TurnStart);
+    app.frame(Frame::RunEnd { at_limit: false });
+    assert!(!notes(&app).contains("stopped at the"), "{}", notes(&app));
+    app.frame(Frame::TurnStart);
+    app.frame(Frame::RunEnd { at_limit: true });
+    assert!(notes(&app).contains("stopped at the"), "{}", notes(&app));
+}
+
+// ---- the pictures of the images a session holds ----
+
+/// The gradient PNG the picture tests draw: 64 by 48 pixels.
+const GRADIENT: &[u8] = include_bytes!("../../../image/tests/fixtures/gradient-64x48.png");
+
+/// The base64 text of an image file.
+fn base64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// An image of `data` that says it is `width` by `height` pixels.
+fn image(width: u32, height: u32, data: &str) -> reagent_ai::Image {
+    reagent_ai::Image {
+        media_type: reagent_ai::ImageType::Png,
+        width,
+        height,
+        data: Text::from(data),
+    }
+}
+
+/// The base64 text of a PNG of `width` by `height` pixels.
+fn solid(width: u32, height: u32) -> String {
+    let mut data = Vec::with_capacity(usize::try_from(width * height * 3).unwrap_or(0));
+    for y in 0..height {
+        for x in 0..width {
+            let shade = u8::try_from((x * 7 + y * 11) % 256).unwrap_or(0);
+            data.extend_from_slice(&[shade, shade, shade]);
+        }
+    }
+    let pixels = reagent_image::Pixels {
+        width,
+        height,
+        channels: reagent_image::Channels::Rgb,
+        data,
+    };
+    base64(&reagent_image::encode::png(&pixels, None).expect("a PNG"))
+}
+
+/// A user message that sends `text` and the image.
+fn user_sending(text: &str, image: reagent_ai::Image) -> Message {
+    Message::user_content(vec![Content::text(text), Content::Image(image)])
+}
+
+/// The chip row of the image whose base64 text is `data`.
+fn chip(width: u32, height: u32, data: &str) -> String {
+    let bytes = data.len().saturating_mul(3) / 4;
+    format!("▣ image {width}x{height} · {} KB", (bytes / 1024).max(1))
+}
+
+/// An app in full screen of `columns` by `rows` cells, laid out.
+fn roomy(columns: u16, rows: u16) -> App {
+    let mut app = App::new(&Initialized::default(), (columns, rows), true);
+    app.screen.resize(columns, rows);
+    app.reflow();
+    app
+}
+
+/// The first row of `screen` that holds `text`.
+fn row_of(screen: &str, text: &str) -> usize {
+    screen
+        .lines()
+        .position(|row| row.contains(text))
+        .unwrap_or_else(|| panic!("no {text:?} on:\n{screen}"))
+}
+
+/// A result frame of `images` images, as the worker sends one.
+fn tool_result(id: &str, images: usize) -> Frame<'_> {
+    Frame::ToolResult {
+        id: id.into(),
+        failed: false,
+        bytes: 10,
+        error: None,
+        output: Some("done".into()),
+        earlier: 0,
+        images,
+    }
+}
+
+/// A resumed session draws the picture of the image a user turn sent under that
+/// turn's row, with the chip under the picture.
+#[tokio::test]
+async fn picture_of_a_resumed_user_image_stands_under_the_turn() {
+    let root = tempfile::tempdir().expect("a temp folder");
+    let dir = root.path().join("sess-picture");
+    let data = base64(GRADIENT);
+    let newest = write_messages(
+        &dir,
+        &[
+            user_sending("look at this", image(64, 48, &data)),
+            Message::assistant(AssistantMessage::new(
+                "fake",
+                "fake-model",
+                vec![Content::text("I see it")],
+            )),
+        ],
+    );
+    let mut app = roomy(100, 60);
+    let room = app.room();
+    let mut tail = crate::history::read(dir, newest, room)
+        .await
+        .expect("the read");
+    app.history(&mut tail);
+    app.commit();
+    let screen = painted(&mut app);
+    let turn = row_of(&screen, "look at this");
+    let cells = row_of(&screen, "▀");
+    let chip_row = row_of(&screen, &chip(64, 48, &data));
+    let reply = row_of(&screen, "I see it");
+    assert!(turn < cells, "the cells under the turn:\n{screen}");
+    assert!(cells < chip_row, "the chip under the cells:\n{screen}");
+    assert!(chip_row < reply, "and above the reply:\n{screen}");
+}
+
+/// A resumed session draws the picture of an image a `read` returned under the
+/// row of that call.
+#[tokio::test]
+async fn picture_of_a_replayed_read_stands_under_the_call() {
+    let root = tempfile::tempdir().expect("a temp folder");
+    let dir = root.path().join("sess-picture");
+    let data = base64(GRADIENT);
+    let call = ToolCall {
+        id: "call-1".into(),
+        name: "read".into(),
+        arguments: r#"{"path":"picture.png"}"#.into(),
+    };
+    let newest = write_messages(
+        &dir,
+        &[
+            Message::user("read the picture"),
+            Message::assistant(AssistantMessage::new(
+                "fake",
+                "fake-model",
+                vec![Content::ToolCall(call)],
+            )),
+            Message::tool_result_with_images(
+                "call-1",
+                "a picture of 64 by 48 pixels",
+                false,
+                vec![image(64, 48, &data)],
+            ),
+            Message::assistant(AssistantMessage::new(
+                "fake",
+                "fake-model",
+                vec![Content::text("it is a gradient")],
+            )),
+        ],
+    );
+    let mut app = roomy(100, 60);
+    let room = app.room();
+    let mut tail = crate::history::read(dir, newest, room)
+        .await
+        .expect("the read");
+    app.history(&mut tail);
+    app.commit();
+    let screen = painted(&mut app);
+    let call_row = row_of(&screen, "picture.png");
+    let cells = row_of(&screen, "▀");
+    let chip_row = row_of(&screen, &chip(64, 48, &data));
+    let reply = row_of(&screen, "it is a gradient");
+    assert!(call_row < cells, "the cells under the call:\n{screen}");
+    assert!(cells < chip_row, "the chip under the cells:\n{screen}");
+    assert!(chip_row < reply, "and above the reply:\n{screen}");
+}
+
+/// The flag of a picture waits for the record that holds the image: a record
+/// that commits before it draws nothing, and the next commit draws the picture
+/// once.
+#[tokio::test]
+async fn picture_waits_for_the_record_that_holds_it() {
+    let root = tempfile::tempdir().expect("a temp folder");
+    let dir = root.path().join("sess-picture");
+    let data = base64(GRADIENT);
+    let newest = write_messages(
+        &dir,
+        &[
+            Message::user("a plain turn"),
+            user_sending("look at this", image(64, 48, &data)),
+            Message::assistant(AssistantMessage::new(
+                "fake",
+                "fake-model",
+                vec![Content::text("I see it")],
+            )),
+        ],
+    );
+    assert_eq!(newest, 3);
+    let mut app = roomy(120, 80);
+    app.journal = Some(dir);
+    // The picture draws as half-block cells whatever terminal runs the test.
+    app.native_decided = true;
+    app.frame(Frame::UserMessage {
+        text: "[Image #1] can u read this".into(),
+        images: 1,
+    });
+    // The first record of the run holds no image, and the read that follows it
+    // finds none.
+    app.frame(Frame::Committed(1));
+    assert!(app.pictures_wait, "the record asks for its read");
+    app.catch_up().await;
+    assert!(app.pictures, "the flag waits for the record that holds it");
+    app.commit();
+    let screen = painted(&mut app);
+    assert!(!screen.contains('▀'), "no picture yet:\n{screen}");
+    assert!(!screen.contains("▣ image"), "and no chip:\n{screen}");
+    // The next commit holds the image, and its read draws the picture once.
+    app.frame(Frame::Committed(2));
+    assert!(app.pictures_wait, "the next record asks for its read");
+    app.catch_up().await;
+    assert!(!app.pictures, "the read found the picture");
+    app.commit();
+    let screen = painted(&mut app);
+    assert_eq!(
+        screen.matches(&chip(64, 48, &data)).count(),
+        1,
+        "the picture draws once:\n{screen}"
+    );
+    assert!(
+        screen.contains('▀'),
+        "with the cells under the turn:\n{screen}"
+    );
+}
+
+/// Eight images read for the pictures of a live turn keep the order of their
+/// records.
+#[tokio::test]
+async fn picture_order_of_eight_images_holds() {
+    let root = tempfile::tempdir().expect("a temp folder");
+    let dir = root.path().join("sess-picture");
+    let mut messages = Vec::new();
+    let mut chips = Vec::new();
+    for size in 2..10_u32 {
+        let data = solid(size, size);
+        messages.push(user_sending(
+            &format!("number {size}"),
+            image(size, size, &data),
+        ));
+        chips.push(chip(size, size, &data));
+    }
+    let newest = write_messages(&dir, &messages);
+    let mut app = roomy(120, 80);
+    app.journal = Some(dir);
+    app.frame(Frame::UserMessage {
+        text: "look at the eight @pictures".into(),
+        images: 8,
+    });
+    app.frame(Frame::Committed(newest));
+    app.catch_up().await;
+    app.commit();
+    let screen = painted(&mut app);
+    let mut above = 0;
+    for (index, chip) in chips.iter().enumerate() {
+        let at = row_of(&screen, chip);
+        assert!(
+            at > above,
+            "picture {index} follows the one before it:\n{screen}"
+        );
+        above = at;
+    }
+}
+
+/// An image that does not decode leaves its chip, and no cells.
+#[tokio::test]
+async fn picture_that_is_broken_leaves_the_chip() {
+    let root = tempfile::tempdir().expect("a temp folder");
+    let dir = root.path().join("sess-picture");
+    let data = base64(b"not a png at all");
+    let newest = write_messages(&dir, &[user_sending("look at this", image(64, 48, &data))]);
+    let mut app = roomy(100, 60);
+    let room = app.room();
+    let mut tail = crate::history::read(dir, newest, room)
+        .await
+        .expect("the read");
+    app.history(&mut tail);
+    app.commit();
+    let screen = painted(&mut app);
+    assert!(
+        screen.contains(&chip(64, 48, &data)),
+        "the chip stays:\n{screen}"
+    );
+    assert!(
+        !screen.contains('▀'),
+        "no cells of a broken image:\n{screen}"
+    );
+}
+
+/// A terminal of sixteen colors leaves the chip, and no cells.
+#[tokio::test]
+async fn picture_in_sixteen_colors_leaves_the_chip() {
+    let root = tempfile::tempdir().expect("a temp folder");
+    let dir = root.path().join("sess-picture");
+    let data = base64(GRADIENT);
+    let newest = write_messages(&dir, &[user_sending("look at this", image(64, 48, &data))]);
+    let mut app = roomy(100, 60);
+    app.look.depth = crate::theme::Depth::Ansi16;
+    let room = app.room();
+    let mut tail = crate::history::read(dir, newest, room)
+        .await
+        .expect("the read");
+    app.history(&mut tail);
+    app.commit();
+    let screen = painted(&mut app);
+    assert!(
+        screen.contains(&chip(64, 48, &data)),
+        "the chip stays:\n{screen}"
+    );
+    assert!(
+        !screen.contains('▀'),
+        "no cells in sixteen colors:\n{screen}"
+    );
+}
+
+/// A transcript with no color pairs left for pictures leaves the chip, and no
+/// cells.
+#[tokio::test]
+async fn picture_with_no_style_left_leaves_the_chip() {
+    let root = tempfile::tempdir().expect("a temp folder");
+    let dir = root.path().join("sess-picture");
+    let data = base64(GRADIENT);
+    let newest = write_messages(&dir, &[user_sending("look at this", image(64, 48, &data))]);
+    let mut app = roomy(100, 60);
+    let room = app.room();
+    let mut tail = crate::history::read(dir, newest, room)
+        .await
+        .expect("the read");
+    let cells = crate::picture::cells(&data, room).expect("the gradient's cells");
+    while app.budget.take(&cells) {}
+    app.history(&mut tail);
+    app.commit();
+    let screen = painted(&mut app);
+    assert!(
+        screen.contains(&chip(64, 48, &data)),
+        "the chip stays:\n{screen}"
+    );
+    assert!(!screen.contains('▀'), "no cells without pairs:\n{screen}");
+}
+
+/// The picture of a resumed image is drawn once, and a live frame of the same
+/// record draws it no more.
+#[tokio::test]
+async fn picture_is_drawn_once_through_replay_and_live() {
+    let root = tempfile::tempdir().expect("a temp folder");
+    let dir = root.path().join("sess-picture");
+    let data = base64(GRADIENT);
+    let call = ToolCall {
+        id: "call-1".into(),
+        name: "read".into(),
+        arguments: r#"{"path":"picture.png"}"#.into(),
+    };
+    let newest = write_messages(
+        &dir,
+        &[
+            Message::user("read the picture"),
+            Message::assistant(AssistantMessage::new(
+                "fake",
+                "fake-model",
+                vec![Content::ToolCall(call)],
+            )),
+            Message::tool_result_with_images(
+                "call-1",
+                "a picture of 64 by 48 pixels",
+                false,
+                vec![image(64, 48, &data)],
+            ),
+        ],
+    );
+    let mut app = roomy(120, 80);
+    let room = app.room();
+    let mut tail = crate::history::read(dir.clone(), newest, room)
+        .await
+        .expect("the read");
+    app.history(&mut tail);
+    // A resume reads the records once, and the records of the run are behind it.
+    app.pictured = newest;
+    app.picture_read = newest;
+    app.journal = Some(dir);
+    app.commit();
+    let resumed = painted(&mut app);
+    assert_eq!(
+        resumed.matches("▣ image").count(),
+        1,
+        "the resume drew the picture:\n{resumed}"
+    );
+    app.frame(tool_result("call-1", 1));
+    app.frame(Frame::Committed(newest));
+    app.catch_up().await;
+    app.commit();
+    let live = painted(&mut app);
+    assert_eq!(
+        live.matches("▣ image").count(),
+        1,
+        "the picture drew once:\n{live}"
+    );
+}
+
+/// A live result with images sets the flag the pictures wait on, and one with
+/// none leaves it clear; a run that ends clears it.
+#[test]
+fn picture_flag_follows_a_live_frame() {
+    let mut app = bare();
+    app.frame(tool_result("call-1", 0));
+    app.frame(Frame::Committed(1));
+    assert!(!app.pictures, "a result of no images names no picture");
+    assert!(!app.pictures_wait, "and its record owes no read");
+    app.frame(tool_result("call-2", 2));
+    assert!(app.pictures, "a result of images names its pictures");
+    app.frame(Frame::Committed(2));
+    assert!(app.pictures_wait, "and its record owes the read");
+    app.frame(Frame::RunEnd { at_limit: false });
+    assert!(!app.pictures, "the end of the run ends its pictures");
+    app.pictures_wait = false;
+    app.frame(Frame::Committed(3));
+    assert!(!app.pictures_wait, "no commit of a later run owes a read");
+}
+
+/// A drag over the rows of a picture copies the chip, and none of its cells.
+#[tokio::test]
+async fn picture_copy_takes_the_chip_and_no_cells() {
+    let root = tempfile::tempdir().expect("a temp folder");
+    let dir = root.path().join("sess-picture");
+    let data = base64(GRADIENT);
+    let newest = write_messages(&dir, &[user_sending("look at this", image(64, 48, &data))]);
+    let mut app = roomy(100, 60);
+    let room = app.room();
+    let mut tail = crate::history::read(dir, newest, room)
+        .await
+        .expect("the read");
+    app.history(&mut tail);
+    app.commit();
+    app.paint();
+    let screen = screen_text(&app);
+    let chip_row = row_of(&screen, &chip(64, 48, &data));
+    let cells = row_of(&screen, "▀");
+    let event = |kind, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    let down = cell_row(cells);
+    let up = cell_row(chip_row);
+    app.mouse(event(MouseEventKind::Down(MouseButton::Left), 0, down));
+    app.mouse(event(MouseEventKind::Drag(MouseButton::Left), 99, up));
+    app.mouse(event(MouseEventKind::Up(MouseButton::Left), 99, up));
+    let copied = app.clip.trim().to_owned();
+    assert_eq!(copied, chip(64, 48, &data), "the copy is the chip");
+    assert!(!copied.contains('▀'), "and no cell of the picture");
+}
+
+/// A row of the screen as the mouse names it.
+fn cell_row(row: usize) -> u16 {
+    u16::try_from(row).unwrap_or(0)
+}
+
+/// How many times `needle` sits in `bytes`.
+fn held(bytes: &[u8], needle: &[u8]) -> usize {
+    bytes
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+/// The image of the fixture PNG, base64 and PNG, as a picture's source holds it.
+fn picture_source() -> crate::picture::Source {
+    let data = base64(GRADIENT);
+    crate::picture::Source {
+        bytes: GRADIENT.len(),
+        png: true,
+        data: data.into(),
+    }
+}
+
+/// The picture of the fixture PNG, the cells it draws as and its source.
+fn picture(room: u32) -> super::Picture {
+    let source = picture_source();
+    super::Picture {
+        cells: crate::picture::cells(&source.data, room),
+        chip: "▣ image 64x48 · 3 KB".to_owned(),
+        source: Some(source),
+    }
+}
+
+/// A full-screen app on `columns` by `rows` whose ring holds one picture, the
+/// terminal's protocol `native`, and the terminal it draws into.
+fn pictured_app(
+    (columns, rows): (u16, u16),
+    native: Option<super::Native>,
+) -> (App, TestTerminal, Arc<Mutex<Vec<u8>>>) {
+    let init = Initialized {
+        session: "sess".to_owned(),
+        ..Initialized::default()
+    };
+    let mut app = App::new(&init, (columns, rows), true);
+    app.screen.resize(columns, rows);
+    app.reflow();
+    app.native = native;
+    app.native_decided = true;
+    app.screen.set_native(native);
+    app.pending
+        .push(super::Item::Picture(Box::new(picture(40))));
+    let (keys, events) = mpsc::unbounded_channel();
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let terminal = TestTerminal {
+        bytes: Arc::clone(&bytes),
+        keys: events,
+        size: (columns, rows),
+        sizes: Arc::new(AtomicUsize::new(0)),
+        frames: Arc::new(AtomicUsize::new(0)),
+    };
+    let _ = keys;
+    (app, terminal, bytes)
+}
+
+/// Moves the armed picture wait to now, as if its settle time had passed.
+fn expire_pictures(app: &mut App) {
+    if app.picture_deadline.is_some() {
+        app.picture_deadline = Some(tokio::time::Instant::now());
+    }
+}
+
+/// The bytes the terminal took since the test last cleared them.
+fn wrote(bytes: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+    std::mem::take(
+        &mut *bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+#[tokio::test]
+async fn native_picture_focus_in_redraws_after_settle() {
+    let native = Some(super::Native {
+        protocol: crate::picture_native::Protocol::Iterm2,
+        tmux: false,
+    });
+    let (mut app, mut terminal, bytes) = pictured_app((80, 24), native);
+    app.draw(&mut terminal).await.expect("the frame");
+    assert_eq!(
+        held(&wrote(&bytes), b"]1337;"),
+        0,
+        "the image waits for the settle time"
+    );
+    let due = app.picture_deadline.expect("the picture is armed");
+    let gap = due.saturating_duration_since(tokio::time::Instant::now());
+    assert!(gap > Duration::from_millis(50), "the wait: {gap:?}");
+    assert!(
+        gap > super::picture_native::SETTLE,
+        "a picture that moved waits out the scroll: {gap:?}"
+    );
+    assert!(
+        gap <= super::picture_native::MOVE_SETTLE,
+        "the wait: {gap:?}"
+    );
+    app.timer(&mut terminal).await.expect("the timer");
+    assert_eq!(
+        held(&wrote(&bytes), b"1337"),
+        0,
+        "a deadline before the settle sends nothing"
+    );
+    expire_pictures(&mut app);
+    app.timer(&mut terminal).await.expect("the timer");
+    assert_eq!(
+        held(&wrote(&bytes), b"]1337;File=inline=1;"),
+        1,
+        "the image goes out"
+    );
+    // The terminal drew its window again: every image on it is gone.
+    app.focused();
+    assert_eq!(
+        held(&wrote(&bytes), b"1337"),
+        0,
+        "nothing before the settle"
+    );
+    let due = app.picture_deadline.expect("the focus-in arms the wait");
+    let gap = due.saturating_duration_since(tokio::time::Instant::now());
+    assert!(gap > Duration::from_millis(50), "the wait: {gap:?}");
+    assert!(
+        app.deadline.is_some_and(|deadline| deadline <= due),
+        "the loop waits for the picture"
+    );
+    expire_pictures(&mut app);
+    app.timer(&mut terminal).await.expect("the timer");
+    assert_eq!(
+        held(&wrote(&bytes), b"]1337;File=inline=1;"),
+        1,
+        "the image is back"
+    );
+}
+
+#[tokio::test]
+async fn native_picture_placeholders_draw_once() {
+    let native = Some(super::Native {
+        protocol: crate::picture_native::Protocol::Placeholders,
+        tmux: false,
+    });
+    let (mut app, mut terminal, bytes) = pictured_app((80, 24), native);
+    app.draw(&mut terminal).await.expect("the frame");
+    let out = wrote(&bytes);
+    assert_eq!(
+        held(&out, b"\x1b_Ga=T,f=100,i="),
+        1,
+        "the image goes out once: {out:?}"
+    );
+    assert_eq!(held(&out, b"]1337;"), 0, "no iTerm2 overlay: {out:?}");
+    let text: String = (0..app.screen.rows())
+        .map(|y| app.screen.row_text(y))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains('\u{10EEEE}'),
+        "the picture's rows are placeholder cells: {text}"
+    );
+    let columns = picture(40).cells.as_ref().map_or(0, |cells| cells.columns);
+    let row = (0..app.screen.rows())
+        .map(|y| app.screen.row_text(y))
+        .find(|row| row.contains('\u{10EEEE}'))
+        .expect("a placeholder row");
+    assert_eq!(
+        row.chars().filter(|c| *c == '\u{10EEEE}').count() as u32,
+        columns,
+        "one placeholder cell for each cell of the picture: {row:?}"
+    );
+    app.draw(&mut terminal).await.expect("the frame");
+    let out = wrote(&bytes);
+    assert_eq!(held(&out, b"a=T"), 0, "one transmission only: {out:?}");
+    // Scrolled out of view and back: the cells are text, so the ring draws them
+    // again and the terminal keeps the image it was sent.
+    let height = u64::from(app.screen.transcript().height());
+    app.screen.transcript_mut().scroll_up(height);
+    app.draw(&mut terminal).await.expect("the frame");
+    app.screen.transcript_mut().scroll_down(height);
+    app.draw(&mut terminal).await.expect("the frame");
+    let out = wrote(&bytes);
+    assert_eq!(held(&out, b"a=T"), 0, "no second transmission: {out:?}");
+    assert_eq!(held(&out, b"]1337;"), 0, "no overlay ever: {out:?}");
+    let text: String = (0..app.screen.rows())
+        .map(|y| app.screen.row_text(y))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains('\u{10EEEE}'),
+        "the cells come back with the ring: {text}"
+    );
+}
+
+#[tokio::test]
+async fn native_picture_placeholder_id_survives_256_colors() {
+    let native = Some(super::Native {
+        protocol: crate::picture_native::Protocol::Placeholders,
+        tmux: false,
+    });
+    let (mut app, mut terminal, _bytes) = pictured_app((80, 24), native);
+    app.look.depth = crate::theme::Depth::Ansi256;
+    app.draw(&mut terminal).await.expect("the frame");
+    let (row, column) = (0..app.screen.rows())
+        .find_map(|y| {
+            let text = app.screen.row_text(y);
+            text.chars()
+                .position(|c| c == '\u{10EEEE}')
+                .map(|x| (y, u16::try_from(x).unwrap_or(u16::MAX)))
+        })
+        .expect("the picture's rows are placeholder cells");
+    let style = app
+        .screen
+        .style_of(app.screen.back().cell(column, row).style());
+    let (r, g, b) = crate::picture_native::id_color(super::first_image_id());
+    assert_eq!(
+        style.fg,
+        crate::screen::Color::Rgb(r, g, b),
+        "the palette leaves the image's id alone"
+    );
+}
+
+#[tokio::test]
+async fn native_picture_lands_on_its_half_block_cells() {
+    let native = Some(super::Native {
+        protocol: crate::picture_native::Protocol::Iterm2,
+        tmux: false,
+    });
+    let (mut app, mut terminal, bytes) = pictured_app((80, 24), native);
+    // Text before the picture, so a blank row parts the two as in a real run.
+    let picture = app.pending.pop().expect("the picture");
+    app.push_plain(vec!["read the file".to_owned()], false);
+    app.pending.push(picture);
+    app.draw(&mut terminal).await.expect("the frame");
+    let (row, column) = (0..app.screen.rows())
+        .find_map(|y| {
+            let text = app.screen.row_text(y);
+            text.chars()
+                .position(|c| c == '▀')
+                .map(|x| (y, u16::try_from(x).unwrap_or(u16::MAX)))
+        })
+        .expect("the half-block cells are on screen");
+    let _ = wrote(&bytes);
+    expire_pictures(&mut app);
+    app.timer(&mut terminal).await.expect("the timer");
+    let out = wrote(&bytes);
+    let image = out
+        .windows(6)
+        .position(|window| window == b"]1337;")
+        .expect("the image goes out");
+    let cup = format!("\x1b[{};{}H", row + 1, column + 1);
+    let before = out.get(..image).unwrap_or_default();
+    let last_cup = before
+        .windows(2)
+        .rposition(|window| window == b"\x1b[")
+        .and_then(|at| before.get(at..))
+        .unwrap_or_default();
+    assert!(
+        last_cup.starts_with(cup.as_bytes()),
+        "the image goes to row {row} column {column}: {:?}",
+        String::from_utf8_lossy(before)
     );
 }

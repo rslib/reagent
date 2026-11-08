@@ -91,6 +91,26 @@ impl fmt::Debug for Block {
     }
 }
 
+/// Where one committed block's text sits in the ring's source arena, with the
+/// lines it took: a copy reads back what the reply wrote from the line it starts
+/// at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Origin {
+    /// The line number of its first stored line.
+    pub line: u64,
+    /// How many stored lines it takes.
+    pub lines: u64,
+    /// Where its text starts in the arena.
+    pub offset: usize,
+    /// How many bytes of the arena hold its text.
+    pub len: usize,
+    /// Whether it draws as a code block: a copy of part of one keeps its line
+    /// breaks.
+    pub code: bool,
+    /// Whether its first row is its fence's tag, which holds none of its text.
+    pub label: bool,
+}
+
 /// A place in the ring: a stored line by number, and the row within it that
 /// starts at the top of the viewport.
 ///
@@ -124,6 +144,10 @@ pub struct Transcript {
     /// The committed blocks the ring still holds, oldest first, one entry per
     /// block whose fold state can change and draw its lines again.
     blocks: VecDeque<Block>,
+    /// The text of the committed blocks, oldest first.
+    source: Vec<u8>,
+    /// Where the text of each committed block sits in `source`.
+    sources: VecDeque<Origin>,
     /// The index in `runs` of the first run a stored line still uses.
     head: usize,
     /// The lines that left the ring.
@@ -150,6 +174,8 @@ impl Transcript {
             runs: Vec::new(),
             lines: VecDeque::new(),
             blocks: VecDeque::new(),
+            source: Vec::new(),
+            sources: VecDeque::new(),
             head: 0,
             dropped: 0,
             top: Mark::default(),
@@ -208,6 +234,7 @@ impl Transcript {
             self.head = oldest.start + oldest.len;
             self.dropped += 1;
             self.trim_blocks();
+            self.trim_sources();
             self.compact();
         }
         if self.follow {
@@ -238,6 +265,18 @@ impl Transcript {
             self.text.drain(..dead);
             for run in &mut self.runs[self.head..] {
                 run.offset -= dead;
+            }
+        }
+        // The sources come in order too, so the bytes before the first live one
+        // are the bytes of the blocks that left the ring.
+        let dead = self
+            .sources
+            .front()
+            .map_or(self.source.len(), |origin| origin.offset);
+        if dead > self.source.len() / 2 {
+            self.source.drain(..dead);
+            for origin in &mut self.sources {
+                origin.offset -= dead;
             }
         }
     }
@@ -282,6 +321,72 @@ impl Transcript {
                 return;
             }
             self.blocks.pop_front();
+        }
+    }
+
+    /// Keep the text of the block that took the lines `line..line + lines`, as
+    /// the reply wrote it, for a copy of it later. A block whose lines all left
+    /// the ring keeps nothing.
+    ///
+    /// A row that holds no text of its own, like a row of a picture's cells,
+    /// keeps an empty source: a copy of it reads the source and takes nothing,
+    /// where no source would let the copy read the glyphs the row draws.
+    pub(super) fn add_source(
+        &mut self,
+        line: u64,
+        lines: u64,
+        text: &str,
+        code: bool,
+        label: bool,
+    ) {
+        let end = line.saturating_add(lines);
+        let line = line.max(self.dropped);
+        if end <= line {
+            return;
+        }
+        let offset = self.source.len();
+        self.source.extend_from_slice(text.as_bytes());
+        self.sources.push_back(Origin {
+            line,
+            lines: end - line,
+            offset,
+            len: text.len(),
+            code,
+            label,
+        });
+    }
+
+    /// Where the text of the block that holds the stored line `line` sits, while
+    /// the ring still holds it.
+    pub(crate) fn source_at(&self, line: u64) -> Option<Origin> {
+        self.sources
+            .iter()
+            .rev()
+            .find(|origin| origin.line <= line && line < origin.line.saturating_add(origin.lines))
+            .copied()
+    }
+
+    /// The text of `origin`, as the reply wrote it.
+    pub(crate) fn source_text(&self, origin: &Origin) -> &str {
+        self.source
+            .get(origin.offset..origin.offset.saturating_add(origin.len))
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Drop the sources whose lines all left the ring, and clip the one the
+    /// dropped lines reached.
+    fn trim_sources(&mut self) {
+        while let Some(origin) = self.sources.front_mut() {
+            let end = origin.line.saturating_add(origin.lines);
+            if end > self.dropped {
+                if origin.line < self.dropped {
+                    origin.line = self.dropped;
+                    origin.lines = end - self.dropped;
+                }
+                return;
+            }
+            self.sources.pop_front();
         }
     }
 
@@ -354,49 +459,41 @@ impl Transcript {
     /// the block shift, and the bytes of the tail and of the new lines swap
     /// places, so a re-render copies neither the ring nor the block. The lines
     /// after it move once, on the key that reopened it, and a later frame draws
-    /// the ring as it found it. Answers whether the ring still held the block.
+    /// the ring as it found it. Answers the line the block used to end at and
+    /// how many lines it gained, or `None` when the ring no longer held it.
     pub(super) fn replace(
         &mut self,
         fold: u64,
         open: bool,
         runs: &[Run<'_>],
         lines: &[Range<usize>],
-    ) -> bool {
-        let Some(index) = self
+    ) -> Option<(u64, i64)> {
+        let index = self
             .blocks
             .iter()
-            .position(|block| block.fold == fold && block.lines > 0)
-        else {
-            return false;
-        };
+            .position(|block| block.fold == fold && block.lines > 0)?;
         if lines.is_empty() {
-            return false;
+            return None;
         }
         let (line, old) = (self.blocks[index].line, self.blocks[index].lines as usize);
         let local = (line - self.dropped) as usize;
         // The block's runs and its bytes are one stretch of each buffer, so the
         // tail after them and the new lines can trade places.
-        let Some((first, last)) = self
+        let (first, last) = self
             .lines
             .get(local)
             .zip(self.lines.get(local + old - 1))
-            .map(|(first, last)| (*first, *last))
-        else {
-            return false;
-        };
+            .map(|(first, last)| (*first, *last))?;
         let (r0, r1) = (first.start, last.start + last.len);
         if r0 == r1 {
             // A block of empty lines takes no room and holds no source to draw.
-            return false;
+            return None;
         }
-        let Some((head, tail)) = self
+        let (head, tail) = self
             .runs
             .get(r0)
             .zip(self.runs.get(r1 - 1))
-            .map(|(head, tail)| (*head, *tail))
-        else {
-            return false;
-        };
+            .map(|(head, tail)| (*head, *tail))?;
         let (t0, t1) = (head.offset, tail.offset + tail.len);
         // The new runs and their text go after the ones the ring holds.
         let before = self.runs.len();
@@ -462,6 +559,11 @@ impl Transcript {
         for after in self.blocks.iter_mut().skip(index + 1) {
             after.line = after.line.saturating_add_signed(grown);
         }
+        // The sources after the block move with the lines after it.
+        let end = line.saturating_add(old as u64);
+        for after in self.sources.iter_mut().skip_while(|after| after.line < end) {
+            after.line = after.line.saturating_add_signed(grown);
+        }
         let block = &mut self.blocks[index];
         block.lines = added as u64;
         block.open = open;
@@ -469,7 +571,7 @@ impl Transcript {
         deque[local..].rotate_right(added);
         self.place(line, old as u64, added as u64);
         self.cap();
-        true
+        Some((end, grown))
     }
 
     /// Keep the view where it was after the block that started at `line` and
@@ -523,6 +625,8 @@ impl Transcript {
         self.runs.clear();
         self.lines.clear();
         self.blocks.clear();
+        self.source.clear();
+        self.sources.clear();
         self.head = 0;
         self.dropped = 0;
         self.top = Mark::default();
@@ -542,6 +646,24 @@ impl Transcript {
     /// The rows the viewport shows.
     pub fn height(&self) -> u16 {
         self.area.height
+    }
+
+    /// Whether the lines of the ring take the rows of the viewport, so its last
+    /// row shows the last row of the last line: a shorter ring is drawn from the
+    /// first row of the area instead.
+    pub fn fills(&self) -> bool {
+        let mut left = u64::from(self.area.height.max(1));
+        let mut index = self.len();
+        while index > self.dropped {
+            let line = index - 1;
+            let rows = u64::from(self.rows_of(line));
+            if rows >= left {
+                return true;
+            }
+            left -= rows;
+            index = line;
+        }
+        false
     }
 
     /// Whether the viewport follows the lines that arrive.
@@ -728,6 +850,37 @@ impl Transcript {
         }
     }
 
+    /// Where the first row of `line` sits in the viewport, as a row counted
+    /// from the area's top, or `None` when the frame does not show it whole.
+    ///
+    /// A line is hidden when it left the ring, when it sits above the viewport,
+    /// when the viewport starts in the middle of its first row, and when its
+    /// first row is below the last row of the area. The notice row of the top
+    /// of the ring counts as a row of its own.
+    pub(crate) fn line_row(&self, line: u64) -> Option<u16> {
+        if line >= self.len() || line < self.dropped || line < self.top.line {
+            return None;
+        }
+        if line == self.top.line && self.top.row > 0 {
+            return None;
+        }
+        let mut row = u32::from(self.notice().is_some());
+        let mut index = self.top.line;
+        while index < line && row < u32::from(self.area.height) {
+            row = row.saturating_add(self.rows_of(index));
+            index += 1;
+        }
+        if row >= u32::from(self.area.height) {
+            return None;
+        }
+        u16::try_from(row).ok()
+    }
+
+    /// Where the transcript's area starts on the screen: its column and its row.
+    pub(crate) fn area_origin(&self) -> (u16, u16) {
+        (self.area.x, self.area.y)
+    }
+
     /// The lines that left the ring, when the viewport has reached the top of
     /// it and the oldest line in the ring is the first row.
     fn notice(&self) -> Option<u64> {
@@ -741,7 +894,7 @@ impl Transcript {
     }
 
     /// The rows one stored line takes at the area's width.
-    fn rows_of(&self, index: u64) -> u32 {
+    pub(crate) fn rows_of(&self, index: u64) -> u32 {
         index
             .checked_sub(self.dropped)
             .and_then(|local| self.lines.get(local as usize))
@@ -790,6 +943,13 @@ impl Transcript {
     #[cfg(test)]
     pub fn lines_visited(&self) -> usize {
         self.visited
+    }
+
+    /// The bytes the arena of the blocks' sources holds, for the tests that a
+    /// copy leaves nothing behind.
+    #[cfg(test)]
+    pub fn source_len(&self) -> usize {
+        self.source.len()
     }
 
     /// The capacities of the text buffer, the run list and the line list, for

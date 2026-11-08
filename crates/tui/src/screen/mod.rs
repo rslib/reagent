@@ -8,14 +8,18 @@ mod transcript;
 pub use cell::{Cell, Color, GraphemeArena, Style, StyleTable};
 pub use grid::Grid;
 pub use terminal::Terminal;
+pub(crate) use transcript::Origin;
 pub use transcript::{TRANSCRIPT_RING_LINES, Transcript};
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::picture::Source as PictureSource;
+use crate::picture_native::{self, Native};
 use grid::is_control;
 
 /// DEC 2026 synchronized output, start.
@@ -42,6 +46,59 @@ const ALT_SCREEN_OFF: &[u8] = b"\x1b[?1049l";
 /// The characters of the session id the exit line names, as the Context panel
 /// shows them.
 const SHORT_SESSION_ID: usize = 8;
+
+/// How many pictures a run keeps registered: the ones on screen and the few
+/// before them that a scroll brings back.
+const NATIVE_PICTURES: usize = 8;
+
+/// One picture the ring registered: the lines its cells were committed at, the
+/// cells it takes, and the image a terminal's own protocol sends.
+#[derive(Clone, Debug)]
+struct NativePicture {
+    /// The id the protocol knows it by, counted up from 1.
+    id: u32,
+    /// The first of the ring lines its cells take.
+    first: u64,
+    /// The rows of cells it takes.
+    rows: u16,
+    /// The columns of cells it takes.
+    columns: u16,
+    /// The column of its first cell, counted from the transcript's left edge.
+    left: u16,
+    /// The image itself.
+    source: PictureSource,
+}
+
+/// A rectangle of cells a frame must write again although both grids agree on
+/// them: the terminal drew an image over them, and only the text going over
+/// them again takes it off.
+#[derive(Clone, Copy, Debug)]
+struct Damage {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+}
+
+impl Damage {
+    /// Whether the cell at column `x` of row `y` is inside it.
+    fn holds(&self, x: u16, y: u16) -> bool {
+        x >= self.x
+            && x < self.x.saturating_add(self.width)
+            && y >= self.y
+            && y < self.y.saturating_add(self.height)
+    }
+}
+
+/// Appends blank cells in the default pen over `columns` by `rows` cells from
+/// column `x` of row `y`.
+fn write_blank(out: &mut Vec<u8>, x: u16, y: u16, columns: u16, rows: u16) {
+    out.extend_from_slice(RESET);
+    for row in y..y.saturating_add(rows) {
+        write_cup(out, row, x);
+        out.resize(out.len() + usize::from(columns), b' ');
+    }
+}
 
 /// Where the terminal cursor sits when a frame ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -142,6 +199,28 @@ pub struct Screen {
     cursor: Cursor,
     /// Where the frame the terminal shows left it.
     drawn_cursor: Cursor,
+    /// The terminal's own image protocol, decided at the first picture of the
+    /// run: `None` while the terminal speaks none, and always `None` inline.
+    native: Option<Native>,
+    /// The pictures the ring registered, oldest first, at most
+    /// [`NATIVE_PICTURES`] of them.
+    pictures: VecDeque<NativePicture>,
+    /// The id, column and row of every picture the terminal holds an image of.
+    shown: Vec<(u32, u16, u16)>,
+    /// Whether a box or a panel covers the transcript, so no image goes out.
+    blocked: bool,
+    /// Whether a picture waits for the settle time before its image goes out.
+    due: bool,
+    /// The id the next registered picture takes.
+    next_picture: u32,
+    /// The image bytes the app handed the screen, which the next write of the
+    /// frame goes first.
+    images: Vec<u8>,
+    /// The cells the frame wrote, so an image the text went over goes out
+    /// again: empty while no image is on screen.
+    wrote: Vec<bool>,
+    /// The rectangles the next frame writes although both grids agree on them.
+    damages: Vec<Damage>,
     /// Rows the last diff compared, for the frame-cost test.
     #[cfg(test)]
     visited_rows: u16,
@@ -173,6 +252,15 @@ impl Screen {
             pen: None,
             cursor: Cursor::Unmanaged,
             drawn_cursor: Cursor::Unmanaged,
+            native: None,
+            pictures: VecDeque::new(),
+            shown: Vec::new(),
+            blocked: false,
+            due: false,
+            next_picture: 0,
+            images: Vec::new(),
+            wrote: Vec::new(),
+            damages: Vec::new(),
             #[cfg(test)]
             visited_rows: 0,
         }
@@ -225,6 +313,15 @@ impl Screen {
             pen: None,
             cursor: Cursor::Unmanaged,
             drawn_cursor: Cursor::Unmanaged,
+            native: None,
+            pictures: VecDeque::new(),
+            shown: Vec::new(),
+            blocked: false,
+            due: false,
+            next_picture: 0,
+            images: Vec::new(),
+            wrote: Vec::new(),
+            damages: Vec::new(),
             #[cfg(test)]
             visited_rows: 0,
         }
@@ -266,6 +363,270 @@ impl Screen {
     pub fn set_transcript_area(&mut self, x: u16, y: u16, width: u16, height: u16) {
         self.transcript.set_area(x, y, width, height);
         self.pending = true;
+    }
+
+    /// Give the screen the terminal's own image protocol, or `None` for a
+    /// terminal that draws a picture only as half-block cells.
+    pub(crate) fn set_native(&mut self, native: Option<Native>) {
+        if self.native == native {
+            return;
+        }
+        self.native = native;
+        // No image the last protocol put on the screen counts any more.
+        self.shown.clear();
+        self.due = native.is_some() && !self.pictures.is_empty();
+    }
+
+    /// Register the picture the ring committed at line `first`: its cells take
+    /// `rows` rows of `columns` columns, and `source` holds the image.
+    ///
+    /// A ninth picture drops the oldest, whose image then leaves the screen.
+    pub(crate) fn add_picture(
+        &mut self,
+        first: u64,
+        rows: u16,
+        columns: u16,
+        left: u16,
+        source: PictureSource,
+    ) {
+        if rows == 0 || columns == 0 {
+            return;
+        }
+        while self.pictures.len() >= NATIVE_PICTURES {
+            let Some(old) = self.pictures.pop_front() else {
+                break;
+            };
+            self.forget_shown(old.id, old.rows, old.columns);
+        }
+        self.next_picture = self.next_picture.wrapping_add(1).max(1);
+        let id = self.next_picture;
+        self.pictures.push_back(NativePicture {
+            id,
+            first,
+            rows,
+            columns,
+            left,
+            source,
+        });
+    }
+
+    /// Whether a box or a panel covers the transcript, which hides every image
+    /// on it and keeps a picture from going out.
+    pub(crate) fn block_pictures(&mut self, blocked: bool) {
+        self.blocked = blocked;
+    }
+
+    /// Every image on the screen is gone: the terminal drew its pane again, so
+    /// each picture the frame shows whole goes out once more.
+    pub(crate) fn pictures_lost(&mut self) {
+        self.shown.clear();
+        self.due = self.native.is_some() && !self.pictures.is_empty();
+    }
+
+    /// Whether a picture waits for its settle time and then goes out.
+    pub(crate) fn pictures_due(&self) -> bool {
+        self.due
+    }
+
+    /// Append the image bytes the app handed the screen to the next frame, or
+    /// to the exit write when none follows.
+    ///
+    /// A frame writes them first, inside its synchronized update, so the cells
+    /// that name them are on the screen after them: an image goes out before
+    /// the placeholder cells that draw it, and the delete of one goes out
+    /// before the screen closes.
+    pub(crate) fn send_images(&mut self, bytes: &[u8]) {
+        self.images.extend_from_slice(bytes);
+    }
+
+    /// Append the image bytes the app handed the screen to `out`, and keep none
+    /// of them.
+    fn write_images(&mut self, out: &mut Vec<u8>) {
+        if self.images.is_empty() {
+            return;
+        }
+        out.extend_from_slice(&self.images);
+        self.images.clear();
+    }
+
+    /// The cell a registered picture draws its image at, when this frame shows
+    /// it whole: the protocol is known, nothing blocks the transcript, its
+    /// lines still take one row each in the ring and its rows fit the viewport.
+    fn picture_cell(&self, picture: &NativePicture) -> Option<(u16, u16)> {
+        if self.native.is_none() || self.blocked || self.transcript.height() == 0 {
+            return None;
+        }
+        let end = picture.first.checked_add(u64::from(picture.rows))?;
+        if picture.first < self.transcript.dropped() || end > self.transcript.len() {
+            return None;
+        }
+        let mut line = picture.first;
+        while line < end {
+            if self.transcript.rows_of(line) != 1 {
+                return None;
+            }
+            line += 1;
+        }
+        let row = self.transcript.line_row(picture.first)?;
+        if u32::from(row) + u32::from(picture.rows) > u32::from(self.transcript.height()) {
+            return None;
+        }
+        let (x, y) = self.transcript.area_origin();
+        Some((x.saturating_add(picture.left), y.saturating_add(row)))
+    }
+
+    /// Take the image of the shown picture `id` off the screen: an iTerm2 image
+    /// comes back with the cells the next frame writes over it.
+    fn forget_shown(&mut self, id: u32, rows: u16, columns: u16) {
+        let Some(slot) = self.shown.iter().position(|shown| shown.0 == id) else {
+            return;
+        };
+        let Some((_, x, y)) = self.shown.get(slot).copied() else {
+            return;
+        };
+        self.shown.remove(slot);
+        if self.native.is_none() {
+            return;
+        }
+        self.damages.push(Damage {
+            x,
+            y,
+            width: columns,
+            height: rows,
+        });
+        for row in y..y.saturating_add(rows) {
+            self.back.mark_dirty(row);
+        }
+    }
+
+    /// Take off the images of the pictures the frame no longer shows whole, and
+    /// mark a picture that is not on the screen yet as due.
+    fn prepare_pictures(&mut self) {
+        if self.pictures.is_empty() {
+            return;
+        }
+        self.wrote.clear();
+        if !self.shown.is_empty() {
+            self.wrote.resize(usize::from(self.back.height()), false);
+        }
+        let mut slot = 0;
+        while slot < self.shown.len() {
+            let Some((id, x, y)) = self.shown.get(slot).copied() else {
+                break;
+            };
+            let wanted = self
+                .pictures
+                .iter()
+                .find(|picture| picture.id == id)
+                .map(|picture| (self.picture_cell(picture), picture.rows, picture.columns));
+            match wanted {
+                Some((Some(cell), _, _)) if cell == (x, y) => slot += 1,
+                Some((_, rows, columns)) => self.forget_shown(id, rows, columns),
+                None => {
+                    self.shown.remove(slot);
+                }
+            }
+        }
+        let mut index = 0;
+        while let Some(picture) = self.pictures.get(index) {
+            if !self.shown.iter().any(|shown| shown.0 == picture.id)
+                && self.picture_cell(picture).is_some()
+            {
+                self.due = true;
+            }
+            index += 1;
+        }
+    }
+
+    /// Drop the shown pictures whose rows this frame wrote again: the text of
+    /// the cells went over the image, so it goes out once more.
+    fn erased_pictures(&mut self) {
+        if self.shown.is_empty() || self.wrote.is_empty() || self.native.is_none() {
+            return;
+        }
+        let full = self.full_redraw;
+        let mut slot = 0;
+        while slot < self.shown.len() {
+            let Some((id, _, y)) = self.shown.get(slot).copied() else {
+                break;
+            };
+            let rows = self
+                .pictures
+                .iter()
+                .find(|picture| picture.id == id)
+                .map_or(0, |picture| picture.rows);
+            let wrote = full
+                || (y..y.saturating_add(rows))
+                    .any(|row| self.wrote.get(usize::from(row)).copied().unwrap_or(false));
+            if wrote {
+                self.shown.remove(slot);
+                self.due = true;
+            } else {
+                slot += 1;
+            }
+        }
+    }
+
+    /// Draw the images of the pictures this frame shows whole into `images`,
+    /// which is cleared first. A frame with no picture due writes nothing.
+    pub(crate) fn draw_pictures(&mut self, images: &mut Vec<u8>) {
+        images.clear();
+        self.due = false;
+        if self.native.is_none() || self.blocked || self.pictures.is_empty() {
+            return;
+        }
+        let mut drew = false;
+        for index in 0..self.pictures.len() {
+            let Some(picture) = self.pictures.get(index) else {
+                continue;
+            };
+            if self.shown.iter().any(|shown| shown.0 == picture.id) {
+                continue;
+            }
+            let Some((x, y)) = self.picture_cell(picture) else {
+                continue;
+            };
+            let (id, columns, rows) = (
+                picture.id,
+                u32::from(picture.columns),
+                u32::from(picture.rows),
+            );
+            // Rio draws text cells over an iTerm2 image, so the cells under it
+            // go blank first, in the same write as the image.
+            write_blank(images, x, y, picture.columns, picture.rows);
+            images.extend_from_slice(b"\x1b7");
+            write_cup(images, y, x);
+            picture_native::iterm2(
+                images,
+                &picture.source.data,
+                picture.source.bytes,
+                columns,
+                rows,
+            );
+            images.extend_from_slice(b"\x1b8");
+            self.shown.push((id, x, y));
+            drew = true;
+        }
+        if drew {
+            // The blank cells reset the pen, and the image steps hide the
+            // cursor: the next frame starts from a known pen, and the edit
+            // point shows again.
+            self.pen = None;
+            if let Cursor::At(x, y) = self.drawn_cursor {
+                write_cup(images, self.origin + y, x);
+                images.extend_from_slice(SHOW_CURSOR);
+            }
+        }
+    }
+
+    /// Forget every picture the ring registered: the alternate screen is about
+    /// to go, and its images with it.
+    fn forget_pictures(&mut self) {
+        self.shown.clear();
+        self.pictures.clear();
+        self.damages.clear();
+        self.wrote.clear();
+        self.due = false;
     }
 
     /// Columns.
@@ -497,8 +858,17 @@ impl Screen {
         runs: &[Run<'_>],
         lines: &[Range<usize>],
     ) -> bool {
-        if !self.full || !self.transcript.replace(fold, open, runs, lines) {
+        if !self.full {
             return false;
+        }
+        let Some((end, grown)) = self.transcript.replace(fold, open, runs, lines) else {
+            return false;
+        };
+        // The pictures after the block move with its lines.
+        for picture in &mut self.pictures {
+            if picture.first >= end {
+                picture.first = picture.first.saturating_add_signed(grown);
+            }
         }
         self.pending = true;
         true
@@ -513,6 +883,33 @@ impl Screen {
     /// Give the committed block `fold` back the source it draws from again.
     pub(crate) fn set_source(&mut self, fold: u64, source: Source) {
         self.transcript.set_source(fold, source);
+    }
+
+    /// Keep the text of the block that took the lines `line..line + lines`, as
+    /// the reply wrote it, for a copy of it later. Inline mode keeps none: its
+    /// lines are in the scrollback and never change.
+    pub(crate) fn set_origin(
+        &mut self,
+        line: u64,
+        lines: u64,
+        text: &str,
+        code: bool,
+        label: bool,
+    ) {
+        if self.full {
+            self.transcript.add_source(line, lines, text, code, label);
+        }
+    }
+
+    /// Where the text of the block that holds the stored line `line` sits, while
+    /// the ring still holds it.
+    pub(crate) fn origin(&self, line: u64) -> Option<Origin> {
+        self.transcript.source_at(line)
+    }
+
+    /// The text of `origin`, as the reply wrote it.
+    pub(crate) fn origin_text(&self, origin: &Origin) -> &str {
+        self.transcript.source_text(origin)
     }
 
     /// Fit the live area to `rows` rows of content.
@@ -634,6 +1031,10 @@ impl Screen {
     /// that names its session, and leave the cursor on a clean line under it.
     fn close_full(&mut self, out: &mut Vec<u8>) {
         out.clear();
+        // A kitty image outlives the alternate screen, so the deletes the app
+        // handed the screen go first.
+        self.write_images(out);
+        self.forget_pictures();
         if self.entered {
             out.extend_from_slice(RESET);
             out.extend_from_slice(ALT_SCREEN_OFF);
@@ -752,17 +1153,23 @@ impl Screen {
             self.visited_rows = 0;
         }
         out.extend_from_slice(SYNC_START);
+        // The image bytes the app handed the screen go first, before the cells
+        // that name them.
+        self.write_images(out);
         let mark = out.len();
         if self.cursor != Cursor::Unmanaged {
             out.extend_from_slice(HIDE_CURSOR);
         }
         let body = out.len();
         let pen = self.pen;
+        self.prepare_pictures();
         if !self.commits.is_empty() {
             out.extend_from_slice(&self.commits);
             self.commits.clear();
         }
         self.write_diff(out);
+        self.erased_pictures();
+        self.damages.clear();
         // The frame touched the terminal unless it wrote no cell and left the
         // cursor where the terminal already shows it.
         if out.len() > body || self.cursor != self.drawn_cursor {
@@ -815,7 +1222,7 @@ impl Screen {
             let row = y * width;
             let mut x = 0;
             while x < width {
-                if !self.cell_differs(row + x) {
+                if !self.cell_differs(row + x, x as u16, y as u16) {
                     x += 1;
                     continue;
                 }
@@ -824,7 +1231,13 @@ impl Screen {
                     cx = x as i32;
                     cy = y as i32;
                 }
-                while x < width && self.cell_differs(row + x) {
+                while x < width && self.cell_differs(row + x, x as u16, y as u16) {
+                    if !self.wrote.is_empty()
+                        && self.covers_shown(x as u16, y as u16)
+                        && let Some(wrote) = self.wrote.get_mut(y)
+                    {
+                        *wrote = true;
+                    }
                     let cell = self.back.cells()[row + x];
                     if cell.is_continuation() {
                         x += 1;
@@ -857,8 +1270,28 @@ impl Screen {
         }
     }
 
-    fn cell_differs(&self, index: usize) -> bool {
-        self.full_redraw || self.front.cells()[index].bits() != self.back.cells()[index].bits()
+    /// Whether the cell at column `x` of row `y` is under an image on screen: a
+    /// write next to an image, such as a sidebar's on the same row, leaves it.
+    fn covers_shown(&self, x: u16, y: u16) -> bool {
+        self.shown.iter().any(|&(id, left, top)| {
+            self.pictures
+                .iter()
+                .find(|picture| picture.id == id)
+                .is_some_and(|picture| {
+                    x >= left
+                        && x < left.saturating_add(picture.columns)
+                        && y >= top
+                        && y < top.saturating_add(picture.rows)
+                })
+        })
+    }
+
+    /// Whether the cell at `index`, column `x` of row `y`, differs from the one
+    /// the terminal shows, or sits in a rectangle an image covered.
+    fn cell_differs(&self, index: usize, x: u16, y: u16) -> bool {
+        self.full_redraw
+            || self.front.cells()[index].bits() != self.back.cells()[index].bits()
+            || self.damages.iter().any(|damage| damage.holds(x, y))
     }
 }
 

@@ -223,6 +223,19 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+/// Whether a request lets the model call its tools.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolChoice {
+    /// The model decides.
+    #[default]
+    Auto,
+    /// The model may not call a tool. The definitions stay in the request, but
+    /// a host may still miss the prompt cache or reject the request. The
+    /// pi-messages wire has no such field and ignores this, so a caller still
+    /// handles a call in the reply.
+    Off,
+}
+
 /// One request to a provider.
 ///
 /// The model id, the system prompt, the tools and the history are borrowed
@@ -239,6 +252,8 @@ pub struct Request<'a> {
     pub system: Option<&'a Text>,
     /// Tools offered to the model.
     pub tools: &'a [ToolSpec],
+    /// Whether the model may call the offered tools.
+    pub tool_choice: ToolChoice,
     /// The conversation so far, oldest first.
     pub messages: &'a [Message],
     /// Whether the model takes images, so the wires send them. When it is

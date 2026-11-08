@@ -52,8 +52,15 @@ pub enum Update<'a> {
     Usage {
         /// Tokens sent.
         input: u64,
+        /// Tokens the request read from the provider's cache and wrote to it.
+        cached: u64,
         /// Tokens received.
         output: u64,
+    },
+    /// Reply text or thinking that came since the last update.
+    Streamed {
+        /// The bytes of it.
+        bytes: usize,
     },
     /// The model the worker runs, and the context window it has.
     Model {

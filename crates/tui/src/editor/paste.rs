@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::Editor;
 
@@ -30,6 +30,16 @@ pub const CHIP: &str = "≡";
 
 /// The glyph a folded chip puts before the count of the lines it holds back.
 pub const CHIP_MORE: &str = "… +";
+
+/// What an image chip's label opens with: `[Image #N]`.
+pub const IMAGE_LABEL: &str = "[Image #";
+
+/// What an image chip's label ends with.
+pub const IMAGE_LABEL_END: &str = "]";
+
+/// The columns of a chip's first line the label keeps: a wider first line is
+/// cut, so the count of the lines the chip holds back always shows.
+pub(super) const CHIP_LINE: u16 = 40;
 
 /// The one character a folded chip puts in the editor text: U+FFFC, the object
 /// replacement character. No terminal draws it, since the chip draws over its
@@ -60,6 +70,9 @@ pub struct Paste {
     range: (usize, usize),
     /// Whether the chip's bytes are the editor's text.
     open: bool,
+    /// The number of a pasted image, for the label the chip draws instead of a
+    /// first line. An image chip never opens.
+    image: Option<u32>,
 }
 
 impl Paste {
@@ -86,6 +99,11 @@ impl Paste {
     /// Whether the chip is open for editing.
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// The number of the pasted image the chip stands for, when it is one.
+    pub fn image(&self) -> Option<u32> {
+        self.image
     }
 
     /// The pasted bytes the chip holds while it is folded, empty while it is
@@ -132,6 +150,7 @@ impl Editor {
             self.insert(&text);
             return;
         }
+        let first = cut_first_line(&text, first);
         let at = self.gap.cursor();
         let width = chip_width(&text[first.0..first.1], other);
         self.insert(MARK_STR);
@@ -145,6 +164,41 @@ impl Editor {
                 width,
                 range: (at, at + MARK_BYTES),
                 open: false,
+                image: None,
+            },
+        );
+    }
+
+    /// Put the image the file at `path` holds in the box as a chip, as Ctrl+V on
+    /// the clipboard does once its bytes are written.
+    ///
+    /// The chip is one mark in the text, with a plain space after it so the next
+    /// key lands after the chip, and its word is the `@"<path>"` mention the
+    /// worker reads, with the space in front of it that makes the word count
+    /// after text that ends in no space. The chip is folded and stays folded: it
+    /// stands for a file, not for text.
+    pub fn paste_image(&mut self, path: &str, number: u32) {
+        // A chip cannot hold a chip: an open one folds first, which puts the
+        // text back to marks before this one adds its own.
+        if let Some(index) = self.selected_paste()
+            && self.pastes[index].open
+        {
+            self.fold(index);
+        }
+        let at = self.gap.cursor();
+        // One insert, so one undo takes the chip and its space.
+        self.insert(&format!("{MARK} "));
+        let index = self.pastes.partition_point(|paste| paste.range.0 < at);
+        self.pastes.insert(
+            index,
+            Paste {
+                text: format!(" @\"{path}\"").into(),
+                first: (0, 0),
+                other: 0,
+                width: image_width(number),
+                range: (at, at + MARK_BYTES),
+                open: false,
+                image: Some(number),
             },
         );
     }
@@ -161,18 +215,47 @@ impl Editor {
     }
 
     /// Tab: open the chip at the edit point, or fold it back when it is open.
-    /// False when no chip is there, so the key is the transcript's or the box's
-    /// as it was.
+    /// With the edit point off every chip it folds the last open chip that
+    /// starts at or before it, else the first open one, so a tab after a chip
+    /// folds it as a click on it would. False when no chip is open and none is
+    /// at the edit point, so the key is the transcript's or the box's as it was.
     pub fn toggle_paste(&mut self) -> bool {
-        let Some(index) = self.selected_paste() else {
+        if let Some(index) = self.selected_paste() {
+            if self.pastes[index].image.is_some() {
+                // An image chip never opens: Tab on it is the key it is off a
+                // chip, which the app answers.
+                return false;
+            }
+            if self.pastes[index].open {
+                self.fold(index);
+            } else {
+                self.open(index);
+            }
+            return true;
+        }
+        let cursor = self.gap.cursor();
+        let open = self
+            .pastes
+            .iter()
+            .rposition(|paste| paste.open && paste.range.0 <= cursor)
+            .or_else(|| self.pastes.iter().position(Paste::is_open));
+        let Some(index) = open else {
             return false;
         };
-        if self.pastes[index].open {
-            self.fold(index);
-        } else {
-            self.open(index);
-        }
+        self.fold(index);
         true
+    }
+
+    /// Fold the open chip at `index` back to its mark, as a click on one of its
+    /// rows does. False when no open chip is at `index`.
+    pub fn fold_paste(&mut self, index: usize) -> bool {
+        match self.pastes.get(index) {
+            Some(paste) if paste.open => {
+                self.fold(index);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Open the chip at `index` in place: its bytes become the editor's text,
@@ -184,6 +267,7 @@ impl Editor {
         self.gap.insert(&text);
         self.pastes[index].range = (start, start + text.len());
         self.pastes[index].open = true;
+        self.shift_after(index, MARK_BYTES, text.len());
         self.gap.move_to(start);
         self.touch(start);
         // The chip moved the text under the undo log and the mark.
@@ -191,14 +275,25 @@ impl Editor {
     }
 
     /// Fold the chip at `index` back: the mark takes its range in the text and
-    /// the chip takes the text, edits and all.
+    /// the chip takes the text, edits and all. The edit point keeps its place:
+    /// one inside the chip moves to its start, one after it moves with the text
+    /// the mark took away, so the next key lands where the eye is.
     fn fold(&mut self, index: usize) {
         let (start, end) = self.pastes[index].range;
+        let cursor = self.gap.cursor();
+        let at = if cursor < start {
+            cursor
+        } else if cursor <= end {
+            start
+        } else {
+            start + MARK_BYTES + (cursor - end)
+        };
         let (head, tail) = self.gap.slice(start, end);
         let mut text = String::with_capacity(end - start);
         text.push_str(head);
         text.push_str(tail);
         let (first, other) = measure(&text);
+        let first = cut_first_line(&text, first);
         let width = chip_width(&text[first.0..first.1], other);
         self.gap.erase(start, end);
         self.gap.insert(MARK_STR);
@@ -209,9 +304,19 @@ impl Editor {
         paste.width = width;
         paste.range = (start, start + MARK_BYTES);
         paste.open = false;
-        self.gap.move_to(start);
+        self.shift_after(index, end - start, MARK_BYTES);
+        self.gap.move_to(at);
         self.touch(start);
         self.readline.forget();
+    }
+
+    /// The chip at `index` took `old` bytes of the text and now takes `new`, so
+    /// the chips after it move with the text behind it.
+    fn shift_after(&mut self, index: usize, old: usize, new: usize) {
+        for paste in &mut self.pastes[index + 1..] {
+            paste.range.0 = paste.range.0 - old + new;
+            paste.range.1 = paste.range.1 - old + new;
+        }
     }
 
     /// The text changed at `at`: `removed` bytes went and `added` arrived, so
@@ -349,6 +454,22 @@ fn measure(text: &str) -> ((usize, usize), usize) {
     ((0, first), other)
 }
 
+/// The first line's range cut to at most [`CHIP_LINE`] columns: a first line
+/// wider than the label takes is cut, on a char boundary, and a wide character
+/// is never left in half.
+fn cut_first_line(text: &str, (start, end): (usize, usize)) -> (usize, usize) {
+    let line = &text[start..end];
+    let mut columns: u16 = 0;
+    for (at, c) in line.char_indices() {
+        let cells = UnicodeWidthChar::width(c).unwrap_or(0) as u16;
+        if columns + cells > CHIP_LINE {
+            return (start, start + at);
+        }
+        columns += cells;
+    }
+    (start, end)
+}
+
 /// The columns a folded chip's label takes: `≡ <first line> … +N`.
 fn chip_width(first: &str, other: usize) -> u16 {
     let mut digits = 1;
@@ -364,6 +485,17 @@ fn chip_width(first: &str, other: usize) -> u16 {
         + UnicodeWidthStr::width(CHIP_MORE)
         + digits;
     width as u16
+}
+
+/// The columns an image chip's label takes: `[Image #N]`.
+fn image_width(number: u32) -> u16 {
+    let mut digits = 1;
+    let mut held = number;
+    while held >= 10 {
+        digits += 1;
+        held /= 10;
+    }
+    (UnicodeWidthStr::width(IMAGE_LABEL) + digits + UnicodeWidthStr::width(IMAGE_LABEL_END)) as u16
 }
 
 #[cfg(test)]

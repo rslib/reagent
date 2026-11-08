@@ -94,6 +94,7 @@ impl App {
         } = self.look;
         self.look = Look::resolve(mode, depth, overrides, color, &mut self.screen);
         self.retheme_replies();
+        self.preview_restyled();
         self.dirty = true;
     }
 
@@ -126,6 +127,7 @@ impl App {
         let mode = self.look.mode();
         self.look = Look::resolve(mode, depth, overrides, color, &mut self.screen);
         self.retheme_replies();
+        self.preview_restyled();
         self.dirty = true;
     }
 

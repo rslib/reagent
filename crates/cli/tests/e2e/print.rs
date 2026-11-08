@@ -261,6 +261,91 @@ async fn a_plain_run_error_goes_to_stderr() {
     assert!(stderr.starts_with("reagent: "), "{stderr}");
 }
 
+/// A script of more tool calls than a run has turns.
+async fn endless_script(dir: &std::path::Path) -> String {
+    tokio::fs::write(dir.join("a"), "x\n")
+        .await
+        .expect("write a");
+    let reply = r#"{"calls": [{"name": "read", "arguments": {"path": "a"}}]}"#;
+    let replies = vec![reply; 201].join(",");
+    script(dir, &format!(r#"{{"replies": [{replies}]}}"#)).await
+}
+
+/// The limit stops the run with no answer, so stderr is all it has to say.
+#[tokio::test]
+async fn a_plain_run_says_why_it_stopped_at_the_turn_limit() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let fake = endless_script(tmp.path()).await;
+    let output = run(tmp.path(), &["--provider", &fake, "-p", "hi"]).await;
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("limit of 200 turns"), "{stderr}");
+    assert!(stderr.contains("--resume"), "{stderr}");
+}
+
+/// The last allowed turn answers with a handoff, and the run is still a stop at
+/// the limit.
+#[tokio::test]
+async fn a_plain_run_prints_the_handoff_at_the_turn_limit() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    tokio::fs::write(tmp.path().join("a"), "x\n")
+        .await
+        .expect("write a");
+    let call = r#"{"calls": [{"name": "read", "arguments": {"path": "a"}}]}"#;
+    let mut replies = vec![call; 199];
+    replies.push(r#"{"text": "status text"}"#);
+    let replies = replies.join(",");
+    let fake = script(tmp.path(), &format!(r#"{{"replies": [{replies}]}}"#)).await;
+    let output = run(tmp.path(), &["--provider", &fake, "-p", "hi"]).await;
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("status text"), "{stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("limit of 200 turns"), "{stderr}");
+}
+
+#[tokio::test]
+async fn a_plain_run_says_why_it_stopped_at_the_deadline() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let fake = script(
+        tmp.path(),
+        r#"{"replies": [{"calls": [{"name": "bash", "arguments": {"command": "sleep 30"}}]}]}"#,
+    )
+    .await;
+    let output = run(
+        tmp.path(),
+        &["--provider", &fake, "--deadline", "1", "-p", "hi"],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(124));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("deadline"), "{stderr}");
+}
+
+/// A clean end has nothing to explain.
+#[tokio::test]
+async fn a_plain_run_says_why_it_stopped_only_when_it_did_not_finish() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let fake = script(tmp.path(), r#"{"replies": [{"text": "ok"}]}"#).await;
+    let output = run(tmp.path(), &["--provider", &fake, "-p", "hi"]).await;
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("stopped"), "{stderr}");
+}
+
+/// JSON mode reports the reason in its summary and keeps stderr as it was.
+#[tokio::test]
+async fn a_json_run_leaves_says_why_it_stopped_to_its_summary() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let fake = endless_script(tmp.path()).await;
+    let output = run(tmp.path(), &["--provider", &fake, "--json", "-p", "hi"]).await;
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("limit of"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("max_turns"), "the summary names the reason");
+}
+
 #[tokio::test]
 async fn the_final_text_is_the_last_turn_only() {
     let tmp = tempfile::tempdir().expect("temp dir");

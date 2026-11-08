@@ -7,9 +7,13 @@
 
 use std::sync::Arc;
 
-use crate::keys::{Group, HINTS, hints};
+use crate::keyfile::Labels;
+use crate::keys::{Group, HINTS};
 
 use super::{Kind, Mark, Row, Sheet};
+
+/// The keys of the footer row, until a keys file moves one.
+const FOOTER: &str = "esc closes \u{b7} ctrl+x / runs any command by name";
 
 /// The groups in the order the sheet lists them, with the name each heads its
 /// lane with.
@@ -21,23 +25,35 @@ const GROUPS: [(Group, &str); 3] = [
 
 /// The key sheet: every key of the one key map, grouped, with the groups side
 /// by side when there is room.
-pub(crate) fn help_sheet() -> Sheet {
+pub(crate) fn help_sheet(labels: Option<&Labels>) -> Sheet {
     let none: Arc<str> = Arc::from("");
     let mut rows = Vec::with_capacity(HINTS.len() + GROUPS.len());
     for (group, name) in GROUPS {
+        // The leader's heading names the key it waits for, which a file moves.
+        let name = match (group, labels) {
+            (Group::Leader, Some(labels)) => Arc::from(format!("{} then", labels.leader())),
+            _ => Arc::from(name),
+        };
         rows.push(Row {
             kind: Kind::Group,
             mark: Mark::None,
-            name: Arc::from(name),
+            name,
             detail: none.clone(),
             right: none.clone(),
             dim: false,
         });
-        for hint in hints(group) {
+        for (index, hint) in HINTS
+            .iter()
+            .enumerate()
+            .filter(|(_, hint)| hint.group == group)
+        {
             rows.push(Row {
                 kind: Kind::Item,
                 mark: Mark::None,
-                name: Arc::from(hint.keys),
+                name: Arc::from(match labels {
+                    Some(labels) => labels.hint(index),
+                    None => hint.keys,
+                }),
                 detail: Arc::from(hint.words),
                 right: none.clone(),
                 dim: false,
@@ -48,7 +64,7 @@ pub(crate) fn help_sheet() -> Sheet {
         "Keys",
         Arc::from(format!("{} keys", HINTS.len())),
         "type to filter",
-        "esc closes \u{b7} ctrl+x / runs any command by name",
+        FOOTER,
         rows,
     )
     .with_columns()
@@ -61,7 +77,7 @@ mod tests {
 
     /// The sheet of the tests.
     fn sheet() -> Sheet {
-        super::help_sheet()
+        super::help_sheet(None)
     }
 
     /// The names of the rows on screen, top down.
@@ -119,6 +135,32 @@ mod tests {
         );
     }
 
+    /// A keys file moves the keys the sheet lists, and the sheet names them.
+    #[test]
+    fn custom_key_label_help_sheet_row() {
+        let (file, notes) = crate::keyfile::KeyFile::parse(
+            "[keys]\nsend = \"ctrl+s\"\nsearch-forward = \"alt+s\"\n",
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        let sheet = super::help_sheet(Some(file.labels()));
+        let rows: Vec<(&str, &str)> = sheet
+            .rows
+            .iter()
+            .filter(|row| row.kind == Kind::Item)
+            .map(|row| (&*row.name, &*row.detail))
+            .collect();
+        assert_eq!(
+            rows[0],
+            ("ctrl+s", "send or steer"),
+            "the send row shows the key it moved to"
+        );
+        assert!(
+            rows.iter().all(|(keys, _)| *keys != "enter"),
+            "no row shows the key send left: {rows:?}"
+        );
+        assert_eq!(rows[18], ("ctrl+r alt+s", "search history"));
+    }
+
     /// The groups flow side by side when the width leaves room for their lanes.
     #[test]
     fn the_groups_flow_side_by_side() {
@@ -144,11 +186,21 @@ mod tests {
                 "ctrl+t alt+t",
                 "ctrl+_",
                 "ctrl+q",
+                "ctrl+v",
                 "ctrl+r ctrl+s",
                 "ctrl+p ctrl+n",
                 "ctrl+o",
+                "esc ctrl+g",
                 "alt+0-9 ctrl+space",
             ]
         );
+    }
+
+    /// A file that moves nothing prints each word as the table has it.
+    #[test]
+    fn keys_in_force_help_foot_matches_the_table() {
+        let (file, _) = crate::keyfile::KeyFile::parse("");
+        let labels = file.labels();
+        assert_eq!(labels.foot(crate::keyfile::Foot::Help), super::FOOTER);
     }
 }

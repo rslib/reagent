@@ -72,7 +72,11 @@ impl App {
             pick: self.style(Role::Selection, Emphasis::Plain),
             pick_key: self.style(Role::Selection, Emphasis::Bold),
         };
-        let (after, cursor) = draw(&mut self.screen, open, pick, queued, y, width, &inks);
+        let Self {
+            screen, keyfile, ..
+        } = self;
+        let labels = keyfile.as_ref().map(crate::keyfile::KeyFile::labels);
+        let (after, cursor) = draw(screen, open, pick, queued, y, width, &inks, labels);
         self.card_cursor = cursor;
         after
     }
@@ -184,6 +188,7 @@ fn note_rows(open: &ApprovalBox, pick: Choice) -> u16 {
 
 /// Draws the card from row `y` and answers the row after its last one, with the
 /// edit point of its note when the note is open.
+#[expect(clippy::too_many_arguments, reason = "one frame's regions, drawn once")]
 fn draw(
     screen: &mut Screen,
     open: &ApprovalBox,
@@ -192,6 +197,7 @@ fn draw(
     y: u16,
     width: u16,
     inks: &Inks,
+    keys: Option<&crate::keyfile::Labels>,
 ) -> (u16, Option<(u16, u16)>) {
     let rows = card_rows(open, pick);
     let mut cursor = None;
@@ -265,6 +271,7 @@ fn draw(
             (inks.text, inks.text)
         };
         let (key, label) = choice.parts();
+        let key = keys.map_or(key, |keys| keys.choice(choice));
         x = screen.put_str_until(x, row, " ", case, width);
         x = screen.put_str_until(x, row, key, key_style, width);
         x = screen.put_str_until(x, row, " ", case, width);
@@ -446,6 +453,29 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    /// A keys file moves the card's answers, and the row shows the keys in
+    /// force.
+    #[test]
+    fn custom_key_label_card_row() {
+        let mut app = new_app();
+        app.read_keys_text("[card]\nonce = \"o\"\n");
+        open(&mut app, "make", "default", false);
+        let rows = frame(&mut app);
+        let answers = rows
+            .iter()
+            .find(|row| row.contains("Allow once"))
+            .expect("the row of answers");
+        assert!(
+            answers.contains(" o Allow once"),
+            "the answer key moved: {answers:?}"
+        );
+        assert!(
+            !answers.contains(" y Allow once"),
+            "the key it left is gone: {answers:?}"
+        );
+        assert!(answers.contains(" a Always here"), "{answers:?}");
     }
 
     /// Types `text` into whatever takes keys: the note of a card.

@@ -20,6 +20,8 @@ pub struct SeenRequest {
     pub images: bool,
     /// The reasoning text the request carried, if any.
     pub reasoning: Option<String>,
+    /// Whether the request let the model call tools.
+    pub tool_choice: crate::ToolChoice,
 }
 
 /// One item a scripted reply can yield: an event or an error.
@@ -87,6 +89,7 @@ impl Provider for FakeProvider {
             messages: request.messages.len(),
             images: request.images,
             reasoning: request.reasoning.map(str::to_string),
+            tool_choice: request.tool_choice,
         });
         let reply = self
             .replies
@@ -145,6 +148,7 @@ mod tests {
             max_tokens: 64,
             system: None,
             tools: &[],
+            tool_choice: crate::ToolChoice::Auto,
             messages: history,
             images: true,
             reasoning: Some("low"),
@@ -197,12 +201,14 @@ mod tests {
                     messages: 2,
                     images: true,
                     reasoning: Some("low".into()),
+                    tool_choice: crate::ToolChoice::Auto,
                 },
                 SeenRequest {
                     model: "fake-model".into(),
                     messages: 2,
                     images: true,
                     reasoning: Some("low".into()),
+                    tool_choice: crate::ToolChoice::Auto,
                 },
             ]
         );

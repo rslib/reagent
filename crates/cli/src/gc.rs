@@ -246,6 +246,29 @@ fn inspect(folder: &Path, dir: &Path) -> std::io::Result<Found> {
     Ok(found)
 }
 
+/// Whether a part of another session in `folder` reads one of `parts`, which
+/// makes the session that owns them a fork parent.
+///
+/// A continued run points its part at an older part of its own session, so a
+/// session's own forks do not count. A session another sweep took first says
+/// nothing. Any other read error is the caller's, because the session it hides
+/// may be a fork. Reading the part headers blocks, so a caller runs this in
+/// `spawn_blocking`.
+pub fn forked_from(folder: &Path, dir: &Path, parts: &[u64]) -> std::io::Result<bool> {
+    for other in paths::session_dirs(folder)? {
+        if other.as_path() == dir {
+            continue;
+        }
+        match inspect(folder, &other) {
+            Ok(found) if found.forks.iter().any(|fork| parts.contains(fork)) => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
 /// The session to delete next: the least recently written one that `eligible`
 /// allows and that no session staying behind forks from.
 fn victim(found: &[Found], keep: &[PathBuf], eligible: impl Fn(&Found) -> bool) -> Option<usize> {

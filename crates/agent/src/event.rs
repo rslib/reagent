@@ -94,6 +94,9 @@ pub enum Event {
         mode: SendMode,
         /// The text the client sent, shared with the conversation.
         text: Text,
+        /// The images that follow the text, such as a pasted one, shared with
+        /// the conversation.
+        images: Vec<reagent_ai::Image>,
     },
     /// A journal record was committed.
     Committed {

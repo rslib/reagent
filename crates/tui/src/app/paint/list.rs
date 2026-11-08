@@ -119,7 +119,7 @@ pub(crate) fn draw_list(
         }
         Source::Commands(_) => commands(screen, list, y + 1, footer, width, inks),
         Source::Files(_) => files(screen, list, y + 1, footer, width, inks),
-        Source::Leader => leader(screen, y + 1, footer, width, inks),
+        Source::Leader => leader(screen, list, y + 1, footer, width, inks),
     }
     footer_row(screen, list, footer, width, inks);
     rows
@@ -229,18 +229,32 @@ fn files(screen: &mut Screen, list: &List, mut row: u16, footer: u16, width: u16
 }
 
 /// Draws the leader's title row and its grid of keys, [`PER_ROW`] to a row.
-fn leader(screen: &mut Screen, mut row: u16, footer: u16, width: u16, inks: &ListInks) {
+fn leader(
+    screen: &mut Screen,
+    list: &List,
+    mut row: u16,
+    footer: u16,
+    width: u16,
+    inks: &ListInks,
+) {
     let inks = &inks.plain;
     if row >= footer {
         return;
     }
-    let mut x = screen.put_str_until(0, row, "ctrl+x", inks.mark, width);
+    let keys = list.keys();
+    let mut x = screen.put_str_until(
+        0,
+        row,
+        keys.map_or("ctrl+x", |keys| &keys.title),
+        inks.mark,
+        width,
+    );
     x = screen.put_str_until(x, row, " ", inks.fill, width);
     screen.put_str_until(x, row, "then", inks.dim, width);
     row += 1;
     let mut cell = 0;
     let mut x = 1;
-    for hint in keys::hints(Group::Leader) {
+    for (index, hint) in keys::hints(Group::Leader).enumerate() {
         if row >= footer {
             return;
         }
@@ -252,9 +266,12 @@ fn leader(screen: &mut Screen, mut row: u16, footer: u16, width: u16, inks: &Lis
                 return;
             }
         }
-        let keys = (UnicodeWidthStr::width(hint.keys) as u16).min(KEY_COL);
-        let key_x = x + KEY_COL - keys;
-        screen.put_str_until(key_x, row, hint.keys, inks.mark, width);
+        let key = keys
+            .and_then(|keys| keys.grid.get(index))
+            .map_or(hint.keys, |key| key);
+        let columns = (UnicodeWidthStr::width(key) as u16).min(KEY_COL);
+        let key_x = x + KEY_COL - columns;
+        screen.put_str_until(key_x, row, key, inks.mark, width);
         screen.put_str_until(x + KEY_COL + 1, row, hint.words, inks.text, width);
         x += CELL_COL;
         cell += 1;
@@ -305,25 +322,32 @@ fn command_row(
     if command.key.is_empty() || width < 2 {
         return;
     }
-    let keys = (UnicodeWidthStr::width(command.key) as u16).min(width - 1);
+    let keys = (UnicodeWidthStr::width(&*command.key) as u16).min(width - 1);
     let key_x = width - 1 - keys;
     if key_x > x {
         // The row keeps one column after the key, so it never reaches the edge.
-        screen.put_str_until(key_x, row, command.key, inks.dim, width - 1);
+        screen.put_str_until(key_x, row, &command.key, inks.dim, width - 1);
     }
 }
 
-/// Draws the footer of the list, in the words of its source.
+/// Draws the footer of the list, in the words of its source: the keys a keys
+/// file moved, or the ones the table names.
 fn footer_row(screen: &mut Screen, list: &List, row: u16, width: u16, inks: &ListInks) {
     let inks = &inks.plain;
     let mut buf = [0u8; DIGITS];
     let mut x = FOOT_COL;
     match list.source() {
         Source::Commands(_) if list.is_palette() => {
-            screen.put_str_until(x, row, PALETTE_FOOT, inks.dim, width);
+            screen.put_str_until(x, row, list.foot().unwrap_or(PALETTE_FOOT), inks.dim, width);
         }
         Source::Commands(_) => {
-            screen.put_str_until(x, row, COMMANDS_FOOT, inks.dim, width);
+            screen.put_str_until(
+                x,
+                row,
+                list.foot().unwrap_or(COMMANDS_FOOT),
+                inks.dim,
+                width,
+            );
         }
         Source::Files(_) => {
             x = screen.put_str_until(
@@ -341,10 +365,10 @@ fn footer_row(screen: &mut Screen, list: &List, row: u16, width: u16, inks: &Lis
                 inks.dim,
                 width,
             );
-            screen.put_str_until(x, row, FILES_FOOT, inks.dim, width);
+            screen.put_str_until(x, row, list.foot().unwrap_or(FILES_FOOT), inks.dim, width);
         }
         Source::Leader => {
-            screen.put_str_until(x, row, LEADER_FOOT, inks.dim, width);
+            screen.put_str_until(x, row, list.foot().unwrap_or(LEADER_FOOT), inks.dim, width);
         }
     }
 }
@@ -508,7 +532,7 @@ mod tests {
         .map(|(name, words, key, group)| Command {
             name,
             words,
-            key,
+            key: key.into(),
             group,
         })
         .collect::<Vec<_>>()
@@ -531,7 +555,7 @@ mod tests {
         .map(|(name, words, key, group)| Command {
             name,
             words,
-            key,
+            key: key.into(),
             group,
         })
         .collect::<Vec<_>>()
@@ -781,7 +805,7 @@ mod tests {
             ("b", "sidebar"),
             ("l", "sessions"),
             ("m", "model"),
-            ("tab", "sidebar focus"),
+            ("t", "level"),
         ] {
             want.push_str(&format!("{keys:>6} {words:<16}"));
         }
@@ -798,12 +822,54 @@ mod tests {
             "its words are body text"
         );
 
-        assert_eq!(
-            text(&screen, 3),
-            format!("{:>7} {:<16}", "/", "commands").trim_end()
-        );
+        let mut want = String::from(" ");
+        for (keys, words) in [("tab", "sidebar focus"), ("/", "commands")] {
+            want.push_str(&format!("{keys:>6} {words:<16}"));
+        }
+        let want: String = want.chars().take(COLUMNS as usize).collect();
+        assert_eq!(text(&screen, 3), want.trim_end());
 
         assert_eq!(text(&screen, 4), "  esc cancels \u{b7} ? shows every key");
+    }
+
+    /// A keys file moves the keys the which-key list shows, and its title too.
+    #[test]
+    fn custom_key_label_which_key_list() {
+        let (file, notes) = crate::keyfile::KeyFile::parse(
+            "[keys]\nleader = \"alt+x\"\n[leader]\nsessions = \"s\"\n",
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+        let mut screen = screen();
+        let inks = inks(&mut screen);
+        let mut list = List::leader();
+        let labels = file.labels();
+        let grid = crate::keys::HINTS
+            .iter()
+            .enumerate()
+            .filter(|(_, hint)| hint.group == crate::keys::Group::Leader)
+            .map(|(index, _)| std::sync::Arc::from(labels.hint(index)))
+            .collect::<Vec<_>>();
+        list.set_keys(super::super::super::list::LeaderKeys {
+            title: std::sync::Arc::from(labels.leader()),
+            grid: grid.into(),
+        });
+        draw_list(&mut screen, &list, 0, COLUMNS, &inks);
+        assert_eq!(text(&screen, 1), "alt+x then");
+        let mut want = String::from(" ");
+        for (keys, words) in [("b", "sidebar"), ("s", "sessions")] {
+            want.push_str(&format!("{keys:>6} {words:<16}"));
+        }
+        let want: String = want.chars().take(COLUMNS as usize).collect();
+        assert!(
+            text(&screen, 2).starts_with(want.trim_end()),
+            "{:?}",
+            text(&screen, 2)
+        );
+        assert!(
+            !text(&screen, 2).contains("l sessions"),
+            "the key it left is gone: {:?}",
+            text(&screen, 2)
+        );
     }
 
     /// Every cell of every row of the list carries the fill of that row: the
@@ -833,5 +899,28 @@ mod tests {
         assert_eq!(super::digits_of(0, &mut buf), "0");
         assert_eq!(super::digits_of(7, &mut buf), "7");
         assert_eq!(super::digits_of(1204, &mut buf), "1204");
+    }
+
+    /// A file that moves nothing prints each word as the table has it.
+    #[test]
+    fn keys_in_force_list_feet_match_the_table() {
+        let (file, _) = crate::keyfile::KeyFile::parse("");
+        let labels = file.labels();
+        assert_eq!(
+            labels.foot(crate::keyfile::Foot::ListCommands),
+            super::COMMANDS_FOOT
+        );
+        assert_eq!(
+            labels.foot(crate::keyfile::Foot::ListPalette),
+            super::PALETTE_FOOT
+        );
+        assert_eq!(
+            labels.foot(crate::keyfile::Foot::ListFiles),
+            super::FILES_FOOT
+        );
+        assert_eq!(
+            labels.foot(crate::keyfile::Foot::ListLeader),
+            super::LEADER_FOOT
+        );
     }
 }

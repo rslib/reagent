@@ -683,6 +683,7 @@ async fn commit_events_rise_and_are_one_per_commit() {
         tx.send(Command::Send {
             client: 1,
             text: Text::from("hello"),
+            blocks: Vec::new(),
             mode: SendMode::Steer,
         })
         .await
@@ -715,6 +716,56 @@ async fn commit_events_rise_and_are_one_per_commit() {
         Some(held),
         "the last event names the last record of the part"
     );
+}
+
+#[tokio::test]
+async fn commit_event_names_a_record_that_is_readable() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let provider = FakeProvider::new(vec![text_reply("done")]);
+    let registry = Registry::new();
+    let (tx, mut inbox) = live::channel();
+    let (events, mut rx) = mpsc::channel(64);
+    let mut history = Vec::new();
+    let mut journal = journal(dir.path());
+    let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new());
+
+    let session = live::run_live(
+        &mut agent,
+        &mut history,
+        Some(&mut journal),
+        &events,
+        &mut inbox,
+    );
+    let client = async {
+        tx.send(Command::Send {
+            client: 1,
+            text: Text::from("hello"),
+            blocks: Vec::new(),
+            mode: SendMode::Steer,
+        })
+        .await
+        .expect("the session is open");
+        drop(tx);
+        let mut checked = 0;
+        while let Some(event) = rx.recv().await {
+            match event {
+                Event::Committed { record } => {
+                    let dir = dir.path().to_path_buf();
+                    let held = tokio::task::spawn_blocking(move || read_records(&dir).len())
+                        .await
+                        .expect("read the journal") as u64;
+                    assert!(held >= record, "{held} records for a commit of {record}");
+                    checked += 1;
+                }
+                Event::RunEnd(_) => break,
+                _ => {}
+            }
+        }
+        checked
+    };
+    let (_, checked) = tokio::join!(session, client);
+    journal.close().expect("close the journal");
+    assert_eq!(checked, 2, "both commits of the run were read");
 }
 
 #[tokio::test]
@@ -783,6 +834,7 @@ async fn a_set_of_the_level_and_the_mode_is_in_the_journal_and_a_resume() {
         tx.send(Command::Send {
             client: 1,
             text: Text::from("hello"),
+            blocks: Vec::new(),
             mode: SendMode::Steer,
         })
         .await
@@ -847,6 +899,7 @@ async fn a_settings_event_names_what_the_journal_recorded() {
         tx.send(Command::Send {
             client: 1,
             text: Text::from("hello"),
+            blocks: Vec::new(),
             mode: SendMode::Steer,
         })
         .await
@@ -928,6 +981,7 @@ async fn a_resume_of_a_waiting_approval_asks_the_same_question() {
     tx.send(Command::Send {
         client: 1,
         text: Text::from("hello"),
+        blocks: Vec::new(),
         mode: SendMode::Steer,
     })
     .await
@@ -1201,6 +1255,7 @@ async fn a_set_level_and_mode_survive_a_compaction_base_on_resume() {
         tx.send(Command::Send {
             client: 1,
             text: Text::from("go"),
+            blocks: Vec::new(),
             mode: SendMode::Steer,
         })
         .await
@@ -1262,6 +1317,7 @@ async fn a_tool_result_commit_event_comes_before_its_result_event() {
         tx.send(Command::Send {
             client: 1,
             text: Text::from("hello"),
+            blocks: Vec::new(),
             mode: SendMode::Steer,
         })
         .await

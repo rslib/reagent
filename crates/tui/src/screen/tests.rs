@@ -1,12 +1,14 @@
 use super::cell::{Cell, Color, GraphemeArena, Style};
 use super::grid::Grid;
 use super::testing::{Vt100Terminal, lines};
+use base64::Engine as _;
 use std::sync::Arc;
 
 use super::{
     ALT_SCREEN_OFF, CommitBlock, GRAPHEME_ARENA_CAP, Run, Screen, Source, TRANSCRIPT_RING_LINES,
     Terminal,
 };
+use crate::picture_native::{Native, Protocol};
 
 async fn render(screen: &mut Screen, term: &mut Vt100Terminal, out: &mut Vec<u8>) {
     screen.diff(out);
@@ -1758,5 +1760,332 @@ fn a_block_that_opens_in_a_full_ring_drops_the_oldest_lines() {
         stored_line(&screen, 10).0,
         "line 10",
         "the oldest line the ring holds keeps its text"
+    );
+}
+
+/// The source of a block reads back by the line it drew, and the ring keeps it
+/// for as long as it keeps that line.
+#[test]
+fn block_source_reads_back_by_its_line() {
+    let mut screen = Screen::full(20, 4);
+    commit_plain(&mut screen, &["one", "two"]);
+    screen.set_origin(0, 2, "one\ntwo\n", false, false);
+    for line in 0..2 {
+        let origin = screen
+            .origin(line)
+            .unwrap_or_else(|| panic!("a source for line {line}"));
+        assert_eq!(screen.origin_text(&origin), "one\ntwo\n");
+        assert_eq!((origin.line, origin.lines), (0, 2));
+    }
+    assert!(screen.origin(2).is_none(), "a line past the block has none");
+    assert!(
+        screen.origin(0).is_some_and(|origin| !origin.code),
+        "a paragraph is no code block"
+    );
+}
+
+/// A ring that drops every line of a block drops its source too, and gives its
+/// bytes back.
+#[test]
+fn a_full_ring_frees_block_source() {
+    let mut screen = Screen::full(20, 4);
+    commit_plain(&mut screen, &["one"]);
+    screen.set_origin(0, 1, "one\n", false, false);
+    assert_eq!(screen.origin_text(&screen.origin(0).unwrap()), "one\n");
+    let filled = TRANSCRIPT_RING_LINES;
+    fill_transcript(&mut screen, filled);
+    assert!(screen.transcript().dropped() > 0, "the oldest line left");
+    assert!(
+        screen.origin(0).is_none(),
+        "the source of the line that left the ring is gone"
+    );
+    assert_eq!(
+        screen.transcript().source_len(),
+        0,
+        "the arena gives its bytes back"
+    );
+}
+
+/// A block that opens above the sources moves their lines with it, so a copy of
+/// a row still reads the text the reply wrote.
+#[test]
+fn a_fold_above_keeps_block_source_in_place() {
+    let mut screen = Screen::full(20, 8);
+    commit_block(&mut screen, 1, &["a0", "a1"]);
+    commit_plain(&mut screen, &["b0", "b1"]);
+    screen.set_origin(2, 2, "b0\nb1\n", false, false);
+    reopen_block(&mut screen, 1, true, &["a0", "a1", "a2", "a3", "a4"]);
+    let origin = screen
+        .origin(5)
+        .expect("the source moved down with its lines");
+    assert_eq!(screen.origin_text(&origin), "b0\nb1\n");
+    assert_eq!(origin.line, 5);
+    assert!(
+        screen.origin(4).is_none(),
+        "the lines the block grew take none"
+    );
+    reopen_block(&mut screen, 1, false, &["a0"]);
+    let origin = screen
+        .origin(2)
+        .expect("the source moved up with its lines");
+    assert_eq!(screen.origin_text(&origin), "b0\nb1\n");
+}
+
+/// The 64 by 48 PNG the picture tests draw, base64 as the journal holds it.
+const GRADIENT: &[u8] = include_bytes!("../../../image/tests/fixtures/gradient-64x48.png");
+
+/// The image of the fixture PNG, as a registered picture holds it.
+fn picture_source() -> crate::picture::Source {
+    let data = base64::engine::general_purpose::STANDARD.encode(GRADIENT);
+    crate::picture::Source {
+        bytes: GRADIENT.len(),
+        png: true,
+        data: data.into(),
+    }
+}
+
+/// How many times `needle` sits in `bytes`.
+fn count(bytes: &[u8], needle: &[u8]) -> usize {
+    bytes
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+/// Whether `needle` sits in `bytes`.
+fn holds(bytes: &[u8], needle: &[u8]) -> bool {
+    count(bytes, needle) > 0
+}
+
+/// A full screen of `rows` rows with the protocol `native` on a ring of `texts`,
+/// where `first` names the line the picture of `height` rows is registered on.
+fn pictured(rows: u16, native: Option<Native>, texts: &[&str], first: u64, height: u16) -> Screen {
+    let mut screen = Screen::full(40, rows);
+    screen.set_native(native);
+    commit_plain(&mut screen, texts);
+    screen.draw_transcript();
+    screen.add_picture(first, height, 2, 0, picture_source());
+    screen
+}
+
+#[test]
+fn native_picture_iterm2_draws_once_whole() {
+    let mut screen = pictured(
+        24,
+        Some(Native {
+            protocol: Protocol::Iterm2,
+            tmux: false,
+        }),
+        &["a", "b", "c", "▀▄", "▄▀"],
+        3,
+        2,
+    );
+    let mut out = Vec::new();
+    screen.diff(&mut out);
+    assert!(
+        !holds(&out, b"]1337;"),
+        "the frame draws the cells only: {out:?}"
+    );
+    let mut images = Vec::new();
+    screen.draw_pictures(&mut images);
+    assert_eq!(count(&images, b"]1337;File=inline=1;"), 1, "{images:?}");
+    let cup = images
+        .windows(6)
+        .position(|window| window == b"\x1b[4;1H")
+        .expect("the cursor moves to the picture's first cell");
+    let inline: &[u8] = b"]1337;File=inline=";
+    let image = images
+        .windows(inline.len())
+        .position(|window| window == inline)
+        .expect("the image follows the cursor");
+    assert!(cup < image, "the CUP comes first: {images:?}");
+    let mut images = Vec::new();
+    screen.draw_pictures(&mut images);
+    assert!(images.is_empty(), "nothing changed");
+}
+
+#[test]
+fn native_picture_unknown_terminal_sends_nothing() {
+    let mut screen = pictured(24, None, &["▀▄", "▄▀"], 0, 2);
+    let mut out = Vec::new();
+    screen.diff(&mut out);
+    assert!(holds(&out, "▀▄".as_bytes()), "the cells are drawn");
+    assert!(!holds(&out, b"1337"), "{out:?}");
+    let mut images = Vec::new();
+    screen.draw_pictures(&mut images);
+    assert!(images.is_empty(), "no image ever");
+    assert!(!screen.pictures_due());
+}
+
+#[test]
+fn native_picture_scroll_cut_removes_it() {
+    let mut screen = Screen::full(40, 4);
+    screen.set_native(Some(Native {
+        protocol: Protocol::Iterm2,
+        tmux: false,
+    }));
+    commit_plain(&mut screen, &["0", "1", "2", "3", "▀▄", "5", "6", "7", "8"]);
+    screen.transcript_mut().scroll_up(1);
+    screen.draw_transcript();
+    screen.add_picture(4, 2, 2, 0, picture_source());
+    let mut out = Vec::new();
+    screen.diff(&mut out);
+    let mut images = Vec::new();
+    screen.draw_pictures(&mut images);
+    assert_eq!(count(&images, b"]1337;File=inline=1;"), 1, "{images:?}");
+    // One line down and the picture's first row leaves the viewport.
+    screen.transcript_mut().scroll_down(1);
+    screen.draw_transcript();
+    let mut out = Vec::new();
+    screen.diff(&mut out);
+    assert!(holds(&out, "5".as_bytes()), "the row under it: {out:?}");
+    let mut images = Vec::new();
+    screen.draw_pictures(&mut images);
+    assert!(images.is_empty(), "no image: {images:?}");
+}
+
+#[test]
+fn native_picture_sheet_blocks_it() {
+    let mut screen = pictured(
+        24,
+        Some(Native {
+            protocol: Protocol::Iterm2,
+            tmux: false,
+        }),
+        &["a", "▀▄", "▄▀"],
+        1,
+        2,
+    );
+    let mut out = Vec::new();
+    screen.diff(&mut out);
+    let mut images = Vec::new();
+    screen.draw_pictures(&mut images);
+    assert_eq!(count(&images, b"]1337;File=inline=1;"), 1);
+    screen.block_pictures(true);
+    let mut out = Vec::new();
+    screen.diff(&mut out);
+    assert!(holds(&out, "▀▄".as_bytes()), "the cells again: {out:?}");
+    let mut images = Vec::new();
+    screen.draw_pictures(&mut images);
+    assert!(images.is_empty(), "a blocked picture waits: {images:?}");
+    screen.block_pictures(false);
+    let mut out = Vec::new();
+    screen.diff(&mut out);
+    assert!(screen.pictures_due(), "the picture wants its image back");
+    let mut images = Vec::new();
+    screen.draw_pictures(&mut images);
+    assert_eq!(count(&images, b"]1337;File=inline=1;"), 1, "{images:?}");
+}
+
+#[test]
+fn native_picture_ninth_drops_the_oldest() {
+    let mut screen = Screen::full(40, 20);
+    screen.set_native(Some(Native {
+        protocol: Protocol::Iterm2,
+        tmux: false,
+    }));
+    let texts: Vec<&str> = vec!["a"; 12];
+    commit_plain(&mut screen, &texts);
+    screen.draw_transcript();
+    for line in 0..9 {
+        screen.add_picture(line, 1, 2, 0, picture_source());
+    }
+    let mut out = Vec::new();
+    screen.diff(&mut out);
+    let mut images = Vec::new();
+    screen.draw_pictures(&mut images);
+    assert_eq!(count(&images, b"]1337;File=inline=1;"), 8, "{images:?}");
+    assert!(!holds(&images, b"\x1b[1;1H"), "the first one dropped");
+    assert!(holds(&images, b"\x1b[2;1H"), "the second one kept");
+}
+
+#[test]
+fn native_picture_write_beside_it_keeps_it() {
+    let mut screen = pictured(
+        24,
+        Some(Native {
+            protocol: Protocol::Iterm2,
+            tmux: false,
+        }),
+        &["a", "b", "c", "▀▄", "▄▀"],
+        3,
+        2,
+    );
+    let mut out = Vec::new();
+    screen.diff(&mut out);
+    let mut images = Vec::new();
+    screen.draw_pictures(&mut images);
+    assert!(holds(&images, b"]1337;"), "the image is on screen");
+    let style = screen.default_style();
+    screen.put_str(20, 3, "tick", style);
+    screen.diff(&mut out);
+    assert!(holds(&out, b"tick"), "the write went out: {out:?}");
+    assert!(
+        !screen.pictures_due(),
+        "a write beside the image leaves it on screen"
+    );
+    screen.put_str(0, 3, "xy", style);
+    screen.diff(&mut out);
+    assert!(
+        screen.pictures_due(),
+        "a write over the image takes it off, so it goes out again"
+    );
+}
+
+#[test]
+fn native_picture_blanks_its_cells_before_the_image() {
+    let mut screen = pictured(
+        24,
+        Some(Native {
+            protocol: Protocol::Iterm2,
+            tmux: false,
+        }),
+        &["a", "b", "c", "▀▄", "▄▀"],
+        3,
+        2,
+    );
+    let mut out = Vec::new();
+    screen.diff(&mut out);
+    let mut images = Vec::new();
+    screen.draw_pictures(&mut images);
+    assert!(
+        holds(&images, b"\x1b[4;1H  ") && holds(&images, b"\x1b[5;1H  "),
+        "both rows go blank: {images:?}"
+    );
+    let spaces = images
+        .windows(8)
+        .position(|window| window == b"\x1b[5;1H  ")
+        .expect("the blank row");
+    let image = images
+        .windows(6)
+        .position(|window| window == b"]1337;")
+        .expect("the image");
+    assert!(spaces < image, "the cells go blank before the image");
+}
+
+#[test]
+fn native_picture_moves_when_a_block_above_opens() {
+    let mut screen = Screen::full(40, 24);
+    screen.set_native(Some(Native {
+        protocol: Protocol::Iterm2,
+        tmux: false,
+    }));
+    commit_block(&mut screen, 1, &["thought"]);
+    commit_plain(&mut screen, &["▀▄", "▄▀"]);
+    screen.add_picture(1, 2, 2, 0, picture_source());
+    screen.draw_transcript();
+    let mut out = Vec::new();
+    screen.diff(&mut out);
+    let mut images = Vec::new();
+    screen.draw_pictures(&mut images);
+    assert!(holds(&images, b"\x1b[2;1H\x1b]1337;"), "{images:?}");
+    // The thinking above the picture opens and takes two more lines.
+    reopen_block(&mut screen, 1, true, &["thought", "first", "second"]);
+    screen.draw_transcript();
+    screen.diff(&mut out);
+    screen.draw_pictures(&mut images);
+    assert!(
+        holds(&images, b"\x1b[4;1H\x1b]1337;"),
+        "the image follows its cells two rows down: {images:?}"
     );
 }

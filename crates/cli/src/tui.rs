@@ -130,6 +130,9 @@ async fn attach(args: &Args, cwd: &Path) -> Result<Exit, String> {
             .ok()
             .flatten()
     };
+    // The keys file, which the app reads once at start: a missing one is no
+    // table and no note.
+    let keys = reagent_config::global_dir().map(|dir| dir.join("keys.toml"));
     let state = crate::session::state_home()
         .ok_or_else(|| "no state folder; set HOME or XDG_STATE_HOME".to_string())?;
     let given: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -167,6 +170,7 @@ async fn attach(args: &Args, cwd: &Path) -> Result<Exit, String> {
         prices,
         state: Some(state),
         theme,
+        keys,
         background: Some(terminal.background()),
         cwd: Some(cwd.to_path_buf()),
         host: Some(app::HostHandle::new(std::sync::Arc::new(host))),
