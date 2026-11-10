@@ -172,6 +172,15 @@ impl Sidebar {
             .find_map(|entry| entry.panel.as_any_mut().downcast_mut::<T>())
     }
 
+    /// The first panel of type `T` whose id is `id`, for a panel the app finds
+    /// by the id a worker names rather than by its type.
+    pub fn get_mut_by_id<T: Panel + 'static>(&mut self, id: &str) -> Option<&mut T> {
+        self.entries
+            .iter_mut()
+            .filter(|entry| entry.panel.id() == id)
+            .find_map(|entry| entry.panel.as_any_mut().downcast_mut::<T>())
+    }
+
     /// The index of the focused panel.
     pub fn focus(&self) -> usize {
         self.focus
@@ -211,24 +220,41 @@ impl Sidebar {
         changed
     }
 
-    /// Focus the next panel, wrapping; false when there is at most one panel.
+    /// Focus the next panel that shows, wrapping; false when no other panel
+    /// shows.
     pub fn focus_next(&mut self) -> bool {
-        if self.entries.len() < 2 {
-            return false;
-        }
-        self.focus = (self.focus + 1) % self.entries.len();
-        self.scroll = 0;
-        true
+        self.focus_by(1)
     }
 
-    /// Focus the previous panel, wrapping; false when there is at most one.
+    /// Focus the previous panel that shows, wrapping; false when no other panel
+    /// shows.
     pub fn focus_previous(&mut self) -> bool {
-        if self.entries.len() < 2 {
+        let back = self.entries.len().saturating_sub(1);
+        self.focus_by(back)
+    }
+
+    /// Moves the focus `step` entries on, wrapping, to the first one that shows
+    /// and is not the focused one; says whether it moved. A hidden panel is no
+    /// place for the focus: a plugin panel with no line is skipped, and a
+    /// sidebar of hidden panels keeps its focus where it is.
+    fn focus_by(&mut self, step: usize) -> bool {
+        let len = self.entries.len();
+        if len < 2 {
             return false;
         }
-        self.focus = (self.focus + self.entries.len() - 1) % self.entries.len();
-        self.scroll = 0;
-        true
+        for by in 1..len {
+            let index = (self.focus + step * by) % len;
+            if self.entries[index].panel.hidden() {
+                continue;
+            }
+            if index == self.focus {
+                return false;
+            }
+            self.focus = index;
+            self.scroll = 0;
+            return true;
+        }
+        false
     }
 
     /// The lines of the last draw.
@@ -297,7 +323,7 @@ impl Sidebar {
         self.places.clear();
         self.fills.fit(width);
         for entry in &mut self.entries {
-            let shown = entry.panel.min_width() <= width;
+            let shown = entry.panel.min_width() <= width && !entry.panel.hidden();
             if shown != entry.shown {
                 // A panel starts its reads when the sidebar starts showing it.
                 entry.panel.update(&Update::Visible(shown));
@@ -767,6 +793,54 @@ mod tests {
         assert_eq!(sidebar.focused().expect("a panel").id(), "three");
         sidebar.draw(40, 10);
         assert_eq!(sidebar.focused().expect("a panel").id(), "three");
+    }
+
+    /// A hidden panel is no place for Tab to stop: the built-in panels keep the
+    /// focus, and a sidebar of hidden panels keeps it where it is.
+    #[test]
+    fn focus_skips_a_hidden_panel() {
+        let mut sidebar = Sidebar::new();
+        crate::panels::add_builtin(&mut sidebar);
+        let builtins = sidebar.len();
+        assert!(builtins > 1, "the built-ins are there to focus");
+        sidebar.add(crate::panels::PluginPanel::new("myplug/build"));
+        let hidden = builtins;
+        sidebar.draw(60, 40);
+
+        let mut forward = Vec::new();
+        for _ in 0..builtins {
+            assert!(sidebar.focus_next(), "a built-in to focus");
+            forward.push(sidebar.focus());
+        }
+        assert_eq!(
+            forward,
+            vec![1, 2, 3, 0],
+            "the built-ins in order, wrapping"
+        );
+        assert!(
+            !forward.contains(&hidden),
+            "the hidden panel is no stop: {forward:?}"
+        );
+
+        let mut backward = Vec::new();
+        for _ in 0..builtins {
+            assert!(sidebar.focus_previous(), "a built-in to focus");
+            backward.push(sidebar.focus());
+        }
+        assert_eq!(backward, (0..builtins).rev().collect::<Vec<_>>());
+        assert!(
+            !backward.contains(&hidden),
+            "the hidden panel is no stop: {backward:?}"
+        );
+
+        // Every panel hidden: the focus stays where it is.
+        let mut dark = Sidebar::new();
+        dark.add(crate::panels::PluginPanel::new("one"));
+        dark.add(crate::panels::PluginPanel::new("two"));
+        dark.draw(60, 40);
+        assert!(!dark.focus_next());
+        assert!(!dark.focus_previous());
+        assert_eq!(dark.focus(), 0);
     }
 
     #[test]

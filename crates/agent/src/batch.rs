@@ -11,6 +11,7 @@ use reagent_util::text;
 
 use crate::coerce;
 use crate::guard::{Ask, Grant, Guard, Verdict};
+use crate::hook::CallVerdict;
 use crate::tool::{Registry, Repaired, Reroute, Seen, Tool, ToolOutput};
 use tokio_util::sync::CancellationToken;
 
@@ -262,6 +263,21 @@ fn run_one_with<'a>(
             let args = repaired
                 .as_ref()
                 .map_or(call.arguments.as_ref(), |(args, _)| args);
+            // A call hook may rewrite the call or block it. What it decides is
+            // what the rules below see, so it cannot get a call past them.
+            let mut rewritten: Option<String> = None;
+            if let Some(hook) = registry.hook() {
+                let verdict = tokio::select! {
+                    verdict = hook.before(name, args) => verdict,
+                    () = token.cancelled() => return None,
+                };
+                match verdict {
+                    CallVerdict::Keep => {}
+                    CallVerdict::Args(new) => rewritten = Some(new),
+                    CallVerdict::Block(reason) => return Some(ToolOutput::error(reason)),
+                }
+            }
+            let args = rewritten.as_deref().unwrap_or(args);
             // The note of the name, then the note of the tool's own repair.
             let note = joined_notes(
                 read_as.as_deref(),
@@ -284,7 +300,9 @@ fn run_one_with<'a>(
                     && let Rerouted::Done(output) =
                         run_reroute(registry, guard, &reroute, token).await
                 {
-                    return output.map(|output| with_note(output, note.as_deref()));
+                    let output = output?;
+                    let output = with_note(output, note.as_deref());
+                    return after_call(registry, name, args, output, token).await;
                 }
             }
             let output = run_call(guard, tool, args, contain.as_ref(), token, report).await?;
@@ -305,14 +323,39 @@ fn run_one_with<'a>(
                 let retried =
                     run_call(guard, tool, &converted, contain.as_ref(), token, report).await?;
                 let note = converted_note(note.as_deref());
-                return Some(with_note(retried, Some(&note)));
+                let output = with_note(retried, Some(&note));
+                return after_call(registry, name, &converted, output, token).await;
             }
-            Some(with_note(output, note.as_deref()))
+            let output = with_note(output, note.as_deref());
+            after_call(registry, name, args, output, token).await
         }),
         None => {
             let error = unknown_tool(registry, &call.name);
             Box::pin(async move { Some(ToolOutput::error(error)) })
         }
+    }
+}
+
+/// Runs a finished call's output through the registry's [`CallHook`], when it
+/// has one. `None` when the run was cancelled while the hook ran.
+///
+/// The hook sees the call as the tool ran it: the tool's own name and the
+/// arguments the rules saw, also for the output of a rerouted call.
+///
+/// [`CallHook`]: crate::hook::CallHook
+async fn after_call(
+    registry: &Registry,
+    tool: &str,
+    args: &str,
+    output: ToolOutput,
+    token: &CancellationToken,
+) -> Option<ToolOutput> {
+    let Some(hook) = registry.hook() else {
+        return Some(output);
+    };
+    tokio::select! {
+        output = hook.after(tool, args, output) => Some(output),
+        () = token.cancelled() => None,
     }
 }
 
@@ -542,6 +585,7 @@ mod tests {
 
     use crate::event::Event;
     use crate::guard::Answer;
+    use crate::hook::CallHook;
     use crate::tool::Tool;
 
     /// A tool that optionally sleeps, records its completion to `log` and
@@ -1975,5 +2019,179 @@ mod tests {
             "needs approval by rule Bash(cargo test:*) in /c/config.toml, and this run cannot ask; the call did not run"
         );
         assert!(ran.lock().expect("ran lock").is_empty());
+    }
+
+    /// A hook that answers `before` with one verdict on every call and leaves
+    /// every output alone.
+    struct Verdicts {
+        verdict: Option<CallVerdict>,
+    }
+
+    impl CallHook for Verdicts {
+        fn before<'a>(&'a self, _tool: &'a str, _args: &'a str) -> BoxFuture<'a, CallVerdict> {
+            let verdict = self.verdict.clone().unwrap_or(CallVerdict::Keep);
+            Box::pin(async move { verdict })
+        }
+
+        fn after<'a>(
+            &'a self,
+            _tool: &'a str,
+            _args: &'a str,
+            output: ToolOutput,
+        ) -> BoxFuture<'a, ToolOutput> {
+            Box::pin(async move { output })
+        }
+    }
+
+    /// A hook that rewrites every call's arguments to one JSON object.
+    struct Rewriter {
+        args: String,
+    }
+
+    impl CallHook for Rewriter {
+        fn before<'a>(&'a self, _tool: &'a str, _args: &'a str) -> BoxFuture<'a, CallVerdict> {
+            let args = self.args.clone();
+            Box::pin(async move { CallVerdict::Args(args) })
+        }
+
+        fn after<'a>(
+            &'a self,
+            _tool: &'a str,
+            _args: &'a str,
+            output: ToolOutput,
+        ) -> BoxFuture<'a, ToolOutput> {
+            Box::pin(async move { output })
+        }
+    }
+
+    /// A hook that replaces `from` with `to` in every output.
+    struct Replacer {
+        from: &'static str,
+        to: &'static str,
+    }
+
+    impl CallHook for Replacer {
+        fn before<'a>(&'a self, _tool: &'a str, _args: &'a str) -> BoxFuture<'a, CallVerdict> {
+            Box::pin(async { CallVerdict::Keep })
+        }
+
+        fn after<'a>(
+            &'a self,
+            _tool: &'a str,
+            _args: &'a str,
+            mut output: ToolOutput,
+        ) -> BoxFuture<'a, ToolOutput> {
+            let (from, to) = (self.from, self.to);
+            Box::pin(async move {
+                output.content = Text::from(output.content.replace(from, to));
+                output
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn call_hook_blocks_a_call() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::new();
+        add_tool(&mut registry, "write_a", false, 0, &log);
+        let hook: Arc<dyn CallHook> = Arc::new(Verdicts {
+            verdict: Some(CallVerdict::Block("no".into())),
+        });
+        let registry = registry.with_hook(hook);
+
+        let results = run_all(
+            &[call("c1", "write_a")],
+            &registry,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let Message::ToolResult(result) = &results[0] else {
+            panic!("expected a tool result");
+        };
+        assert!(result.is_error);
+        assert_eq!(result.content.as_ref(), "no");
+        assert!(
+            log.lock().expect("log lock").is_empty(),
+            "a blocked call never runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_hook_rewrites_arguments_before_the_rules() {
+        let hook: Arc<dyn CallHook> = Arc::new(Rewriter {
+            args: serde_json::json!({ "path": "secrets/k.txt" }).to_string(),
+        });
+        let call = fixer_call(serde_json::json!({ "path": "a.rs" }));
+
+        // The tool receives the rewritten arguments.
+        let registry = fixer().with_hook(Arc::clone(&hook));
+        let results = run_all_guarded_seen(
+            std::slice::from_ref(&call),
+            &registry,
+            None,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(content_of(&results[0].0), "edited secrets/k.txt");
+
+        // A rule that refuses the NEW arguments refuses the call.
+        let layer = reagent_config::Layer {
+            path: std::path::PathBuf::from("/c/config.toml"),
+            settings: reagent_config::Settings {
+                permissions: Lists {
+                    deny: vec!["Edit(secrets/**)".into()],
+                    default: Some("allow".into()),
+                    ..Lists::default()
+                },
+                ..reagent_config::Settings::default()
+            },
+        };
+        let rules = Rules::from_layers(&[layer], std::path::Path::new("/work"), None).unwrap();
+        let guard = Guard::new(rules);
+        let results =
+            run_all_guarded_seen(&[call], &registry, Some(&guard), &CancellationToken::new()).await;
+        let Message::ToolResult(result) = &results[0].0 else {
+            panic!("expected a tool result");
+        };
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("Edit(secrets/**)"),
+            "the rules saw the rewritten arguments: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn call_hook_rewrites_the_output() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::new();
+        add_tool(&mut registry, "ro_a", true, 0, &log);
+        let hook: Arc<dyn CallHook> = Arc::new(Replacer {
+            from: "ro_a",
+            to: "rewritten",
+        });
+        let registry = registry.with_hook(hook);
+
+        let results = run_all(&[call("c1", "ro_a")], &registry, &CancellationToken::new()).await;
+
+        assert_eq!(content_of(&results[0]), "rewritten");
+        assert_eq!(
+            log.lock().expect("log lock").clone(),
+            vec!["ro_a".to_string()],
+            "the tool ran once"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_hook_absent_changes_nothing() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::new();
+        add_tool(&mut registry, "ro_a", true, 0, &log);
+        assert!(registry.hook().is_none());
+
+        let results = run_all(&[call("c1", "ro_a")], &registry, &CancellationToken::new()).await;
+
+        assert_eq!(content_of(&results[0]), "ro_a");
     }
 }

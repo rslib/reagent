@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use reagent_protocol::lines::Lines;
-use reagent_protocol::message::{AnswerKind, MAJOR, Mode};
+use reagent_protocol::message::{AnswerKind, MAJOR, Mode, PanelLine, PluginCommand};
 use serde::Deserialize;
 use serde::de::{self, Visitor};
 use tokio::io::AsyncWriteExt;
@@ -196,6 +196,22 @@ pub enum Frame<'a> {
     },
     /// The worker cut this client off: the reason it named.
     Closing(Cow<'a, str>),
+    /// The commands the JS plugins of the session offer, sent once after the
+    /// worker attached this client.
+    PluginCommands(Vec<PluginCommand<'a>>),
+    /// One sidebar panel a JS plugin sets: its id, its title and its lines. A
+    /// panel with no lines hides the one that id names.
+    PluginPanel {
+        /// The id the panel is known by.
+        id: Cow<'a, str>,
+        /// The title row the panel draws.
+        title: Cow<'a, str>,
+        /// Its lines, in the order the plugin wrote them.
+        lines: Vec<PanelLine<'a>>,
+    },
+    /// Text the worker asks the transcript to show, such as what a plugin
+    /// command printed.
+    Note(Cow<'a, str>),
     /// A method or an event type this build does not know, or an answer to a
     /// request: nothing to draw.
     Unknown,
@@ -375,6 +391,20 @@ impl Client {
             None => self.out.extend_from_slice(b"{}"),
         }
         self.out.push(b'\n');
+        self.flush().await
+    }
+
+    /// Runs the JS plugin command `name` with `args`: the rest of the line as
+    /// it was typed. The answer is empty, and the text the command prints
+    /// comes back as a `note`.
+    pub async fn command(&mut self, name: &str, args: &str) -> io::Result<()> {
+        let id = self.id();
+        begin(&mut self.out, id, "command");
+        self.out.extend_from_slice(b"{\"name\":");
+        push_str(&mut self.out, name);
+        self.out.extend_from_slice(b",\"args\":");
+        push_str(&mut self.out, args);
+        self.out.extend_from_slice(b"}}\n");
         self.flush().await
     }
 
@@ -697,6 +727,9 @@ pub fn decode(line: &[u8]) -> Option<Frame<'_>> {
         level,
         mode,
         questions,
+        commands,
+        title,
+        lines,
     } = params?;
     Some(match (&*method, kind.as_deref().unwrap_or_default()) {
         ("event", "turn_start") => Frame::TurnStart,
@@ -773,6 +806,13 @@ pub fn decode(line: &[u8]) -> Option<Frame<'_>> {
             name: name.unwrap_or_default(),
         },
         ("client_left", _) => Frame::ClientLeft { id: client? },
+        ("plugin_commands", _) => Frame::PluginCommands(commands),
+        ("plugin_panel", _) => Frame::PluginPanel {
+            id: id?.text()?,
+            title: title.unwrap_or_default(),
+            lines,
+        },
+        ("note", _) => Frame::Note(text?),
         _ => return None,
     })
 }
@@ -863,6 +903,15 @@ struct Params<'a> {
     /// The questions a `question_request` names.
     #[serde(borrow, default)]
     questions: Vec<Question<'a>>,
+    /// The commands a `plugin_commands` notice names.
+    #[serde(borrow, default)]
+    commands: Vec<PluginCommand<'a>>,
+    /// The title of a `plugin_panel` notice.
+    #[serde(default, borrow, deserialize_with = "cow")]
+    title: Option<Cow<'a, str>>,
+    /// The lines of a `plugin_panel` notice.
+    #[serde(borrow, default)]
+    lines: Vec<PanelLine<'a>>,
 }
 
 /// One string field of a line: borrowed when the line wrote it verbatim, and
@@ -1082,7 +1131,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use reagent_protocol::lines::Lines;
-    use reagent_protocol::message::{self, MAJOR, Mode, Request};
+    use reagent_protocol::message::{self, MAJOR, Mode, PanelLine, Request};
     use serde_json::json;
     use tokio::net::UnixListener;
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -1904,6 +1953,118 @@ mod tests {
             }
             other => panic!("expected the settings, got {other:?}"),
         }
+    }
+
+    /// A `plugin_commands` notice names the commands the plugins offer, and an
+    /// empty one names none.
+    #[test]
+    fn a_plugin_commands_notice_lists_the_commands() {
+        match frame(
+            r#"{"jsonrpc":"2.0","method":"plugin_commands","params":{"commands":[{"name":"deploy","description":"ship it"},{"name":"echo","description":""}]}}"#,
+        ) {
+            Some(Frame::PluginCommands(commands)) => {
+                let got: Vec<(&str, &str)> = commands
+                    .iter()
+                    .map(|command| (command.name.as_ref(), command.description.as_ref()))
+                    .collect();
+                assert_eq!(got, [("deploy", "ship it"), ("echo", "")]);
+            }
+            other => panic!("expected the plugin commands, got {other:?}"),
+        }
+        match frame(r#"{"jsonrpc":"2.0","method":"plugin_commands","params":{}}"#) {
+            Some(Frame::PluginCommands(commands)) => assert!(commands.is_empty()),
+            other => panic!("expected no plugin commands, got {other:?}"),
+        }
+    }
+
+    /// A `plugin_panel` notice carries the panel's id, its title and its lines,
+    /// each of the four shapes as the protocol names it.
+    #[test]
+    fn a_plugin_panel_notice_carries_its_lines() {
+        match frame(
+            r#"{"jsonrpc":"2.0","method":"plugin_panel","params":{"id":"myplug/build","title":"Build","lines":["plain",{"text":"strong","role":"strong"},{"key":"branch","value":"main"},{"label":"tests","value":3,"max":10}]}}"#,
+        ) {
+            Some(Frame::PluginPanel { id, title, lines }) => {
+                assert_eq!(id, "myplug/build");
+                assert_eq!(title, "Build");
+                assert_eq!(lines.len(), 4);
+                assert!(
+                    matches!(&lines[0], PanelLine::Plain(text) if text == "plain"),
+                    "{:?}",
+                    lines[0]
+                );
+                assert!(
+                    matches!(&lines[1], PanelLine::Text { text, role } if text == "strong" && role.as_deref() == Some("strong")),
+                    "{:?}",
+                    lines[1]
+                );
+                assert!(
+                    matches!(&lines[2], PanelLine::Row { key, value } if key == "branch" && value == "main"),
+                    "{:?}",
+                    lines[2]
+                );
+                assert!(
+                    matches!(&lines[3], PanelLine::Progress { label, value, max } if label == "tests" && *value == 3 && *max == 10),
+                    "{:?}",
+                    lines[3]
+                );
+            }
+            other => panic!("expected the plugin panel, got {other:?}"),
+        }
+        match frame(
+            r#"{"jsonrpc":"2.0","method":"plugin_panel","params":{"id":"myplug/build","title":"Build","lines":[]}}"#,
+        ) {
+            Some(Frame::PluginPanel { id, lines, .. }) => {
+                assert_eq!(id, "myplug/build");
+                assert!(lines.is_empty(), "an empty line list hides the panel");
+            }
+            other => panic!("expected the empty plugin panel, got {other:?}"),
+        }
+    }
+
+    /// A `note` notice is the text the transcript shows.
+    #[test]
+    fn a_plugin_note_notice_is_a_note() {
+        match frame(r#"{"jsonrpc":"2.0","method":"note","params":{"text":"deployed to staging"}}"#)
+        {
+            Some(Frame::Note(text)) => assert_eq!(text, "deployed to staging"),
+            other => panic!("expected the note, got {other:?}"),
+        }
+    }
+
+    /// A command request carries the plugin command's name and the rest of the
+    /// line as one string, as typed.
+    #[tokio::test]
+    async fn a_plugin_command_request_writes_its_line() {
+        let mut fake = Fake::start("sess", 0);
+        let (mut client, _) = Client::connect(&fake.socket, "tok", "probe")
+            .await
+            .expect("connect");
+        client
+            .command("echo", "a b  c")
+            .await
+            .expect("run the command");
+        // The handshake's own line comes first.
+        let _ = timeout(WAIT, fake.sent.recv())
+            .await
+            .expect("the handshake")
+            .expect("the fake worker");
+        let line = timeout(WAIT, fake.sent.recv())
+            .await
+            .expect("the command line")
+            .expect("the fake worker");
+        assert_eq!(
+            line,
+            r#"{"jsonrpc":"2.0","id":2,"method":"command","params":{"name":"echo","args":"a b  c"}}"#
+        );
+        let (_, request) = message::decode(line.as_bytes()).expect("decode");
+        assert_eq!(
+            request,
+            Request::Command {
+                name: Cow::Borrowed("echo"),
+                args: Cow::Borrowed("a b  c"),
+            }
+        );
     }
 
     /// An approval request offers the save answer only when it names rules.

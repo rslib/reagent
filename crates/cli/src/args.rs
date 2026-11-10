@@ -256,6 +256,9 @@ pub struct Args {
     /// Folders sandboxed commands may write, besides the working and temp
     /// folders.
     pub write: Vec<PathBuf>,
+    /// The folder the run loads its plugins from, `None` when `--no-plugins`
+    /// is given or the folder does not exist.
+    pub plugins_dir: Option<PathBuf>,
 }
 
 /// One provider the `models` command lists.
@@ -392,6 +395,7 @@ fn usage() -> &'static str {
         "                       +name adds, -name removes, plain names replace (default: all but codemode)\n",
         "      --mcp <list>     MCP servers to start: +name adds, -name removes, plain names replace\n",
         "      --no-mcp         start no MCP server\n",
+        "      --no-plugins     load no plugins from the config folder\n",
         "      --policy <list>  loop policies: completion, stuck, budget, snapshot, mask, compact;\n",
         "                       all = completion, budget, snapshot; none = off;\n",
         "                       +name adds, -name removes, plain names replace\n",
@@ -634,6 +638,21 @@ fn load_settings(cwd: &Path, profile: Option<&str>) -> Result<Loaded, String> {
     let servers = reagent_config::load_mcp_for(profile)?;
     let (settings, rules) = settings_from(layers, cwd, &servers.servers)?;
     Ok((settings, rules, servers))
+}
+
+/// The plugins folder under the global config folder `config`, when the folder
+/// exists.
+///
+/// The callers read it where the config files are read, before the runtime
+/// starts or in `spawn_blocking`, so it costs a run that has no plugins folder
+/// one stat, no job and no thread.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the config is read before the runtime starts or in spawn_blocking"
+)]
+fn plugins_dir(config: Option<&Path>) -> Option<PathBuf> {
+    let dir = config?.join("plugins");
+    std::fs::metadata(&dir).ok()?.is_dir().then_some(dir)
 }
 
 #[expect(
@@ -964,6 +983,7 @@ fn parse_from(
     let mut policy: Vec<Vec<String>> = Vec::new();
     let mut mcp: Vec<Vec<String>> = Vec::new();
     let mut no_mcp = false;
+    let mut no_plugins = false;
     let mut models: Option<Option<String>> = None;
     let mut refresh = false;
     let mut profile = None;
@@ -1103,6 +1123,7 @@ fn parse_from(
                 mcp.push(mcp_list(&text).map_err(|error| format!("--mcp: {error}"))?);
             }
             lexopt::Arg::Long("no-mcp") => no_mcp = true,
+            lexopt::Arg::Long("no-plugins") => no_plugins = true,
             lexopt::Arg::Long("cwd") => {
                 let value = parser
                     .value()
@@ -1206,6 +1227,7 @@ fn parse_from(
             || !policy.is_empty()
             || !mcp.is_empty()
             || no_mcp
+            || no_plugins
         {
             return Err("the models command takes no run flags".into());
         }
@@ -1248,6 +1270,14 @@ fn parse_from(
         && task.is_some()
         && !matches!(sessions, Sessions::None);
     let (settings, rules, servers) = load(&cwd, profile.as_deref())?;
+    // The plugins folder is read here, where the config files are, and not on
+    // the blocking pool: a run with no plugins folder costs one stat before the
+    // runtime starts, no job and no thread.
+    let plugins_dir = if no_plugins {
+        None
+    } else {
+        plugins_dir(reagent_config::global_dir().as_deref())
+    };
     check_provider_names(&settings)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let (sandbox, network, write) = resolve_sandbox(&settings.sandbox, home.as_deref())?;
@@ -1443,6 +1473,7 @@ fn parse_from(
         sandbox,
         network,
         write,
+        plugins_dir,
     })))
 }
 
@@ -3430,5 +3461,41 @@ mod tests {
             args.compat.map(|compat| compat.reasoning_off),
             Some(Some("disabled"))
         );
+    }
+
+    #[test]
+    fn plugins_flag_parses_as_a_run() {
+        // The folder is the machine's, so the test reads the flag, not the path.
+        let args = run_with(&["-p", "task", "--no-plugins"], Settings::default());
+        assert!(args.task.is_some());
+    }
+
+    #[test]
+    fn no_plugins_gives_no_plugins_folder() {
+        let args = run_with(&["-p", "task", "--no-plugins"], Settings::default());
+        assert_eq!(args.plugins_dir, None);
+    }
+
+    #[test]
+    fn plugins_folder_that_is_missing_gives_none() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        assert_eq!(plugins_dir(Some(tmp.path())), None);
+    }
+
+    #[test]
+    fn plugins_folder_that_exists_is_the_config_folder_plugins() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let dir = tmp.path().join("plugins");
+        make_dir(&dir);
+        assert_eq!(plugins_dir(Some(tmp.path())), Some(dir));
+    }
+
+    /// Makes one folder of a test's own temp dir.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test makes the plugins folder of its own temp dir"
+    )]
+    fn make_dir(path: &Path) {
+        std::fs::create_dir_all(path).expect("the plugins folder");
     }
 }

@@ -97,6 +97,12 @@ pub trait Panel: Send {
     /// when the sidebar is narrower.
     fn min_width(&self) -> u16;
 
+    /// Whether the host leaves the panel out of the sidebar, as a panel with
+    /// nothing to show yet: it draws no title row and takes no rows.
+    fn hidden(&self) -> bool {
+        false
+    }
+
     /// Take one update, and say whether it changed what the panel draws.
     fn update(&mut self, update: &Update<'_>) -> bool;
 

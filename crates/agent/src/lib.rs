@@ -8,6 +8,7 @@ pub mod coerce;
 pub mod compact;
 pub mod event;
 pub mod guard;
+pub mod hook;
 pub mod journal;
 pub mod leak;
 pub mod live;

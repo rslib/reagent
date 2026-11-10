@@ -11,7 +11,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 reagent-agent.workspace = true
 reagent-ai.workspace = true
 reagent-tools.workspace = true
-rquickjs = { version = "0.14.0", default-features = false }
+rquickjs = { version = "0.14.0", default-features = false, features = ["loader"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "sync", "time", "macros", "fs", "io-util"] }

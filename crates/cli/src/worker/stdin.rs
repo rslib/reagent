@@ -1,6 +1,7 @@
 //! The requests a run takes on its standard input instead of a socket.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use reagent_agent::live;
 use reagent_agent::live::Sender;
@@ -29,7 +30,7 @@ use super::handle;
 pub(crate) async fn serve<R: AsyncRead + Unpin>(
     mut input: R,
     answers: mpsc::UnboundedSender<Vec<u8>>,
-    shared: &Shared,
+    shared: &Arc<Shared>,
     sender: Option<&Sender>,
     client: live::ClientId,
     cwd: &Path,

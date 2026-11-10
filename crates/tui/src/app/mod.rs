@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use reagent_ai::{AssistantMessage, Content, Message, ToolCall, ToolResult};
-use reagent_protocol::message::{AnswerKind, Mode};
+use reagent_protocol::message::{AnswerKind, Mode, PluginCommand};
 use serde::Deserialize;
 
 use crate::client::{Approval, Client, Frame, Initialized, Next};
@@ -819,6 +819,9 @@ enum Command {
     },
     /// Compact the history into a checkpoint, with the user's note in it.
     Compact { note: Option<String> },
+    /// Run one command a JS plugin offers, with the rest of the line as its
+    /// argument.
+    Plugin { name: String, args: String },
     /// Leave the session.
     Detach,
 }
@@ -3353,6 +3356,11 @@ impl App {
             Frame::ClientJoined { id, .. } if id == self.client => {}
             Frame::ClientJoined { id, name } => self.client_joined(id, &name),
             Frame::ClientLeft { id } => self.client_left(id),
+            Frame::PluginCommands(commands) => self.plugin_commands(&commands),
+            Frame::PluginPanel { id, title, lines } => {
+                self.plugin_panel(&id, &title, &lines);
+            }
+            Frame::Note(text) => self.note(text.into_owned()),
             Frame::Settings {
                 model,
                 context_window,
@@ -5543,6 +5551,36 @@ impl App {
         self.dirty = true;
     }
 
+    /// Takes the commands the JS plugins of the session offer: each one joins
+    /// the `/` list and the palette after the built-in rows, under the plugin
+    /// group and with no key of its own.
+    ///
+    /// A name a built-in already has is skipped, since a built-in keeps its
+    /// meaning, and the note says which one. A second frame, from a reattach,
+    /// replaces the plugin rows rather than adding them again.
+    fn plugin_commands(&mut self, commands: &[PluginCommand<'_>]) {
+        let labels = self.keyfile.as_ref().map(keyfile::KeyFile::labels);
+        let mut rows: Vec<list::Command> = commands::table(labels).to_vec();
+        let builtins = rows.len();
+        for command in commands {
+            let name = format!("/{}", command.name);
+            if rows[..builtins].iter().any(|row| row.name == name) {
+                let note =
+                    format!("plugin command {name} skipped: a built-in command has that name");
+                self.note(note);
+                continue;
+            }
+            rows.push(list::Command {
+                name: Cow::Owned(name),
+                words: Cow::Owned(command.description.to_string()),
+                key: Cow::Borrowed(""),
+                group: commands::PLUGIN_GROUP,
+            });
+        }
+        self.slash = Arc::from(rows);
+        self.dirty = true;
+    }
+
     /// Takes the picked row of the open list: a file inserts its path, a
     /// command puts its name in the box.
     fn complete(&mut self) {
@@ -5555,13 +5593,13 @@ impl App {
             .list
             .as_ref()
             .and_then(List::command)
-            .map(|command| command.name)
+            .map(|command| command.name.clone())
         else {
             return;
         };
         self.list = None;
         self.editor.clear();
-        self.editor.insert(name);
+        self.editor.insert(&name);
         self.editor.insert(" ");
         self.editor_dirty = true;
         self.dirty = true;
@@ -5609,7 +5647,7 @@ impl App {
     /// Runs the command line the box holds whole, and answers whether it did;
     /// a line that names no command is sent as a message.
     fn run_line(&mut self) -> bool {
-        let index = {
+        let (index, plugin) = {
             let (before, after) = self.editor.chunks();
             if !after.is_empty() {
                 return false;
@@ -5618,31 +5656,34 @@ impl App {
             let Some(name) = parts.next() else {
                 return false;
             };
-            // The note of a compaction is the rest of the line, as it was typed.
-            let arg = if name == "/compact" {
-                let at = before.find(name).unwrap_or(0) + name.len();
-                Some(before[at..].trim()).filter(|arg| !arg.is_empty())
-            } else {
-                let arg = parts.next();
-                if parts.next().is_some() {
-                    return false;
-                }
-                arg
-            };
             let Some(index) = self.slash.iter().position(|command| command.name == name) else {
                 return false;
             };
+            let plugin = self.slash[index].group == commands::PLUGIN_GROUP;
             self.query.clear();
-            if let Some(arg) = arg {
+            if plugin {
+                // A plugin command takes the rest of the line as it was typed,
+                // after the name and one space.
+                let at = before.find(name).unwrap_or(0) + name.len();
+                let rest = &before[at..];
+                self.query.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+            } else if name == "/compact" {
+                // The note of a compaction is the rest of the line, as it was typed.
+                let at = before.find(name).unwrap_or(0) + name.len();
+                self.query.push_str(before[at..].trim());
+            } else if let Some(arg) = parts.next() {
+                if parts.next().is_some() {
+                    return false;
+                }
                 self.query.push_str(arg);
             }
-            index
+            (index, plugin)
         };
         let arg = std::mem::take(&mut self.query);
-        let text = if arg.is_empty() {
-            None
-        } else {
+        let text = if plugin || !arg.is_empty() {
             Some(arg.as_str())
+        } else {
+            None
         };
         self.run_command(index, text);
         self.query = arg;
@@ -5655,10 +5696,18 @@ impl App {
         self.editor.clear();
         self.editor_dirty = true;
         self.dirty = true;
-        let Some(name) = self.slash.get(index).map(|command| command.name) else {
+        let Some(command) = self.slash.get(index) else {
             return;
         };
-        match name {
+        let name = command.name.clone();
+        if command.group == commands::PLUGIN_GROUP {
+            // The rest of the line is the plugin command's own argument.
+            let name = name.strip_prefix('/').unwrap_or(&name).to_owned();
+            let args = arg.unwrap_or_default().to_owned();
+            self.commands.push_back(Command::Plugin { name, args });
+            return;
+        }
+        match &*name {
             "/quit" => self.quit(),
             "/level" => match arg {
                 None => self.open_levels(),
@@ -5717,6 +5766,7 @@ impl App {
                 }
                 Command::Detach => client.detach().await,
                 Command::Compact { note } => client.compact(note.as_deref()).await,
+                Command::Plugin { name, args } => client.command(&name, &args).await,
             };
             if sent.is_err() {
                 self.exit = true;

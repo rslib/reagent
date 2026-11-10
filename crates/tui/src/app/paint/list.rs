@@ -313,12 +313,12 @@ fn command_row(
             marks,
         )
     };
-    x = marked(screen, x, row, command.name, marks, name, width);
+    x = marked(screen, x, row, &command.name, marks, name, width);
     while x < NAME_COL && x < width {
         screen.set(x, row, Cell::from_char(' ', inks.fill));
         x += 1;
     }
-    x = screen.put_str_until(x, row, command.words, inks.dim, width);
+    x = screen.put_str_until(x, row, &command.words, inks.dim, width);
     if command.key.is_empty() || width < 2 {
         return;
     }
@@ -530,8 +530,8 @@ mod tests {
         ]
         .into_iter()
         .map(|(name, words, key, group)| Command {
-            name,
-            words,
+            name: name.into(),
+            words: words.into(),
             key: key.into(),
             group,
         })
@@ -553,8 +553,8 @@ mod tests {
         ]
         .into_iter()
         .map(|(name, words, key, group)| Command {
-            name,
-            words,
+            name: name.into(),
+            words: words.into(),
             key: key.into(),
             group,
         })

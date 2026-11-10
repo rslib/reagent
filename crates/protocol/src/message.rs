@@ -27,6 +27,12 @@ pub mod methods {
     /// The model, its context window, the level and the mode after a `set`
     /// changed the model.
     pub const SETTINGS: &str = "settings";
+    /// The JS plugin commands a client may run, sent once after it attaches.
+    pub const PLUGIN_COMMANDS: &str = "plugin_commands";
+    /// One panel of a JS plugin. A panel with no lines is hidden.
+    pub const PLUGIN_PANEL: &str = "plugin_panel";
+    /// A note to show in the transcript.
+    pub const NOTE: &str = "note";
 }
 
 const JSONRPC: &str = "2.0";
@@ -75,6 +81,12 @@ pub enum Request<'a> {
     Send {
         text: Cow<'a, str>,
         mode: Mode,
+    },
+    /// Runs one command a JS plugin offers, with the rest of the line as its
+    /// arguments. The command's output comes back as a `note`.
+    Command {
+        name: Cow<'a, str>,
+        args: Cow<'a, str>,
     },
     Approve {
         id: u64,
@@ -198,6 +210,72 @@ pub struct SettingsNotice<'a> {
     pub mode: &'a str,
 }
 
+/// One command a JS plugin offers, with the line that describes it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PluginCommand<'a> {
+    #[serde(borrow)]
+    pub name: Cow<'a, str>,
+    #[serde(borrow)]
+    pub description: Cow<'a, str>,
+}
+
+/// The commands the JS plugins of a session offer, sent once to a client after
+/// it attaches.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PluginCommands<'a> {
+    #[serde(borrow)]
+    pub commands: Vec<PluginCommand<'a>>,
+}
+
+/// One panel of a JS plugin: its id, its title and its lines. A panel with an
+/// empty `lines` is hidden.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PluginPanel<'a> {
+    #[serde(borrow)]
+    pub id: Cow<'a, str>,
+    #[serde(borrow)]
+    pub title: Cow<'a, str>,
+    #[serde(borrow)]
+    pub lines: Vec<PanelLine<'a>>,
+}
+
+/// One line of a plugin panel.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum PanelLine<'a> {
+    /// A plain line.
+    Plain(#[serde(borrow)] Cow<'a, str>),
+    /// A line in a role: text, dim, strong, accent, good, warn or bad. The
+    /// client draws an unknown or missing role as text.
+    Text {
+        #[serde(borrow)]
+        text: Cow<'a, str>,
+        #[serde(default, borrow)]
+        role: Option<Cow<'a, str>>,
+    },
+    /// A key and its value, such as `tests 12`.
+    Row {
+        #[serde(borrow)]
+        key: Cow<'a, str>,
+        #[serde(borrow)]
+        value: Cow<'a, str>,
+    },
+    /// A labelled progress bar, `value` of `max`.
+    Progress {
+        #[serde(borrow)]
+        label: Cow<'a, str>,
+        value: u64,
+        max: u64,
+    },
+}
+
+/// A note to show in the transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Note<'a> {
+    #[serde(borrow)]
+    pub text: Cow<'a, str>,
+}
+
 /// The worker's answer to `attach`.
 ///
 /// `committed` is the newest record the journal committed when it attached, and
@@ -303,6 +381,14 @@ struct CompactParams<'a> {
     note: Option<Text<'a>>,
 }
 
+#[derive(Deserialize)]
+struct CommandParams<'a> {
+    #[serde(borrow)]
+    name: Cow<'a, str>,
+    #[serde(borrow, default)]
+    args: Cow<'a, str>,
+}
+
 fn params<'a, P: Deserialize<'a>>(line: &'a [u8]) -> Result<P, RpcError> {
     match serde_json::from_slice::<Params<P>>(line) {
         Ok(found) => Ok(found.params),
@@ -338,6 +424,13 @@ pub fn decode(line: &[u8]) -> Result<(Option<u64>, Request<'_>), RpcError> {
             Request::Send {
                 text: found.text,
                 mode: found.mode,
+            }
+        }
+        "command" => {
+            let found: CommandParams<'_> = params(line)?;
+            Request::Command {
+                name: found.name,
+                args: found.args,
             }
         }
         "approve" => {
@@ -445,6 +538,55 @@ pub fn settings(buf: &mut Vec<u8>, settings: &SettingsNotice<'_>) {
         return;
     }
     buf.extend_from_slice(b"}\n");
+}
+
+/// Writes a notice line whose `params` are `value`, under `method`.
+fn notice(buf: &mut Vec<u8>, method: &str, value: &impl Serialize) {
+    let start = buf.len();
+    buf.extend_from_slice(br#"{"jsonrpc":"2.0","method":""#);
+    buf.extend_from_slice(method.as_bytes());
+    buf.extend_from_slice(br#"","params":"#);
+    if !push_json(buf, value) {
+        buf.truncate(start);
+        return;
+    }
+    buf.extend_from_slice(b"}\n");
+}
+
+/// Writes the `plugin_commands` notice line into `buf`.
+pub fn plugin_commands(buf: &mut Vec<u8>, commands: &PluginCommands<'_>) {
+    notice(buf, methods::PLUGIN_COMMANDS, commands);
+}
+
+/// Writes the `plugin_panel` notice line into `buf`.
+pub fn plugin_panel(buf: &mut Vec<u8>, panel: &PluginPanel<'_>) {
+    notice(buf, methods::PLUGIN_PANEL, panel);
+}
+
+/// Writes the `note` notice line into `buf`.
+pub fn note(buf: &mut Vec<u8>, text: &str) {
+    notice(
+        buf,
+        methods::NOTE,
+        &Note {
+            text: Cow::Borrowed(text),
+        },
+    );
+}
+
+/// Decodes the params of a `plugin_commands` notice. They borrow from `params`.
+pub fn decode_plugin_commands(params: &[u8]) -> Option<PluginCommands<'_>> {
+    serde_json::from_slice(params).ok()
+}
+
+/// Decodes the params of a `plugin_panel` notice. They borrow from `params`.
+pub fn decode_plugin_panel(params: &[u8]) -> Option<PluginPanel<'_>> {
+    serde_json::from_slice(params).ok()
+}
+
+/// Decodes the params of a `note` notice. The text borrows from `params`.
+pub fn decode_note(params: &[u8]) -> Option<Note<'_>> {
+    serde_json::from_slice(params).ok()
 }
 
 /// Writes a notification line into `buf`, copying `params` once as given.
@@ -588,6 +730,30 @@ mod tests {
         assert_eq!(
             decode_ok(br#"{"jsonrpc":"2.0","id":12,"method":"compact","params":{}}"#),
             (Some(12), Request::Compact { note: None })
+        );
+        assert_eq!(
+            decode_ok(
+                br#"{"jsonrpc":"2.0","id":13,"method":"command","params":{"name":"deploy","args":"staging now"}}"#
+            ),
+            (
+                Some(13),
+                Request::Command {
+                    name: Cow::Borrowed("deploy"),
+                    args: Cow::Borrowed("staging now"),
+                }
+            )
+        );
+        assert_eq!(
+            decode_ok(
+                br#"{"jsonrpc":"2.0","id":14,"method":"command","params":{"name":"deploy"}}"#
+            ),
+            (
+                Some(14),
+                Request::Command {
+                    name: Cow::Borrowed("deploy"),
+                    args: Cow::Borrowed(""),
+                }
+            )
         );
     }
 
@@ -923,6 +1089,210 @@ mod tests {
         assert_eq!(
             text(&buf),
             "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"parse error\"}}\n"
+        );
+    }
+
+    /// The params bytes of a written line, which the notice decoders take.
+    fn params_of(line: &[u8]) -> &[u8] {
+        let marker = br#""params":"#;
+        let at = line
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("params")
+            + marker.len();
+        &line[at..line.len() - 2]
+    }
+
+    #[test]
+    fn a_plugin_command_request_decodes() {
+        let line: &[u8] = br#"{"jsonrpc":"2.0","id":5,"method":"command","params":{"name":"deploy","args":"staging now"}}"#;
+        match decode(line).expect("decodes").1 {
+            Request::Command { name, args } => {
+                assert_eq!(name, "deploy");
+                assert_eq!(args, "staging now");
+                assert!(borrowed_from(&name, line), "no escape, no copy");
+                assert!(borrowed_from(&args, line), "no escape, no copy");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            decode_ok(br#"{"jsonrpc":"2.0","id":6,"method":"command","params":{"name":"deploy"}}"#),
+            (
+                Some(6),
+                Request::Command {
+                    name: Cow::Borrowed("deploy"),
+                    args: Cow::Borrowed(""),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn a_plugin_command_request_without_a_name_is_invalid() {
+        let err =
+            decode(br#"{"jsonrpc":"2.0","id":1,"method":"command","params":{"args":"staging"}}"#)
+                .expect_err("fails");
+        assert_eq!(err.code, RpcError::INVALID_PARAMS);
+        let err = decode(br#"{"jsonrpc":"2.0","id":1,"method":"command"}"#).expect_err("fails");
+        assert_eq!(err.code, RpcError::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn plugin_commands_round_trip() {
+        let commands = PluginCommands {
+            commands: vec![
+                PluginCommand {
+                    name: Cow::Borrowed("deploy"),
+                    description: Cow::Borrowed("ship it"),
+                },
+                PluginCommand {
+                    name: Cow::Borrowed("test"),
+                    description: Cow::Borrowed(""),
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        plugin_commands(&mut buf, &commands);
+        let decoded = decode_plugin_commands(params_of(&buf)).expect("decodes");
+        assert_eq!(decoded, commands);
+        assert!(
+            borrowed_from(&decoded.commands[0].name, &buf),
+            "no escape, no copy"
+        );
+    }
+
+    #[test]
+    fn plugin_panel_round_trip() {
+        let panel = PluginPanel {
+            id: Cow::Borrowed("build"),
+            title: Cow::Borrowed("Build"),
+            lines: vec![
+                PanelLine::Plain(Cow::Borrowed("all green")),
+                PanelLine::Text {
+                    text: Cow::Borrowed("waiting"),
+                    role: Some(Cow::Borrowed("warn")),
+                },
+                PanelLine::Row {
+                    key: Cow::Borrowed("tests"),
+                    value: Cow::Borrowed("12"),
+                },
+                PanelLine::Progress {
+                    label: Cow::Borrowed("pack"),
+                    value: 3,
+                    max: 4,
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        plugin_panel(&mut buf, &panel);
+        assert_eq!(decode_plugin_panel(params_of(&buf)), Some(panel));
+
+        let hidden = PluginPanel {
+            id: Cow::Borrowed("build"),
+            title: Cow::Borrowed("Build"),
+            lines: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        plugin_panel(&mut buf, &hidden);
+        assert_eq!(decode_plugin_panel(params_of(&buf)), Some(hidden));
+    }
+
+    #[test]
+    fn plugin_note_round_trip() {
+        let mut buf = Vec::new();
+        note(&mut buf, "deployed to staging");
+        let decoded = decode_note(params_of(&buf)).expect("decodes");
+        assert_eq!(decoded.text, "deployed to staging");
+        assert!(borrowed_from(&decoded.text, &buf), "no escape, no copy");
+    }
+
+    #[test]
+    fn plugin_panel_lines_decode_to_their_shape() {
+        fn line(json: &str) -> PanelLine<'_> {
+            serde_json::from_str(json).expect("decodes")
+        }
+        assert_eq!(line(r#""x""#), PanelLine::Plain(Cow::Borrowed("x")));
+        assert_eq!(
+            line(r#"{"text":"x"}"#),
+            PanelLine::Text {
+                text: Cow::Borrowed("x"),
+                role: None,
+            }
+        );
+        assert_eq!(
+            line(r#"{"text":"x","role":"bad"}"#),
+            PanelLine::Text {
+                text: Cow::Borrowed("x"),
+                role: Some(Cow::Borrowed("bad")),
+            }
+        );
+        assert_eq!(
+            line(r#"{"key":"a","value":"b"}"#),
+            PanelLine::Row {
+                key: Cow::Borrowed("a"),
+                value: Cow::Borrowed("b"),
+            }
+        );
+        assert_eq!(
+            line(r#"{"label":"l","value":3,"max":4}"#),
+            PanelLine::Progress {
+                label: Cow::Borrowed("l"),
+                value: 3,
+                max: 4,
+            }
+        );
+        assert!(
+            serde_json::from_str::<PanelLine<'_>>(r#"{"value":1}"#).is_err(),
+            "no shape takes a bare value"
+        );
+
+        // The same shapes inside a panel, through its decoder.
+        let params = br#"{"id":"build","title":"Build","lines":["x",{"text":"y","role":"good"},{"key":"a","value":"b"},{"label":"l","value":1,"max":2}]}"#;
+        let panel = decode_plugin_panel(params).expect("decodes");
+        assert_eq!(panel.lines.len(), 4);
+        assert!(matches!(panel.lines[0], PanelLine::Plain(_)));
+        assert!(matches!(panel.lines[1], PanelLine::Text { .. }));
+        assert!(matches!(panel.lines[2], PanelLine::Row { .. }));
+        assert!(matches!(panel.lines[3], PanelLine::Progress { .. }));
+        assert!(decode_plugin_panel(br#"{"id":"b","title":"B","lines":[1]}"#).is_none());
+    }
+
+    #[test]
+    fn plugin_notices_write_exact_bytes() {
+        let mut buf = Vec::new();
+        plugin_commands(
+            &mut buf,
+            &PluginCommands {
+                commands: vec![PluginCommand {
+                    name: Cow::Borrowed("deploy"),
+                    description: Cow::Borrowed("ship it"),
+                }],
+            },
+        );
+        assert_eq!(
+            text(&buf),
+            "{\"jsonrpc\":\"2.0\",\"method\":\"plugin_commands\",\"params\":\
+             {\"commands\":[{\"name\":\"deploy\",\"description\":\"ship it\"}]}}\n"
+        );
+        let mut buf = Vec::new();
+        plugin_panel(
+            &mut buf,
+            &PluginPanel {
+                id: Cow::Borrowed("build"),
+                title: Cow::Borrowed("Build"),
+                lines: vec![PanelLine::Plain(Cow::Borrowed("ok"))],
+            },
+        );
+        assert_eq!(
+            text(&buf),
+            "{\"jsonrpc\":\"2.0\",\"method\":\"plugin_panel\",\"params\":\
+             {\"id\":\"build\",\"title\":\"Build\",\"lines\":[\"ok\"]}}\n"
+        );
+        let mut buf = Vec::new();
+        note(&mut buf, "hi");
+        assert_eq!(
+            text(&buf),
+            "{\"jsonrpc\":\"2.0\",\"method\":\"note\",\"params\":{\"text\":\"hi\"}}\n"
         );
     }
 }

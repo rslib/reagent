@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use reagent_agent::agent_loop::Agent;
@@ -38,6 +39,8 @@ use reagent_protocol::message::MAJOR;
 use reagent_protocol::message::Request;
 use reagent_protocol::message::RpcError;
 use reagent_protocol::token;
+use reagent_script::plugin::PanelView;
+use reagent_script::plugin::Plugins;
 use serde::Serialize;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWriteExt;
@@ -78,6 +81,10 @@ const FILE_MODE: u32 = 0o600;
 
 /// The room one answer line needs before it grows.
 const LINE: usize = 256;
+
+/// How long a panel frame keeps the next one back: a burst of `set` calls costs
+/// a client at most one frame per gap, and the lines of the last one go out.
+const PANEL_GAP: Duration = Duration::from_millis(100);
 
 /// The empty result of `detach`.
 #[derive(Serialize)]
@@ -436,6 +443,12 @@ impl Worker {
         self.stdin = Some(task);
     }
 
+    /// Takes the plugins of the run: their commands, their panels, their notes
+    /// and the messages they send go to every client of the session.
+    pub(crate) fn plugins(&mut self, plugins: Arc<Plugins>) {
+        self.shared.set_plugins(plugins);
+    }
+
     /// The socket this run takes clients on, when it takes any.
     pub(crate) fn socket(&self) -> Option<String> {
         self.mark
@@ -614,9 +627,16 @@ impl Worker {
         let shared = Arc::clone(&self.shared);
         let stop = self.stop.clone().unwrap_or_default();
         let mut leaving = self.leaving.take();
+        // What the plugins publish reaches the clients while the session lives;
+        // a run with no plugins starts no task.
+        let mut pump = Pump::start(&shared, sender.as_ref());
         let live = live::run_live(agent, history, journal, events, &mut inbox);
         tokio::pin!(live);
         let Some(leaving) = leaving.as_mut() else {
+            // No client can leave: the pump goes, and its sender with it, so the
+            // session returns at the end of its work.
+            end_pump(&mut pump).await;
+            drop(sender);
             live.await;
             return;
         };
@@ -625,6 +645,7 @@ impl Worker {
             _ = leaving => {
                 // A run that waits for an answer no client can give is
                 // cancelled, then the senders go so the session returns.
+                end_pump(&mut pump).await;
                 if shared.waits()
                     && let Some(sender) = &sender
                 {
@@ -636,12 +657,14 @@ impl Worker {
             () = stop.cancelled() => {
                 // The signal cancelled the run; the connections go with the
                 // acceptor, and with them the last senders of the session.
+                end_pump(&mut pump).await;
                 drop(sender);
                 stop_accepting(acceptor).await;
                 live.await;
                 return;
             }
         }
+        end_pump(&mut pump).await;
         stop_accepting(acceptor).await;
     }
 
@@ -669,6 +692,8 @@ impl Worker {
         let shared = Arc::clone(&self.shared);
         let stop = self.stop.clone().unwrap_or_default();
         let input = self.stdin.take();
+        // The clients of a steered run see what the plugins publish too.
+        let mut pump = Pump::start(&shared, sender.as_ref());
         let mut changed = shared.changed();
         let live = live::run_live(agent, history, journal, events, &mut inbox);
         tokio::pin!(live);
@@ -699,6 +724,7 @@ impl Worker {
         if let Some(input) = input {
             input.abort();
         }
+        end_pump(&mut pump).await;
         drop(sender);
         stop_clients(acceptor).await;
         if !returned {
@@ -729,6 +755,9 @@ struct State {
     committed: u64,
     /// The clients that joined and have not left.
     clients: u32,
+    /// The clients that attached, in the order they attached: every one of
+    /// them gets what the plugins publish.
+    attached: Vec<live::ClientId>,
     /// Whether a client has ever joined.
     seen: bool,
     /// The deadline a client that left without `detach` keeps the worker up to,
@@ -757,6 +786,7 @@ impl Default for State {
             armed: false,
             committed: 0,
             clients: 0,
+            attached: Vec::new(),
             seen: false,
             linger: None,
             next: 1,
@@ -916,6 +946,9 @@ pub(crate) struct Shared {
     /// The login of the provider a client switched to, kept so its refresh
     /// keeps working.
     held: Mutex<Option<Arc<Session>>>,
+    /// The plugins of the run, set once before the servers start: `None` for a
+    /// run with no plugins, which sends no frame of its own.
+    plugins: OnceLock<Arc<Plugins>>,
     /// Bumped on every change of `state`, so a wait wakes on it.
     changed: watch::Sender<u64>,
 }
@@ -929,8 +962,20 @@ impl Shared {
             model: Mutex::new(model),
             stdin: Mutex::new(None),
             held: Mutex::new(None),
+            plugins: OnceLock::new(),
             changed,
         }
+    }
+
+    /// Takes the plugins of the run: their commands, their panels, their notes
+    /// and the messages they send go to every client of the session.
+    fn set_plugins(&self, plugins: Arc<Plugins>) {
+        let _ = self.plugins.set(plugins);
+    }
+
+    /// The plugins of the run, or `None` when the run loaded none.
+    fn plugins(&self) -> Option<&Arc<Plugins>> {
+        self.plugins.get()
     }
 
     /// The state of a session served by `args`, with the provider and model
@@ -1016,11 +1061,43 @@ impl Shared {
 
     /// Attaches the client of `id` for its request, and queues the frames it
     /// missed, and the answer says whether a run is open now.
+    ///
+    /// The commands and the panels of `plugins` follow them, under the same
+    /// lock, so a panel that changes now cannot come before the one it
+    /// replaces.
     fn attach(&self, id: live::ClientId, request: Option<u64>) {
-        let running = self.state().running;
+        let running = {
+            let mut state = self.state();
+            if !state.attached.contains(&id) {
+                state.attached.push(id);
+            }
+            state.running
+        };
         let mut frames = self.hub();
         frames.set_running(running);
         frames.attach(id, request);
+        if let Some(plugins) = self.plugins() {
+            plugin_state(&mut frames, id, plugins);
+        }
+    }
+
+    /// Queues one frame to every client that attached, and keeps it for none of
+    /// them: the catch-up of the hub is the frames of the run itself, so what a
+    /// plugin publishes never piles up in it. A client that attaches later gets
+    /// the state of the plugins instead.
+    ///
+    /// Says whether a client got it: a frame no client got is one the caller
+    /// writes somewhere else, so a note is never lost.
+    fn broadcast(&self, frame: &[u8]) -> bool {
+        let clients = self.state().attached.clone();
+        if clients.is_empty() {
+            return false;
+        }
+        let mut frames = self.hub();
+        for id in clients {
+            frames.reply(id, frame);
+        }
+        true
     }
 
     /// Queues the answer in `out` to the client of `id`: on the channel of the
@@ -1042,8 +1119,10 @@ impl Shared {
         self.hub().reply(id, out);
     }
 
-    /// Takes the client of `id` out of the hub.
+    /// Takes the client of `id` out of the hub and out of the clients the
+    /// plugins publish to.
     fn left_client(&self, id: live::ClientId) {
+        self.state().attached.retain(|client| *client != id);
         self.hub().leave(id);
     }
 
@@ -1519,6 +1598,173 @@ async fn join(
     }
 }
 
+/// Queues the state of `plugins` to the client of `id`: the commands they
+/// offer, when they offer one, then the panels that show something.
+fn plugin_state(frames: &mut hub::Hub, id: live::ClientId, plugins: &Plugins) {
+    let commands = plugins.commands();
+    if !commands.is_empty() {
+        let list = commands
+            .iter()
+            .map(|command| message::PluginCommand {
+                name: Cow::Borrowed(command.name.as_str()),
+                description: Cow::Borrowed(command.description.as_str()),
+            })
+            .collect();
+        let mut out = Vec::with_capacity(LINE);
+        message::plugin_commands(&mut out, &message::PluginCommands { commands: list });
+        frames.reply(id, &out);
+    }
+    let mut out = Vec::with_capacity(LINE);
+    for panel in plugins.panels() {
+        if !shown(&panel) {
+            continue;
+        }
+        out.clear();
+        panel_frame(&mut out, &panel);
+        frames.reply(id, &out);
+    }
+}
+
+/// Whether `panel` shows anything: a panel whose lines are the empty array is
+/// hidden, and one with no lines at all is hidden too.
+fn shown(panel: &PanelView) -> bool {
+    let lines = panel.lines.trim();
+    !lines.is_empty() && lines != "[]"
+}
+
+/// Writes one `plugin_panel` frame into `out`.
+///
+/// The lines the plugin wrote go into the frame as they are: the worker never
+/// parses them and never encodes them again.
+fn panel_frame(out: &mut Vec<u8>, panel: &PanelView) {
+    let mut params =
+        Vec::with_capacity(panel.id.len() + panel.title.len() + panel.lines.len() + 32);
+    params.extend_from_slice(br#"{"id":"#);
+    quote(&mut params, &panel.id);
+    params.extend_from_slice(br#","title":"#);
+    quote(&mut params, &panel.title);
+    params.extend_from_slice(br#","lines":"#);
+    params.extend_from_slice(panel.lines.as_bytes());
+    params.push(b'}');
+    message::notify(out, message::methods::PLUGIN_PANEL, &params);
+}
+
+/// Writes `text` as one JSON string, quotes and all.
+fn quote(out: &mut Vec<u8>, text: &str) {
+    // A string always serializes, and a vector takes every byte it is given.
+    let _ = serde_json::to_writer(&mut *out, text);
+}
+
+/// What the plugins publish, sent to the clients of the session while it lives.
+struct Pump {
+    /// Cancelled when the session ends, which frees the sender it holds.
+    stop: CancellationToken,
+    /// The task that pumps.
+    task: JoinHandle<()>,
+}
+
+impl Pump {
+    /// Starts sending what the plugins of `shared` publish to its clients,
+    /// whose own messages the session takes on `sender`.
+    ///
+    /// A run with no plugins starts no task, holds no sender and reads no
+    /// clock: a run that changes nothing pays nothing.
+    fn start(shared: &Arc<Shared>, sender: Option<&Sender>) -> Option<Self> {
+        let plugins = Arc::clone(shared.plugins()?);
+        let sender = sender?.clone();
+        let stop = CancellationToken::new();
+        let shared = Arc::clone(shared);
+        let token = stop.clone();
+        let task = tokio::spawn(pump(shared, plugins, sender, token));
+        Some(Self { stop, task })
+    }
+}
+
+/// Ends the pump of a session, if it started one: the sender it holds goes,
+/// so the session sees the last of them.
+async fn end_pump(pump: &mut Option<Pump>) {
+    let Some(pump) = pump.take() else {
+        return;
+    };
+    pump.stop.cancel();
+    let _ = pump.task.await;
+}
+
+/// Sends what the plugins publish to the clients of the session, and queues the
+/// messages they send as the worker's own, until `stop` ends the session.
+async fn pump(shared: Arc<Shared>, plugins: Arc<Plugins>, sender: Sender, stop: CancellationToken) {
+    let mut out = Vec::with_capacity(LINE);
+    // When the last panel frame went out, so a burst of sets waits the rest of
+    // the gap instead of one frame per set.
+    let mut sent: Option<tokio::time::Instant> = None;
+    loop {
+        tokio::select! {
+            () = plugins.changed() => {}
+            () = stop.cancelled() => return,
+        }
+        for note in plugins.take_notes() {
+            out.clear();
+            message::note(&mut out, &note);
+            // A note no client saw goes to the stderr of the worker at once:
+            // the end of the run does not see it, since the pump took it.
+            if !shared.broadcast(&out) {
+                eprintln!("reagent: {note}");
+            }
+        }
+        // The messages go before the panels wait: a plugin that sets a panel and
+        // then sends starts its turn at once.
+        for text in plugins.take_sent() {
+            shared.queued();
+            let message = shared.message();
+            let command = live::Command::Send {
+                message,
+                client: WORKER,
+                text: Text::from(text),
+                blocks: Vec::new(),
+                mode: SendMode::Queue,
+            };
+            tokio::select! {
+                taken = sender.send(command) => {
+                    if taken.is_err() {
+                        return;
+                    }
+                }
+                () = stop.cancelled() => return,
+            }
+        }
+        let mut panels = plugins.take_changed_panels();
+        if panels.is_empty() {
+            continue;
+        }
+        if let Some(at) = sent {
+            tokio::select! {
+                () = tokio::time::sleep_until(at + PANEL_GAP) => {}
+                () = stop.cancelled() => return,
+            }
+            // The sets that came while this one waited hold the newest lines, so
+            // the last lines of a panel are the ones that go out.
+            latest(&mut panels, plugins.take_changed_panels());
+        }
+        for panel in &panels {
+            out.clear();
+            panel_frame(&mut out, panel);
+            shared.broadcast(&out);
+        }
+        sent = Some(tokio::time::Instant::now());
+    }
+}
+
+/// Puts the lines of the `newer` panels over the ones the pump already holds,
+/// so one panel goes out once, with its newest lines.
+fn latest(panels: &mut Vec<PanelView>, newer: Vec<PanelView>) {
+    for panel in newer {
+        match panels.iter_mut().find(|held| held.id == panel.id) {
+            Some(held) => *held = panel,
+            None => panels.push(panel),
+        }
+    }
+}
+
 /// Does one request of one client: a message, a cancel, a `set`, a `compact`
 /// or an approval goes to the session, and its answer goes to the client that
 /// sent it.
@@ -1527,7 +1773,7 @@ async fn join(
 /// `initialize`, are refused here: a run that reads its requests on stdin has
 /// no session to attach to, no connection to detach and no handshake.
 async fn handle(
-    shared: &Shared,
+    shared: &Arc<Shared>,
     sender: Option<&Sender>,
     client: live::ClientId,
     cwd: &Path,
@@ -1672,6 +1918,47 @@ async fn handle(
                 }),
             };
             deliver(shared, sender, client, id, out, answer, None).await;
+        }
+        // A plugin command answers as soon as it is taken: the client that
+        // sent it reads its requests while the plugin runs, and the text the
+        // command shows goes to every client of the session as a note.
+        Request::Command { name, args } => {
+            let Some(plugins) = shared.plugins() else {
+                let message = format!("no plugin command is named '/{name}'");
+                out.clear();
+                message::error(
+                    out,
+                    id,
+                    &RpcError {
+                        code: RpcError::METHOD_NOT_FOUND,
+                        message: message.into(),
+                    },
+                );
+                shared.reply(client, out);
+                return;
+            };
+            if let Some(id) = id {
+                out.clear();
+                message::result(out, id, &Empty {});
+                shared.reply(client, out);
+            }
+            let plugins = Arc::clone(plugins);
+            let shared = Arc::clone(shared);
+            // The request line is gone once this call returns, so the command
+            // runs on its own copy of its name and arguments.
+            let (name, args) = (name.into_owned(), args.into_owned());
+            tokio::spawn(async move {
+                if let Some(text) = plugins.command(&name, &args).await {
+                    let mut out = Vec::with_capacity(LINE);
+                    message::note(&mut out, &text);
+                    // The text a command returns is a note the client that asked
+                    // gets, and a note with no client to take it is written
+                    // where the worker's own stderr goes.
+                    if !shared.broadcast(&out) {
+                        eprintln!("reagent: {text}");
+                    }
+                }
+            });
         }
         Request::Attach { .. } | Request::Detach | Request::Initialize { .. } => {
             out.clear();

@@ -11,72 +11,76 @@ use crate::keyfile::Labels;
 
 use super::list::Command;
 
+/// The group the palette lists the plugin commands under, and the mark the `/`
+/// list uses to tell a plugin row from a built-in one.
+pub(crate) const PLUGIN_GROUP: &str = "plugin";
+
 /// The commands, in the order an empty list shows them, with the key the table
 /// gives each one until a keys file moves it.
 const TABLE: [Command; 11] = [
     Command {
-        name: "/model",
-        words: "pick the model and the provider",
+        name: Cow::Borrowed("/model"),
+        words: Cow::Borrowed("pick the model and the provider"),
         key: Cow::Borrowed("ctrl+x m"),
         group: "model",
     },
     Command {
-        name: "/level",
-        words: "reasoning effort",
+        name: Cow::Borrowed("/level"),
+        words: Cow::Borrowed("reasoning effort"),
         key: Cow::Borrowed("ctrl+x t"),
         group: "model",
     },
     Command {
-        name: "/mode",
-        words: "permission mode",
+        name: Cow::Borrowed("/mode"),
+        words: Cow::Borrowed("permission mode"),
         key: Cow::Borrowed(""),
         group: "model",
     },
     Command {
-        name: "/sessions",
-        words: "open another session",
+        name: Cow::Borrowed("/sessions"),
+        words: Cow::Borrowed("open another session"),
         key: Cow::Borrowed("ctrl+x l"),
         group: "session",
     },
     Command {
-        name: "/new",
-        words: "start a new session",
+        name: Cow::Borrowed("/new"),
+        words: Cow::Borrowed("start a new session"),
         key: Cow::Borrowed(""),
         group: "session",
     },
     Command {
-        name: "/fork",
-        words: "fork this session into a new one",
+        name: Cow::Borrowed("/fork"),
+        words: Cow::Borrowed("fork this session into a new one"),
         key: Cow::Borrowed(""),
         group: "session",
     },
     Command {
-        name: "/compact",
-        words: "compact the history into a checkpoint",
+        name: Cow::Borrowed("/compact"),
+        words: Cow::Borrowed("compact the history into a checkpoint"),
         key: Cow::Borrowed(""),
         group: "session",
     },
     Command {
-        name: "/login",
-        words: "log in to a provider",
+        name: Cow::Borrowed("/login"),
+        words: Cow::Borrowed("log in to a provider"),
         key: Cow::Borrowed(""),
         group: "session",
     },
     Command {
-        name: "/cost",
-        words: "tokens and cost of this session",
+        name: Cow::Borrowed("/cost"),
+        words: Cow::Borrowed("tokens and cost of this session"),
         key: Cow::Borrowed(""),
         group: "view",
     },
     Command {
-        name: "/help",
-        words: "every key",
+        name: Cow::Borrowed("/help"),
+        words: Cow::Borrowed("every key"),
         key: Cow::Borrowed("?"),
         group: "view",
     },
     Command {
-        name: "/quit",
-        words: "leave the session",
+        name: Cow::Borrowed("/quit"),
+        words: Cow::Borrowed("leave the session"),
         key: Cow::Borrowed("ctrl+c ctrl+c"),
         group: "app",
     },
@@ -93,8 +97,8 @@ pub(crate) fn table(labels: Option<&Labels>) -> Arc<[Command]> {
             .iter()
             .enumerate()
             .map(|(index, row)| Command {
-                name: row.name,
-                words: row.words,
+                name: row.name.clone(),
+                words: row.words.clone(),
                 key: Cow::Owned(labels.command(index).to_owned()),
                 group: row.group,
             })

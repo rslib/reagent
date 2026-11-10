@@ -33,6 +33,7 @@ use reagent_config::Secret;
 use reagent_config::mcp::McpDirect;
 use reagent_config::permissions::Rules;
 use reagent_script::codemode::{Codemode, ToolSource};
+use reagent_script::plugin::Plugins;
 use reagent_tools::bash::{Bash, Fallback, Launcher};
 use reagent_tools::edit::Edit;
 use reagent_tools::find::Find;
@@ -638,6 +639,35 @@ pub async fn run(mut args: Args) -> ExitCode {
     if let Some(questions) = &questions {
         registry.add(reagent_agent::question::Ask::new(Arc::clone(questions)));
     }
+    // The plugins of the run, after every other tool so a name they take is
+    // already owned. A run with no plugins folder loads nothing and adds no
+    // hook: its loop stays the one it was.
+    let mut plugins: Option<Arc<Plugins>> = None;
+    if let Some(dir) = args.plugins_dir.as_deref() {
+        let (loaded, notes) = Plugins::load(dir).await;
+        for note in notes {
+            eprintln!("reagent: {note}");
+        }
+        if let Some(loaded) = loaded {
+            for tool in loaded.tools() {
+                let name = tool.spec().name.clone();
+                if registry.get(&name).is_some() {
+                    eprintln!("reagent: plugin tool {name} skipped: another tool has that name");
+                    continue;
+                }
+                registry.add(tool);
+            }
+            // The run starts for the plugins here, before the first request.
+            loaded.event("run_start", serde_json::json!({}));
+            registry = registry.with_hook(loaded.clone());
+            plugins = Some(loaded);
+        }
+    }
+    // The clients of a session this run serves see the commands, the panels and
+    // the notes of its plugins: the worker pumps them while its session lives.
+    if let (Some(worker), Some(plugins)) = (worker.as_mut(), plugins.as_ref()) {
+        worker.plugins(Arc::clone(plugins));
+    }
     if let Err(message) = check_rule_tools(&args.rules, &registry) {
         eprintln!("reagent: {message}");
         stop_servers(servers).await;
@@ -723,6 +753,9 @@ pub async fn run(mut args: Args) -> ExitCode {
     } else {
         guard
     });
+    if let Some(plugins) = &plugins {
+        agent = agent.with_turn_hook(plugins.clone());
+    }
     if let Some(questions) = &questions {
         agent = agent.with_questions(Arc::clone(questions));
     }
@@ -751,6 +784,7 @@ pub async fn run(mut args: Args) -> ExitCode {
         socket,
         billing,
         context_window: args.context_window,
+        plugins: plugins.as_ref().map(Arc::clone),
     };
     // The answer lines of the run's stdin client, when it has one, and the end
     // its session reports once it is over.
@@ -1038,6 +1072,13 @@ pub async fn run(mut args: Args) -> ExitCode {
             Err(_) => eprintln!("reagent: warning: the session sweep failed"),
         }
     }
+    // The notes the plugins raised that no client of the session saw, one line
+    // each, after its own output.
+    if let Some(plugins) = &plugins {
+        for note in plugins.take_notes() {
+            eprintln!("reagent: {note}");
+        }
+    }
     // A worker stops because its last client left, so its exit code says it
     // stopped rather than how its last run ended. A steered run is a `-p` run
     // and ends with the reason of its session.
@@ -1196,6 +1237,9 @@ struct Report {
     socket: Option<String>,
     billing: Option<Billing>,
     context_window: Option<u64>,
+    /// The plugins of the run, `None` when it loaded none: then the loop does
+    /// nothing per event.
+    plugins: Option<Arc<Plugins>>,
 }
 
 /// The next thing the drain loop takes: a batch of events, or one answer line
@@ -1203,6 +1247,53 @@ struct Report {
 enum Step {
     Events(usize),
     Line(Option<Vec<u8>>),
+}
+
+/// Hands one agent event to the plugins' listeners.
+///
+/// `calls` holds the calls that started and have not reported yet, so a
+/// `tool_end` names its tool: the result event carries the id, not the name.
+fn plugin_event(plugins: &Plugins, event: &Event, calls: &mut Vec<(Text, Text)>) {
+    match event {
+        Event::TurnStart => plugins.event("turn_start", serde_json::json!({})),
+        Event::ToolCallReady { id, name, .. } => calls.push((id.clone(), name.clone())),
+        Event::ToolResult { id, is_error, .. } => {
+            let name = match calls.iter().position(|(call, _)| call == id) {
+                Some(at) => calls.swap_remove(at).1,
+                // A resumed session's calls started in another run.
+                None => Text::from(""),
+            };
+            plugins.event(
+                "tool_end",
+                serde_json::json!({ "tool": name.as_ref(), "isError": is_error }),
+            );
+        }
+        Event::TurnEnd(reason) => {
+            plugins.event(
+                "turn_end",
+                serde_json::json!({ "reason": reason_word(reason) }),
+            );
+        }
+        Event::RunEnd(reason) => {
+            plugins.event(
+                "run_end",
+                serde_json::json!({ "reason": reason_word(reason) }),
+            );
+        }
+        _ => {}
+    }
+}
+
+/// The word `--json` writes for an end reason, which the plugin events carry
+/// too (`crate::json::turn_reason`).
+fn reason_word(reason: &TurnEndReason) -> &'static str {
+    match reason {
+        TurnEndReason::EndTurn => "end_turn",
+        TurnEndReason::Cancelled => "cancelled",
+        TurnEndReason::Stopped(_) => "stopped",
+        TurnEndReason::MaxTurns => "max_turns",
+        TurnEndReason::Error => "error",
+    }
 }
 
 /// Consumes the agent's event channel, prints it and returns how the run ended.
@@ -1236,6 +1327,9 @@ async fn drain<W: AsyncWrite + Unpin>(
     let mut ended = false;
     // The prompt size of the last turn: how full the context is now.
     let mut context_tokens = 0u64;
+    // The calls that started and have not reported yet, so a `tool_end` event
+    // names its tool. A call a resumed session left open has no start here.
+    let mut calls: Vec<(Text, Text)> = Vec::new();
 
     let mut buf = Vec::with_capacity(512);
     // Whether the start line has gone into a batch; it is written once, with
@@ -1334,6 +1428,9 @@ async fn drain<W: AsyncWrite + Unpin>(
                         ended = !steered;
                     }
                     _ => {}
+                }
+                if let Some(plugins) = report.plugins.as_deref() {
+                    plugin_event(plugins, &event, &mut calls);
                 }
                 if json {
                     // A steered run's caller answers its approvals, so it needs
@@ -3301,6 +3398,7 @@ mod tests {
             socket: None,
             billing: None,
             context_window: None,
+            plugins: None,
         };
         drain(rx, None, None, Out::with_writer(sink.clone()), report).await;
     }
@@ -3338,6 +3436,7 @@ mod tests {
             socket: None,
             billing: None,
             context_window: None,
+            plugins: None,
         };
         let reason = drain(rx, None, None, Out::with_writer(sink.clone()), report).await;
         assert_eq!(reason, TurnEndReason::EndTurn);

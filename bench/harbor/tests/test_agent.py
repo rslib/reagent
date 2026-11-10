@@ -71,6 +71,7 @@ def test_the_command_passes_the_instruction_on_stdin_not_argv(
     assert args == [
         "--json",
         "--no-serve",
+        "--no-plugins",
         "--cwd",
         "/app dir",
         "--model",
@@ -97,6 +98,13 @@ def test_the_command_passes_no_serve(tmp_path: Path) -> None:
     run_command(tmp_path, timeout_sec=None)
     args = json.loads((tmp_path / "reagent.args").read_text())
     assert "--no-serve" in args
+
+
+def test_the_command_passes_no_plugins(tmp_path: Path) -> None:
+    # A benchmark run measures reagent itself, never a user's plugins.
+    run_command(tmp_path, timeout_sec=None)
+    args = json.loads((tmp_path / "reagent.args").read_text())
+    assert "--no-plugins" in args
 
 
 def test_the_command_sets_the_deadline_below_the_timeout(tmp_path: Path) -> None:

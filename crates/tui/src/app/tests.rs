@@ -15,7 +15,7 @@ use crossterm::event::{
 use reagent_ai::record::{MESSAGE, encode_message};
 use reagent_ai::{AssistantMessage, Content, Message, Text, ToolCall};
 use reagent_protocol::lines::Lines;
-use reagent_protocol::message::{self, AnswerKind, Mode, Request};
+use reagent_protocol::message::{self, AnswerKind, Mode, PanelLine, PluginCommand, Request};
 use reagent_store::{Header, Session, Writer};
 use serde_json::{Value, json};
 use tokio::net::UnixListener;
@@ -230,6 +230,7 @@ fn name_of(line: &str) -> &'static str {
         Request::Detach => "detach",
         Request::Set { .. } => "set",
         Request::Compact { .. } => "compact",
+        Request::Command { .. } => "command",
     }
 }
 
@@ -4726,6 +4727,310 @@ async fn command_quit_detaches() {
     assert_eq!(harness.fake.expect_method().await, "initialize");
     assert_eq!(harness.fake.expect_method().await, "attach");
     assert_eq!(harness.fake.expect_method().await, "detach");
+}
+
+/// The commands of a plugin join the `/` list after the built-ins, with the
+/// words that describe them; with no such frame the list holds the built-ins
+/// alone.
+#[test]
+fn plugin_commands_show_in_the_slash_list() {
+    let mut app = bare();
+    app.frame(Frame::PluginCommands(vec![PluginCommand {
+        name: Cow::Borrowed("deploy"),
+        description: Cow::Borrowed("ship it"),
+    }]));
+    assert_eq!(
+        app.slash.len(),
+        12,
+        "the plugin row joins the eleven built-ins"
+    );
+    type_keys(&mut app, "/de");
+    app.paint();
+    let screen = screen_text(&app);
+    let row = screen
+        .lines()
+        .find(|line| line.contains("/deploy"))
+        .unwrap_or_else(|| panic!("the plugin row draws:\n{screen}"));
+    assert!(
+        row.contains("ship it"),
+        "the words draw beside it:\n{screen}"
+    );
+
+    let mut app = bare();
+    type_keys(&mut app, "/de");
+    app.paint();
+    let screen = screen_text(&app);
+    assert!(
+        !screen.contains("/deploy"),
+        "no frame names it, so no row draws it:\n{screen}"
+    );
+}
+
+/// A plugin command takes the rest of the line as one argument, as it was
+/// typed, and runs it as a `command` request rather than sending a message.
+#[tokio::test]
+async fn a_plugin_command_sends_the_rest_of_the_line() {
+    // The plugin's commands arrive as the frame a worker sends before its
+    // attach answer, so the list holds them by the time the test types.
+    let mut frame = Vec::new();
+    message::notify(
+        &mut frame,
+        "plugin_commands",
+        br#"{"commands":[{"name":"echo","description":"say it back"}]}"#,
+    );
+    let (link, _talk) = Link::new(1, frame, Vec::new());
+    let mut worker = Cutting::start("sess-plugin", vec![link]);
+    let harness = Harness::new_session(worker.fake());
+    wait_text(&harness.bytes, "idle").await;
+    assert_eq!(worker.expect_method().await, "initialize");
+    assert_eq!(worker.expect_method().await, "attach");
+    harness.type_text("/echo a b  c");
+    harness.press(KeyCode::Enter);
+    let line = timeout(WAIT, worker.sent.recv())
+        .await
+        .expect("a request before the wait ran out")
+        .expect("the fake worker");
+    assert!(
+        line.contains(r#""method":"command","params":{"name":"echo","args":"a b  c"}"#),
+        "the line the fake read is the command: {line}"
+    );
+    let (_, request) = message::decode(line.as_bytes()).expect("decode");
+    assert_eq!(
+        request,
+        Request::Command {
+            name: Cow::Borrowed("echo"),
+            args: Cow::Borrowed("a b  c"),
+        }
+    );
+    assert!(
+        timeout(Duration::from_millis(200), worker.sent.recv())
+            .await
+            .is_err(),
+        "the line is no message, so no send follows it"
+    );
+}
+
+/// `/echo` with nothing behind it is still the plugin's command, with an empty
+/// argument rather than a message.
+#[tokio::test]
+async fn a_plugin_command_with_no_text_sends_no_argument() {
+    let mut frame = Vec::new();
+    message::notify(
+        &mut frame,
+        "plugin_commands",
+        br#"{"commands":[{"name":"echo","description":"say it back"}]}"#,
+    );
+    let (link, _talk) = Link::new(1, frame, Vec::new());
+    let mut worker = Cutting::start("sess-plugin", vec![link]);
+    let harness = Harness::new_session(worker.fake());
+    wait_text(&harness.bytes, "idle").await;
+    assert_eq!(worker.expect_method().await, "initialize");
+    assert_eq!(worker.expect_method().await, "attach");
+    harness.type_text("/echo");
+    harness.press(KeyCode::Enter);
+    let line = timeout(WAIT, worker.sent.recv())
+        .await
+        .expect("a request before the wait ran out")
+        .expect("the fake worker");
+    let (_, request) = message::decode(line.as_bytes()).expect("decode");
+    assert_eq!(
+        request,
+        Request::Command {
+            name: Cow::Borrowed("echo"),
+            args: Cow::Borrowed(""),
+        },
+        "the line the fake read is the command with no argument: {line}"
+    );
+}
+
+/// A `plugin_commands` frame adds rows to the `/` list, and a `/foo bar` that
+/// names none of them is still a message to the model, as it was typed.
+#[tokio::test]
+async fn an_unknown_plugin_command_still_goes_to_the_model() {
+    let mut frame = Vec::new();
+    message::notify(
+        &mut frame,
+        "plugin_commands",
+        br#"{"commands":[{"name":"deploy","description":"ship it"}]}"#,
+    );
+    let (link, _talk) = Link::new(1, frame, Vec::new());
+    let mut worker = Cutting::start("sess-plugin", vec![link]);
+    let harness = Harness::new_session(worker.fake());
+    wait_text(&harness.bytes, "idle").await;
+    assert_eq!(worker.expect_method().await, "initialize");
+    assert_eq!(worker.expect_method().await, "attach");
+    harness.type_text("/foo bar");
+    harness.press(KeyCode::Enter);
+    let line = timeout(WAIT, worker.sent.recv())
+        .await
+        .expect("a request before the wait ran out")
+        .expect("the fake worker");
+    let (_, request) = message::decode(line.as_bytes()).expect("decode");
+    let Request::Send { text, .. } = request else {
+        panic!("a `/foo bar` that names no command is a message: {line}");
+    };
+    assert_eq!(text, "/foo bar");
+}
+
+/// A plugin command whose name a built-in already has is skipped with a note,
+/// and the built-in keeps its meaning.
+#[test]
+fn a_plugin_command_named_like_a_built_in_is_skipped() {
+    let mut app = bare();
+    app.frame(Frame::PluginCommands(vec![PluginCommand {
+        name: Cow::Borrowed("model"),
+        description: Cow::Borrowed("pick a model for me"),
+    }]));
+    assert_eq!(app.slash.len(), 11, "no row joins the table");
+    assert_eq!(
+        note_rows(&app),
+        ["plugin command /model skipped: a built-in command has that name".to_owned()]
+    );
+    type_keys(&mut app, "/model");
+    app.models = Some(two_models());
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.sheet.is_some(),
+        "the built-in `/model` still opens the model sheet"
+    );
+}
+
+/// A second `plugin_commands` frame, from a reattach, replaces the plugin rows
+/// rather than adding them again.
+#[test]
+fn a_second_plugin_commands_frame_replaces_the_rows() {
+    let mut app = bare();
+    let commands = |name: &'static str| {
+        vec![PluginCommand {
+            name: Cow::Borrowed(name),
+            description: Cow::Borrowed("ship it"),
+        }]
+    };
+    app.frame(Frame::PluginCommands(commands("deploy")));
+    app.frame(Frame::PluginCommands(commands("deploy")));
+    assert_eq!(app.slash.len(), 12, "the same frame twice adds one row");
+    app.frame(Frame::PluginCommands(commands("echo")));
+    let names: Vec<&str> = app.slash.iter().map(|row| &*row.name).collect();
+    assert_eq!(names.len(), 12, "one plugin row: {names:?}");
+    assert_eq!(names[11], "/echo");
+    assert!(
+        !names.contains(&"/deploy"),
+        "the old row is gone: {names:?}"
+    );
+}
+
+/// The lines of the sidebar of `app`, drawn for `height` rows.
+fn sidebar_lines(app: &mut App, height: u16) -> Vec<String> {
+    app.sidebar
+        .draw(28, height)
+        .iter()
+        .map(|spans| spans.iter().map(|span| span.text()).collect::<String>())
+        .collect()
+}
+
+/// A plugin panel draws its title and its lines in the sidebar, a later frame
+/// with the same id replaces them, a frame with no line hides it, and a panel
+/// keeps at most fifty lines.
+#[test]
+fn a_plugin_panel_draws_in_the_sidebar() {
+    let mut app = bare();
+    let lines = vec![
+        PanelLine::Plain(Cow::Borrowed("all green")),
+        PanelLine::Text {
+            text: Cow::Borrowed("one warning"),
+            role: Some(Cow::Borrowed("warn")),
+        },
+        PanelLine::Row {
+            key: Cow::Borrowed("branch"),
+            value: Cow::Borrowed("main"),
+        },
+        PanelLine::Progress {
+            label: Cow::Borrowed("tests"),
+            value: 3,
+            max: 10,
+        },
+    ];
+    app.frame(Frame::PluginPanel {
+        id: Cow::Borrowed("myplug/build"),
+        title: Cow::Borrowed("Build"),
+        lines,
+    });
+    let drawn = sidebar_lines(&mut app, 40);
+    for needle in [
+        "Build",
+        "all green",
+        "one warning",
+        "branch",
+        "main",
+        "tests",
+    ] {
+        assert!(
+            drawn.iter().any(|line| line.contains(needle)),
+            "{needle:?} draws in the sidebar: {drawn:?}"
+        );
+    }
+    assert_eq!(app.sidebar.len(), 5, "one plugin panel joins the four");
+
+    app.frame(Frame::PluginPanel {
+        id: Cow::Borrowed("myplug/build"),
+        title: Cow::Borrowed("Built"),
+        lines: vec![PanelLine::Plain(Cow::Borrowed("done"))],
+    });
+    let drawn = sidebar_lines(&mut app, 40);
+    assert_eq!(app.sidebar.len(), 5, "the same id keeps one panel");
+    assert!(drawn.iter().any(|line| line.contains("Built")), "{drawn:?}");
+    assert!(drawn.iter().any(|line| line.contains("done")), "{drawn:?}");
+    assert!(
+        !drawn.iter().any(|line| line.contains("all green")),
+        "the new lines replace the old: {drawn:?}"
+    );
+
+    app.frame(Frame::PluginPanel {
+        id: Cow::Borrowed("myplug/build"),
+        title: Cow::Borrowed("Built"),
+        lines: Vec::new(),
+    });
+    let drawn = sidebar_lines(&mut app, 40);
+    assert!(
+        !drawn.iter().any(|line| line.contains("Built")),
+        "a panel with no line draws no title row: {drawn:?}"
+    );
+    assert!(!drawn.iter().any(|line| line.contains("done")), "{drawn:?}");
+
+    let many: Vec<PanelLine<'_>> = (0..80)
+        .map(|index| PanelLine::Plain(Cow::Owned(format!("row {index}"))))
+        .collect();
+    app.frame(Frame::PluginPanel {
+        id: Cow::Borrowed("myplug/build"),
+        title: Cow::Borrowed("Many"),
+        lines: many,
+    });
+    let drawn = sidebar_lines(&mut app, 80);
+    let rows = drawn.iter().filter(|line| line.contains("row ")).count();
+    assert_eq!(rows, 50, "a panel keeps fifty lines: {drawn:?}");
+    assert!(
+        drawn.iter().any(|line| line.contains("row 49")),
+        "{drawn:?}"
+    );
+    assert!(
+        !drawn.iter().any(|line| line.contains("row 50")),
+        "{drawn:?}"
+    );
+}
+
+/// A `note` frame is a line of the transcript.
+#[tokio::test]
+async fn a_plugin_note_shows_in_the_transcript() {
+    let mut app = bare();
+    app.frame(Frame::Note(Cow::Borrowed("deployed to staging")));
+    assert_eq!(note_rows(&app), ["deployed to staging".to_owned()]);
+
+    let harness = Harness::new_session(Fake::start("sess-note", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness
+        .fake
+        .notify("note", &json!({ "text": "deployed to staging" }));
+    wait_text(&harness.bytes, "deployed to staging").await;
 }
 
 /// `/cost` lines the session's tokens and cost into the transcript once.

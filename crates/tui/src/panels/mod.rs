@@ -14,16 +14,21 @@
 //! The header row the sidebar folds into reads the same panels: the context
 //! panel's share and cost, the changes panel's tally, the sessions that wait and
 //! the client count. No panel data is kept twice.
+//!
+//! [`PluginPanel`] is the one panel a worker drives: the app adds one per id a
+//! JS plugin sets, and hands it the title and the lines of its notice.
 
 mod changes;
 mod clients;
 mod context;
+mod plugin;
 mod right;
 mod sessions;
 
 pub use changes::ChangesPanel;
 pub use clients::ClientsPanel;
 pub use context::ContextPanel;
+pub use plugin::PluginPanel;
 pub(crate) use right::Right;
 pub use sessions::{SessionRow, SessionsPanel};
 

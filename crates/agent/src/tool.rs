@@ -3,12 +3,15 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use futures_util::future::BoxFuture;
 
 use reagent_ai::{Text, ToolSpec};
 use tokio_util::sync::CancellationToken;
+
+use crate::hook::CallHook;
 
 /// What one file is, so a read is matched with a later read of the same file
 /// without looking at the path again.
@@ -353,6 +356,8 @@ pub struct Reroute {
 pub struct Registry {
     tools: BTreeMap<String, Box<dyn Tool>>,
     specs: Vec<ToolSpec>,
+    /// The hook every call of this registry goes through, when one is set.
+    hook: Option<Arc<dyn CallHook>>,
 }
 
 impl Registry {
@@ -361,7 +366,20 @@ impl Registry {
         Self {
             tools: BTreeMap::new(),
             specs: Vec::new(),
+            hook: None,
         }
+    }
+
+    /// Sets the hook every call through this registry goes through.
+    #[must_use]
+    pub fn with_hook(mut self, hook: Arc<dyn CallHook>) -> Self {
+        self.hook = Some(hook);
+        self
+    }
+
+    /// The call hook of this registry, if it has one.
+    pub fn hook(&self) -> Option<&dyn CallHook> {
+        self.hook.as_deref()
     }
 
     /// Adds a tool, replacing any tool with the same name.

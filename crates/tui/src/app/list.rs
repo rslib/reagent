@@ -39,9 +39,9 @@ pub(crate) enum Source {
 #[derive(Debug, Clone)]
 pub(crate) struct Command {
     /// The name the text box takes, the slash included.
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     /// The words that say what the command does.
-    pub words: &'static str,
+    pub words: Cow<'static, str>,
     /// The keys that run it elsewhere, as the terminal prints them: a `Cow`
     /// because a keys file may have moved one of them.
     pub key: Cow<'static, str>,
@@ -305,7 +305,7 @@ impl List {
         match &self.source {
             Source::Commands(commands) => {
                 self.matcher
-                    .run(&query, commands.iter().map(|command| command.name));
+                    .run(&query, commands.iter().map(|command| &*command.name));
             }
             Source::Files(paths) => {
                 self.matcher.run(&query, paths.iter().map(|path| &**path));
@@ -337,8 +337,8 @@ mod tests {
         ]
         .into_iter()
         .map(|(name, words, group)| Command {
-            name,
-            words,
+            name: Cow::Borrowed(name),
+            words: Cow::Borrowed(words),
             key: Cow::Borrowed(""),
             group,
         })

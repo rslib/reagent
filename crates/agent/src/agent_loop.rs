@@ -16,6 +16,7 @@ use crate::batch::{Note, Outcome, run_all_noted};
 use crate::compact::{Compact, Compacted};
 use crate::event::{DropReason, Event, MessageState, TurnEndReason};
 use crate::guard::{Answer, Guard};
+use crate::hook::TurnHook;
 use crate::journal::Journal;
 use crate::journal::record::ApprovalKind;
 use crate::journal::resume::PendingCall;
@@ -108,6 +109,8 @@ pub struct Agent<'a> {
     config: AgentConfig,
     token: CancellationToken,
     policies: Vec<Box<dyn TurnPolicy>>,
+    /// The async hook that runs when a turn ends, after the policies.
+    turn_hook: Option<Arc<dyn TurnHook>>,
     mask: Option<Mask>,
     archive: Option<Arc<Archive>>,
     compact: Option<Compact>,
@@ -164,6 +167,7 @@ impl<'a> Agent<'a> {
             registry,
             token,
             policies: Vec::new(),
+            turn_hook: None,
             mask: None,
             archive: None,
             tool_choice: ToolChoice::Auto,
@@ -206,6 +210,7 @@ impl<'a> Agent<'a> {
             registry,
             token,
             policies,
+            turn_hook: None,
             mask: None,
             archive: None,
             tool_choice: ToolChoice::Auto,
@@ -229,6 +234,13 @@ impl<'a> Agent<'a> {
             changed_settings: false,
             config,
         }
+    }
+
+    /// Adds the hook that runs when a turn ends, after the policies.
+    #[must_use]
+    pub fn with_turn_hook(mut self, hook: Arc<dyn TurnHook>) -> Self {
+        self.turn_hook = Some(hook);
+        self
     }
 
     /// Names the config provider id of the starting provider, so a request and
@@ -1418,7 +1430,8 @@ impl<'a> Agent<'a> {
         TurnOutcome::Finish
     }
 
-    /// Runs the policies after one normal turn and applies what they asked.
+    /// Runs the policies and the turn hook after one normal turn and applies
+    /// what they asked.
     ///
     /// Returns the run-end reason when the run stops after this turn.
     ///
@@ -1427,6 +1440,9 @@ impl<'a> Agent<'a> {
     /// message. An injected text on a tool turn is appended in place to the
     /// last tool result, which was already recorded as that result; the
     /// append is not re-recorded because a journal is append-only.
+    ///
+    /// The turn hook's text, when it returns one, joins the policies' texts
+    /// after them and counts as one more injection.
     async fn apply_policies(
         &mut self,
         index: u32,
@@ -1436,8 +1452,9 @@ impl<'a> Agent<'a> {
         journal: &mut Option<&mut Journal>,
         events: &mpsc::Sender<Event>,
     ) -> Option<TurnEndReason> {
-        if self.policies.is_empty() {
-            // No policies: a tool turn continues, a no-tool turn ends.
+        if self.policies.is_empty() && self.turn_hook.is_none() {
+            // No policies and no hook: a tool turn continues, a no-tool turn
+            // ends.
             return if ran_tools {
                 None
             } else {
@@ -1470,9 +1487,24 @@ impl<'a> Agent<'a> {
                 tools: &tools,
                 changed_files,
             };
-            let run = PolicyRun::new(&mut self.policies, &view);
+            let mut run = PolicyRun::new(&mut self.policies, &view);
+            // The hook sees the same view and adds its follow-up after the
+            // policies, as one more injection.
+            if let Some(hook) = self.turn_hook.as_deref() {
+                let follow = tokio::select! {
+                    follow = hook.turn_end(&view) => follow,
+                    () = self.token.cancelled() => None,
+                };
+                if let Some(text) = follow {
+                    run.notes.push(Event::PolicyNote(text.clone()));
+                    run.injected = Some(match run.injected {
+                        Some(policies) => Text::from(join_text(&policies, &text)),
+                        None => text,
+                    });
+                }
+            }
             let continue_run = run.continue_run();
-            (run.injected.clone(), run.notes, continue_run)
+            (run.injected, run.notes, continue_run)
         };
 
         // When a policy stopped the run, any other policy's injected text is
@@ -2308,6 +2340,16 @@ fn last_turn(history: &[Message]) -> (&AssistantMessage, Vec<(ToolCall, ToolResu
         }
     }
     (assistant, tools)
+}
+
+/// Joins the text the policies injected with the turn hook's follow-up, the
+/// same way the policies' own texts join.
+fn join_text(previous: &str, follow_up: &str) -> String {
+    let mut out = String::with_capacity(previous.len() + 2 + follow_up.len());
+    out.push_str(previous);
+    out.push_str("\n\n");
+    out.push_str(follow_up);
+    out
 }
 
 /// Appends injected text to the content of the last tool result in `history`.
@@ -6226,6 +6268,81 @@ mod tests {
 
         let seen = seen.lock().expect("requests lock").clone();
         assert_eq!(seen, [(4_096, true)]);
+    }
+
+    /// A turn hook that returns its text once, then nothing.
+    struct FollowUp {
+        text: Mutex<Option<Text>>,
+    }
+
+    impl crate::hook::TurnHook for FollowUp {
+        fn turn_end<'a>(
+            &'a self,
+            _turn: &'a crate::policy::TurnView<'a>,
+        ) -> BoxFuture<'a, Option<Text>> {
+            Box::pin(async move { self.text.lock().expect("follow-up lock").take() })
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_hook_adds_a_follow_up() {
+        let provider = FakeProvider::new(vec![text_reply("first"), text_reply("second")]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+        let hook = Arc::new(FollowUp {
+            text: Mutex::new(Some(Text::from("check the tests"))),
+        });
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_turn_hook(hook)
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(provider.seen().len(), 2, "two turns, two requests");
+        let last_user = history
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                Message::User { content } => Some(content),
+                _ => None,
+            })
+            .expect("a user message exists");
+        assert!(
+            last_user.iter().any(
+                |content| matches!(content, Content::Text { text } if text.as_ref() == "check the tests")
+            ),
+            "the follow-up starts another turn: {history:?}"
+        );
+        let events = drain(tx, &mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::PolicyNote(text) if text.as_ref() == "check the tests")),
+            "a PolicyNote event reports the follow-up: {events:?}"
+        );
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
+    }
+
+    #[tokio::test]
+    async fn turn_hook_none_ends_a_no_tool_turn() {
+        let provider = FakeProvider::new(vec![text_reply("done")]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+        let hook = Arc::new(FollowUp {
+            text: Mutex::new(None),
+        });
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_turn_hook(hook)
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(provider.seen().len(), 1, "one turn, one request");
+        assert_eq!(history.len(), 2, "the reply ends the run: {history:?}");
+        let events = drain(tx, &mut rx);
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
     }
 }
 

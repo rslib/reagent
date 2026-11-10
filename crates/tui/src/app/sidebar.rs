@@ -22,13 +22,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use reagent_protocol::message::PanelLine;
 use reagent_store::list::{Entry, SessionList, State};
 use unicode_width::UnicodeWidthStr;
 
 use crate::keyfile::Foot;
 use crate::keys::Leader;
 use crate::layout::{self, DOCK_COLUMNS, Rect, SIDEBAR_MAX};
-use crate::panels::{self, ChangesPanel, ClientsPanel, ContextPanel, SessionRow, SessionsPanel};
+use crate::panels::{
+    self, ChangesPanel, ClientsPanel, ContextPanel, PluginPanel, SessionRow, SessionsPanel,
+};
 use crate::screen::{Color, Screen};
 use crate::slot::{Role, Sidebar, Text, Update};
 use crate::theme::{self, Emphasis};
@@ -224,6 +227,22 @@ impl App {
         if panel.left(id) {
             self.touch();
         }
+    }
+
+    /// Takes one sidebar panel a JS plugin sets: the panel known by `id` takes
+    /// the title and the lines, and a new panel joins the sidebar under them
+    /// when no panel has that id yet. A notice with no line hides the panel, and
+    /// one that names a new title gives it back.
+    pub(super) fn plugin_panel(&mut self, id: &str, title: &str, lines: &[PanelLine<'_>]) {
+        match self.sidebar.get_mut_by_id::<PluginPanel>(id) {
+            Some(panel) => panel.set(title, lines),
+            None => {
+                let mut panel = PluginPanel::new(id);
+                panel.set(title, lines);
+                self.sidebar.add(panel);
+            }
+        }
+        self.touch();
     }
 
     /// The price of the run's model, in USD per million tokens, for the context

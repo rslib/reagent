@@ -7,6 +7,7 @@ mod max_tokens;
 mod mcp;
 mod models;
 mod permissions;
+mod plugin;
 mod presets;
 mod print;
 mod provider;
