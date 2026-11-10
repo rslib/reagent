@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -629,6 +630,14 @@ pub async fn run(mut args: Args) -> ExitCode {
     for adapter in direct {
         registry.add(adapter);
     }
+    // Only a run a person can answer through, on a socket or on stdin, offers
+    // the question tool. A served run takes clients, but none of them answers
+    // its calls, so it offers the tool list of a plain run.
+    let questions = asks(&args.tools, worker.is_some() && !args.serve)
+        .then(reagent_agent::question::Questions::new);
+    if let Some(questions) = &questions {
+        registry.add(reagent_agent::question::Ask::new(Arc::clone(questions)));
+    }
     if let Err(message) = check_rule_tools(&args.rules, &registry) {
         eprintln!("reagent: {message}");
         stop_servers(servers).await;
@@ -706,7 +715,17 @@ pub async fn run(mut args: Args) -> ExitCode {
     if mask_enabled {
         agent = agent.with_mask();
     }
-    agent = agent.with_guard(Guard::new(args.rules.clone()));
+    // A served run takes clients, but the answers a person gives are not its:
+    // a call the rules send to a person is refused at once, as in a plain run.
+    let guard = Guard::new(args.rules.clone());
+    agent = agent.with_guard(if args.serve {
+        guard.without_clients()
+    } else {
+        guard
+    });
+    if let Some(questions) = &questions {
+        agent = agent.with_questions(Arc::clone(questions));
+    }
     if compact_enabled {
         agent = agent.with_compact(match args.context_window {
             Some(_) => Compact::with_budget(compact_budget(args.context_window), cwd.clone()),
@@ -720,21 +739,48 @@ pub async fn run(mut args: Args) -> ExitCode {
     }
     let (tx, rx) = mpsc::channel::<Event>(256);
     let session_id = plan.as_ref().map(|plan| plan.id.clone());
+    // A run that takes its clients while it runs serves its session as a worker
+    // does, and prints the lines of every run it takes.
+    let steered = args.commands || args.listen || args.serve;
+    let socket = worker.as_ref().and_then(|worker| worker.socket());
+    let report = Report {
+        json: args.json,
+        // A served run takes clients, but it prints what a plain run prints.
+        steered: args.commands || args.listen,
+        session: session_id,
+        socket,
+        billing,
+        context_window: args.context_window,
+    };
+    // The answer lines of the run's stdin client, when it has one, and the end
+    // its session reports once it is over.
+    let mut answers = None;
+    let mut finish = None;
     // A worker's events go to its own tasks; a run prints them through
-    // `drain`.
+    // `drain`. A steered run has both: the tracker forwards every event it
+    // takes to the writer that prints it.
     let writer = match worker.as_mut() {
         Some(worker) => {
             worker.watch(rx);
-            None
+            if steered {
+                let (forward, printed) = mpsc::channel::<Event>(PRINTED_EVENTS);
+                let (lines, received) = mpsc::unbounded_channel::<Vec<u8>>();
+                let (ended, last) = oneshot::channel::<TurnEndReason>();
+                worker.print(forward);
+                answers = Some(lines);
+                finish = Some(ended);
+                Some(tokio::spawn(drain(
+                    printed,
+                    Some(received),
+                    Some(last),
+                    Out::new(),
+                    report,
+                )))
+            } else {
+                None
+            }
         }
-        None => Some(tokio::spawn(drain(
-            rx,
-            Out::new(),
-            args.json,
-            session_id,
-            billing,
-            args.context_window,
-        ))),
+        None => Some(tokio::spawn(drain(rx, None, None, Out::new(), report))),
     };
 
     if let Some(probe) = probe
@@ -797,6 +843,15 @@ pub async fn run(mut args: Args) -> ExitCode {
             });
         worker.begin(committed_at_start, listed);
     }
+    // The calls a resumed session left open may ask for an approval, which
+    // only stdin can answer when no client joins, so the stdin client starts
+    // before them; with none open it starts after the task, which runs first.
+    if args.commands
+        && !pending.is_empty()
+        && let (Some(worker), Some(answers)) = (worker.as_mut(), answers.take())
+    {
+        worker.stdin_client(tokio::io::stdin(), answers);
+    }
     if let Some(worker) = worker.as_mut() {
         if let Some((journal, _)) = journal.as_mut() {
             // A live session answers a call the rules send to a person from its
@@ -825,6 +880,7 @@ pub async fn run(mut args: Args) -> ExitCode {
         eprintln!("reagent: the pending tool calls could not run");
     }
     let mut asked = task.is_some();
+    let no_task = task.is_none();
     if let Some(text) = task {
         // The image files the task names by `@path` go with it: the text is
         // kept as written, then one note line and one image per image. A file
@@ -853,10 +909,35 @@ pub async fn run(mut args: Args) -> ExitCode {
             }
         }
     }
+    // The task is queued, so the client that reads the requests on stdin goes
+    // after it: a request that comes first would start a run before the task.
+    if args.commands
+        && let (Some(worker), Some(answers)) = (worker.as_mut(), answers.take())
+    {
+        worker.stdin_client(tokio::io::stdin(), answers);
+    }
     // A crash in the first request of a turn leaves its message with no reply,
     // and the continue asks for that reply.
     asked = asked
         || resumed.is_none_or(|resumed| resumed.open_turn || history.len() > resumed.recorded);
+    // A steered run with no task owes the model the reply its session left open,
+    // and asks for it here as a plain continue does. The client on stdin is
+    // already reading, so a steer or a cancel reaches this run; the session loop
+    // after it waits for what comes next.
+    if steered
+        && !args.worker
+        && no_task
+        && !matches!(pending_reason, TurnEndReason::Error)
+        && resumed.is_some_and(|resumed| {
+            resumed.open_turn || history.len() > resumed.recorded || !pending.is_empty()
+        })
+        && let Some(worker) = worker.as_mut()
+        && let Some((journal, _)) = journal.as_mut()
+    {
+        pending_reason = worker
+            .resume(&mut agent, &mut history, &mut Some(journal), &tx)
+            .await;
+    }
     if let Some(worker) = worker.as_mut() {
         // The worker's session runs from its inbox until its last client
         // leaves; the task it was given is already queued there.
@@ -893,7 +974,17 @@ pub async fn run(mut args: Args) -> ExitCode {
     }
     // The writer task never panics; a join error would mean a runtime bug.
     let mut reason = match (writer, worker.as_mut()) {
-        (Some(writer), _) => writer
+        (Some(writer), Some(worker)) => {
+            // A steered run ends on its own rule, so the end its session reports
+            // is the one its writer prints; it waits for it before its summary.
+            let reason = worker.reason().await;
+            if let Some(finish) = finish.take() {
+                let _ = finish.send(reason);
+            }
+            let _ = writer.await;
+            reason
+        }
+        (Some(writer), None) => writer
             .await
             .unwrap_or_else(|_| panic!("writer task failed")),
         // A worker's writer is its tracker, which ends with the channel.
@@ -948,8 +1039,9 @@ pub async fn run(mut args: Args) -> ExitCode {
         }
     }
     // A worker stops because its last client left, so its exit code says it
-    // stopped rather than how its last run ended.
-    if worker.is_some() {
+    // stopped rather than how its last run ended. A steered run is a `-p` run
+    // and ends with the reason of its session.
+    if args.worker {
         return ExitCode::SUCCESS;
     }
     let cause = Cause::from_u8(cause.load(Ordering::SeqCst));
@@ -1029,7 +1121,9 @@ async fn plan_session(
     let provider = args.provider_name.clone().unwrap_or_default();
     let model = args.model.clone();
     let title = title.to_owned();
-    let worker = args.worker;
+    // A steered run serves its session to clients as a worker does, so it may
+    // continue a session with nothing open and wait for a message.
+    let worker = args.worker || args.commands || args.listen;
     tokio::task::spawn_blocking(move || {
         let ask = crate::session::Ask {
             sessions: &sessions,
@@ -1085,6 +1179,32 @@ const JSON_BATCH: usize = 8 * 1024;
 /// The most events one receive takes from the channel.
 const EVENT_BATCH: usize = 64;
 
+/// The most events a steered run holds for its writer while the tracker takes
+/// more.
+const PRINTED_EVENTS: usize = 256;
+
+/// What the lines of a run name and price: the session it writes, the socket
+/// it takes clients on, the prices it fills in and the context window its end
+/// line reports.
+struct Report {
+    json: bool,
+    /// Whether the run writes the lines of a steered run: the ids of the
+    /// approvals and questions it answers and where each message it takes
+    /// lands. A served run takes clients but writes a plain run's lines.
+    steered: bool,
+    session: Option<String>,
+    socket: Option<String>,
+    billing: Option<Billing>,
+    context_window: Option<u64>,
+}
+
+/// The next thing the drain loop takes: a batch of events, or one answer line
+/// of the run's stdin client.
+enum Step {
+    Events(usize),
+    Line(Option<Vec<u8>>),
+}
+
 /// Consumes the agent's event channel, prints it and returns how the run ended.
 ///
 /// Owns stdout: in plain mode only the final answer is printed; in JSON mode a
@@ -1092,14 +1212,22 @@ const EVENT_BATCH: usize = 64;
 /// run end. `session` is the session the run writes, named by the start line.
 /// `billing` fills the cost of a usage the provider did not price, and
 /// `context_window` is the window the end line reports.
+///
+/// A run that serves a session takes `answers` and `last`: the lines the
+/// answers of its stdin client carry join the ones of its events, it prints
+/// every run the session takes, and `last` is the end its session reports, sent
+/// once the session loop has ended.
 async fn drain<W: AsyncWrite + Unpin>(
-    rx: mpsc::Receiver<Event>,
+    mut rx: mpsc::Receiver<Event>,
+    mut answers: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    last: Option<oneshot::Receiver<TurnEndReason>>,
     mut out: Out<W>,
-    json: bool,
-    session: Option<String>,
-    billing: Option<Billing>,
-    context_window: Option<u64>,
+    report: Report,
 ) -> TurnEndReason {
+    let json = report.json;
+    // A session takes one run after another, so its end is the close of the
+    // channel, not the end of a run.
+    let steered = last.is_some();
     let mut answer = String::new();
     let mut total = Usage::default();
     let mut turns = 0u32;
@@ -1109,7 +1237,6 @@ async fn drain<W: AsyncWrite + Unpin>(
     // The prompt size of the last turn: how full the context is now.
     let mut context_tokens = 0u64;
 
-    let mut rx = rx;
     let mut buf = Vec::with_capacity(512);
     // Whether the start line has gone into a batch; it is written once, with
     // the first batch, so it costs no extra write.
@@ -1121,17 +1248,69 @@ async fn drain<W: AsyncWrite + Unpin>(
     // there, so an idle channel still writes at once and turn end and run end
     // keep their latency.
     let mut batch: Vec<Event> = Vec::with_capacity(EVENT_BATCH);
-    'run: while rx.recv_many(&mut batch, EVENT_BATCH).await > 0 {
+    // A steered run may wait for a client before any event, and a client finds
+    // its socket in this line, so it goes out at once.
+    if json && steered {
+        crate::json::write_start(
+            &mut buf,
+            report.session.as_deref(),
+            report.socket.as_deref(),
+        );
+        let _ = out.write(&buf).await;
+        buf.clear();
+        started = true;
+    }
+    'run: loop {
+        let step = {
+            let events = rx.recv_many(&mut batch, EVENT_BATCH);
+            match answers.as_mut() {
+                Some(lines) => tokio::select! {
+                    taken = events => Step::Events(taken),
+                    line = lines.recv() => Step::Line(line),
+                },
+                None => Step::Events(events.await),
+            }
+        };
+        match step {
+            // The line of a stdin client goes out at once: the client waits for
+            // it, and the batch of events that follows shares no write with it.
+            Step::Line(Some(line)) => {
+                if json {
+                    if !started {
+                        crate::json::write_start(
+                            &mut buf,
+                            report.session.as_deref(),
+                            report.socket.as_deref(),
+                        );
+                        started = true;
+                    }
+                    buf.extend_from_slice(&line);
+                    let _ = out.write(&buf).await;
+                    buf.clear();
+                }
+                continue 'run;
+            }
+            Step::Line(None) => {
+                answers = None;
+                continue 'run;
+            }
+            Step::Events(0) => break 'run,
+            Step::Events(_) => {}
+        }
         if json {
             buf.clear();
             if !started {
-                crate::json::write_start(&mut buf, session.as_deref());
+                crate::json::write_start(
+                    &mut buf,
+                    report.session.as_deref(),
+                    report.socket.as_deref(),
+                );
                 started = true;
             }
         }
         loop {
             for event in batch.drain(..) {
-                let event = priced(event, billing);
+                let event = priced(event, report.billing);
                 match &event {
                     Event::TurnStart => {
                         turns += 1;
@@ -1151,12 +1330,30 @@ async fn drain<W: AsyncWrite + Unpin>(
                     Event::RunEnd(r) => {
                         reason = *r;
                         stop = stop_string(r);
-                        ended = true;
+                        // A session takes another run after the one that ended.
+                        ended = !steered;
                     }
                     _ => {}
                 }
                 if json {
-                    crate::json::write_event(&mut buf, &event);
+                    // A steered run's caller answers its approvals, so it needs
+                    // their ids, and sees where each message it sent lands; a
+                    // plain run prints the lines it always printed.
+                    if report.steered
+                        && matches!(
+                            event,
+                            Event::ApprovalRequest(_)
+                                | Event::ApprovalResolved { .. }
+                                | Event::QuestionRequest(_)
+                                | Event::QuestionResolved { .. }
+                                | Event::UserMessage { .. }
+                                | Event::MessageState { .. }
+                        )
+                    {
+                        crate::json::write_line(&mut buf, &event);
+                    } else {
+                        crate::json::write_event(&mut buf, &event);
+                    }
                     if ended || buf.len() >= JSON_BATCH {
                         let _ = out.write(&buf).await;
                         buf.clear();
@@ -1177,10 +1374,23 @@ async fn drain<W: AsyncWrite + Unpin>(
         }
     }
 
+    // The end of a session is its own, not the end of one of its runs: a
+    // session that stopped with no run open has no `run_end` to name it.
+    if let Some(last) = last
+        && let Ok(seen) = last.await
+    {
+        reason = seen;
+        stop = stop_string(&reason);
+    }
+
     if json {
         buf.clear();
         if !started {
-            crate::json::write_start(&mut buf, session.as_deref());
+            crate::json::write_start(
+                &mut buf,
+                report.session.as_deref(),
+                report.socket.as_deref(),
+            );
         }
         crate::json::write_summary(
             &mut buf,
@@ -1189,7 +1399,7 @@ async fn drain<W: AsyncWrite + Unpin>(
             &reason,
             stop,
             context_tokens,
-            context_window,
+            report.context_window,
         );
         let _ = out.write(&buf).await;
     } else {
@@ -1199,7 +1409,7 @@ async fn drain<W: AsyncWrite + Unpin>(
             let line = end_line(
                 turns,
                 context_tokens,
-                context_window,
+                report.context_window,
                 total.cost,
                 crate::json::cache_hit_rate(&total),
             );
@@ -2021,6 +2231,13 @@ fn direct_tools(
     if chosen(selected, "find") {
         registry.add(Find::new(cwd).with_skip(skip.iter().cloned()));
     }
+}
+
+/// Whether a run offers the question tool: its list names `ask` and a person
+/// can answer it, which only a worker or a run that takes its requests on
+/// stdin or a socket can.
+pub(crate) fn asks(selected: &[String], answering: bool) -> bool {
+    answering && chosen(selected, reagent_agent::question::NAME)
 }
 
 /// Whether a resolved tool list holds `name`.
@@ -3077,7 +3294,15 @@ mod tests {
                 .expect("the channel takes the event");
         }
         drop(tx);
-        drain(rx, Out::with_writer(sink.clone()), json, None, None, None).await;
+        let report = Report {
+            json,
+            steered: false,
+            session: None,
+            socket: None,
+            billing: None,
+            context_window: None,
+        };
+        drain(rx, None, None, Out::with_writer(sink.clone()), report).await;
     }
 
     #[tokio::test]
@@ -3086,7 +3311,7 @@ mod tests {
         let sink = Sink::default();
         let (tx, rx) = mpsc::channel(1024);
         let mut expected = Vec::new();
-        crate::json::write_start(&mut expected, None);
+        crate::json::write_start(&mut expected, None, None);
         for _ in 0..1000 {
             let event = Event::TextDelta(Text::from(text.as_str()));
             crate::json::write_event(&mut expected, &event);
@@ -3106,7 +3331,15 @@ mod tests {
             None,
         );
 
-        let reason = drain(rx, Out::with_writer(sink.clone()), true, None, None, None).await;
+        let report = Report {
+            json: true,
+            steered: false,
+            session: None,
+            socket: None,
+            billing: None,
+            context_window: None,
+        };
+        let reason = drain(rx, None, None, Out::with_writer(sink.clone()), report).await;
         assert_eq!(reason, TurnEndReason::EndTurn);
         assert_eq!(
             sink.bytes.borrow().as_slice(),

@@ -43,7 +43,9 @@ const DEFAULT_CHAT_POLICIES: [&str; 3] = ["budget", "mask", "snapshot"];
 const DEFAULT_MAX_TOKENS: u32 = 64_000;
 
 /// The tool names a `--tools` value may select.
-pub const TOOL_NAMES: [&str; 7] = ["bash", "edit", "find", "grep", "read", "write", "codemode"];
+pub const TOOL_NAMES: [&str; 8] = [
+    "bash", "edit", "find", "grep", "read", "write", "codemode", "ask",
+];
 
 /// Whether the folded `--tools` list writes a plain list at all, and whether
 /// it names `codemode`.
@@ -57,7 +59,8 @@ fn codemode_in_tools(folded: &[String]) -> (bool, bool) {
 
 /// The tools with no `--tools` flag. `codemode` joins them only when asked
 /// for: a script the model writes costs a turn more than the calls it saves.
-const DEFAULT_TOOLS: [&str; 6] = ["bash", "edit", "find", "grep", "read", "write"];
+pub(crate) const DEFAULT_TOOLS: [&str; 7] =
+    ["bash", "edit", "find", "grep", "read", "write", "ask"];
 
 /// What a run says when a tool list leaves `codemode` out and drops the servers
 /// whose tools all need one, naming them.
@@ -182,6 +185,13 @@ pub struct Args {
     pub inline: bool,
     /// Serve the session as a worker instead of running it once.
     pub worker: bool,
+    /// Read protocol requests from standard input while the run goes on.
+    pub commands: bool,
+    /// Take clients on the run's socket.
+    pub listen: bool,
+    /// Serve the run's socket by default, so a client can steer, queue or cancel
+    /// it; `--no-serve` turns that off.
+    pub serve: bool,
     /// The provider model id.
     pub model: String,
     /// The provider wire to use.
@@ -358,6 +368,10 @@ fn usage() -> &'static str {
         "  -p, --print <task>   the task for the agent to complete; `-` reads it from stdin\n",
         "      --json           print one JSON object per event on stdout\n",
         "      --inline         keep the terminal UI inline, under the shell's scrollback\n",
+        "      --commands       read protocol requests (send, cancel, approve, set, compact) from stdin,\n",
+        "                       one JSON-RPC line each; needs --json\n",
+        "      --listen         take clients on the run's socket, found in the discovery folder by session id\n",
+        "      --no-serve       take no clients on the run's socket; a -p run serves it by default\n",
         "      --model <id>     the provider model id\n",
         "      --provider <wire>  anthropic, openai-chat, openai-responses or pi-messages\n",
         "                       (default: anthropic)\n",
@@ -374,7 +388,7 @@ fn usage() -> &'static str {
         "      --cwd <dir>      the working directory for the tools (default: current dir)\n",
         "      --profile <name>  read <config dir>/profiles/<name>.toml over the global config;\n",
         "                       REAGENT_PROFILE names one too\n",
-        "  -t, --tools <list>   tools: bash, edit, find, grep, read, write, codemode;\n",
+        "  -t, --tools <list>   tools: bash, edit, find, grep, read, write, codemode, ask;\n",
         "                       +name adds, -name removes, plain names replace (default: all but codemode)\n",
         "      --mcp <list>     MCP servers to start: +name adds, -name removes, plain names replace\n",
         "      --no-mcp         start no MCP server\n",
@@ -933,6 +947,9 @@ fn parse_from(
     let mut resume_value = false;
     let mut json = false;
     let mut inline = false;
+    let mut commands = false;
+    let mut listen = false;
+    let mut no_serve = false;
     let mut model = None;
     let mut provider = None;
     let mut base_url = None;
@@ -972,6 +989,9 @@ fn parse_from(
             }
             lexopt::Arg::Long("json") => json = true,
             lexopt::Arg::Long("inline") => inline = true,
+            lexopt::Arg::Long("commands") => commands = true,
+            lexopt::Arg::Long("listen") => listen = true,
+            lexopt::Arg::Long("no-serve") => no_serve = true,
             lexopt::Arg::Long("model") => {
                 let value = parser
                     .value()
@@ -1121,6 +1141,28 @@ fn parse_from(
         check_profile_name(name)?;
     }
 
+    // The two flags that serve the requests of a run, checked before the ones
+    // of a worker so an error names the flag that was given.
+    if worker && commands {
+        return Err(
+            "--commands is not for a worker: it reads the requests its clients send".into(),
+        );
+    }
+    if worker && listen {
+        return Err("--listen is not for a worker: it takes clients already".into());
+    }
+    // A served run is a plain one, so it cannot also be a run that a person
+    // answers: those flags say how the run takes the answers it has none to ask
+    // for.
+    if no_serve && listen {
+        return Err("--no-serve cannot go with --listen: it takes clients".into());
+    }
+    if no_serve && commands {
+        return Err("--no-serve cannot go with --commands: it takes requests on stdin".into());
+    }
+    if no_serve && worker {
+        return Err("--no-serve cannot go with --worker: it takes clients already".into());
+    }
     // A worker speaks the client protocol on stdout and needs a journal to
     // catch a client up from, so neither flag means anything for one.
     if worker && json {
@@ -1129,10 +1171,29 @@ fn parse_from(
     if worker && matches!(sessions, Sessions::None) {
         return Err("--no-session is not for a worker: it needs a journal".into());
     }
+    // A client of the protocol is told what happens to the session, and the
+    // requests it answers name its records, so its run speaks `--json` and
+    // keeps a journal.
+    if commands && !json {
+        return Err("--commands needs --json: the answers are event lines too".into());
+    }
+    if commands && matches!(task, Some(TaskSource::Stdin)) {
+        return Err("--commands cannot read the task from stdin: -p takes the task text".into());
+    }
+    if matches!(sessions, Sessions::None) {
+        if commands {
+            return Err("--no-session is not for --commands: it needs a journal".into());
+        }
+        if listen {
+            return Err("--no-session is not for --listen: it needs a journal".into());
+        }
+    }
 
     if let Some(name) = models {
         if task.is_some()
             || json
+            || commands
+            || listen
             || model.is_some()
             || provider.is_some()
             || base_url.is_some()
@@ -1163,21 +1224,29 @@ fn parse_from(
     if refresh {
         return Err("--refresh needs the models command".into());
     }
-    // Only a continue, a resume, a worker or the terminal UI may run with no
-    // message: the run answers the calls its ledger left open, a worker takes
-    // the ones its clients send, and the UI sends its own.
+    // Only a continue, a resume, a worker, a run that takes its requests on
+    // stdin or the terminal UI may run with no message: the run answers the
+    // calls its ledger left open, a worker takes the ones its clients send, a
+    // run with `--commands` takes them on stdin, and the UI sends its own.
     let open = matches!(sessions, Sessions::Continue | Sessions::Resume(_))
         || worker
+        || commands
         || (ui && matches!(sessions, Sessions::New));
-    if task.is_none() {
+    if task.is_none() && !open {
         if json {
             return Err("the --json flag needs a task; use -p <task>".into());
         }
-        if !open {
-            return Err("missing task; use -p <task>".into());
-        }
+        return Err("missing task; use -p <task>".into());
     }
     let cwd = cwd.unwrap_or_else(|| PathBuf::from("."));
+    // A `-p` run with a session serves its socket by default, so a client or
+    // another agent can steer, queue or cancel it. `--no-serve` turns that off.
+    let serve = !no_serve
+        && !listen
+        && !commands
+        && !worker
+        && task.is_some()
+        && !matches!(sessions, Sessions::None);
     let (settings, rules, servers) = load(&cwd, profile.as_deref())?;
     check_provider_names(&settings)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -1330,6 +1399,9 @@ fn parse_from(
         json,
         inline,
         worker,
+        commands,
+        listen,
+        serve,
         model: model_id,
         provider,
         profile,
@@ -1778,11 +1850,39 @@ mod tests {
     }
 
     #[test]
+    fn ask_the_default_tools_hold_it_and_a_minus_never_does() {
+        let args = run(&["-p", "task"]);
+        assert!(
+            args.tools.iter().any(|name| name == "ask"),
+            "{:?}",
+            args.tools
+        );
+        let args = run(&["-p", "task", "--tools", "-ask"]);
+        assert!(
+            !args.tools.iter().any(|name| name == "ask"),
+            "{:?}",
+            args.tools
+        );
+        let args = run(&["-p", "task", "--tools", "read,bash"]);
+        assert!(
+            !args.tools.iter().any(|name| name == "ask"),
+            "{:?}",
+            args.tools
+        );
+        let args = run(&["-p", "task", "--tools", "+ask"]);
+        assert!(
+            args.tools.iter().any(|name| name == "ask"),
+            "{:?}",
+            args.tools
+        );
+    }
+
+    #[test]
     fn list_edit_tools_add_and_remove() {
         let args = run(&["-p", "task", "--tools", "+codemode,-write"]);
         assert_eq!(
             args.tools,
-            ["bash", "codemode", "edit", "find", "grep", "read"]
+            ["ask", "bash", "codemode", "edit", "find", "grep", "read"]
         );
     }
 
@@ -1863,6 +1963,27 @@ mod tests {
         )
     }
 
+    /// Parses `args` as a run the worker word started does.
+    fn parse_worker(args: &[&str]) -> Result<Outcome, String> {
+        let argv = args.iter().map(std::ffi::OsString::from);
+        parse_from(
+            lexopt::Parser::from_args(argv),
+            &|_, _| {
+                Ok((
+                    Settings::default(),
+                    Rules::none(),
+                    McpConfig {
+                        servers: BTreeMap::new(),
+                        warn_many_direct: true,
+                        settings: Default::default(),
+                    },
+                ))
+            },
+            true,
+            false,
+        )
+    }
+
     /// The UI opens only a new session or a continue, so a run that can do
     /// neither still needs its task, in a build with the UI too.
     #[test]
@@ -1877,6 +1998,114 @@ mod tests {
             matches!(parse_ui(&[]), Ok(Outcome::Run(_))),
             "a plain run opens the UI"
         );
+    }
+
+    /// The message that refused `outcome`, which names `flag`.
+    fn refused(outcome: Result<Outcome, String>, flag: &str) -> String {
+        match outcome {
+            Err(message) => {
+                assert!(message.contains(flag), "{message} names no {flag}");
+                message
+            }
+            Ok(outcome) => panic!("{flag} parsed: {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn steer_flags_commands_needs_json() {
+        let message = refused(parse(&["--commands", "-p", "x"]), "--commands");
+        assert!(message.contains("--json"), "{message}");
+    }
+
+    #[test]
+    fn steer_flags_commands_refuses_the_task_from_stdin() {
+        let message = refused(parse(&["--json", "--commands", "-p", "-"]), "--commands");
+        assert!(message.contains("stdin"), "{message}");
+    }
+
+    #[test]
+    fn steer_flags_refuse_no_session() {
+        for flag in ["--commands", "--listen"] {
+            let args: &[&str] = if flag == "--commands" {
+                &["--json", "--no-session", "--commands", "-p", "x"]
+            } else {
+                &["--no-session", "--listen", "-p", "x"]
+            };
+            let message = refused(parse(args), "--no-session");
+            assert!(message.contains(flag), "{message} names no {flag}");
+        }
+    }
+
+    #[test]
+    fn steer_flags_refuse_the_worker_word() {
+        let message = refused(
+            parse_worker(&["--json", "--commands", "-p", "x"]),
+            "--commands",
+        );
+        assert!(message.contains("worker"), "{message}");
+        let message = refused(parse_worker(&["--listen", "-p", "x"]), "--listen");
+        assert!(message.contains("worker"), "{message}");
+    }
+
+    #[test]
+    fn steer_flags_commands_runs_with_no_task() {
+        let args = run_with(&["--json", "--commands"], Settings::default());
+        assert!(args.commands);
+        assert!(args.task.is_none(), "no task is queued");
+    }
+
+    #[test]
+    fn steer_flags_listen_parses_with_a_task() {
+        let args = run_with(&["--listen", "-p", "x"], Settings::default());
+        assert!(args.listen);
+        assert!(!args.commands);
+    }
+
+    #[test]
+    fn steer_flags_neither_is_on_by_default() {
+        let args = run_with(&["-p", "x"], Settings::default());
+        assert!(!args.commands);
+        assert!(!args.listen);
+    }
+
+    /// A `-p` run with a session serves its socket unless a flag says otherwise.
+    #[test]
+    fn serve_is_on_for_a_print_run_with_a_session() {
+        let args = run_with(&["-p", "x"], Settings::default());
+        assert!(args.serve, "a -p run serves its socket by default");
+        assert!(args.task.is_some());
+        assert!(!matches!(args.sessions, Sessions::None));
+    }
+
+    #[test]
+    fn serve_is_off_for_the_flags_that_take_clients_another_way() {
+        for args in [
+            &["--no-serve", "-p", "x"][..],
+            &["--no-session", "-p", "x"][..],
+            &["--listen", "-p", "x"][..],
+            &["--json", "--commands", "-p", "x"][..],
+        ] {
+            assert!(!run_with(args, Settings::default()).serve, "{args:?}");
+        }
+        // A run with no task is no `-p` run, and a worker serves already.
+        assert!(!run_with(&["--json", "--commands"], Settings::default()).serve);
+        match parse_worker(&["-p", "x"]) {
+            Ok(Outcome::Run(args)) => assert!(!args.serve, "a worker serves already"),
+            other => panic!("expected a worker run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_refuses_the_flags_that_take_clients() {
+        let message = refused(parse(&["--no-serve", "--listen", "-p", "x"]), "--no-serve");
+        assert!(message.contains("--listen"), "{message}");
+        let message = refused(
+            parse(&["--no-serve", "--json", "--commands", "-p", "x"]),
+            "--no-serve",
+        );
+        assert!(message.contains("--commands"), "{message}");
+        let message = refused(parse_worker(&["--no-serve", "-p", "x"]), "--no-serve");
+        assert!(message.contains("--worker"), "{message}");
     }
 
     fn run_servers(

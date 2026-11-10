@@ -65,11 +65,24 @@ pub enum Kind {
     ApprovalRequest(u64),
     /// The frame of the answer that resolved the approval of this id.
     ApprovalResolved(u64),
+    /// The frame of the question request that waits, by id.
+    QuestionRequest(u64),
+    /// The frame of the answer that resolved the question of this id, or the
+    /// one of a question no client answered.
+    QuestionResolved(u64),
     /// The end of a run. An approval it cancelled gets no answer, so the end
     /// takes every waiting request out of the catch-up.
     RunEnd,
     /// Anything else, written as soon as it is queued.
     Other,
+}
+
+/// A request that waits for a person. The two kinds are told apart, so that an
+/// approval and a question of the same id do not resolve each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waits {
+    Approval(u64),
+    Question(u64),
 }
 
 /// One entry of a client's queue: the frame, and whether it is a delta.
@@ -119,8 +132,8 @@ pub struct Hub {
     /// The frames since the last committed record, so that a client catches up
     /// from the record it read in the journal.
     uncommitted: Vec<Frame>,
-    /// The frames of the approval requests that still wait, by request id.
-    waiting: Vec<(u64, Frame)>,
+    /// The frames of the requests that wait for a person, by request id.
+    waiting: Vec<(Waits, Frame)>,
     /// The newest record the journal committed.
     committed: u64,
     /// Whether a run is open, which the answer to `attach` names.
@@ -182,8 +195,18 @@ impl Hub {
     /// client that attaches later catches up from it.
     pub fn send(&mut self, frame: Frame, kind: Kind) {
         match kind {
-            Kind::ApprovalRequest(id) => self.waiting.push((id, Arc::clone(&frame))),
-            Kind::ApprovalResolved(id) => self.waiting.retain(|(open, _)| *open != id),
+            Kind::ApprovalRequest(id) => {
+                self.waiting.push((Waits::Approval(id), Arc::clone(&frame)))
+            }
+            Kind::QuestionRequest(id) => {
+                self.waiting.push((Waits::Question(id), Arc::clone(&frame)))
+            }
+            Kind::ApprovalResolved(id) => self
+                .waiting
+                .retain(|(open, _)| *open != Waits::Approval(id)),
+            Kind::QuestionResolved(id) => self
+                .waiting
+                .retain(|(open, _)| *open != Waits::Question(id)),
             Kind::Committed => {}
             Kind::RunEnd => {
                 self.waiting.clear();
@@ -593,6 +616,31 @@ mod tests {
         Arc::from(buf.as_slice())
     }
 
+    /// One question request frame for `id`.
+    fn question(id: u64) -> Frame {
+        let mut buf = Vec::new();
+        message::notify(
+            &mut buf,
+            methods::QUESTION_REQUEST,
+            format!(
+                r#"{{"id":{id},"questions":[{{"q":"Which database?","options":[{{"label":"sqlite"}}],"multi":false}}]}}"#
+            )
+            .as_bytes(),
+        );
+        Arc::from(buf.as_slice())
+    }
+
+    /// One question resolved frame for `id`, by `client`.
+    fn answer(id: u64) -> Frame {
+        let mut buf = Vec::new();
+        message::notify(
+            &mut buf,
+            methods::QUESTION_RESOLVED,
+            format!(r#"{{"id":{id},"client":1}}"#).as_bytes(),
+        );
+        Arc::from(buf.as_slice())
+    }
+
     /// A hub whose clients are the ids, their queues and their cut signals.
     fn hub_with(ids: &[ClientId]) -> (Hub, Vec<mpsc::Receiver<Entry>>, Vec<oneshot::Receiver<()>>) {
         let mut hub = Hub::new();
@@ -702,6 +750,37 @@ mod tests {
         assert!(
             seen.iter().all(|line| line["method"] != "approval_request"),
             "a late client is not asked a question no call waits for: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn ask_a_client_that_attaches_while_a_question_waits_gets_it() {
+        let (mut hub, mut queues, _cuts) = hub_with(&[1]);
+        hub.send(question(4), Kind::QuestionRequest(4));
+        hub.attach(1, None);
+        let seen = lines(&frames(drain(&mut queues[0])));
+        let asked: Vec<&Value> = seen
+            .iter()
+            .filter(|line| line["method"] == "question_request")
+            .collect();
+        assert_eq!(
+            asked.len(),
+            1,
+            "the catch-up carries the question: {seen:?}"
+        );
+        assert_eq!(asked[0]["params"]["id"], 4);
+        assert!(asked[0]["params"]["questions"].is_array());
+
+        hub.send(answer(4), Kind::QuestionResolved(4));
+        let (mut hub, mut queues, _cuts) = hub_with(&[2]);
+        hub.send(question(5), Kind::QuestionRequest(5));
+        hub.send(answer(5), Kind::QuestionResolved(5));
+        assert!(hub.waiting.is_empty(), "an answered question waits no more");
+        hub.attach(2, None);
+        let seen = lines(&frames(drain(&mut queues[0])));
+        assert!(
+            seen.iter().all(|line| line["method"] != "question_request"),
+            "a resolved question is not asked again: {seen:?}"
         );
     }
 

@@ -70,6 +70,7 @@ use crate::picture_native::{self, Native, Protocol};
 use crate::screen::{Color, SYNC_PAIR, Screen, Style, Terminal};
 use crate::slot::{Sidebar, Update};
 use crate::theme::{Depth, Emphasis, Overrides, Role, Theme};
+use crate::watch::Watch;
 
 use self::fold::Folds;
 use self::list::{List, Source};
@@ -275,6 +276,7 @@ async fn run_session(
         ),
     };
     let mut app = App::new(&init, terminal.size(), options.full);
+    app.cell = terminal.cell();
     // A session the app switched to draws with the look the last one had, and
     // reads the keys the last one read.
     let looked = carried.is_some();
@@ -286,6 +288,13 @@ async fn run_session(
         }
     }
     app.state = options.state.clone();
+    // The discovery folder of the live workers: a change there is a session
+    // that started, ended or waits for an approval. A folder the watch cannot
+    // open leaves every read of it as it was.
+    let mut watch = app
+        .state
+        .as_deref()
+        .and_then(|state| Watch::new(&reagent_protocol::discovery::folder(state)).ok());
     app.host = options.host.clone();
     if let Some(cwd) = &options.cwd {
         app.place = sidebar::shown(cwd, std::env::var("HOME").ok().as_deref());
@@ -362,7 +371,10 @@ async fn run_session(
                 match event {
                     Ok(Event::Key(key)) => app.key(key),
                     Ok(Event::Mouse(mouse)) => app.mouse(mouse),
-                    Ok(Event::Resize(columns, rows)) => app.resize(columns, rows),
+                    Ok(Event::Resize(columns, rows)) => {
+                        app.cell = terminal.cell();
+                        app.resize(columns, rows);
+                    }
                     Ok(Event::Paste(text)) => app.paste(text),
                     Ok(Event::FocusGained) => app.focused(),
                     Ok(_) => {}
@@ -394,6 +406,19 @@ async fn run_session(
             opened = open_answer(&mut app.waits.open) => app.opened(opened),
             deleted = delete_answer(&mut app.waits.delete) => app.deleted(deleted.0, deleted.1, deleted.2),
             (request, image) = image_answer(&mut app.image_job) => app.image_pasted(request, image),
+            found = read_answer(&mut app.reading) => app.sessions_arrived(found).await,
+            changed = watch_answer(&mut watch) => match changed {
+                Ok(()) => {
+                    tokio::time::sleep(FOLDER_SETTLE).await;
+                    app.read_sessions();
+                }
+                // A watch that stops working costs the live marks, which the
+                // turns that end and the frames that arrive read as before.
+                Err(error) => {
+                    app.note(format!("folder: {error}"));
+                    watch = None;
+                }
+            },
             frame = client.next_frame() => {
                 match frame {
                     Ok(Next::Frame(frame)) => app.frame(frame),
@@ -572,6 +597,11 @@ fn signal_end(app: &mut App) {
 /// How long the status line says what a mouse copy took.
 const COPIED_FOR: Duration = Duration::from_secs(3);
 
+/// How long a change of the discovery folder is left to settle: a worker
+/// writes its entry under a temp name and renames it in, and one read takes
+/// both.
+const FOLDER_SETTLE: Duration = Duration::from_millis(50);
+
 /// Waits until `at`, or forever when no frame is due.
 async fn wait(at: Option<tokio::time::Instant>) {
     match at {
@@ -682,6 +712,30 @@ async fn open_answer(
     answer
 }
 
+/// Waits for the read of the folder's sessions, and empties `slot` once it
+/// came; stays pending while no read is in flight.
+async fn read_answer(
+    slot: &mut Option<tokio::task::JoinHandle<Vec<reagent_store::list::Entry>>>,
+) -> Vec<reagent_store::list::Entry> {
+    // The job stays in its slot while it runs: another branch of the loop's
+    // `select!` that fires first drops only this wait, not the job.
+    let answer = match slot.as_mut() {
+        Some(reading) => reading.await,
+        None => std::future::pending().await,
+    };
+    *slot = None;
+    answer.unwrap_or_default()
+}
+
+/// Waits for a change of the discovery folder; stays pending while no watch of
+/// it runs.
+async fn watch_answer(watch: &mut Option<Watch>) -> io::Result<()> {
+    match watch.as_mut() {
+        Some(watch) => watch.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The signals that end the run: the terminal is restored and the app exits.
 #[cfg(unix)]
 #[derive(Debug, Default)]
@@ -750,6 +804,12 @@ enum Command {
         id: u64,
         answer: AnswerKind,
         reason: Option<String>,
+    },
+    /// Answer a question request: one list of picks or own text per question,
+    /// and none at all to skip them.
+    Answer {
+        id: u64,
+        answers: Option<Vec<Vec<String>>>,
     },
     /// Set the model, the reasoning level or the permission mode.
     Set {
@@ -1419,6 +1479,227 @@ impl ApprovalBox {
     }
 }
 
+/// The question card's box: the questions of one `ask` request, the pick and
+/// the checked rows of each, the answer typed for each, and when the card went
+/// on screen.
+#[derive(Debug)]
+struct QuestionBox {
+    /// The id the answer names.
+    id: u64,
+    /// The questions, in the order the model asked them.
+    asks: Vec<Ask>,
+    /// When the card went on screen: its keys answer it only after
+    /// [`APPROVAL_ARMED`], so a key already being typed or a key repeat answers
+    /// nothing.
+    shown: std::time::Instant,
+    /// The question the card shows.
+    at: usize,
+    /// The row each question has picked: one of its options, or the answer
+    /// field after them.
+    picks: Vec<usize>,
+    /// Which options each question has checked, one flag per option.
+    checked: Vec<Vec<bool>>,
+    /// The answer field of each question: an editor with the text box's keys,
+    /// made when the first key reaches it.
+    fields: Vec<Option<Editor>>,
+}
+
+/// One question of a card, owned for as long as the card is on screen.
+#[derive(Debug)]
+struct Ask {
+    /// The question text.
+    q: String,
+    /// The answers offered, in the order the card numbers them.
+    options: Vec<AskOption>,
+    /// Whether several options may be checked.
+    multi: bool,
+}
+
+/// One answer a question offers.
+#[derive(Debug)]
+struct AskOption {
+    /// The label an answer reads back.
+    label: String,
+    /// The short note the card draws after the label.
+    note: Option<String>,
+}
+
+impl QuestionBox {
+    /// The box for the request `id`, with the answers of the frame it came in.
+    fn new(id: u64, questions: &[crate::client::Question<'_>], shown: std::time::Instant) -> Self {
+        let asks: Vec<Ask> = questions
+            .iter()
+            .map(|question| Ask {
+                q: question.q.as_ref().to_owned(),
+                options: question
+                    .options
+                    .iter()
+                    .map(|option| AskOption {
+                        label: option.label.as_ref().to_owned(),
+                        note: option.note.as_deref().map(str::to_owned),
+                    })
+                    .collect(),
+                multi: question.multi,
+            })
+            .collect();
+        let picks = vec![0; asks.len()];
+        let checked = asks
+            .iter()
+            .map(|ask| vec![false; ask.options.len()])
+            .collect();
+        let fields = asks.iter().map(|_| None).collect();
+        QuestionBox {
+            id,
+            asks,
+            shown,
+            at: 0,
+            picks,
+            checked,
+            fields,
+        }
+    }
+
+    /// Whether the card takes answer keys: it has been on screen for
+    /// [`APPROVAL_ARMED`] and the user is not typing in the text box.
+    fn ready(&self, now: std::time::Instant, typing: bool) -> bool {
+        !typing && now.duration_since(self.shown) >= APPROVAL_ARMED
+    }
+
+    /// The question the card shows, and the row it has picked.
+    fn current(&self) -> Option<(&Ask, usize)> {
+        let ask = self.asks.get(self.at)?;
+        let pick = self.picks.get(self.at).copied().unwrap_or(0);
+        Some((ask, pick))
+    }
+
+    /// The row of the answer field: after the options.
+    fn own_row(ask: &Ask) -> usize {
+        ask.options.len()
+    }
+
+    /// Whether the answer field of the question on screen is picked, so the
+    /// keys type into it.
+    fn typing(&self) -> bool {
+        self.current()
+            .is_some_and(|(ask, pick)| pick == Self::own_row(ask))
+    }
+
+    /// The answer field of the question on screen, when a key reached it.
+    fn field(&self) -> Option<&Editor> {
+        self.fields.get(self.at).and_then(Option::as_ref)
+    }
+
+    /// The answer field of the question on screen, made empty on first use.
+    fn field_mut(&mut self) -> Option<&mut Editor> {
+        let slot = self.fields.get_mut(self.at)?;
+        Some(slot.get_or_insert_with(Editor::new))
+    }
+
+    /// Whether the question on screen has typed text in its field.
+    fn has_text(&self) -> bool {
+        self.field().is_some_and(|field| !field.is_empty())
+    }
+
+    /// Picks the row `row` of the question on screen, when it has one.
+    fn pick(&mut self, row: usize) {
+        let Some((ask, _)) = self.current() else {
+            return;
+        };
+        if row > Self::own_row(ask) {
+            return;
+        }
+        let at = self.at;
+        if let Some(pick) = self.picks.get_mut(at) {
+            *pick = row;
+        }
+    }
+
+    /// Moves the pick of the question on screen by `step` rows, within the
+    /// options and the answer field.
+    fn step(&mut self, step: isize) {
+        let Some((ask, pick)) = self.current() else {
+            return;
+        };
+        let last = ask.options.len() as isize;
+        let row = (pick as isize + step).clamp(0, last) as usize;
+        self.pick(row);
+    }
+
+    /// Toggles the checked state of the option the question on screen has
+    /// picked.
+    fn toggle(&mut self) {
+        let Some((_, pick)) = self.current() else {
+            return;
+        };
+        let at = self.at;
+        if let Some(set) = self.checked.get_mut(at).and_then(|set| set.get_mut(pick)) {
+            *set = !*set;
+        }
+    }
+
+    /// Picks the answer field of the question on screen and types `c` into it.
+    fn start_typing(&mut self, c: char) {
+        let Some((ask, _)) = self.current() else {
+            return;
+        };
+        let own = Self::own_row(ask);
+        self.pick(own);
+        if let Some(field) = self.field_mut() {
+            field.type_char(c);
+        }
+    }
+
+    /// Empties the answer field of the question on screen.
+    fn clear_field(&mut self) {
+        if let Some(slot) = self.fields.get_mut(self.at) {
+            *slot = None;
+        }
+    }
+
+    /// The answer of every question, one list each, in the order the model
+    /// asked them: the checked labels and any typed text of a question that
+    /// takes several, and the picked label or the typed text of one that takes
+    /// a single answer.
+    fn answers(&self) -> Vec<Vec<String>> {
+        let mut answers = Vec::with_capacity(self.asks.len());
+        for (at, ask) in self.asks.iter().enumerate() {
+            let typed = self
+                .fields
+                .get(at)
+                .and_then(Option::as_ref)
+                .map(|field| {
+                    let (before, after) = field.chunks();
+                    let mut text = String::with_capacity(before.len() + after.len());
+                    text.push_str(before);
+                    text.push_str(after);
+                    text
+                })
+                .filter(|text| !text.trim().is_empty());
+            let own = Self::own_row(ask);
+            let mut answer: Vec<String> = Vec::new();
+            if ask.multi {
+                let set = self.checked.get(at);
+                for (row, option) in ask.options.iter().enumerate() {
+                    let on = set.and_then(|set| set.get(row)).copied().unwrap_or(false);
+                    if on {
+                        answer.push(option.label.clone());
+                    }
+                }
+                answer.extend(typed);
+            } else {
+                let pick = self.picks.get(at).copied().unwrap_or(0);
+                if pick == own {
+                    answer.extend(typed);
+                } else if let Some(option) = ask.options.get(pick) {
+                    answer.push(option.label.clone());
+                }
+            }
+            answers.push(answer);
+        }
+        answers
+    }
+}
+
 /// The theme of the mode the app is in: every role resolved once, and its id in
 /// the screen's style table.
 ///
@@ -1449,6 +1730,57 @@ const RIGHT_MAX: u16 = 40;
 
 /// The columns a call's result may take at the right edge of its row.
 const RESULT_MAX: usize = 24;
+
+/// Runs one key that needs the editor alone, the same in the text box and in
+/// an answer field. Answers false for Up or Down at the edge of the text and
+/// for a key that needs the app (the history, its search, an image).
+fn edit_text(editor: &mut Editor, key: EditKey, width: u16) -> bool {
+    match key {
+        EditKey::Insert(c) => editor.type_char(c),
+        EditKey::Left => editor.backward_char(),
+        EditKey::Right => editor.forward_char(),
+        EditKey::ForwardWord => editor.forward_word(),
+        EditKey::BackwardWord => editor.backward_word(),
+        EditKey::DeleteChar | EditKey::Delete => editor.delete_char(),
+        EditKey::KillWordForward => editor.kill_word(),
+        EditKey::KillWordBackward => editor.backward_kill_word_at(Instant::now()),
+        EditKey::DeleteSpace => editor.delete_horizontal_space(),
+        EditKey::Transpose => editor.transpose_chars(),
+        EditKey::TransposeWords => editor.transpose_words(),
+        EditKey::Upcase => editor.upcase_word(),
+        EditKey::Downcase => editor.downcase_word(),
+        EditKey::Capitalize => editor.capitalize_word(),
+        EditKey::Yank => editor.yank(),
+        EditKey::YankPop => editor.yank_pop(),
+        EditKey::Undo => editor.undo(),
+        EditKey::Mark => editor.set_mark(),
+        EditKey::Exchange => editor.exchange_point_and_mark(),
+        EditKey::Quote => editor.quote_next(),
+        EditKey::CharSearch => editor.search_char(true),
+        EditKey::CharSearchBackward => editor.search_char(false),
+        EditKey::Digit(digit) => editor.digit(digit),
+        EditKey::NegativeArgument => editor.negative_argument(),
+        EditKey::NextKey(key) => editor.next_key(key),
+        EditKey::AbortSearch => editor.search_abort(),
+        EditKey::Up => return editor.up(width),
+        EditKey::Down => return editor.down(width),
+        EditKey::Home => editor.home(width),
+        EditKey::End => editor.end(width),
+        EditKey::Backspace => editor.backward_delete_char(),
+        EditKey::LineStart => editor.beginning_of_line(),
+        EditKey::LineEnd => editor.end_of_line(),
+        EditKey::KillEnd => editor.kill_line(),
+        EditKey::KillStart => editor.unix_line_discard(),
+        EditKey::KillWord => editor.unix_word_rubout(),
+        EditKey::PasteImage
+        | EditKey::SearchBackward
+        | EditKey::SearchForward
+        | EditKey::HistoryOldest
+        | EditKey::HistoryNewest
+        | EditKey::YankLastArg => return false,
+    }
+    true
+}
 
 /// What a tool call's arguments say about the work, read borrowed: nothing is
 /// copied out of the frame's buffer to show a row.
@@ -1492,6 +1824,17 @@ struct CallArgs<'a> {
     /// `write`: the whole content.
     #[serde(default, borrow)]
     content: Option<Cow<'a, str>>,
+    /// `ask`: the questions; the row shows the first.
+    #[serde(default, borrow)]
+    questions: Option<Vec<AskArg<'a>>>,
+}
+
+/// One question of an `ask` call, borrowed from the frame.
+#[derive(Deserialize)]
+struct AskArg<'a> {
+    /// The question text.
+    #[serde(borrow)]
+    q: Cow<'a, str>,
 }
 
 impl<'a> Call<'a> {
@@ -1501,6 +1844,11 @@ impl<'a> Call<'a> {
         let target = match name {
             "bash" => args.command.unwrap_or_else(|| short(arguments)),
             "grep" | "find" => args.pattern.unwrap_or_else(|| short(arguments)),
+            "ask" => args
+                .questions
+                .and_then(|questions| questions.into_iter().next())
+                .map(|first| first.q)
+                .unwrap_or_else(|| short(arguments)),
             _ => args
                 .path
                 .or(args.pattern)
@@ -1837,6 +2185,9 @@ struct App {
     /// Where the note of the card on screen ends, when it is open: the row and
     /// column the frame ends the cursor on, so the note is typed where it shows.
     card_cursor: Option<(u16, u16)>,
+    /// The question card on screen, and the ones that wait behind it.
+    question: Option<QuestionBox>,
+    questions: std::collections::VecDeque<QuestionBox>,
     /// The approval boxes that wait for their turn, oldest first.
     queue: VecDeque<ApprovalBox>,
     /// The user messages of the session, oldest first, for Up and Down.
@@ -1982,6 +2333,11 @@ struct App {
     sessions: Vec<SessionRow>,
     /// The job that reads the folder's sessions, while it runs.
     reading: Option<tokio::task::JoinHandle<Vec<reagent_store::list::Entry>>>,
+    /// Whether a read was asked for while one ran and runs after it.
+    reread: bool,
+    /// The sessions whose live worker says its run waits for an approval, as
+    /// the discovery folder last read them.
+    waiting: Vec<Arc<str>>,
     /// When the next tick of a panel that wants one is due.
     tick: Option<Instant>,
     /// The image paste in flight, and the ones that wait behind it.
@@ -1991,6 +2347,9 @@ struct App {
     /// The terminal's own image protocol, decided at the first picture of the
     /// run and kept for the rest of it.
     native: Option<Native>,
+    /// The size of one cell in pixels, read at start and on each resize; `None`
+    /// when the terminal reports none, and pictures size for half-blocks.
+    cell: Option<crate::picture::CellShape>,
     /// Whether the protocol of the terminal was decided.
     native_decided: bool,
     /// When the pictures that moved or were lost go out.
@@ -2342,6 +2701,8 @@ impl App {
             cents: 0,
             approval: None,
             card_cursor: None,
+            question: None,
+            questions: VecDeque::new(),
             queue: VecDeque::new(),
             history: Vec::new(),
             commands: VecDeque::new(),
@@ -2401,10 +2762,13 @@ impl App {
             state: None,
             sessions: Vec::new(),
             reading: None,
+            reread: false,
+            waiting: Vec::new(),
             tick: None,
             image_job: None,
             image_queue: VecDeque::new(),
             native: None,
+            cell: None,
             native_decided: false,
             picture_deadline: None,
             image_id: first_image_id(),
@@ -2983,6 +3347,8 @@ impl App {
             }
             Frame::ApprovalRequest { request, saves } => self.approval_request(request, saves),
             Frame::ApprovalResolved { id } => self.resolved(id),
+            Frame::QuestionRequest { id, questions } => self.question_request(id, &questions),
+            Frame::QuestionResolved { id } => self.question_resolved(id),
             Frame::Closing(reason) => self.closing(&reason),
             Frame::ClientJoined { id, .. } if id == self.client => {}
             Frame::ClientJoined { id, name } => self.client_joined(id, &name),
@@ -3660,7 +4026,7 @@ impl App {
     fn approval_request(&mut self, request: Approval<'_>, saves: Vec<Cow<'_, str>>) {
         let width = self.text_width();
         let boxed = ApprovalBox::new(request, width).saving(saves);
-        if self.approval.is_none() {
+        if self.approval.is_none() && self.question.is_none() {
             self.approval = Some(boxed);
         } else {
             self.queue.push_back(boxed);
@@ -3670,14 +4036,59 @@ impl App {
         self.set_sessions();
     }
 
+    /// A question request of the `ask` tool: its card goes on screen, or waits
+    /// behind the card that is open.
+    fn question_request(&mut self, id: u64, questions: &[crate::client::Question<'_>]) {
+        let boxed = QuestionBox::new(id, questions, std::time::Instant::now());
+        if self.question.is_none() && self.approval.is_none() {
+            self.question = Some(boxed);
+        } else {
+            self.questions.push_back(boxed);
+        }
+        self.status_dirty = true;
+        self.dirty = true;
+        self.set_sessions();
+    }
+
+    /// A question request got its answer, here or in another client.
+    fn question_resolved(&mut self, id: u64) {
+        if self.question.as_ref().is_some_and(|open| open.id == id) {
+            self.question = None;
+            self.next_card();
+            self.set_sessions();
+            return;
+        }
+        self.questions.retain(|waiting| waiting.id != id);
+    }
+
     /// An approval request got its answer, here or in another client.
     fn resolved(&mut self, id: u64) {
         if self.approval.as_ref().is_some_and(|open| open.id == id) {
-            self.next_approval();
+            self.approval = None;
+            self.next_card();
             self.set_sessions();
             return;
         }
         self.queue.retain(|waiting| waiting.id != id);
+    }
+
+    /// Shows the next card that waits, if one waits: an open card keeps the
+    /// screen, so a question and an approval never show at once.
+    fn next_card(&mut self) {
+        if self.approval.is_some() || self.question.is_some() {
+            return;
+        }
+        if !self.queue.is_empty() {
+            self.next_approval();
+            return;
+        }
+        if let Some(mut open) = self.questions.pop_front() {
+            open.shown = std::time::Instant::now();
+            self.question = Some(open);
+            self.status_dirty = true;
+            self.dirty = true;
+            self.set_sessions();
+        }
     }
 
     /// Shows the next waiting box, if one waits.
@@ -3693,9 +4104,11 @@ impl App {
     }
 
     /// The sections a key press is read in, for what is on screen now.
-    fn key_chain(&self, overlay: Overlay) -> &'static [Section] {
+    fn key_chain(&self, overlay: Overlay, asking: bool) -> &'static [Section] {
         if self.keys.leader_pending() {
             keyfile::LEADER_CHAIN
+        } else if asking {
+            keyfile::ASK_CHAIN
         } else if overlay == Overlay::Approval {
             keyfile::CARD_CHAIN
         } else if overlay == Overlay::Sheet {
@@ -3724,6 +4137,12 @@ impl App {
             .approval
             .as_ref()
             .is_some_and(|open| open.ready(now, !self.editor.is_empty()));
+        // A question card takes its keys once it has been on screen a moment,
+        // and a typed answer takes them whatever the box holds.
+        let asking = self
+            .question
+            .as_ref()
+            .is_some_and(|open| open.typing() || open.ready(now, !self.editor.is_empty()));
         let overlay = match (&self.approval, refusing) {
             (Some(_), true) => Overlay::Popup,
             (Some(_), false) if armed => Overlay::Approval,
@@ -3735,7 +4154,7 @@ impl App {
         // A key the file moved reads as the first key of its action, before the
         // map or any raw reader sees it, and a key it swallowed goes no further.
         let event = match &self.keyfile {
-            Some(file) => match file.translate(self.key_chain(overlay), event) {
+            Some(file) => match file.translate(self.key_chain(overlay, asking), event) {
                 Some(event) => event,
                 None => return,
             },
@@ -3779,6 +4198,15 @@ impl App {
         }
         if let Some(leader) = self.keys.take_leader() {
             return self.leader(leader);
+        }
+        // The question card owns the keys while it is open, before the sidebar,
+        // the scroll keys and the fold keys behind it see them.
+        if asking {
+            match action {
+                Action::Quit => return self.quit(),
+                Action::QuitArmed => self.armed = true,
+                _ => return self.question_key(action),
+            }
         }
         // An open list or sheet owns Tab, the arrows and Esc, so the sidebar,
         // the scroll keys and the fold keys behind it do not see them.
@@ -4096,6 +4524,15 @@ impl App {
     fn paste(&mut self, text: String) {
         self.deadline = None;
         self.dirty = true;
+        if let Some(field) = self
+            .question
+            .as_mut()
+            .filter(|open| open.typing())
+            .and_then(QuestionBox::field_mut)
+        {
+            field.insert(&text);
+            return;
+        }
         // A paste is no key of the search: it ends the search and keeps the
         // match in the box, the way every other key does.
         self.editor.search_end();
@@ -4246,6 +4683,144 @@ impl App {
         }
     }
 
+    /// One key of the question card, which holds every key while it is open.
+    fn question_key(&mut self, action: Action) {
+        self.dirty = true;
+        let typing = self.question.as_ref().is_some_and(QuestionBox::typing);
+        match action {
+            Action::Edit(key) if typing => self.field_key(key),
+            Action::Edit(EditKey::Up) => self.step_question(-1),
+            Action::Edit(EditKey::Down) => self.step_question(1),
+            Action::Edit(EditKey::Insert(c)) => self.question_char(c),
+            Action::NewLine if typing => {
+                if let Some(field) = self.question.as_mut().and_then(QuestionBox::field_mut) {
+                    field.new_line();
+                }
+            }
+            // Enter answers the question on screen, and the last one sends.
+            Action::Send => self.answer_question(),
+            // Tab shows the next question.
+            Action::Queue => self.next_question(),
+            Action::Cancel => self.close_question(),
+            _ => {}
+        }
+    }
+
+    /// One key of the answer field, read as the text box reads it: Up and Down
+    /// past its first or its last row move the pick instead.
+    fn field_key(&mut self, key: EditKey) {
+        let width = self.field_columns();
+        let Some(field) = self.question.as_mut().and_then(QuestionBox::field_mut) else {
+            return;
+        };
+        let moved = edit_text(field, key, width);
+        if !matches!(key, EditKey::Digit(_) | EditKey::NegativeArgument) {
+            field.clear_argument();
+        }
+        if !moved {
+            match key {
+                EditKey::Up => self.step_question(-1),
+                EditKey::Down => self.step_question(1),
+                _ => {}
+            }
+        }
+    }
+
+    /// The columns the answer field wraps its text at.
+    pub(crate) fn field_columns(&self) -> u16 {
+        paint::field_columns(self.text_width())
+    }
+
+    /// One typed character of a question whose field is not picked: a digit
+    /// picks that option, a space checks an option of a question that takes
+    /// several, and any other character starts an answer of its own.
+    fn question_char(&mut self, c: char) {
+        let Some(open) = self.question.as_mut() else {
+            return;
+        };
+        if c == ' ' && open.current().is_some_and(|(ask, _)| ask.multi) {
+            open.toggle();
+            return;
+        }
+        if let Some(digit) = c.to_digit(10).filter(|digit| (1..=9).contains(digit)) {
+            open.pick(digit as usize - 1);
+            return;
+        }
+        if c != ' ' {
+            open.start_typing(c);
+        }
+    }
+
+    /// Moves the pick of the question on screen by `step` rows.
+    fn step_question(&mut self, step: isize) {
+        let Some(open) = self.question.as_mut() else {
+            return;
+        };
+        open.step(step);
+    }
+
+    /// Shows the question after the one on screen, and the first after the last.
+    fn next_question(&mut self) {
+        let Some(open) = self.question.as_mut() else {
+            return;
+        };
+        if open.asks.len() > 1 {
+            open.at = (open.at + 1) % open.asks.len();
+            self.status_dirty = true;
+        }
+    }
+
+    /// Enter on the card: an empty answer field takes nothing, any question but
+    /// the last moves on, and the last sends every answer.
+    fn answer_question(&mut self) {
+        let Some(open) = self.question.as_mut() else {
+            return;
+        };
+        if open.typing() && !open.has_text() {
+            return;
+        }
+        if open.at + 1 < open.asks.len() {
+            open.at += 1;
+            self.status_dirty = true;
+            return;
+        }
+        let Some(open) = self.question.take() else {
+            return;
+        };
+        let answers = open.answers();
+        self.question_answered(&open, &answers);
+        self.commands.push_back(Command::Answer {
+            id: open.id,
+            answers: Some(answers),
+        });
+        self.next_card();
+        self.set_sessions();
+        self.status_dirty = true;
+    }
+
+    /// Esc on the card: a field with text loses its text, and anything else
+    /// skips the whole request.
+    fn close_question(&mut self) {
+        let Some(open) = self.question.as_mut() else {
+            return;
+        };
+        if open.typing() && open.has_text() {
+            open.clear_field();
+            return;
+        }
+        let Some(open) = self.question.take() else {
+            return;
+        };
+        self.question_skipped(&open);
+        self.commands.push_back(Command::Answer {
+            id: open.id,
+            answers: None,
+        });
+        self.next_card();
+        self.set_sessions();
+        self.status_dirty = true;
+    }
+
     /// Answers the open request and shows the next one.
     fn approve(&mut self, answer: AnswerKind) {
         let Some(open) = self.approval.take() else {
@@ -4358,35 +4933,9 @@ impl App {
             }
         }
         match key {
-            EditKey::Insert(c) => self.editor.type_char(c),
-            EditKey::Left => self.editor.backward_char(),
-            EditKey::Right => self.editor.forward_char(),
-            EditKey::ForwardWord => self.editor.forward_word(),
-            EditKey::BackwardWord => self.editor.backward_word(),
-            EditKey::DeleteChar => self.editor.delete_char(),
-            EditKey::KillWordForward => self.editor.kill_word(),
-            EditKey::KillWordBackward => self.editor.backward_kill_word_at(Instant::now()),
-            EditKey::DeleteSpace => self.editor.delete_horizontal_space(),
-            EditKey::Transpose => self.editor.transpose_chars(),
-            EditKey::TransposeWords => self.editor.transpose_words(),
-            EditKey::Upcase => self.editor.upcase_word(),
-            EditKey::Downcase => self.editor.downcase_word(),
-            EditKey::Capitalize => self.editor.capitalize_word(),
-            EditKey::Yank => self.editor.yank(),
-            EditKey::YankPop => self.editor.yank_pop(),
-            EditKey::Undo => self.editor.undo(),
-            EditKey::Mark => self.editor.set_mark(),
-            EditKey::Exchange => self.editor.exchange_point_and_mark(),
-            EditKey::Quote => self.editor.quote_next(),
             EditKey::PasteImage => self.paste_image(),
-            EditKey::CharSearch => self.editor.search_char(true),
-            EditKey::CharSearchBackward => self.editor.search_char(false),
-            EditKey::Digit(digit) => self.editor.digit(digit),
-            EditKey::NegativeArgument => self.editor.negative_argument(),
-            EditKey::NextKey(key) => self.editor.next_key(key),
             EditKey::SearchBackward => self.start_search(false),
             EditKey::SearchForward => self.start_search(true),
-            EditKey::AbortSearch => self.editor.search_abort(),
             EditKey::HistoryOldest => {
                 self.editor.history_oldest(&self.history);
             }
@@ -4406,15 +4955,9 @@ impl App {
                     editor.history_down(history);
                 }
             }
-            EditKey::Home => self.editor.home(width),
-            EditKey::End => self.editor.end(width),
-            EditKey::Backspace => self.editor.backward_delete_char(),
-            EditKey::Delete => self.editor.delete_char(),
-            EditKey::LineStart => self.editor.beginning_of_line(),
-            EditKey::LineEnd => self.editor.end_of_line(),
-            EditKey::KillEnd => self.editor.kill_line(),
-            EditKey::KillStart => self.editor.unix_line_discard(),
-            EditKey::KillWord => self.editor.unix_word_rubout(),
+            _ => {
+                edit_text(&mut self.editor, key, width);
+            }
         }
         self.editor_dirty = true;
         self.refresh_list();
@@ -5166,6 +5709,7 @@ impl App {
                 Command::Approve { id, answer, reason } => {
                     client.approve(id, answer, reason.as_deref()).await
                 }
+                Command::Answer { id, answers } => client.answer(id, answers.as_deref()).await,
                 Command::Set { model, level, mode } => {
                     client
                         .set(model.as_deref(), level.as_deref(), mode.as_deref())
@@ -5318,13 +5862,16 @@ impl App {
     /// columns its rows are indented by. Before the first layout has set the
     /// main area, the screen's own width stands in for it, so the pictures of
     /// the replay fit the terminal the app was started on.
-    fn room(&self) -> u32 {
+    fn room(&self) -> crate::picture::Room {
         let width = if self.main.width == 0 {
             self.screen.columns().saturating_sub(4)
         } else {
             self.transcript_width()
         };
-        u32::from(width.saturating_sub(2)).max(1)
+        crate::picture::Room {
+            columns: u32::from(width.saturating_sub(2)).max(1),
+            cell: self.cell.unwrap_or(crate::picture::CellShape::HALF_BLOCK),
+        }
     }
 
     /// The interned style of every cell of `picture`, its columns and its rows:

@@ -246,6 +246,8 @@ async fn provider_select_a_missing_key_exits_2_with_the_variable_name() {
             "openai-responses",
             "--base-url",
             "http://127.0.0.1:1",
+            // The run takes no clients: only the missing key matters here.
+            "--no-serve",
             "-p",
             "hi",
         ],
@@ -271,6 +273,8 @@ async fn provider_select_a_named_missing_key_exits_2_with_its_name() {
             "http://127.0.0.1:1",
             "--api-key-env",
             "MY_KEY",
+            // The run takes no clients: only the missing key matters here.
+            "--no-serve",
             "-p",
             "hi",
         ],
@@ -294,6 +298,8 @@ async fn provider_select_an_empty_key_var_exits_2() {
             "openai-chat",
             "--base-url",
             "http://127.0.0.1:1",
+            // The run takes no clients: only the missing key matters here.
+            "--no-serve",
             "-p",
             "hi",
         ],

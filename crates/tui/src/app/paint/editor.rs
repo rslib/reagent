@@ -240,7 +240,8 @@ impl App {
             let at = y + 1 + offset;
             self.paint_box_row(at, width, &pen);
             if empty {
-                if offset == prompt {
+                // An open question card owns the keys, so the box offers none.
+                if offset == prompt && self.question.is_none() {
                     let labels = self.keyfile.as_ref().map(crate::keyfile::KeyFile::labels);
                     let placeholder = placeholder(self.running, labels);
                     self.screen.put_str(BAR + PAD, at, placeholder, pen.dim);
@@ -269,7 +270,7 @@ impl App {
         // that has no fill of its own.
         blank_row(&mut self.screen, footer + GAP, 0, width, spacer);
         // The frame carries one cursor, the terminal's own, on the edit point.
-        if self.approval.is_some() {
+        if self.approval.is_some() || self.question.is_some() {
             self.screen.clear_cursor();
         } else {
             // An open chip's gutter stands in front of its own text, so the
@@ -1221,6 +1222,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An open question card owns the keys: the box draws no cursor and no
+    /// placeholder that offers a key.
+    #[test]
+    fn question_the_text_box_yields_to_an_open_card() {
+        let mut app = app("");
+        app.running = true;
+        let questions = [crate::client::Question {
+            q: "Which database?".into(),
+            options: vec![crate::client::QuestionOption {
+                label: "sqlite".into(),
+                note: None,
+            }],
+            multi: false,
+        }];
+        app.question = Some(crate::app::QuestionBox::new(
+            1,
+            &questions,
+            std::time::Instant::now(),
+        ));
+        let bytes = frame(&mut app);
+        assert!(
+            !bytes.contains("\x1b[?25h"),
+            "the cursor stays hidden while the card waits: {bytes:?}"
+        );
+        assert!(
+            !bytes.contains("Steer the run"),
+            "the box offers no key while the card waits: {bytes:?}"
+        );
     }
 
     #[test]

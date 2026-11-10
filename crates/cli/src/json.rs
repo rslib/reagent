@@ -3,7 +3,7 @@
 use serde::Serialize;
 use serde::ser::SerializeSeq;
 
-use reagent_agent::event::{Event, TurnEndReason};
+use reagent_agent::event::{DropReason, Event, MessageState, TurnEndReason};
 use reagent_agent::guard::Answer;
 use reagent_agent::live::{ClientId, SendMode};
 use reagent_ai::Usage;
@@ -86,8 +86,15 @@ enum Line<'a> {
         reagent: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
         session: Option<&'a str>,
+        /// The socket the run takes clients on, in a run that listens.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        socket: Option<&'a str>,
     },
     UserMessage {
+        /// The id the worker gave the message, which its `message_state` names
+        /// too. Not `message`, which a client reads as the text of an error.
+        #[serde(rename = "message_id")]
+        message: u64,
         client: ClientId,
         mode: &'static str,
         text: &'a str,
@@ -97,6 +104,14 @@ enum Line<'a> {
     },
     Committed {
         record: u64,
+    },
+    MessageState {
+        #[serde(rename = "message_id")]
+        message: u64,
+        state: &'static str,
+        /// Why the message was dropped, on one that never landed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<&'static str>,
     },
     ApprovalRequest {
         id: u64,
@@ -114,6 +129,14 @@ enum Line<'a> {
         /// The reason a refusal answers the model with, when it has one.
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<&'a str>,
+    },
+    QuestionRequest {
+        id: u64,
+        questions: Vec<QuestionLine<'a>>,
+    },
+    QuestionResolved {
+        id: u64,
+        client: ClientId,
     },
     RuleToSave {
         rule: &'a str,
@@ -164,6 +187,22 @@ impl Serialize for Rules<'_> {
     }
 }
 
+/// One question of a `question_request` line.
+#[derive(Serialize)]
+struct QuestionLine<'a> {
+    q: &'a str,
+    options: Vec<ChoiceLine<'a>>,
+    multi: bool,
+}
+
+/// One option of a question, with the note its label carries when it has one.
+#[derive(Serialize)]
+struct ChoiceLine<'a> {
+    label: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<&'a str>,
+}
+
 /// One image of a tool result: what it is and how big, without its base64 text.
 #[derive(Serialize)]
 struct ImageLine<'a> {
@@ -195,9 +234,12 @@ pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
     if matches!(
         event,
         Event::UserMessage { .. }
+            | Event::MessageState { .. }
             | Event::Committed { .. }
             | Event::ApprovalRequest(_)
             | Event::ApprovalResolved { .. }
+            | Event::QuestionRequest(_)
+            | Event::QuestionResolved { .. }
             | Event::RuleToSave { .. }
             | Event::Settings { .. }
     ) {
@@ -307,15 +349,26 @@ fn write(buf: &mut Vec<u8>, event: &Event, tailed: bool) {
             bytes: *bytes,
         },
         Event::UserMessage {
+            message,
             client,
             mode,
             text,
             images,
         } => Line::UserMessage {
+            message: *message,
             client: *client,
             mode: send_mode(*mode),
             text,
             images: image_lines(images),
+        },
+        Event::MessageState {
+            message,
+            state,
+            reason,
+        } => Line::MessageState {
+            message: *message,
+            state: message_state(*state),
+            reason: reason.as_ref().map(drop_reason),
         },
         Event::Committed { record } => Line::Committed { record: *record },
         Event::ApprovalRequest(ask) => Line::ApprovalRequest {
@@ -334,6 +387,29 @@ fn write(buf: &mut Vec<u8>, event: &Event, tailed: bool) {
                 reason,
             }
         }
+        Event::QuestionRequest(request) => Line::QuestionRequest {
+            id: request.id,
+            questions: request
+                .questions
+                .iter()
+                .map(|question| QuestionLine {
+                    q: &question.q,
+                    multi: question.multi,
+                    options: question
+                        .options
+                        .iter()
+                        .map(|choice| ChoiceLine {
+                            label: &choice.label,
+                            note: choice.note.as_deref(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        },
+        Event::QuestionResolved { id, client } => Line::QuestionResolved {
+            id: *id,
+            client: *client,
+        },
         Event::RuleToSave { rule } => Line::RuleToSave { rule },
         Event::Settings { model, level, mode } => Line::Settings {
             model: model.as_deref(),
@@ -345,14 +421,17 @@ fn write(buf: &mut Vec<u8>, event: &Event, tailed: bool) {
 }
 
 /// Appends the line an `--json` run starts with: the format version, the
-/// reagent version and the session the run writes, when it writes one.
-pub fn write_start(buf: &mut Vec<u8>, session: Option<&str>) {
+/// reagent version, the session the run writes, when it writes one, and the
+/// socket it takes clients on, when it takes any. The join token is never in
+/// it.
+pub fn write_start(buf: &mut Vec<u8>, session: Option<&str>, socket: Option<&str>) {
     push(
         buf,
         &Line::Start {
             version: JSON_VERSION,
             reagent: env!("CARGO_PKG_VERSION"),
             session,
+            socket,
         },
     );
 }
@@ -496,6 +575,22 @@ fn send_mode(mode: SendMode) -> &'static str {
     match mode {
         SendMode::Steer => "steer",
         SendMode::Queue => "queue",
+    }
+}
+
+/// The word a client reads for where a message it sent stands.
+fn message_state(state: MessageState) -> &'static str {
+    match state {
+        MessageState::Landed => "landed",
+        MessageState::Dropped => "dropped",
+    }
+}
+
+/// The word a client reads for why a message never landed.
+fn drop_reason(reason: &DropReason) -> &'static str {
+    match reason {
+        DropReason::Cancelled => "cancelled",
+        DropReason::Ended => "ended",
     }
 }
 
@@ -794,24 +889,27 @@ mod tests {
         let cases = [
             (
                 Event::UserMessage {
+                    message: 5,
                     client: 7,
                     mode: reagent_agent::live::SendMode::Steer,
                     text: "use cargo nextest".into(),
                     images: Vec::new(),
                 },
-                json!({ "type": "user_message", "client": 7, "mode": "steer", "text": "use cargo nextest" }),
+                json!({ "type": "user_message", "message_id": 5, "client": 7, "mode": "steer", "text": "use cargo nextest" }),
             ),
             (
                 Event::UserMessage {
+                    message: 6,
                     client: 3,
                     mode: reagent_agent::live::SendMode::Queue,
                     text: "later".into(),
                     images: Vec::new(),
                 },
-                json!({ "type": "user_message", "client": 3, "mode": "queue", "text": "later" }),
+                json!({ "type": "user_message", "message_id": 6, "client": 3, "mode": "queue", "text": "later" }),
             ),
             (
                 Event::UserMessage {
+                    message: 7,
                     client: 3,
                     mode: reagent_agent::live::SendMode::Steer,
                     text: "[Image #1] what is this".into(),
@@ -823,7 +921,32 @@ mod tests {
                     }],
                 },
                 // A pasted image is named by its size, never by its base64 text.
-                json!({ "type": "user_message", "client": 3, "mode": "steer", "text": "[Image #1] what is this", "images": [{ "media_type": "image/png", "width": 64, "height": 48, "bytes": 2 }] }),
+                json!({ "type": "user_message", "message_id": 7, "client": 3, "mode": "steer", "text": "[Image #1] what is this", "images": [{ "media_type": "image/png", "width": 64, "height": 48, "bytes": 2 }] }),
+            ),
+            (
+                Event::MessageState {
+                    message: 7,
+                    state: reagent_agent::event::MessageState::Landed,
+                    reason: None,
+                },
+                // A message that landed names no reason.
+                json!({ "type": "message_state", "message_id": 7, "state": "landed" }),
+            ),
+            (
+                Event::MessageState {
+                    message: 8,
+                    state: reagent_agent::event::MessageState::Dropped,
+                    reason: Some(reagent_agent::event::DropReason::Cancelled),
+                },
+                json!({ "type": "message_state", "message_id": 8, "state": "dropped", "reason": "cancelled" }),
+            ),
+            (
+                Event::MessageState {
+                    message: 9,
+                    state: reagent_agent::event::MessageState::Dropped,
+                    reason: Some(reagent_agent::event::DropReason::Ended),
+                },
+                json!({ "type": "message_state", "message_id": 9, "state": "dropped", "reason": "ended" }),
             ),
             (
                 Event::Committed { record: 12 },
@@ -902,10 +1025,39 @@ mod tests {
     }
 
     #[test]
+    fn message_state_a_frame_keeps_the_shape_its_clients_decode() {
+        let event = Event::UserMessage {
+            message: 5,
+            client: 7,
+            mode: reagent_agent::live::SendMode::Steer,
+            text: "use cargo nextest".into(),
+            images: Vec::new(),
+        };
+        let mut frame = Vec::new();
+        write_worker_line(&mut frame, &event);
+        assert_eq!(
+            parse_line(&frame),
+            json!({ "type": "user_message", "message_id": 5, "client": 7, "mode": "steer", "text": "use cargo nextest" }),
+            "a client of a worker reads `message` as the text of an error, so the id is `message_id`"
+        );
+        let state = Event::MessageState {
+            message: 5,
+            state: reagent_agent::event::MessageState::Landed,
+            reason: None,
+        };
+        let mut frame = Vec::new();
+        write_worker_line(&mut frame, &state);
+        assert_eq!(
+            parse_line(&frame),
+            json!({ "type": "message_state", "message_id": 5, "state": "landed" })
+        );
+    }
+
+    #[test]
     fn start_line_names_the_version_and_the_session() {
         assert_eq!(JSON_VERSION, 1);
         let mut buf = Vec::new();
-        write_start(&mut buf, None);
+        write_start(&mut buf, None, None);
         assert_eq!(
             std::str::from_utf8(&buf).expect("utf8"),
             format!(
@@ -915,11 +1067,24 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        write_start(&mut buf, Some("s1"));
+        write_start(&mut buf, Some("s1"), None);
         assert_eq!(
             std::str::from_utf8(&buf).expect("utf8"),
             format!(
                 "{{\"type\":\"start\",\"version\":1,\"reagent\":\"{}\",\"session\":\"s1\"}}\n",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    #[test]
+    fn start_line_names_the_socket_of_a_run_that_listens() {
+        let mut buf = Vec::new();
+        write_start(&mut buf, Some("s1"), Some("/tmp/d/s1.sock"));
+        assert_eq!(
+            std::str::from_utf8(&buf).expect("utf8"),
+            format!(
+                "{{\"type\":\"start\",\"version\":1,\"reagent\":\"{}\",\"session\":\"s1\",\"socket\":\"/tmp/d/s1.sock\"}}\n",
                 env!("CARGO_PKG_VERSION")
             )
         );
@@ -1011,10 +1176,16 @@ mod tests {
     fn a_live_session_event_writes_no_line() {
         for event in [
             Event::UserMessage {
+                message: 5,
                 client: 7,
                 mode: reagent_agent::live::SendMode::Steer,
                 text: "use cargo nextest".into(),
                 images: Vec::new(),
+            },
+            Event::MessageState {
+                message: 5,
+                state: reagent_agent::event::MessageState::Dropped,
+                reason: Some(reagent_agent::event::DropReason::Cancelled),
             },
             Event::Committed { record: 12 },
             Event::ApprovalRequest(Box::new(reagent_agent::event::ApprovalRequest {

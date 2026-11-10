@@ -19,6 +19,8 @@ pub mod methods {
     pub const EVENT: &str = "event";
     pub const APPROVAL_REQUEST: &str = "approval_request";
     pub const APPROVAL_RESOLVED: &str = "approval_resolved";
+    pub const QUESTION_REQUEST: &str = "question_request";
+    pub const QUESTION_RESOLVED: &str = "question_resolved";
     pub const CLIENT_JOINED: &str = "client_joined";
     pub const CLIENT_LEFT: &str = "client_left";
     pub const CLOSING: &str = "closing";
@@ -78,6 +80,12 @@ pub enum Request<'a> {
         id: u64,
         answer: AnswerKind,
         reason: Option<Cow<'a, str>>,
+    },
+    Answer {
+        id: u64,
+        /// One list of labels per question, in the order asked, or `None` to
+        /// skip the whole request.
+        answers: Option<Vec<Vec<Cow<'a, str>>>>,
     },
     Cancel,
     Detach,
@@ -258,6 +266,27 @@ struct ApproveParams<'a> {
     reason: Option<Text<'a>>,
 }
 
+/// The picks of each question of an `answer` request, one list per question.
+type Picks<'a> = Vec<Vec<Text<'a>>>;
+
+#[derive(Deserialize)]
+struct AnswerParams<'a> {
+    id: u64,
+    /// The picks of each question, `Some(None)` for a skip; the outer `None`
+    /// stands for the field a client left out.
+    #[serde(borrow, default, deserialize_with = "picks")]
+    answers: Option<Option<Picks<'a>>>,
+}
+
+/// Reads the `answers` of an `answer` request: the field is there, so `null`
+/// is a skip and a list is one list of labels per question.
+fn picks<'de, D>(deserializer: D) -> Result<Option<Option<Picks<'de>>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Picks<'de>>::deserialize(deserializer).map(Some)
+}
+
 #[derive(Deserialize)]
 struct SetParams<'a> {
     #[serde(borrow, default)]
@@ -320,6 +349,20 @@ pub fn decode(line: &[u8]) -> Result<(Option<u64>, Request<'_>), RpcError> {
             }
         }
         "cancel" => Request::Cancel,
+        "answer" => {
+            let found: AnswerParams<'_> = params(line)?;
+            let answers = found
+                .answers
+                .ok_or_else(|| RpcError::invalid_params("answer without answers".to_string()))?;
+            Request::Answer {
+                id: found.id,
+                answers: answers.map(|per| {
+                    per.into_iter()
+                        .map(|picks| picks.into_iter().map(|pick| pick.0).collect())
+                        .collect()
+                }),
+            }
+        }
         "detach" => Request::Detach,
         "set" => {
             let found: SetParams<'_> = params(line)?;
@@ -662,6 +705,51 @@ mod tests {
             decode(br#"{"jsonrpc":"2.0","id":1,"method":"send","params":{}}"#).expect_err("fails");
         assert_eq!(err.code, RpcError::INVALID_PARAMS);
         let err = decode(br#"{"jsonrpc":"2.0","id":1,"method":"send"}"#).expect_err("fails");
+        assert_eq!(err.code, RpcError::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn ask_answer_carries_the_picks_of_each_question() {
+        let line: &[u8] = br#"{"jsonrpc":"2.0","id":13,"method":"answer","params":{"id":4,"answers":[["sqlite"],["a","b"]]}}"#;
+        match decode(line).expect("decodes").1 {
+            Request::Answer { id, answers } => {
+                assert_eq!(id, 4);
+                let answers = answers.expect("an answer");
+                assert_eq!(answers.len(), 2);
+                assert_eq!(answers[0], [Cow::Borrowed("sqlite")]);
+                assert_eq!(answers[1], [Cow::Borrowed("a"), Cow::Borrowed("b")]);
+                assert!(borrowed_from(&answers[0][0], line));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            decode_ok(
+                br#"{"jsonrpc":"2.0","id":14,"method":"answer","params":{"id":4,"answers":null}}"#
+            ),
+            (
+                Some(14),
+                Request::Answer {
+                    id: 4,
+                    answers: None
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn ask_a_bad_answers_shape_is_invalid_params() {
+        let err = decode(
+            br#"{"jsonrpc":"2.0","id":1,"method":"answer","params":{"id":4,"answers":"sqlite"}}"#,
+        )
+        .expect_err("fails");
+        assert_eq!(err.code, RpcError::INVALID_PARAMS);
+        let err = decode(br#"{"jsonrpc":"2.0","id":1,"method":"answer","params":{"id":4}}"#)
+            .expect_err("fails");
+        assert_eq!(err.code, RpcError::INVALID_PARAMS);
+        let err = decode(
+            br#"{"jsonrpc":"2.0","id":1,"method":"answer","params":{"id":4,"answers":[[1]]}}"#,
+        )
+        .expect_err("fails");
         assert_eq!(err.code, RpcError::INVALID_PARAMS);
     }
 

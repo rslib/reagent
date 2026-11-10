@@ -5,6 +5,7 @@ use reagent_config::permissions::PermissionMode;
 
 use crate::guard::Answer;
 use crate::live::{ClientId, SendMode};
+use crate::question::Question;
 
 /// Why a turn, or the whole run, ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +21,25 @@ pub enum TurnEndReason {
     MaxTurns,
     /// The provider or a tool produced an error.
     Error,
+}
+
+/// Where a message a client sent stands: in the conversation, or dropped
+/// before it got there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageState {
+    /// The message joined the conversation.
+    Landed,
+    /// The message never reached the conversation.
+    Dropped,
+}
+
+/// Why a message never reached the conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropReason {
+    /// A cancel cleared it while it waited.
+    Cancelled,
+    /// The session ended before a run carried it.
+    Ended,
 }
 
 /// One thing that happened while the agent ran, for the UI or a logger.
@@ -88,6 +108,9 @@ pub enum Event {
     /// A client sent a message to a live session, sent once per accepted
     /// message so every client sees the messages of the others.
     UserMessage {
+        /// The id the worker gave the message, which its
+        /// [`Event::MessageState`] carries too.
+        message: u64,
         /// The client that sent the message.
         client: ClientId,
         /// How the message joined the session: a steer or a queue.
@@ -97,6 +120,16 @@ pub enum Event {
         /// The images that follow the text, such as a pasted one, shared with
         /// the conversation.
         images: Vec<reagent_ai::Image>,
+    },
+    /// A client's message entered the conversation or was dropped before it
+    /// did, sent once per message and never both.
+    MessageState {
+        /// The id of the message, as its `user_message` event names it.
+        message: u64,
+        /// Where the message stands.
+        state: MessageState,
+        /// Why it was dropped; `None` for a message that landed.
+        reason: Option<DropReason>,
     },
     /// A journal record was committed.
     Committed {
@@ -125,6 +158,16 @@ pub enum Event {
         client: ClientId,
         /// What it answered.
         answer: Answer,
+    },
+    /// The model asks the person a question and waits for the answer. Boxed,
+    /// since it is rare and would make every event larger.
+    QuestionRequest(Box<QuestionRequest>),
+    /// A question request is done: a client answered it, or nobody did.
+    QuestionResolved {
+        /// The id of the request.
+        id: u64,
+        /// The client that answered; 0 when none did.
+        client: ClientId,
     },
     /// A client's answer saves a rule to the config.
     RuleToSave {
@@ -159,6 +202,15 @@ pub struct ApprovalRequest {
     pub rule: Text,
     /// The rule a save would write, when a save is possible.
     pub save: Option<Text>,
+}
+
+/// What [`Event::QuestionRequest`] shows a client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionRequest {
+    /// The id of the request, which the answer names.
+    pub id: u64,
+    /// The questions, in the order the model asked them.
+    pub questions: Vec<Question>,
 }
 
 #[cfg(test)]

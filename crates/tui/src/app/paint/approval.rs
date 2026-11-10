@@ -55,22 +55,26 @@ impl App {
     pub(crate) fn paint_approval(&mut self, y: u16) -> u16 {
         self.card_sync();
         self.card_cursor = None;
-        let Some(open) = &self.approval else {
+        if self.approval.is_none() {
             return 0;
-        };
+        }
         let width = self.text_width();
         let queued = self.queue.len();
         let pick = self.keys.card().pick();
+        let card = Role::CardWarn;
         let inks = Inks {
-            bar: self.style(Role::Warn, Emphasis::Plain),
-            tint: self.style(Role::CardWarn, Emphasis::Plain),
-            text: self.style(Role::Text, Emphasis::Plain),
-            bold: self.style(Role::Text, Emphasis::Bold),
-            dim: self.style(Role::Dim, Emphasis::Plain),
-            accent: self.style(Role::Accent, Emphasis::Plain),
+            bar: self.style_on(Role::Warn, Emphasis::Plain, card),
+            tint: self.style(card, Emphasis::Plain),
+            text: self.style_on(Role::Text, Emphasis::Plain, card),
+            bold: self.style_on(Role::Text, Emphasis::Bold, card),
+            dim: self.style_on(Role::Dim, Emphasis::Plain, card),
+            accent: self.style_on(Role::Accent, Emphasis::Plain, card),
             code: self.style(Role::CodeFill, Emphasis::Plain),
             pick: self.style(Role::Selection, Emphasis::Plain),
             pick_key: self.style(Role::Selection, Emphasis::Bold),
+        };
+        let Some(open) = &self.approval else {
+            return 0;
         };
         let Self {
             screen, keyfile, ..

@@ -261,14 +261,20 @@ impl App {
         }
     }
 
-    /// Starts a read of the folder's sessions, unless one runs or the app does
-    /// not know the state folder.
+    /// Starts a read of the folder's sessions, unless the app does not know
+    /// the state folder.
     ///
     /// The store's list blocks on one small file, so it is read in a
     /// `spawn_blocking` job; the discovery folder of the live workers is read
     /// async when the job answers, and the two meet in [`App::take_sessions`].
+    /// A read asked for while one runs runs after it, so a change the read in
+    /// flight was too early to see is not lost.
     pub(super) fn read_sessions(&mut self) {
-        if self.reading.is_some() || self.state.is_none() {
+        if self.reading.is_some() {
+            self.reread = true;
+            return;
+        }
+        if self.state.is_none() {
             return;
         }
         let Some(folder) = self.folder() else {
@@ -288,6 +294,12 @@ impl App {
         }
         let reading = self.reading.take().expect("the read that finished");
         let found = reading.await.unwrap_or_default();
+        self.sessions_arrived(found).await;
+    }
+
+    /// Hands the rows of a read that answered to the panel, with the live
+    /// workers and the sessions that wait for an approval.
+    pub(super) async fn sessions_arrived(&mut self, found: Vec<reagent_store::list::Entry>) {
         let live = match &self.state {
             Some(state) => {
                 let folder = reagent_protocol::discovery::folder(state);
@@ -308,20 +320,33 @@ impl App {
                 headless: entry.headless,
             });
         }
+        self.waiting = live
+            .iter()
+            .filter(|worker| worker.waiting)
+            .map(|worker| Arc::from(worker.session.as_str()))
+            .collect();
         self.sessions = rows;
         self.set_sessions();
+        if std::mem::take(&mut self.reread) {
+            self.read_sessions();
+        }
     }
 
-    /// Hands the rows the panel shows, with the current session marked as one
-    /// that waits while an approval is open. A session the discovery folder
-    /// names carries no approval state, so `waiting` stays false for it.
+    /// Hands the rows the panel shows, with every session whose live worker
+    /// waits for an approval marked, and this session marked too while an
+    /// approval is open here.
+    ///
+    /// Another session's mark comes from the discovery folder, which says
+    /// whether a worker waits; this app's own wait is its open approval or
+    /// question, which
+    /// the folder may not have caught up with yet.
     pub(super) fn set_sessions(&mut self) {
         if self.sessions.is_empty() {
             return;
         }
-        let waiting = self.approval.is_some();
+        let open = self.approval.is_some() || self.question.is_some();
         for row in &mut self.sessions {
-            row.waiting = row.current && waiting;
+            row.waiting = (row.current && open) || self.waiting.contains(&row.id);
         }
         let now = reagent_store::paths::now_ms() / 1000;
         let rows = self.sessions.clone();
@@ -814,7 +839,7 @@ fn marked_headless(header: &reagent_store::Header) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::Initialized;
+    use crate::client::{Approval, Initialized};
     use crate::theme::{Depth, Mode, Rgb};
 
     /// The session of the tests, and the title the sessions list gives it.
@@ -1245,5 +1270,102 @@ mod tests {
         let (file, _) = crate::keyfile::KeyFile::parse("");
         let labels = file.labels();
         assert_eq!(labels.foot(crate::keyfile::Foot::SidebarHint), super::HINT);
+    }
+
+    /// The approval request a test opens the box with.
+    fn request() -> Approval<'static> {
+        Approval {
+            id: 1,
+            tool: "Bash".into(),
+            call: "make".into(),
+            rule: "default".into(),
+            save: false,
+        }
+    }
+
+    /// A worker of another session says in the discovery folder that its run
+    /// waits: the row waits and the header counts it, though no approval is
+    /// open here.
+    #[test]
+    fn approval_mark_of_another_sessions_waiting_entry_shows_and_counts() {
+        let mut docked = app(160, 40);
+        docked.waiting = vec![Arc::from("older")];
+        docked.set_sessions();
+        assert!(docked.approval.is_none(), "no approval is open here");
+        let rows = drawn(&mut docked);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("\u{23f8} an older session")),
+            "{rows:#?}"
+        );
+        let mut folded = app(100, 30);
+        folded.waiting = vec![Arc::from("older")];
+        folded.set_sessions();
+        let rows = drawn(&mut folded);
+        assert!(rows[0].contains("1 waits"), "{:?}", rows[0]);
+    }
+
+    /// No entry of the folder says a run waits and no approval is open here, so
+    /// no row waits and the header counts none.
+    #[test]
+    fn approval_mark_clears_without_a_waiting_entry_or_an_open_approval() {
+        let mut docked = app(160, 40);
+        docked.set_sessions();
+        let rows = drawn(&mut docked);
+        assert!(
+            !rows.iter().any(|row| row.contains('\u{23f8}')),
+            "{rows:#?}"
+        );
+        let mut folded = app(100, 30);
+        folded.set_sessions();
+        let rows = drawn(&mut folded);
+        assert!(!rows[0].contains("waits"), "{:?}", rows[0]);
+    }
+
+    /// This app's own approval marks its own row a waiting one, whatever the
+    /// folder says, and the header counts it.
+    #[test]
+    fn approval_mark_of_the_own_session_comes_from_this_app() {
+        let mut docked = app(160, 40);
+        docked.approval_request(request(), Vec::new());
+        assert!(docked.waiting.is_empty(), "the folder says nothing waits");
+        let rows = drawn(&mut docked);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("\u{23f8} fix the start test")),
+            "{rows:#?}"
+        );
+        let mut folded = app(100, 30);
+        folded.approval_request(request(), Vec::new());
+        let rows = drawn(&mut folded);
+        assert!(rows[0].contains("1 waits"), "{:?}", rows[0]);
+    }
+
+    /// An open question of the `ask` tool marks this app's own row as an
+    /// approval does, and the answer clears the mark.
+    #[test]
+    fn question_marks_the_own_session_until_it_is_resolved() {
+        let mut docked = app(160, 40);
+        let questions = [crate::client::Question {
+            q: "Which database?".into(),
+            options: vec![crate::client::QuestionOption {
+                label: "sqlite".into(),
+                note: None,
+            }],
+            multi: false,
+        }];
+        docked.question_request(7, &questions);
+        let rows = drawn(&mut docked);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("\u{23f8} fix the start test")),
+            "{rows:#?}"
+        );
+        docked.question_resolved(7);
+        let rows = drawn(&mut docked);
+        assert!(
+            !rows.iter().any(|row| row.contains('\u{23f8}')),
+            "{rows:#?}"
+        );
     }
 }

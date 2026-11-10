@@ -53,6 +53,7 @@ use crate::args::Args;
 use crate::session::Plan;
 
 mod fanout;
+mod stdin;
 
 use fanout::Encoder;
 
@@ -82,14 +83,33 @@ const LINE: usize = 256;
 #[derive(Serialize)]
 struct Empty {}
 
-/// Starts the worker of `plan`, or returns `None` when this run is not one.
+/// The result of a `send`: whether the message starts a run now or waits for
+/// the open one, which it joins as a steer or after which it runs, and the id
+/// the session reports its fate with.
+#[derive(Serialize)]
+struct Sent {
+    disposition: &'static str,
+    message_id: u64,
+}
+
+/// Starts the session of `plan`, or returns `None` when this run serves no
+/// session of its own.
 ///
 /// `model` is the provider and model text the run uses, `context_window` its
 /// context window and `level` the reasoning level it sends: the answer to
 /// `initialize` names the first two, and the `settings` notice every one.
 ///
-/// A worker takes its session here: the lock, the socket and the entry of the discovery folder are all
-/// there before the ready line goes out.
+/// A worker, a run that takes clients on `--listen`, a run that reads its
+/// requests on `--commands` and a `-p` run that serves its socket all serve
+/// their session as a live one. A run that takes clients on its socket takes
+/// the session here: the lock, the socket and the entry of the discovery folder
+/// are all there before the ready line goes out, which only a worker writes. A
+/// run that reads its requests on stdin alone takes no lock and writes no entry:
+/// it has no socket for another process to find, and a `--no-serve` run keeps
+/// no file of its own either.
+///
+/// A served `-p` run whose socket cannot open is a plain run: it warns on stderr
+/// and returns `None`.
 pub(crate) async fn start(
     args: &Args,
     plan: Option<&Plan>,
@@ -98,99 +118,168 @@ pub(crate) async fn start(
     context_window: Option<u64>,
     level: Option<&str>,
 ) -> Result<Option<Worker>, String> {
-    if !args.worker {
+    let steered = args.commands || args.listen;
+    if !args.worker && !steered && !args.serve {
         return Ok(None);
     }
     let Some(plan) = plan else {
         return Err("a worker needs a session".to_string());
     };
-    let state = crate::session::state_home()
-        .ok_or_else(|| "no state folder; set HOME or XDG_STATE_HOME".to_string())?;
-    let folder = discovery::folder(&state);
-    let session = plan.id.clone();
-    let (at, id) = (folder.clone(), session.clone());
-    let lock = match tokio::task::spawn_blocking(move || take(&at, &id))
+    // Finding the state folder and resolving the project folder touch the
+    // file system, so they run on the blocking pool. A served run refuses every
+    // call the rules send to a person, so it never saves a rule.
+    let at = cwd.to_path_buf();
+    let saved = if args.serve {
+        None
+    } else {
+        tokio::task::spawn_blocking(move || {
+            reagent_config::auth::dir()
+                .ok()
+                .map(|dir| reagent_config::saved::path(&dir, &at))
+        })
         .await
-        .map_err(|_| "the worker lock failed".to_string())?
+        .ok()
+        .flatten()
+    };
+    let (sender, inbox) = live::channel();
+    let shared = Shared::solo(args, model, context_window, level);
+    let mut worker = Worker {
+        session: plan.id.clone(),
+        cwd: cwd.to_path_buf(),
+        saved,
+        mark: None,
+        _files: None,
+        _lock: None,
+        token: Arc::from(""),
+        listener: None,
+        shared: Arc::new(shared),
+        events: None,
+        sender: Some(sender),
+        inbox: Some(inbox),
+        print: None,
+        tracker: None,
+        stdin: None,
+        leaving: None,
+        acceptor: None,
+        stop: None,
+        stopping: false,
+        // A served run ends on its own rule: its clients hold nothing.
+        steered: steered || args.serve,
+    };
+    if args.worker || args.listen {
+        worker.listening(args, cwd).await?;
+    } else if args.serve
+        && let Err(reason) = worker.listening(args, cwd).await
     {
+        // A `-p` run serves its socket when it can, and is a plain run when it
+        // cannot: one warning says why, and no file of the run is left behind.
+        eprintln!("reagent: warning: {reason}; the run takes no clients");
+        return Ok(None);
+    }
+    Ok(Some(worker))
+}
+
+impl Worker {
+    /// Takes the session a run that takes clients on its socket serves: the
+    /// lock, the socket, the entry a client reads and the ready line a worker
+    /// writes.
+    async fn listening(&mut self, args: &Args, cwd: &Path) -> Result<(), String> {
+        let state = crate::session::state_home()
+            .ok_or_else(|| "no state folder; set HOME or XDG_STATE_HOME".to_string())?;
+        let folder = discovery::folder(&state);
+        let session = self.session.clone();
+        let (at, id, place) = (folder.clone(), session.clone(), cwd.to_path_buf());
+        // Every file call of the socket runs in one job, so opening it costs
+        // one trip to the blocking pool and not one per call.
+        let opened = tokio::task::spawn_blocking(move || open(&at, &id, place))
+            .await
+            .map_err(|_| "the worker lock failed".to_string())?;
+        let Opened {
+            lock,
+            files,
+            listener,
+            token,
+            entry,
+        } = match opened {
+            Ok(Some(opened)) => opened,
+            Ok(None) => return Err(busy(&folder, &session).await),
+            Err(error) => return Err(error),
+        };
+        let listener = UnixListener::from_std(listener)
+            .map_err(|error| format!("{}: {error}", entry.socket.display()))?;
+        let socket = entry.socket.clone();
+        if args.worker {
+            ready(&session, &socket, entry.pid)
+                .await
+                .map_err(|error| format!("could not write the ready line: {error}"))?;
+        }
+        self.mark = Some(Mark { folder, entry });
+        self.token = Arc::from(token);
+        self.listener = Some(listener);
+        self._files = Some(files);
+        self._lock = Some(lock);
+        Ok(())
+    }
+}
+
+/// The socket of a session, open and named in the discovery folder.
+struct Opened {
+    lock: Lock,
+    files: Files,
+    listener: std::os::unix::net::UnixListener,
+    token: String,
+    entry: Entry,
+}
+
+/// Takes the lock of `session`, binds its socket and writes its entry, or
+/// `None` when another process holds the lock. An error leaves no socket and
+/// no entry behind.
+#[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]
+fn open(folder: &Path, session: &str, cwd: PathBuf) -> Result<Option<Opened>, String> {
+    let lock = match take(folder, session) {
         Ok(Some(lock)) => lock,
-        Ok(None) => return Err(busy(&folder, &session).await),
+        Ok(None) => return Ok(None),
         Err(error) => return Err(format!("{}: {error}", folder.display())),
     };
-    let socket = discovery::socket_path(&folder, &session).map_err(|error| error.to_string())?;
+    let socket = discovery::socket_path(folder, session).map_err(|error| error.to_string())?;
     // From here every way out removes the socket and the entry, so an early
-    // error leaves no file that names this worker.
+    // error leaves no file that names this run.
     let files = Files {
         socket: socket.clone(),
         entry: folder.join(format!("{session}.json")),
     };
-    // The lock says no live worker uses this path, so a file here is the
+    // The lock says no live run uses this path, so a file here is the
     // leftover of one that stopped.
-    match tokio::fs::remove_file(&socket).await {
+    match std::fs::remove_file(&socket) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("{}: {error}", socket.display())),
     }
-    let listener =
-        UnixListener::bind(&socket).map_err(|error| format!("{}: {error}", socket.display()))?;
-    let token = token::new_token()
-        .await
-        .map_err(|error| format!("no join token: {error}"))?;
-    let instance = token::new_token()
-        .await
-        .map_err(|error| format!("no instance id: {error}"))?;
+    let listener = std::os::unix::net::UnixListener::bind(&socket)
+        .and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
+        .map_err(|error| format!("{}: {error}", socket.display()))?;
+    let token = token::new_token_blocking().map_err(|error| format!("no join token: {error}"))?;
+    let instance =
+        token::new_token_blocking().map_err(|error| format!("no instance id: {error}"))?;
     let entry = Entry {
         pid: std::process::id(),
         instance,
         major: MAJOR,
         token: token.clone(),
-        socket: socket.clone(),
-        session: session.clone(),
-        cwd: cwd.to_path_buf(),
+        socket,
+        session: session.to_string(),
+        cwd,
         started_ms: reagent_store::paths::now_ms(),
+        waiting: false,
     };
-    discovery::write(&folder, &entry)
-        .await
+    discovery::write_blocking(folder, &entry)
         .map_err(|error| format!("{}: {error}", folder.display()))?;
-    ready(&session, &socket, entry.pid)
-        .await
-        .map_err(|error| format!("could not write the ready line: {error}"))?;
-    // Finding the state folder and resolving the project folder touch the
-    // file system, so they run on the blocking pool.
-    let at = cwd.to_path_buf();
-    let saved = tokio::task::spawn_blocking(move || {
-        reagent_config::auth::dir()
-            .ok()
-            .map(|dir| reagent_config::saved::path(&dir, &at))
-    })
-    .await
-    .ok()
-    .flatten();
-    let (sender, inbox) = live::channel();
-    let model = Model::new(
-        Arc::from(model),
-        context_window,
-        level.map(Arc::from),
-        args.provider_name.as_deref().map(Arc::from),
-        crate::models::cache_dir(),
-    );
-    Ok(Some(Worker {
-        session,
-        cwd: cwd.to_path_buf(),
-        saved,
-        _files: files,
-        _lock: lock,
-        token: Arc::from(token),
-        listener: Some(listener),
-        shared: Arc::new(Shared::new(model)),
-        events: None,
-        sender: Some(sender),
-        inbox: Some(inbox),
-        tracker: None,
-        leaving: None,
-        acceptor: None,
-        stop: None,
-        stopping: false,
+    Ok(Some(Opened {
+        lock,
+        files,
+        listener,
+        token,
+        entry,
     }))
 }
 
@@ -279,10 +368,14 @@ pub(crate) struct Worker {
     /// The file the rules a client saves go to, when the state folder has a
     /// path.
     saved: Option<PathBuf>,
+    /// The discovery entry of this run and the folder it goes in, rewritten
+    /// when the run starts or stops waiting for a person; `None` for a run
+    /// that takes no client on a socket.
+    mark: Option<Mark>,
     /// The socket and the entry, removed before the lock goes.
-    _files: Files,
-    /// The lock that keeps it the only worker of its session.
-    _lock: Lock,
+    _files: Option<Files>,
+    /// The lock that keeps it the only run of its session.
+    _lock: Option<Lock>,
     /// The token a client must present. It is never printed.
     token: Arc<str>,
     /// The listener clients connect to, until it is handed to the acceptor.
@@ -295,24 +388,59 @@ pub(crate) struct Worker {
     sender: Option<Sender>,
     /// The commands of the session.
     inbox: Option<Inbox>,
+    /// The events of a steered run, forwarded to the task that prints them.
+    print: Option<mpsc::Sender<Event>>,
     /// The task that reads the events of the run.
     tracker: Option<JoinHandle<TurnEndReason>>,
+    /// The task that reads the session's requests on stdin, for a run that
+    /// takes them there.
+    stdin: Option<JoinHandle<()>>,
     /// Fires when the last client leaves.
     leaving: Option<oneshot::Receiver<()>>,
     /// The task that accepts clients; the connections are its own tasks and
     /// end with it.
     acceptor: Option<JoinHandle<()>>,
-    /// Cancelled by a signal: the worker stops whether clients are attached or
+    /// Cancelled by a signal: the run stops whether clients are attached or
     /// not.
     stop: Option<CancellationToken>,
-    /// Whether the worker stopped serving before its session loop began.
+    /// Whether the run stopped serving before its session loop began.
     stopping: bool,
+    /// Whether this run is a `-p` run that takes its requests on stdin or on
+    /// its socket, instead of a worker.
+    steered: bool,
 }
 
 impl Worker {
     /// Takes the events of the agent, which the tracker reads.
     pub(crate) fn watch(&mut self, events: mpsc::Receiver<Event>) {
         self.events = Some(events);
+    }
+
+    /// Forwards the events of the run to `print`, so a steered run prints them
+    /// while its tracker sends them to the clients of its socket.
+    pub(crate) fn print(&mut self, print: mpsc::Sender<Event>) {
+        self.print = Some(print);
+    }
+
+    /// Takes the client that reads the session's requests on `input`, whose
+    /// answers go on `answers`, one line each.
+    ///
+    /// The client is one more of the session, and the run it sees is the one
+    /// the session takes: it starts the first run when the run has no task.
+    pub(crate) fn stdin_client<R: AsyncRead + Unpin + Send + 'static>(
+        &mut self,
+        input: R,
+        answers: mpsc::UnboundedSender<Vec<u8>>,
+    ) {
+        let (_, task) = commands(&self.shared, self.sender.clone(), &self.cwd, input, answers);
+        self.stdin = Some(task);
+    }
+
+    /// The socket this run takes clients on, when it takes any.
+    pub(crate) fn socket(&self) -> Option<String> {
+        self.mark
+            .as_ref()
+            .map(|mark| mark.entry.socket.to_string_lossy().into_owned())
     }
 
     /// Queues the message the worker was started with, as its own.
@@ -328,7 +456,9 @@ impl Worker {
             }
         };
         self.shared.queued();
+        let message = self.shared.message();
         let command = live::Command::Send {
+            message,
             client: WORKER,
             text: Text::from(text),
             blocks,
@@ -347,26 +477,34 @@ impl Worker {
         self.shared.set_committed(committed);
         if let Some(events) = self.events.take() {
             let saved = self.saved.take();
+            let mark = self.mark.clone();
+            let print = self.print.take();
             self.tracker = Some(tokio::spawn(track(
                 events,
                 Arc::clone(&self.shared),
                 saved,
+                mark,
                 committed,
                 listed,
+                print,
             )));
         }
-        let (leaving, wait) = oneshot::channel();
-        self.leaving = Some(wait);
         let Some(listener) = self.listener.take() else {
             return;
         };
+        // Only a worker leaves when its last client goes: a steered run ends on
+        // its own rule, and its clients hold nothing.
+        let steered = self.steered;
+        let (leaving, wait) = oneshot::channel();
+        self.leaving = (!steered).then_some(wait);
         let shared = Arc::clone(&self.shared);
         let token = Arc::clone(&self.token);
         let sender = self.sender.clone();
+        let first = !steered;
         let session: Arc<str> = Arc::from(self.session.as_str());
         let cwd = self.cwd.clone();
         self.acceptor = Some(tokio::spawn(async move {
-            accept(listener, shared, token, sender, session, cwd).await;
+            accept(listener, shared, token, sender, session, cwd, first).await;
             let _ = leaving.send(());
         }));
     }
@@ -379,7 +517,7 @@ impl Worker {
     /// Runs the calls a resumed session left open, answered by its clients.
     ///
     /// The worker leaves as it does from its session loop: when the last client
-    /// is gone while the calls wait for an approval, or on a signal. The
+    /// is gone while the calls wait for a person, or on a signal. The
     /// session loop then does not start.
     pub(crate) async fn pending(
         &mut self,
@@ -415,7 +553,40 @@ impl Worker {
         reason
     }
 
-    /// Runs the session from the inbox until the last client leaves.
+    /// Runs the turn a resumed session left unanswered once, with the clients of
+    /// the session answering it: opened before its first request, settled after.
+    pub(crate) async fn resume(
+        &mut self,
+        agent: &mut Agent<'_>,
+        history: &mut Vec<Message>,
+        journal: &mut Option<&mut Journal>,
+        events: &mpsc::Sender<Event>,
+    ) -> TurnEndReason {
+        self.shared.opened();
+        let stop = self.stop.clone().unwrap_or_default();
+        let Some(inbox) = self.inbox.as_mut() else {
+            return TurnEndReason::Error;
+        };
+        let run = agent.run_with_inbox(history, journal.as_deref_mut(), events, inbox);
+        tokio::pin!(run);
+        tokio::select! {
+            () = &mut run => {}
+            () = stop.cancelled() => run.await,
+        }
+        // The tracker is what sees the end of the run: it clears the open run
+        // from the state, and the reason it keeps there is this run's.
+        let mut changed = self.shared.changed();
+        while self.shared.running() {
+            if changed.changed().await.is_err() {
+                break;
+            }
+        }
+        self.shared.settled();
+        self.shared.end()
+    }
+
+    /// Runs the session from the inbox until the last client leaves, or, in a
+    /// steered run, until nothing is left to run and stdin has ended.
     pub(crate) async fn serve(
         &mut self,
         agent: &mut Agent<'_>,
@@ -429,6 +600,11 @@ impl Worker {
         let acceptor = self.acceptor.take();
         if self.stopping {
             stop_accepting(acceptor).await;
+            return;
+        }
+        if self.steered {
+            self.serve_steered(agent, history, journal, events, acceptor)
+                .await;
             return;
         }
         let Some(mut inbox) = self.inbox.take() else {
@@ -469,6 +645,67 @@ impl Worker {
         stop_accepting(acceptor).await;
     }
 
+    /// Runs a session that takes its requests while it runs, until it has no
+    /// run open, nothing queued and no request left to read on stdin.
+    ///
+    /// The clients of its socket do not hold it: when the end comes, the socket
+    /// stops taking connections and every client gets the frames it was owed
+    /// before its connection goes. A signal or the deadline ends the session
+    /// whether a run is open or not, and whether it waits for a person or
+    /// for a request on stdin.
+    async fn serve_steered(
+        &mut self,
+        agent: &mut Agent<'_>,
+        history: &mut Vec<Message>,
+        journal: Option<&mut Journal>,
+        events: &mpsc::Sender<Event>,
+        acceptor: Option<JoinHandle<()>>,
+    ) {
+        let Some(mut inbox) = self.inbox.take() else {
+            stop_accepting(acceptor).await;
+            return;
+        };
+        let sender = self.sender.take();
+        let shared = Arc::clone(&self.shared);
+        let stop = self.stop.clone().unwrap_or_default();
+        let input = self.stdin.take();
+        let mut changed = shared.changed();
+        let live = live::run_live(agent, history, journal, events, &mut inbox);
+        tokio::pin!(live);
+        // Whether the session loop ended before the end of the rule below, so
+        // its own return is awaited once.
+        let mut returned = false;
+        loop {
+            // A request still on its way in holds the session up as a run does:
+            // the loop of `run_live` takes the commands the channel holds before
+            // it returns, so closing the senders loses none of them.
+            if shared.stdin_ended() && !shared.running() {
+                break;
+            }
+            tokio::select! {
+                () = &mut live => {
+                    returned = true;
+                    break;
+                }
+                _ = changed.changed() => {}
+                () = stop.cancelled() => break,
+            }
+        }
+        if stop.is_cancelled() {
+            shared.stopped();
+        }
+        shared.finish();
+        shared.release();
+        if let Some(input) = input {
+            input.abort();
+        }
+        drop(sender);
+        stop_clients(acceptor).await;
+        if !returned {
+            live.await;
+        }
+    }
+
     /// How the last run of the session ended, once every event is seen.
     pub(crate) async fn reason(&mut self) -> TurnEndReason {
         match self.tracker.take() {
@@ -483,8 +720,9 @@ impl Worker {
 struct State {
     /// Whether a run is open.
     running: bool,
-    /// The approval the open run waits for, if it waits for one.
-    approval: Option<u64>,
+    /// The approval or the question the open run waits for a person to
+    /// answer, if it waits for one.
+    wait: Option<u64>,
     /// Whether the worker has queued its own work.
     armed: bool,
     /// The newest record the journal committed.
@@ -498,22 +736,35 @@ struct State {
     linger: Option<tokio::time::Instant>,
     /// The id the next client gets.
     next: live::ClientId,
+    /// The id the next message gets.
+    next_message: u64,
     /// Why the last run ended.
     end: TurnEndReason,
+    /// Whether no request comes on stdin from now on: true for a run that takes
+    /// none there.
+    stdin_done: bool,
+    /// Whether a signal or the deadline stopped the session.
+    stopped: bool,
+    /// Whether the session is over and takes no client of its socket.
+    done: bool,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
             running: false,
-            approval: None,
+            wait: None,
             armed: false,
             committed: 0,
             clients: 0,
             seen: false,
             linger: None,
             next: 1,
+            next_message: 1,
             end: TurnEndReason::EndTurn,
+            stdin_done: true,
+            stopped: false,
+            done: false,
         }
     }
 }
@@ -525,19 +776,20 @@ impl State {
             Event::UserMessage { .. } | Event::TurnStart => self.running = true,
             Event::RunEnd(reason) => {
                 self.running = false;
-                self.approval = None;
+                self.wait = None;
                 self.end = *reason;
             }
-            Event::ApprovalRequest(request) => self.approval = Some(request.id),
-            Event::ApprovalResolved { .. } => self.approval = None,
+            Event::ApprovalRequest(request) => self.wait = Some(request.id),
+            Event::QuestionRequest(request) => self.wait = Some(request.id),
+            Event::ApprovalResolved { .. } | Event::QuestionResolved { .. } => self.wait = None,
             Event::Committed { record } => self.committed = self.committed.max(*record),
             _ => {}
         }
     }
 
     /// Whether the worker may stop: no client is left, its own work is queued,
-    /// no run is open (or the open run waits for an approval no client can
-    /// give), and the linger of a client that left without `detach` is over.
+    /// no run is open (or the open run waits for a person no client can
+    /// answer), and the linger of a client that left without `detach` is over.
     fn idle(&self, now: impl FnOnce() -> tokio::time::Instant) -> bool {
         // `now` runs only when a linger is set, so a run a client watches
         // reads no clock here.
@@ -563,9 +815,9 @@ impl State {
     }
 
     /// Whether no client is left, the worker queued its work, and no run is
-    /// open, or the open run waits for an approval no client can give.
+    /// open, or the open run waits for a person no client can answer.
     fn alone(&self) -> bool {
-        self.clients == 0 && self.armed && (!self.running || self.approval.is_some())
+        self.clients == 0 && self.armed && (!self.running || self.wait.is_some())
     }
 }
 
@@ -624,14 +876,43 @@ impl Model {
     }
 }
 
+/// The discovery entry of one worker and the folder it goes in.
+///
+/// Only the run's wait for a person changes it, and only after the frame of
+/// that change has gone to the clients of the session.
+#[derive(Clone)]
+struct Mark {
+    folder: PathBuf,
+    entry: Entry,
+}
+
+impl Mark {
+    /// Writes the entry again, saying whether the run waits for a person.
+    ///
+    /// The write of a value the entry already carries does nothing, and a
+    /// write that fails costs the mark, not the run.
+    async fn waiting(&mut self, waiting: bool) {
+        if self.entry.waiting == waiting {
+            return;
+        }
+        self.entry.waiting = waiting;
+        if let Err(error) = discovery::write(&self.folder, &self.entry).await {
+            eprintln!("reagent: warning: could not mark the waiting request: {error}");
+        }
+    }
+}
+
 /// The state every task of one worker shares.
 #[derive(Debug)]
-struct Shared {
+pub(crate) struct Shared {
     state: Mutex<State>,
     /// The frames of the session, and the queues of its clients.
     hub: Mutex<hub::Hub>,
     /// The model of the session and the settings a client set last.
     model: Mutex<Model>,
+    /// The client that reads its requests on stdin, if the run has one: its id,
+    /// and the channel the answers to its requests go on.
+    stdin: Mutex<Option<(live::ClientId, mpsc::UnboundedSender<Vec<u8>>)>>,
     /// The login of the provider a client switched to, kept so its refresh
     /// keeps working.
     held: Mutex<Option<Arc<Session>>>,
@@ -646,9 +927,44 @@ impl Shared {
             state: Mutex::new(State::default()),
             hub: Mutex::new(hub::Hub::new()),
             model: Mutex::new(model),
+            stdin: Mutex::new(None),
             held: Mutex::new(None),
             changed,
         }
+    }
+
+    /// The state of a session served by `args`, with the provider and model
+    /// text `model` the run uses, its context window and the reasoning level it
+    /// sends.
+    ///
+    /// A run that serves its session through no socket of its own builds this
+    /// itself, so its `set` requests answer with the model of the run.
+    pub(crate) fn solo(args: &Args, model: &str, window: Option<u64>, level: Option<&str>) -> Self {
+        Self::new(Model::new(
+            Arc::from(model),
+            window,
+            level.map(Arc::from),
+            args.provider_name.as_deref().map(Arc::from),
+            crate::models::cache_dir(),
+        ))
+    }
+
+    /// Takes the client that reads the session's requests on stdin, with the
+    /// channel its answer lines go on.
+    ///
+    /// The client gets no frame of the session, only the answers to its own
+    /// requests, and it counts as a client until the run counts it gone.
+    pub(crate) fn steering(&self, answers: mpsc::UnboundedSender<Vec<u8>>) -> live::ClientId {
+        let client = self.joined();
+        {
+            let mut state = self.state();
+            state.stdin_done = false;
+        }
+        *self
+            .stdin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((client, answers));
+        client
     }
 
     /// Switches the model of the session to the provider `name` a client set,
@@ -707,8 +1023,22 @@ impl Shared {
         frames.attach(id, request);
     }
 
-    /// Queues the answer in `out` to the client of `id`.
+    /// Queues the answer in `out` to the client of `id`: on the channel of the
+    /// run's stdin client, or in the queue of the client of the session.
     fn reply(&self, id: live::ClientId, out: &[u8]) {
+        let stdin = self
+            .stdin
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((client, answers)) = stdin.as_ref()
+            && *client == id
+        {
+            // A channel the run stopped reading drops the answer of a request
+            // nobody waits for any more, as a client that is gone does.
+            let _ = answers.send(out.to_vec());
+            return;
+        }
+        drop(stdin);
         self.hub().reply(id, out);
     }
 
@@ -738,8 +1068,17 @@ impl Shared {
     }
 
     /// Takes one event of the run: the state, then the frame every client gets.
-    fn observe(&self, event: &Event, frame: hub::Frame) {
-        self.state().observe(event);
+    ///
+    /// It says whether the run now waits for a person, and that value is
+    /// `Some` only when the wait began or ended.
+    fn observe(&self, event: &Event, frame: hub::Frame) -> Option<bool> {
+        let waiting = {
+            let mut state = self.state();
+            let before = state.wait.is_some();
+            state.observe(event);
+            let after = state.wait.is_some();
+            (before != after).then_some(after)
+        };
         let mut frames = self.hub();
         if let Event::Committed { record } = event {
             frames.set_committed(*record);
@@ -747,6 +1086,16 @@ impl Shared {
         frames.send(frame, fanout::kind(event));
         drop(frames);
         self.tell();
+        waiting
+    }
+
+    /// The id of the next message a client sends, one for every `send` of every
+    /// client and one for the work the worker queues itself.
+    fn message(&self) -> u64 {
+        let mut state = self.state();
+        let message = state.next_message;
+        state.next_message += 1;
+        message
     }
 
     /// Gives one client its id and counts it as joined.
@@ -796,9 +1145,9 @@ impl Shared {
         self.hub().set_committed(record);
     }
 
-    /// Whether the open run waits for an approval.
+    /// Whether the open run waits for a person.
     fn waits(&self) -> bool {
-        self.state().approval.is_some()
+        self.state().wait.is_some()
     }
 
     /// Notes that a message the worker sent waits for a run.
@@ -811,13 +1160,13 @@ impl Shared {
     fn settled(&self) {
         let mut state = self.state();
         state.running = false;
-        state.approval = None;
+        state.wait = None;
         drop(state);
         self.tell();
     }
 
     /// Notes that the calls a resumed session left open run now: the worker's
-    /// own work, which an approval with no client to answer it may stop.
+    /// own work, which a wait with no client to answer it may stop.
     fn opened(&self) {
         let mut state = self.state();
         state.running = true;
@@ -832,9 +1181,60 @@ impl Shared {
         self.tell();
     }
 
+    /// Notes that the client of stdin is gone: no request comes from it again.
+    fn stdin_gone(&self) {
+        self.state().stdin_done = true;
+        self.tell();
+    }
+
+    /// Whether the run reads no more requests on stdin.
+    fn stdin_ended(&self) -> bool {
+        self.state().stdin_done
+    }
+
+    /// Whether a run is open.
+    fn running(&self) -> bool {
+        self.state().running
+    }
+
+    /// Notes that a signal or the deadline stopped the session.
+    fn stopped(&self) {
+        self.state().stopped = true;
+        self.tell();
+    }
+
+    /// Notes that the session is over: its socket takes no client, and the
+    /// connections it serves are on their way out.
+    fn finish(&self) {
+        self.state().done = true;
+        self.tell();
+    }
+
+    /// Whether the session is over.
+    fn done(&self) -> bool {
+        self.state().done
+    }
+
+    /// Lets every client of the socket go: the queue of each closes, so the
+    /// frames it was owed go out and its connection ends.
+    fn release(&self) {
+        let last = self.state().next;
+        let mut frames = self.hub();
+        for id in 1..last {
+            frames.leave(id);
+        }
+    }
+
     /// Why the last run ended.
     fn end(&self) -> TurnEndReason {
-        self.state().end
+        let state = self.state();
+        // A session a signal stopped ended cancelled even when no run was open
+        // to end with that reason.
+        if state.stopped {
+            TurnEndReason::Cancelled
+        } else {
+            state.end
+        }
     }
 }
 
@@ -846,7 +1246,27 @@ async fn stop_accepting(acceptor: Option<JoinHandle<()>>) {
     }
 }
 
-/// Accepts clients until the last one leaves and no run is open.
+/// Ends the acceptor of a session that is over: it stops taking connections and
+/// lets the ones it serves write what they were owed and close. A connection
+/// that takes nothing is cut after [`LINGER`].
+async fn stop_clients(acceptor: Option<JoinHandle<()>>) {
+    let Some(mut acceptor) = acceptor else {
+        return;
+    };
+    // A handle is polled once, so the one that came back within the wait is
+    // taken here and the one that did not is cut and taken below.
+    if acceptor.is_finished() {
+        let _ = acceptor.await;
+        return;
+    }
+    if tokio::time::timeout(LINGER, &mut acceptor).await.is_err() {
+        acceptor.abort();
+        let _ = acceptor.await;
+    }
+}
+
+/// Accepts clients until the last one leaves and no run is open, or until the
+/// session of a steered run is over.
 ///
 /// Each connection is a task of `joins`, so a connection still in its
 /// handshake ends with the acceptor and holds no sender of the session after
@@ -858,18 +1278,28 @@ async fn accept(
     sender: Option<Sender>,
     session: Arc<str>,
     cwd: PathBuf,
+    first: bool,
 ) {
     let mut changed = shared.changed();
     let mut joins = tokio::task::JoinSet::new();
-    // A worker waits a little for its first client, so the one that started
-    // it can connect.
+    // A worker waits a little for its first client, so the one that started it
+    // can connect; a steered run takes the clients it gets.
     let deadline = tokio::time::Instant::now() + FIRST_CLIENT;
-    let mut waiting = true;
+    let mut waiting = first;
     loop {
+        if shared.done() {
+            // The session ended: every connection goes once its own frames are
+            // written.
+            let _ =
+                tokio::time::timeout(LINGER, async { while joins.join_next().await.is_some() {} })
+                    .await;
+            return;
+        }
         // The one deadline the wait needs: the linger of a client that left
         // without `detach`, armed only while that is all that keeps the worker
-        // up.
-        let linger = {
+        // up. A steered run ends when its session says so, not when its clients
+        // go, so it takes connections until then.
+        let linger = if first {
             let state = shared.state();
             if state.may_stop(waiting) {
                 return;
@@ -879,6 +1309,8 @@ async fn accept(
             } else {
                 None
             }
+        } else {
+            None
         };
         tokio::select! {
             accepted = listener.accept() => {
@@ -1040,112 +1472,6 @@ async fn join(
             // hub holds every frame after the last committed record, which is
             // all a client needs on top of that read.
             Request::Attach { .. } => shared.attach(client, id),
-            Request::Send { text, mode } => {
-                // The image files the message names by `@path` go with it. A
-                // file that cannot be prepared is told to the client that named
-                // it, and the text goes as it was written.
-                let blocks = match crate::attach::blocks(&cwd, text.as_ref()).await {
-                    Ok(blocks) => blocks,
-                    Err(message) => {
-                        let message = format!("{message}: the image was not attached");
-                        let frame = Encoder::default().frame(&Event::Error(Text::from(message)));
-                        shared.reply(client, &frame);
-                        Vec::new()
-                    }
-                };
-                let send = live::Command::Send {
-                    client,
-                    text: Text::from(text.as_ref()),
-                    blocks,
-                    mode: send_mode(mode),
-                };
-                deliver(&shared, sender.as_ref(), client, id, &mut out, send).await;
-            }
-            Request::Cancel => {
-                deliver(
-                    &shared,
-                    sender.as_ref(),
-                    client,
-                    id,
-                    &mut out,
-                    live::Command::Cancel { client },
-                )
-                .await;
-            }
-            Request::Set { model, level, mode } => {
-                let mode = match mode.map(|text| text.parse::<PermissionMode>()) {
-                    Some(Ok(mode)) => Some(mode),
-                    Some(Err(error)) => {
-                        out.clear();
-                        message::error(&mut out, id, &RpcError::invalid_params(error));
-                        shared.reply(client, &out);
-                        continue;
-                    }
-                    None => None,
-                };
-                // The model text is a bare provider model id, which the
-                // session's provider takes, or the `provider/model` of another
-                // provider, which the worker builds and switches to.
-                let (model, provider, config, max_tokens) = match model {
-                    Some(text) => match switched(&shared, text.as_ref()).await {
-                        Ok(asked) => (
-                            Some(asked.model),
-                            asked.swap,
-                            asked.config,
-                            asked.max_tokens,
-                        ),
-                        Err(error) => {
-                            out.clear();
-                            message::error(&mut out, id, &error);
-                            shared.reply(client, &out);
-                            continue;
-                        }
-                    },
-                    None => (None, None, None, None),
-                };
-                // A model the session does not run brings the limits of its
-                // cache entry and the level it takes, so the first request it
-                // serves is the one that model takes.
-                let limits = match &model {
-                    Some(id) => limits_of(&shared, id, level.as_deref(), max_tokens).await,
-                    None => Limits::default(),
-                };
-                let settings = live::Settings {
-                    provider,
-                    config_provider: config,
-                    model,
-                    level: limits
-                        .level
-                        .or_else(|| level.map(|text| Text::from(text.as_ref()))),
-                    mode,
-                    images: limits.images,
-                    max_tokens: limits.max_tokens,
-                    compact_budget: limits.compact_budget,
-                };
-                let set = live::Command::Set { client, settings };
-                // The settings the session applied come back as an event: the
-                // notice every client gets is sent once the session has them.
-                deliver(&shared, sender.as_ref(), client, id, &mut out, set).await;
-            }
-            Request::Compact { note } => {
-                let compact = live::Command::Compact {
-                    client,
-                    note: note.map(|text| Text::from(text.as_ref())),
-                };
-                deliver(&shared, sender.as_ref(), client, id, &mut out, compact).await;
-            }
-            Request::Approve {
-                id: ask,
-                answer,
-                reason,
-            } => {
-                let approve = live::Command::Approve {
-                    client,
-                    id: ask,
-                    answer: answer_of(answer, reason),
-                };
-                deliver(&shared, sender.as_ref(), client, id, &mut out, approve).await;
-            }
             Request::Detach => {
                 out.clear();
                 if let Some(id) = id {
@@ -1159,6 +1485,18 @@ async fn join(
                 out.clear();
                 message::error(&mut out, id, &RpcError::method_not_found());
                 shared.reply(client, &out);
+            }
+            request => {
+                handle(
+                    &shared,
+                    sender.as_ref(),
+                    client,
+                    &cwd,
+                    id,
+                    request,
+                    &mut out,
+                )
+                .await
             }
         }
     }
@@ -1181,6 +1519,193 @@ async fn join(
     }
 }
 
+/// Does one request of one client: a message, a cancel, a `set`, a `compact`
+/// or an approval goes to the session, and its answer goes to the client that
+/// sent it.
+///
+/// The requests only a client of the socket sends, `attach`, `detach` and
+/// `initialize`, are refused here: a run that reads its requests on stdin has
+/// no session to attach to, no connection to detach and no handshake.
+async fn handle(
+    shared: &Shared,
+    sender: Option<&Sender>,
+    client: live::ClientId,
+    cwd: &Path,
+    id: Option<u64>,
+    request: Request<'_>,
+    out: &mut Vec<u8>,
+) {
+    match request {
+        Request::Send { text, mode } => {
+            // The image files the message names by `@path` go with it. A
+            // file that cannot be prepared is told to the client that named
+            // it, and the text goes as it was written.
+            let blocks = match crate::attach::blocks(cwd, text.as_ref()).await {
+                Ok(blocks) => blocks,
+                Err(message) => {
+                    let message = format!("{message}: the image was not attached");
+                    let frame = Encoder::default().frame(&Event::Error(Text::from(message)));
+                    shared.reply(client, &frame);
+                    Vec::new()
+                }
+            };
+            let message = shared.message();
+            let send = live::Command::Send {
+                message,
+                client,
+                text: Text::from(text.as_ref()),
+                blocks,
+                mode: send_mode(mode),
+            };
+            // Read before the send, so the answer names the session the
+            // message found.
+            let disposition = if shared.running() {
+                "queued"
+            } else {
+                "started"
+            };
+            deliver(
+                shared,
+                sender,
+                client,
+                id,
+                out,
+                send,
+                Some((disposition, message)),
+            )
+            .await;
+        }
+        Request::Cancel => {
+            deliver(
+                shared,
+                sender,
+                client,
+                id,
+                out,
+                live::Command::Cancel { client },
+                None,
+            )
+            .await;
+        }
+        Request::Set { model, level, mode } => {
+            let mode = match mode.map(|text| text.parse::<PermissionMode>()) {
+                Some(Ok(mode)) => Some(mode),
+                Some(Err(error)) => {
+                    out.clear();
+                    message::error(out, id, &RpcError::invalid_params(error));
+                    shared.reply(client, out);
+                    return;
+                }
+                None => None,
+            };
+            // The model text is a bare provider model id, which the
+            // session's provider takes, or the `provider/model` of another
+            // provider, which the worker builds and switches to.
+            let (model, provider, config, max_tokens) = match model {
+                Some(text) => match switched(shared, text.as_ref()).await {
+                    Ok(asked) => (
+                        Some(asked.model),
+                        asked.swap,
+                        asked.config,
+                        asked.max_tokens,
+                    ),
+                    Err(error) => {
+                        out.clear();
+                        message::error(out, id, &error);
+                        shared.reply(client, out);
+                        return;
+                    }
+                },
+                None => (None, None, None, None),
+            };
+            // A model the session does not run brings the limits of its
+            // cache entry and the level it takes, so the first request it
+            // serves is the one that model takes.
+            let limits = match &model {
+                Some(id) => limits_of(shared, id, level.as_deref(), max_tokens).await,
+                None => Limits::default(),
+            };
+            let settings = live::Settings {
+                provider,
+                config_provider: config,
+                model,
+                level: limits
+                    .level
+                    .or_else(|| level.map(|text| Text::from(text.as_ref()))),
+                mode,
+                images: limits.images,
+                max_tokens: limits.max_tokens,
+                compact_budget: limits.compact_budget,
+            };
+            let set = live::Command::Set { client, settings };
+            // The settings the session applied come back as an event: the
+            // notice every client gets is sent once the session has them.
+            deliver(shared, sender, client, id, out, set, None).await;
+        }
+        Request::Compact { note } => {
+            let compact = live::Command::Compact {
+                client,
+                note: note.map(|text| Text::from(text.as_ref())),
+            };
+            deliver(shared, sender, client, id, out, compact, None).await;
+        }
+        Request::Approve {
+            id: ask,
+            answer,
+            reason,
+        } => {
+            let approve = live::Command::Approve {
+                client,
+                id: ask,
+                answer: answer_of(answer, reason),
+            };
+            deliver(shared, sender, client, id, out, approve, None).await;
+        }
+        Request::Answer { id: ask, answers } => {
+            let answer = live::Command::Answer {
+                client,
+                id: ask,
+                answers: answers.map(|per| {
+                    per.into_iter()
+                        .map(|picks| picks.into_iter().map(|pick| pick.into_owned()).collect())
+                        .collect()
+                }),
+            };
+            deliver(shared, sender, client, id, out, answer, None).await;
+        }
+        Request::Attach { .. } | Request::Detach | Request::Initialize { .. } => {
+            out.clear();
+            message::error(out, id, &RpcError::invalid_request());
+            shared.reply(client, out);
+        }
+    }
+}
+
+/// Takes the client that reads the session's requests on stdin, and reads them
+/// from `input` until it ends.
+///
+/// The client is one more client of `shared`, with no frame of the session
+/// ever sent to it: the answer to each of its requests goes on `answers`, one
+/// line each, and the run writes them out among its event lines. The task ends
+/// at the end of `input`, which the caller reads as it likes; it never stops
+/// the run, and the end it notes is that no request comes from it again.
+pub(crate) fn commands<R: AsyncRead + Unpin + Send + 'static>(
+    shared: &Arc<Shared>,
+    sender: Option<Sender>,
+    cwd: &Path,
+    input: R,
+    answers: mpsc::UnboundedSender<Vec<u8>>,
+) -> (live::ClientId, JoinHandle<()>) {
+    let client = shared.steering(answers.clone());
+    let shared = Arc::clone(shared);
+    let cwd = cwd.to_path_buf();
+    let task = tokio::spawn(async move {
+        stdin::serve(input, answers, &shared, sender.as_ref(), client, &cwd).await;
+        shared.stdin_gone();
+    });
+    (client, task)
+}
+
 /// Sends one command to the session, and answers `id` once it is in.
 ///
 /// It says whether the session's channel took the command.
@@ -1191,16 +1716,26 @@ async fn deliver(
     id: Option<u64>,
     out: &mut Vec<u8>,
     command: live::Command,
+    sent: Option<(&'static str, u64)>,
 ) -> bool {
-    let sent = match sender {
+    let delivered = match sender {
         Some(sender) => sender.send(command).await.is_ok(),
         None => false,
     };
     let Some(id) = id else {
-        return sent;
+        return delivered;
     };
     out.clear();
-    if sent {
+    if let (true, Some((disposition, message))) = (delivered, sent) {
+        message::result(
+            out,
+            id,
+            &Sent {
+                disposition,
+                message_id: message,
+            },
+        );
+    } else if delivered {
         message::result(out, id, &Empty {});
     } else {
         message::error(
@@ -1210,7 +1745,7 @@ async fn deliver(
         );
     }
     shared.reply(client, out);
-    sent
+    delivered
 }
 
 /// Takes the settings a session applied, from its `Event::Settings`, and
@@ -1525,12 +2060,19 @@ async fn track(
     mut events: mpsc::Receiver<Event>,
     shared: Arc<Shared>,
     saved: Option<PathBuf>,
+    mut mark: Option<Mark>,
     committed: u64,
     mut listed: Option<crate::session::Listing>,
+    print: Option<mpsc::Sender<Event>>,
 ) -> TurnEndReason {
     let mut encode = Encoder::default();
     let mut writes = Vec::new();
     while let Some(event) = events.recv().await {
+        if let Some(print) = &print {
+            // A steered run prints the line of every event too; a writer that
+            // is gone costs the line, not the run.
+            let _ = print.send(event.clone()).await;
+        }
         // A worker lists its session at its first committed record, so a
         // session it never runs a message in keeps its place in the list. A
         // resumed session starts after the records of the parts it continues.
@@ -1573,7 +2115,12 @@ async fn track(
             continue;
         }
         let frame = encode.frame(&event);
-        shared.observe(&event, frame);
+        let waiting = shared.observe(&event, frame);
+        // The entry follows the frame, so a client of another session marks
+        // this one a moment after the clients here saw the change.
+        if let (Some(waiting), Some(mark)) = (waiting, mark.as_mut()) {
+            mark.waiting(waiting).await;
+        }
     }
     for write in writes {
         let _ = write.await;
@@ -1619,6 +2166,7 @@ mod tests {
     fn a_user_message_opens_a_run_before_its_first_turn() {
         let mut state = State::default();
         state.observe(&Event::UserMessage {
+            message: 1,
             client: 1,
             mode: SendMode::Queue,
             text: Text::from("hi"),
@@ -1638,13 +2186,13 @@ mod tests {
             rule: Text::from("default"),
             save: None,
         })));
-        assert_eq!(state.approval, Some(7));
+        assert_eq!(state.wait, Some(7));
         state.observe(&Event::ApprovalResolved {
             id: 7,
             client: 1,
             answer: Answer::Once,
         });
-        assert_eq!(state.approval, None);
+        assert_eq!(state.wait, None);
         assert!(state.running, "the run goes on after the answer");
     }
 
@@ -1668,7 +2216,7 @@ mod tests {
         state.clients = 0;
         event_turn_start(&mut state);
         assert!(!state.idle(|| now), "a run is open");
-        state.approval = Some(3);
+        state.wait = Some(3);
         assert!(state.idle(|| now), "no client can answer the approval");
     }
 

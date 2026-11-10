@@ -132,6 +132,16 @@ impl Terminal for Real {
         terminal::size().unwrap_or((80, 24))
     }
 
+    fn cell(&self) -> Option<crate::picture::CellShape> {
+        let window = terminal::window_size().ok()?;
+        crate::picture::CellShape::of_window(
+            window.columns,
+            window.rows,
+            window.width,
+            window.height,
+        )
+    }
+
     async fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
         write_frame(&mut self.out, frame).await
     }

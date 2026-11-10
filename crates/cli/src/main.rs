@@ -73,14 +73,26 @@ fn main() -> std::process::ExitCode {
 
     // With no task for a terminal, the run is the UI: a worker for the new or
     // the continued session, and the app attached to it. Every other shape,
-    // `--json` and a run with no terminal included, keeps the plain path.
+    // `--json` and a run with no terminal included, keeps the plain path. A run
+    // that takes its requests while it runs is headless, and its stdin and its
+    // socket are not the editors of the UI.
     #[cfg(feature = "tui")]
-    if tui::wanted(&args) {
+    if tui::wanted(&args) && !args.commands && !args.listen {
         let code = runtime().block_on(tui::run(args));
         reagent_tools::spill::cleanup();
         return code;
     }
-    let code = runtime().block_on(run::run(args));
+    let commands = args.commands;
+    let runtime = runtime();
+    let code = runtime.block_on(run::run(args));
+    if commands {
+        // The client of stdin holds a blocking read of it, and dropping the
+        // runtime waits for that thread, so a run that reads its requests there
+        // shuts down without waiting for the input to end.
+        runtime.shutdown_background();
+    } else {
+        drop(runtime);
+    }
     // Every way out of a run comes back here, Ctrl-C and the deadline too, so
     // the spill folder of this run goes at its end, once the runtime is gone.
     reagent_tools::spill::cleanup();
@@ -95,6 +107,8 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 /// The serialized tool specs plus the filled system prompt, in bytes.
+///
+/// These are the specs of a plain `-p` run, which never offers `ask`.
 #[cfg(test)]
 fn budget_bytes() -> usize {
     // The free `spec()` builders give the exact specs a run offers the model.
@@ -125,6 +139,29 @@ mod tests {
         assert!(
             estimated < PROMPT_BUDGET,
             "prompt and tool specs estimated at {estimated} tokens ({bytes} bytes), over {PROMPT_BUDGET}"
+        );
+    }
+
+    /// The budget above covers the specs of a plain `-p` run, which offers no
+    /// `ask`: only a run a person can answer through keeps it.
+    #[test]
+    fn ask_the_plain_run_offers_no_ask() {
+        let defaults: Vec<String> = crate::args::DEFAULT_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert!(
+            !crate::run::asks(&defaults, false),
+            "a plain run offers no ask"
+        );
+        assert!(
+            crate::run::asks(&defaults, true),
+            "a steered run keeps the ask of the default list"
+        );
+        let plain = ["bash".to_string(), "read".to_string()];
+        assert!(
+            !crate::run::asks(&plain, true),
+            "a plain list without ask has none"
         );
     }
 }

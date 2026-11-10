@@ -36,6 +36,9 @@ pub struct Guard {
     mode: PermissionMode,
     /// Whether the session may switch to [`PermissionMode::Bypass`].
     bypass_enabled: bool,
+    /// Whether `listen` raises the guard: a run that serves its session but
+    /// takes no answer from a client keeps this off.
+    listening: bool,
     /// The events of the live session that listens, when one does.
     events: Option<mpsc::Sender<Event>>,
     /// The calls that wait for an answer. Every clone shares the list and its
@@ -50,6 +53,7 @@ impl Guard {
             rules,
             mode: PermissionMode::default(),
             bypass_enabled: false,
+            listening: true,
             events: None,
             approvals: Arc::default(),
         }
@@ -91,10 +95,20 @@ impl Guard {
         Ok(())
     }
 
+    /// A guard that never raises to clients: `listen` does nothing, so a call
+    /// the rules send to a person is refused at once.
+    #[must_use]
+    pub fn without_clients(mut self) -> Self {
+        self.listening = false;
+        self
+    }
+
     /// Raises the guard to the clients of a live session: an ask becomes an
     /// [`Event::ApprovalRequest`] they answer.
     pub fn listen(&mut self, events: mpsc::Sender<Event>) {
-        self.events = Some(events);
+        if self.listening {
+            self.events = Some(events);
+        }
     }
 
     /// Lowers the guard again, so the next run refuses instead of waiting for
@@ -757,6 +771,53 @@ mod tests {
             output.content.as_ref(),
             "denied: no rule allows this call (default deny); the call did not run"
         );
+    }
+
+    #[tokio::test]
+    async fn a_guard_without_clients_refuses_while_listening() {
+        let (events, mut requests) = mpsc::channel(4);
+        let mut guard = guard(&[], &["Bash(rm:*)"], &[], None).without_clients();
+        guard.listen(events);
+        let tool = Shell {
+            spec: spec("bash"),
+            ran: std::sync::Arc::new(Mutex::new(Vec::new())),
+        };
+        let Verdict::Ask(ask) = guard.check(&tool, "bash", r#"{"command":"rm -rf build"}"#) else {
+            panic!("expected an ask");
+        };
+        let refusal = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            guard.approve(&ask, &CancellationToken::new()),
+        )
+        .await
+        .expect("the refusal is at once")
+        .expect("the call was refused, not cancelled");
+        let Grant::Refuse(output) = refusal else {
+            panic!("the call did not run");
+        };
+        assert!(
+            output.content.contains("this run cannot ask"),
+            "{}",
+            output.content
+        );
+        assert!(requests.try_recv().is_err(), "no request reached a client");
+    }
+
+    #[test]
+    fn a_guard_without_clients_keeps_the_rules_and_the_mode() {
+        let guard = guard(&[], &["Bash(rm:*)"], &[], None)
+            .with_bypass(true)
+            .without_clients();
+        assert_eq!(guard.mode(), PermissionMode::Default);
+        assert!(guard.bypass_enabled());
+        let tool = Shell {
+            spec: spec("bash"),
+            ran: std::sync::Arc::new(Mutex::new(Vec::new())),
+        };
+        assert!(matches!(
+            guard.check(&tool, "bash", r#"{"command":"rm -rf build"}"#),
+            Verdict::Ask(_)
+        ));
     }
 
     #[test]

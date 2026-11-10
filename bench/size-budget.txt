@@ -7,17 +7,25 @@
 # darwin-arm64: measured 5154976 bytes on 2026-10-30 (min profile at
 # opt-level "z" with "s" for the CPU-heavy crates; 6050480 before, with the
 # worker, the protocol and saved rules), budget 5414912.
+# 2026-11-09: 4824480 bytes with only the zstd level 1 compressor built
+# (.cargo/config.toml), 5022864 before.
 darwin-arm64 5414912
 # linux-x86_64: measured 7123048 bytes on 2026-10-30 (dftu-gate, Debian 13;
 # min profile at opt-level "z" with "s" for the CPU-heavy crates; 7442456
 # before, with the worker, the protocol and saved rules), budget 7479296.
+# 2026-11-09: 7066344 bytes with only the zstd level 1 compressor, 7236264
+# before (paste-linux).
 linux-x86_64 7479296
 #
 # The full build with the TUI (default features), checked by the same script
 # against the `-tui` lines; the lines above are the build without it.
 # darwin-arm64-tui: measured 5754832 bytes on 2026-11-05 (with the native
 # clipboard; 5754096 before it), budget 5799936 set on 2026-10-30.
+# 2026-11-09: 5491072 bytes with only the zstd level 1 compressor, 5705968
+# before.
 darwin-arm64-tui 5799936
 # linux-x86_64-tui: measured 8404888 bytes on 2026-11-05 (lab workspace, with the
 # native clipboard: wl-clipboard-rs and x11rb; 8093096 before them), budget 8826880.
+# 2026-11-09: 8443528 bytes with only the zstd level 1 compressor, 8617544
+# before (paste-linux).
 linux-x86_64-tui 8826880

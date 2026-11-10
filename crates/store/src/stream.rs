@@ -10,6 +10,10 @@ use std::io::{self, Write};
 /// zstd level of the live stream.
 pub const LEVEL: i32 = 1;
 
+// `.cargo/config.toml` builds zstd with only the level 1 compressor; another
+// level would fall back to it without a word.
+const _: () = assert!(LEVEL == 1, "change the zstd excludes in .cargo/config.toml");
+
 /// Compresses the records of one part.
 pub struct Compressor {
     enc: Option<zstd::stream::write::Encoder<'static, Vec<u8>>>,

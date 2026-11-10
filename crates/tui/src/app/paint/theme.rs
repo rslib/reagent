@@ -83,6 +83,19 @@ impl App {
         self.look.id(role, emphasis)
     }
 
+    /// The style id of `role` drawn over the fill of `fill`, so text on a card
+    /// keeps the card's tint behind it. A mode with no fill answers the plain
+    /// style. Interned: a style seen before costs no allocation.
+    pub(crate) fn style_on(&mut self, role: Role, emphasis: Emphasis, fill: Role) -> u32 {
+        let background = self.look.theme.fill(fill);
+        if background == crate::screen::Color::Default {
+            return self.style(role, emphasis);
+        }
+        let mut style = self.look.theme.styled(role, emphasis);
+        style.bg = background;
+        self.screen.intern(style)
+    }
+
     /// Resolves every role again for `mode`, interned into the same style table,
     /// so the next frame draws in it.
     pub(crate) fn restyle(&mut self, mode: Mode) {

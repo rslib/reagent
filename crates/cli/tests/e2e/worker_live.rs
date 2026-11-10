@@ -52,6 +52,13 @@ const CHUNK: usize = 8192;
 /// The marker of the notice of a client that left.
 const CLIENT_LEFT: &[u8] = br#""method":"client_left""#;
 
+/// How often a test looks at the discovery entry a worker rewrites.
+const MARK: Duration = Duration::from_millis(20);
+
+/// How long a test waits for the discovery entry to say the run waits for an
+/// approval, or stopped waiting for one.
+const MARK_WAIT: Duration = Duration::from_millis(2000);
+
 /// A state folder short enough for a socket path, which the platform caps.
 fn state() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -355,6 +362,23 @@ impl Worker {
             .await
             .expect("the entry file is there");
         serde_json::from_slice(&bytes).expect("the entry is JSON")
+    }
+
+    /// The entry, once it says `waiting`: the worker rewrites it after the
+    /// frame of the change went out, so it lands a moment later.
+    async fn waiting(&self, waiting: bool) -> reagent_protocol::discovery::Entry {
+        let rounds = MARK_WAIT.as_millis() / MARK.as_millis();
+        for _ in 0..rounds {
+            let entry = self.entry().await;
+            if entry.waiting == waiting {
+                return entry;
+            }
+            tokio::time::sleep(MARK).await;
+        }
+        panic!(
+            "the entry never said waiting = {waiting}: {:?}",
+            self.entry().await
+        );
     }
 
     async fn connect(&self) -> UnixStream {
@@ -1031,6 +1055,70 @@ async fn a_client_that_attaches_while_an_approval_waits_gets_it() {
         assert_eq!(resolved.len(), 1, "{frames:?}");
         assert_eq!(resolved[0]["params"]["client"], a.id);
     }
+    let mut worker = worker;
+    worker.kill().await;
+}
+
+/// A worker whose run asks for an approval, with `a` attached, and the id of
+/// the approval it waits for.
+async fn asking(state: &Path) -> (Worker, Client, u64) {
+    let cwd = state.join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    ask_folder(&cwd).await;
+    let provider = script(
+        state,
+        r#"{"replies":[{"calls":[{"name":"bash","arguments":{"command":"echo hi"}}]},
+            {"text":"done"}]}"#,
+    )
+    .await;
+    let worker = Worker::start(state, &cwd, &["--provider", &provider]).await;
+    let token = worker.entry().await.token;
+    let mut a = Client::initialize(&worker, &token, "a").await;
+    a.attach(a.committed).await;
+    assert!(!worker.entry().await.waiting, "no run runs yet");
+
+    a.request("send", r#"{"text":"run it","mode":"queue"}"#)
+        .await;
+    let asked = a.until(|frame| frame["method"] == "approval_request").await;
+    let id = asked.last().expect("an approval").clone()["params"]["id"]
+        .as_u64()
+        .expect("an approval id");
+    (worker, a, id)
+}
+
+#[tokio::test]
+async fn approval_mark_follows_an_answered_approval() {
+    let state = state();
+    let (worker, mut a, id) = asking(state.path()).await;
+    let marked = worker.waiting(true).await;
+    assert_eq!(
+        marked.session,
+        worker.session(),
+        "the mark is this worker's"
+    );
+
+    let once = a
+        .request("approve", &format!("{{\"id\":{id},\"answer\":\"once\"}}"))
+        .await;
+    assert!(
+        a.answer(once).await["result"].is_object(),
+        "the answer is taken"
+    );
+    worker.waiting(false).await;
+    let mut worker = worker;
+    worker.kill().await;
+}
+
+#[tokio::test]
+async fn approval_mark_clears_when_the_run_is_cancelled() {
+    let state = state();
+    let (worker, mut a, _) = asking(state.path()).await;
+    worker.waiting(true).await;
+
+    a.request("cancel", "null").await;
+    let (_, reason) = a.run_end().await;
+    assert_eq!(reason, "cancelled", "the cancel stops the run that asks");
+    worker.waiting(false).await;
     let mut worker = worker;
     worker.kill().await;
 }
@@ -2598,6 +2686,93 @@ async fn a_worker_image_word_on_a_text_file_sends_no_image() {
     let blocks = message_blocks(&body, 0);
     assert_eq!(blocks.len(), 1, "{blocks:?}");
     assert_eq!(blocks[0]["text"], "mail me@host.com about @notes.txt");
+    let mut worker = worker;
+    worker.kill().await;
+}
+
+/// The script of a run whose first reply asks a question and whose next one
+/// ends the run.
+fn ask_script() -> String {
+    r#"{"replies":[{"calls":[{"name":"ask","arguments":{"questions":[{"q":"Which database?","options":[{"label":"sqlite"},{"label":"postgres"}]}]}}]},{"text":"done"}]}"#.to_string()
+}
+
+#[tokio::test]
+async fn ask_a_client_that_attaches_while_a_question_waits_gets_it() {
+    let state = state();
+    let cwd = state.path().join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    let provider = script(state.path(), &ask_script()).await;
+    let worker = Worker::start(state.path(), &cwd, &["--provider", &provider]).await;
+    let token = worker.entry().await.token;
+    let mut a = Client::initialize(&worker, &token, "a").await;
+    a.attach(a.committed).await;
+    a.request("send", r#"{"text":"run it","mode":"queue"}"#)
+        .await;
+    let asked = a.until(|frame| frame["method"] == "question_request").await;
+    let id = asked.last().expect("a question").clone()["params"]["id"]
+        .as_u64()
+        .expect("a question id");
+
+    let mut b = Client::initialize(&worker, &token, "b").await;
+    let missed = b.attach(b.committed).await;
+    let caught: Vec<&Value> = missed
+        .iter()
+        .filter(|frame| frame["method"] == "question_request")
+        .collect();
+    assert_eq!(
+        caught.len(),
+        1,
+        "the catch-up carries the question that waits: {missed:?}"
+    );
+    assert_eq!(caught[0]["params"]["id"], id);
+    assert_eq!(caught[0]["params"]["questions"][0]["q"], "Which database?");
+
+    let answer = a
+        .request(
+            "answer",
+            &format!("{{\"id\":{id},\"answers\":[[\"sqlite\"]]}}"),
+        )
+        .await;
+    assert!(a.answer(answer).await["result"].is_object());
+    let from_a = a.until(|frame| is_event(frame, "run_end")).await;
+    let resolved: Vec<&Value> = from_a
+        .iter()
+        .filter(|frame| frame["method"] == "question_resolved")
+        .collect();
+    assert_eq!(resolved.len(), 1, "{from_a:?}");
+    assert_eq!(resolved[0]["params"]["client"], a.id);
+    let mut worker = worker;
+    worker.kill().await;
+}
+
+#[tokio::test]
+async fn ask_a_waiting_question_sets_the_waiting_mark() {
+    let state = state();
+    let cwd = state.path().join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    let provider = script(state.path(), &ask_script()).await;
+    let worker = Worker::start(state.path(), &cwd, &["--provider", &provider]).await;
+    let token = worker.entry().await.token;
+    let mut a = Client::initialize(&worker, &token, "a").await;
+    a.attach(a.committed).await;
+    a.request("send", r#"{"text":"run it","mode":"queue"}"#)
+        .await;
+    let asked = a.until(|frame| frame["method"] == "question_request").await;
+    let id = asked.last().expect("a question").clone()["params"]["id"]
+        .as_u64()
+        .expect("a question id");
+    let marked = worker.waiting(true).await;
+    assert_eq!(
+        marked.session,
+        worker.session(),
+        "the mark is this worker's"
+    );
+
+    let answer = a
+        .request("answer", &format!("{{\"id\":{id},\"answers\":null}}"))
+        .await;
+    assert!(a.answer(answer).await["result"].is_object());
+    worker.waiting(false).await;
     let mut worker = worker;
     worker.kill().await;
 }

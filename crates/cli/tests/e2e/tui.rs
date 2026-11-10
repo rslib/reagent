@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use nix::pty::{Winsize, openpty};
 use nix::sys::termios::{self, InputFlags, LocalFlags, Termios};
 use reagent_protocol::discovery;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 
 const BIN: &str = env!("CARGO_BIN_EXE_reagent");
@@ -795,6 +796,168 @@ async fn the_sessions_sheet_keeps_a_fork_parent() {
     assert_eq!(tui.quit().await, 0, "a normal quit");
 }
 
+/// A worker of another session of this home, with one client of it.
+///
+/// The client sends the few requests an approval test needs: `initialize`,
+/// `attach`, `send` and `approve`. Nothing else answers its frames.
+struct Second {
+    /// The worker's process, which stops with the test.
+    _child: Child,
+    /// The client's connection to it.
+    stream: tokio::net::UnixStream,
+    /// The bytes read, of which the first `at` are used.
+    buf: Vec<u8>,
+    at: usize,
+    /// The id of the next request the client sends.
+    next: u64,
+}
+
+/// How many bytes one read of the second client asks for.
+const SECOND_CHUNK: usize = 8192;
+
+impl Second {
+    /// Starts a worker of a session of its own with `provider`, attaches a
+    /// client to it and answers its frames.
+    async fn start(home: &Home, provider: &str) -> Second {
+        let mut child = home
+            .command()
+            .args(["worker", "--provider", provider])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("the second worker starts");
+        let mut stdout = tokio::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+        let mut ready = String::new();
+        stdout
+            .read_line(&mut ready)
+            .await
+            .expect("the ready line of the second worker");
+        let ready: serde_json::Value =
+            serde_json::from_str(ready.trim_end()).expect("the ready line is JSON");
+        let socket = PathBuf::from(ready["socket"].as_str().expect("a socket path"));
+        let session = ready["session"].as_str().expect("a session id").to_owned();
+        let token = token_of(home, &session).await;
+        let stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("the second worker accepts a client");
+        let mut second = Second {
+            _child: child,
+            stream,
+            buf: Vec::new(),
+            at: 0,
+            next: 0,
+        };
+        let request = second
+            .request(
+                "initialize",
+                &format!(
+                    "{{\"major\":1,\"client\":{{\"name\":\"second\",\"version\":\"1\"}},\
+                     \"capabilities\":[],\"token\":\"{token}\"}}"
+                ),
+            )
+            .await;
+        let answer = second.answer(request).await;
+        let committed = answer["result"]["committed"].as_u64().expect("a record");
+        let request = second
+            .request("attach", &format!("{{\"from\":{committed}}}"))
+            .await;
+        second.answer(request).await;
+        second
+    }
+
+    /// Sends one request and returns the id it carries.
+    async fn request(&mut self, method: &str, params: &str) -> u64 {
+        self.next += 1;
+        let line = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"{method}\",\"params\":{params}}}\n",
+            self.next
+        );
+        self.stream
+            .write_all(line.as_bytes())
+            .await
+            .expect("the request reaches the worker");
+        self.next
+    }
+
+    /// The next frame of the worker.
+    async fn frame(&mut self) -> serde_json::Value {
+        loop {
+            if let Some(len) = self.buf[self.at..].iter().position(|byte| *byte == b'\n') {
+                let start = self.at;
+                self.at += len + 1;
+                let line = self.buf[start..start + len].to_vec();
+                return serde_json::from_slice(&line).expect("a frame is JSON");
+            }
+            if self.at > SECOND_CHUNK {
+                self.buf.drain(..self.at);
+                self.at = 0;
+            }
+            let mut chunk = [0u8; SECOND_CHUNK];
+            let read = tokio::time::timeout(WAIT, self.stream.read(&mut chunk))
+                .await
+                .expect("a frame in time")
+                .expect("the connection reads");
+            assert!(read > 0, "the worker closed the connection");
+            self.buf.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    /// The answer to the request `id`, with the frames before it dropped.
+    async fn answer(&mut self, id: u64) -> serde_json::Value {
+        loop {
+            let frame = self.frame().await;
+            if frame["id"].as_u64() == Some(id) {
+                return frame;
+            }
+        }
+    }
+
+    /// Sends a message and returns the id of the approval its run asks for.
+    async fn asking(&mut self, text: &str) -> u64 {
+        self.request(
+            "send",
+            &format!("{{\"text\":\"{text}\",\"mode\":\"queue\"}}"),
+        )
+        .await;
+        loop {
+            let frame = self.frame().await;
+            if frame["method"] == "approval_request" {
+                return frame["params"]["id"].as_u64().expect("an approval id");
+            }
+        }
+    }
+
+    /// Answers the approval `id` once.
+    async fn answer_approval(&mut self, id: u64) {
+        let request = self
+            .request("approve", &format!("{{\"id\":{id},\"answer\":\"once\"}}"))
+            .await;
+        self.answer(request).await;
+    }
+}
+
+/// The token of the worker of `session`, once its entry is in the folder.
+async fn token_of(home: &Home, session: &str) -> String {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Some(entry) = home
+            .workers()
+            .await
+            .into_iter()
+            .find(|entry| entry.session == session)
+        {
+            return entry.token;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no entry of {session}: {:?}",
+            home.workers().await
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// A `bash` call the project config asks about shows a box, and `y` runs it.
 #[tokio::test]
 async fn an_approval_box_runs_the_call_on_y() {
@@ -827,6 +990,107 @@ async fn an_approval_box_runs_the_call_on_y() {
 
     assert_eq!(tui.quit().await, 0, "a normal quit");
     assert!(home.no_worker().await, "the worker stopped on its own");
+}
+
+/// The `ask` tool's card shows the question and its options, Down moves the pick,
+/// Enter answers it, and the run goes on with the answer in the history.
+#[tokio::test]
+async fn ask_a_question_card_sends_the_pick() {
+    let home = Home::new();
+    let provider = home.script(
+        "two",
+        r#"{"replies": [{"calls": [{"name": "ask", "arguments": {"questions": [
+            {"q": "Which database?", "options": [{"label": "sqlite"}, {"label": "postgres"}]}]}}]},
+            {"text": "the answer came back"}]}"#,
+    );
+    let mut tui = Tui::start(&home, &["--provider", &provider]);
+    tui.until("idle").await;
+
+    tui.keys("ask me\r");
+    tui.until("? reagent asks").await;
+    tui.until("Which database?").await;
+    tui.until("1 sqlite").await;
+    tui.until("2 postgres").await;
+    tui.until("type your own answer...").await;
+
+    // The card takes keys only once it has been on screen a moment.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    tui.keys("\u{1b}[B\r");
+    tui.until("the answer came back").await;
+    tui.until("? Which database? -> postgres").await;
+    tui.until_gone("type your own answer...").await;
+
+    assert_eq!(tui.quit().await, 0, "a normal quit");
+    assert!(home.no_worker().await, "the worker stopped on its own");
+}
+
+/// Esc on the card skips the whole request, and the run goes on without an
+/// answer.
+#[tokio::test]
+async fn ask_esc_skips_the_question() {
+    let home = Home::new();
+    let provider = home.script(
+        "two",
+        r#"{"replies": [{"calls": [{"name": "ask", "arguments": {"questions": [
+            {"q": "Which database?", "options": [{"label": "sqlite"}, {"label": "postgres"}]}]}}]},
+            {"text": "the answer came back"}]}"#,
+    );
+    let mut tui = Tui::start(&home, &["--provider", &provider]);
+    tui.until("idle").await;
+
+    tui.keys("ask me\r");
+    tui.until("Which database?").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    tui.keys("\u{1b}");
+    tui.until("the answer came back").await;
+    tui.until("? Which database? -> skipped").await;
+
+    assert_eq!(tui.quit().await, 0, "a normal quit");
+    assert!(home.no_worker().await, "the worker stopped on its own");
+}
+
+/// Another session whose run waits for an approval marks the idle TUI at once,
+/// and the mark goes when that run's client answers.
+#[tokio::test]
+async fn approval_mark_another_session_shows_while_idle() {
+    let home = Home::new();
+    home.ask();
+    let provider = home.script("one", r#"{"replies": [{"text": "unused"}]}"#);
+    let asking = home.script(
+        "asking",
+        r#"{"replies": [{"calls": [{"name": "bash", "arguments": {"command": "echo hi"}}]},
+            {"text": "the call ran"}]}"#,
+    );
+    let mut tui = Tui::start(&home, &["--provider", &provider]);
+    tui.until("idle").await;
+
+    // The count is the sessions panel's own, drawn in the header row the panels
+    // fold into at this terminal's width. No key goes to the TUI from here on.
+    let mut second = Second::start(&home, &asking).await;
+    let id = second.asking("run it").await;
+    let started = Instant::now();
+    tui.until("1 waits").await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the mark took {:?}",
+        started.elapsed()
+    );
+
+    second.answer_approval(id).await;
+    let started = Instant::now();
+    tui.until_gone("1 waits").await;
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the mark took {:?} to go",
+        started.elapsed()
+    );
+    assert!(
+        !tui.rows()[0].contains("waits"),
+        "the count left the header row:\n{}",
+        tui.text()
+    );
+
+    assert_eq!(tui.quit().await, 0, "a normal quit");
 }
 
 /// `reagent -c` shows the turns the session already has above the editor.

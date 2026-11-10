@@ -59,7 +59,8 @@ pub struct SessionRow {
     pub updated: u64,
     /// Whether a worker runs it now.
     pub live: bool,
-    /// Whether it waits for an approval.
+    /// Whether a worker of it waits for an approval, its own here or another
+    /// session's in the discovery folder.
     pub waiting: bool,
     /// Whether it is the session of this TUI.
     pub current: bool,

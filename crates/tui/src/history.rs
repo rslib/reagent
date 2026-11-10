@@ -79,7 +79,7 @@ pub struct Tail {
 ///
 /// The images the messages hold are decoded and fitted into `room` columns
 /// inside the same blocking job, one list per message.
-pub async fn read(dir: PathBuf, upto: u64, room: u32) -> io::Result<Tail> {
+pub async fn read(dir: PathBuf, upto: u64, room: picture::Room) -> io::Result<Tail> {
     tokio::task::spawn_blocking(move || read_blocking(&dir, upto, room))
         .await
         .map_err(|error| io::Error::other(error.to_string()))?
@@ -97,7 +97,7 @@ pub async fn since(
     dir: PathBuf,
     from: u64,
     upto: u64,
-    room: u32,
+    room: picture::Room,
 ) -> io::Result<Vec<(u64, Message, Vec<Picture>)>> {
     tokio::task::spawn_blocking(move || since_blocking(&dir, from, upto, room))
         .await
@@ -348,7 +348,7 @@ fn checkpoint_text(message: &Message) -> Option<Text> {
 }
 
 /// The blocking read behind [`read`].
-fn read_blocking(dir: &Path, upto: u64, room: u32) -> io::Result<Tail> {
+fn read_blocking(dir: &Path, upto: u64, room: picture::Room) -> io::Result<Tail> {
     let session = Session::open(dir)?;
     let mut tail = Tail::default();
     let mut ends: Option<HashMap<u64, u64>> = None;
@@ -451,7 +451,7 @@ fn since_blocking(
     dir: &Path,
     from: u64,
     upto: u64,
-    room: u32,
+    room: picture::Room,
 ) -> io::Result<Vec<(u64, Message, Vec<Picture>)>> {
     if upto <= from {
         return Ok(Vec::new());
@@ -524,7 +524,7 @@ mod tests {
     };
 
     /// The columns the pictures of a read fit into in these tests.
-    const ROOM: u32 = 100;
+    const ROOM: crate::picture::Room = crate::picture::Room::columns(100);
 
     /// The messages of a preview as the side and the text of each.
     fn shown(recent: &RecentMessages) -> Vec<(&'static str, &str)> {

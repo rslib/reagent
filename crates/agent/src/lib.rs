@@ -13,6 +13,7 @@ pub mod leak;
 pub mod live;
 pub mod mask;
 pub mod policy;
+pub mod question;
 pub mod repair;
 pub(crate) mod reread;
 pub mod retry;

@@ -12,6 +12,7 @@
 //! - [`transcript`]: the transcript rows of the ring, the live entries, and the
 //!   commit of finished lines into the scrollback or the ring.
 //! - [`approval`]: the approval card.
+//! - [`question`]: the question card of the `ask` tool.
 //! - [`editor`]: the text box.
 //! - [`list`]: the list above the text box.
 //! - [`sheet`]: a sheet in place of the text box.
@@ -21,11 +22,13 @@
 mod approval;
 mod editor;
 mod list;
+mod question;
 mod sheet;
 mod status;
 mod theme;
 mod transcript;
 
+pub(crate) use self::question::field_columns;
 pub(crate) use self::sheet::pane_width;
 pub(crate) use self::transcript::rows::Wrap;
 pub(crate) use self::transcript::rows::{
@@ -58,9 +61,12 @@ impl App {
         let list_rows = self.list_height();
         let full = self.screen.is_full();
         let mut y = if full {
-            self.paint_full(editor_rows, dim)
+            // The question card takes its rows from the same place the approval
+            // card does: the transcript leaves them before the card draws.
+            let card_rows = self.question_rows();
+            self.paint_full(editor_rows + card_rows, dim)
         } else {
-            let box_rows = self.approval_rows();
+            let box_rows = self.approval_rows() + self.question_rows();
             let limit = rows.saturating_sub(box_rows + editor_rows + 1);
             self.paint_live(0, limit, dim)
         };
@@ -69,6 +75,7 @@ impl App {
         // the text box.
         let mut list_y = (list_rows > 0 && full).then(|| y.saturating_sub(list_rows));
         y += self.paint_approval(y);
+        y += self.paint_question(y);
         if list_rows > 0 && !full {
             list_y = Some(y);
         }
@@ -97,6 +104,7 @@ impl App {
     pub(super) fn content_rows(&mut self) -> u16 {
         let mut rows = self.live_rows();
         rows += self.approval_rows();
+        rows += self.question_rows();
         rows += self.editor_height();
         rows += self.list_height();
         (rows + 1).min(self.screen.term_rows())

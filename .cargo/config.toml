@@ -1,0 +1,6 @@
+# The store compresses at zstd level 1 only (crates/store/src/stream.rs), which
+# uses the `fast` block compressor in every zstd parameter table. Leaving the
+# other seven out cut the macOS min TUI build by 214896 bytes. zstd-sys takes
+# extra defines only through CFLAGS, and a CFLAGS set in the environment wins.
+[env]
+CFLAGS = "-DZSTD_EXCLUDE_DFAST_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_GREEDY_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_LAZY_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_LAZY2_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_BTLAZY2_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_BTOPT_BLOCK_COMPRESSOR -DZSTD_EXCLUDE_BTULTRA_BLOCK_COMPRESSOR"

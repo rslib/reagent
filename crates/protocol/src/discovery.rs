@@ -16,7 +16,6 @@ use nix::unistd::{Pid, getuid};
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
 
 use crate::message::MAJOR;
 
@@ -45,6 +44,9 @@ pub struct Entry {
     pub session: String,
     pub cwd: PathBuf,
     pub started_ms: u64,
+    /// True while the worker's run waits for an approval.
+    #[serde(default)]
+    pub waiting: bool,
 }
 
 impl fmt::Debug for Entry {
@@ -58,6 +60,7 @@ impl fmt::Debug for Entry {
             .field("session", &self.session)
             .field("cwd", &self.cwd)
             .field("started_ms", &self.started_ms)
+            .field("waiting", &self.waiting)
             .finish()
     }
 }
@@ -65,37 +68,50 @@ impl fmt::Debug for Entry {
 /// Writes the folder and the entry file for one worker.
 ///
 /// The folder is 0700 and the entry 0600. The entry is written to a temp file
-/// and renamed, so a client never reads half of one.
+/// and renamed, so a client never reads half of one. The file calls run as one
+/// job on the blocking pool.
 pub async fn write(folder: &Path, entry: &Entry) -> io::Result<()> {
-    fs::DirBuilder::new()
+    let (folder, entry) = (folder.to_path_buf(), entry.clone());
+    tokio::task::spawn_blocking(move || write_blocking(&folder, &entry))
+        .await
+        .map_err(io::Error::other)?
+}
+
+/// [`write`] for a caller already on the blocking pool.
+#[expect(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "runs inside spawn_blocking"
+)]
+pub fn write_blocking(folder: &Path, entry: &Entry) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::DirBuilder::new()
         .recursive(true)
         .mode(DIR_MODE)
-        .create(folder)
-        .await?;
-    let found = fs::symlink_metadata(folder).await?;
+        .create(folder)?;
+    let found = std::fs::symlink_metadata(folder)?;
     if !found.is_dir() || found.uid() != getuid().as_raw() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("{} is not a folder of this user", folder.display()),
         ));
     }
-    fs::set_permissions(folder, Permissions::from_mode(DIR_MODE)).await?;
+    std::fs::set_permissions(folder, Permissions::from_mode(DIR_MODE))?;
     let name = format!("{}.json", entry.session);
     let temp = folder.join(format!("{name}.tmp-{}", entry.pid));
     let bytes = serde_json::to_vec(entry).map_err(io::Error::other)?;
-    let mut file = fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(FILE_MODE)
-        .open(&temp)
-        .await?;
-    file.write_all(&bytes).await?;
-    file.set_permissions(Permissions::from_mode(FILE_MODE))
-        .await?;
-    file.flush().await?;
+        .open(&temp)?;
+    file.write_all(&bytes)?;
+    file.set_permissions(Permissions::from_mode(FILE_MODE))?;
     drop(file);
-    fs::rename(&temp, folder.join(name)).await
+    std::fs::rename(&temp, folder.join(name))
 }
 
 /// Removes the entry file of `session`; a missing one is not an error.
@@ -195,6 +211,7 @@ mod tests {
             session: session.to_string(),
             cwd: PathBuf::from("/tmp"),
             started_ms: 7,
+            waiting: false,
         }
     }
 
@@ -338,6 +355,40 @@ mod tests {
         assert!(list(&folder).await.is_empty());
         let left = names(&folder).await;
         assert_eq!(left, vec!["bad.json".to_string(), "note.txt".to_string()]);
+    }
+
+    /// An entry an older worker wrote, with no `waiting` field, reads as one
+    /// whose run waits for nothing.
+    #[tokio::test]
+    async fn approval_mark_an_entry_without_the_field_reads_not_waiting() {
+        let tmp = TempDir::new().expect("temp");
+        let folder = folder(tmp.path());
+        fs::create_dir_all(&folder).await.expect("creates");
+        let old = format!(
+            concat!(
+                r#"{{"pid":{},"instance":"an-instance","major":{},"token":"{}","#,
+                r#""socket":"/tmp/s1.sock","session":"s1","cwd":"/tmp","started_ms":7}}"#
+            ),
+            std::process::id(),
+            MAJOR,
+            "0123456789abcdef0123456789abcdef",
+        );
+        fs::write(folder.join("s1.json"), old)
+            .await
+            .expect("writes");
+        let listed = list(&folder).await;
+        assert_eq!(listed.len(), 1, "the entry of a live pid is listed");
+        assert!(!listed[0].waiting);
+    }
+
+    #[tokio::test]
+    async fn approval_mark_round_trips() {
+        let tmp = TempDir::new().expect("temp");
+        let folder = folder(tmp.path());
+        let mut entry = entry("s1", std::process::id(), &folder);
+        entry.waiting = true;
+        write(&folder, &entry).await.expect("writes");
+        assert_eq!(list(&folder).await, vec![entry]);
     }
 
     #[test]

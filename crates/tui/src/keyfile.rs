@@ -56,16 +56,19 @@ pub enum Section {
     Sidebar,
     /// The approval card's row of answers, `[card]`.
     Card,
+    /// The question card's rows, `[ask]`.
+    Ask,
 }
 
 /// The sections the file has a table for, in the order the notes name them.
-const WRITTEN: [Section; 6] = [
+const WRITTEN: [Section; 7] = [
     Section::Keys,
     Section::Leader,
     Section::List,
     Section::Sheet,
     Section::Sidebar,
     Section::Card,
+    Section::Ask,
 ];
 
 impl Section {
@@ -81,6 +84,7 @@ impl Section {
             Section::Sheet => SHEET,
             Section::Sidebar => SIDEBAR,
             Section::Card => CARD,
+            Section::Ask => ASK,
         }
     }
 
@@ -93,6 +97,7 @@ impl Section {
             Section::Sheet => "sheet",
             Section::Sidebar => "sidebar",
             Section::Card => "card",
+            Section::Ask => "ask",
         }
     }
 
@@ -521,12 +526,47 @@ static CARD: &[Row] = &[
     },
 ];
 
+/// The question card's keys: the pick, the answer, the next question and the
+/// skip.
+static ASK: &[Row] = &[
+    Row {
+        name: "up",
+        keys: "up,ctrl+p",
+    },
+    Row {
+        name: "down",
+        keys: "down,ctrl+n",
+    },
+    Row {
+        name: "answer",
+        keys: "enter",
+    },
+    Row {
+        name: "next",
+        keys: "tab",
+    },
+    Row {
+        name: "toggle",
+        keys: "space",
+    },
+    Row {
+        name: "skip",
+        keys: "esc",
+    },
+    Row {
+        name: "new-line",
+        keys: "ctrl+j,shift+enter",
+    },
+];
+
 /// The chain of a key press with nothing else on screen.
 pub const KEYS_CHAIN: &[Section] = &[Section::Keys];
 /// The chain of the key that follows the leader.
 pub const LEADER_CHAIN: &[Section] = &[Section::Leader, Section::Keys];
 /// The chain of a key press while an approval card takes its answers.
 pub const CARD_CHAIN: &[Section] = &[Section::Card, Section::Keys];
+/// The chain of a key press while a question card takes its answers.
+pub const ASK_CHAIN: &[Section] = &[Section::Ask, Section::Keys];
 /// The chain of a key press while a sheet is open: the sheet's keys, then only
 /// the quit and the leader of the text box's.
 pub const SHEET_CHAIN: &[Section] = &[Section::Sheet, Section::KeysQuitLeader];
@@ -736,6 +776,10 @@ pub struct Labels {
     delete: String,
     /// The keys that answer the approval card, for the status line.
     answer: String,
+    /// The keys that pick and answer a question, for its card's hint row.
+    ask: String,
+    /// The keys that edit and send a typed answer, for the card's hint row.
+    ask_text: String,
     /// One per foot of [`Foot`], in its order.
     feet: Box<[String]>,
     /// One per row of the command table, in its order.
@@ -791,6 +835,16 @@ impl Labels {
     /// The keys that move through the card's answers and pick one.
     pub fn answer(&self) -> &str {
         &self.answer
+    }
+
+    /// The keys that pick a row of a question card and answer the question.
+    pub fn ask(&self) -> &str {
+        &self.ask
+    }
+
+    /// The keys that edit a typed answer and send it.
+    pub fn ask_text(&self) -> &str {
+        &self.ask_text
     }
 
     /// The key one row of the command table shows, by its place there.
@@ -988,6 +1042,14 @@ impl KeyFile {
         file.labels = Labels {
             delete: label("sheet:delete", "", &file.moved),
             answer: labelled(answer, &file.moved),
+            ask: labelled(
+                "1-9 or {ask:up} {ask:down} pick \u{b7} type to answer \u{b7} {ask:answer} answers \u{b7} {ask:next} next question \u{b7} {ask:skip} skips",
+                &file.moved,
+            ),
+            ask_text: labelled(
+                "{ask:answer} sends your answer \u{b7} {ask:new-line} new line \u{b7} {ask:skip} clears",
+                &file.moved,
+            ),
             feet: Foot::ALL
                 .iter()
                 .map(|foot| labelled(foot.text(), &file.moved))

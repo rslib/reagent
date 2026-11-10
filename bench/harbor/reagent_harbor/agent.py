@@ -291,7 +291,7 @@ def build_command(
         f"mkdir -p {shlex.quote(str(logs_dir))}; "
         f'v="${{{task_env}}}"; unset {task_env}; '
         f"printf '%s' \"$v\" | "
-        f"{_AGENT_BINARY} --json --cwd {shlex.quote(workdir)} "
+        f"{_AGENT_BINARY} --json --no-serve --cwd {shlex.quote(workdir)} "
         f"--model {shlex.quote(model_id)} "
         f"{provider_flags}{policy_flag}{max_tokens_flag}{deadline}"
         f"-p - "

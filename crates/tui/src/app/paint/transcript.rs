@@ -769,6 +769,7 @@ impl Group {
         rows.width = width.saturating_sub(rows::INDENT);
         let mut branch = rows::Branch::new(sink, hang);
         let fold = self.draw_member(member, rows, &mut branch, styles, folds, place.open);
+        branch.settle();
         rows.width = width;
         fold
     }
@@ -1409,10 +1410,11 @@ pub(crate) mod rows {
             rows.air(&mut null);
             // A run that still goes and a run of one call draw no summary row.
             if !group.going && group.calls > 1 {
-                // The summary's padding row, the summary row, and its pad again.
-                for _ in 0..SUMMARY_ROWS {
+                // The rows of the summary card and the blank row under it.
+                for _ in 0..=SUMMARY_ROWS {
                     let _ = rows.line(&mut null);
                 }
+                rows.blank = true;
             }
             row.members
                 .member_at(&mut rows, &styles, &self.folds, true, offset)
@@ -1831,6 +1833,10 @@ pub(crate) mod rows {
         lead: Lead,
         /// The row whose lead is drawn already.
         drawn: Option<u16>,
+        /// The open row whose lead waits for its text: the member's first row
+        /// of text takes the branch, so the line goes in only once the row
+        /// ends without it. A row of runs keeps the first text at a column.
+        waiting: Option<u16>,
     }
 
     impl<'a> Branch<'a> {
@@ -1844,13 +1850,27 @@ pub(crate) mod rows {
                 last: hang.last,
                 lead: Lead::Branch,
                 drawn: None,
+                waiting: None,
+            }
+        }
+
+        /// Draws the line of the open row when it ended with no text that
+        /// takes the branch.
+        pub(crate) fn settle(&mut self) {
+            if let Some(y) = self.waiting.take() {
+                self.line(y);
             }
         }
 
         /// The lead of a row that puts `text`: the branch on the member's first
         /// row of text, and the line on every other row.
         fn start(&mut self, y: u16, text: &str) {
-            if self.lead == Lead::Branch && text != BAR {
+            if self.lead == Lead::Branch {
+                if text == BAR {
+                    self.waiting = Some(y);
+                    return;
+                }
+                self.waiting = None;
                 self.inner.put(y, 0, self.edge, self.rail);
                 self.lead = if self.last { Lead::Blank } else { Lead::Line };
                 self.drawn = Some(y);
@@ -1871,8 +1891,13 @@ pub(crate) mod rows {
 
     impl Sink for Branch<'_> {
         fn row(&mut self, y: u16) {
+            self.settle();
             self.inner.row(y);
-            self.line(y);
+            if self.lead == Lead::Branch {
+                self.waiting = Some(y);
+            } else {
+                self.line(y);
+            }
         }
 
         fn fill(&mut self, y: u16, style: u32) {
@@ -1905,6 +1930,7 @@ pub(crate) mod rows {
         }
 
         fn end(&mut self) {
+            self.settle();
             self.inner.end();
         }
 
@@ -2541,12 +2567,20 @@ pub(crate) mod rows {
         paint_plain_row(rows, sink, tool, open, styles);
         paint_diff(rows, sink, styles, shown, tool.diff);
         if open {
-            if let Some(error) = tool.error {
+            let shown = if let Some(error) = tool.error {
                 paint_error(rows, sink, error, styles);
+                !error.is_empty()
             } else if tool.diff.is_empty()
                 && let Some(output) = tool.output
             {
                 paint_output(rows, sink, output, tool.earlier, styles);
+                !output.is_empty()
+            } else {
+                false
+            };
+            // The next member of an open run would sit on the last line.
+            if shown {
+                rows.air(sink);
             }
         }
     }
@@ -2714,6 +2748,15 @@ pub(crate) mod rows {
     /// A padding row of a card: the surface and the bar alone.
     fn pad(rows: &mut Rows, sink: &mut dyn Sink, styles: &Styles) {
         let _ = card_row(rows, sink, styles);
+    }
+
+    /// The blank row between an open run's summary card and its first member,
+    /// with no fill and the tree line in column 0.
+    fn rail_air(rows: &mut Rows, sink: &mut dyn Sink, rail: u32) {
+        if let Some(y) = rows.line(sink) {
+            sink.put_until(y, 0, RAIL, rail, rows.width);
+        }
+        rows.blank = true;
     }
 
     /// A padding row of a card that starts with `edge` in column 0.
@@ -3179,6 +3222,7 @@ pub(crate) mod rows {
             group.members.paint_failed(rows, sink, styles, folds);
             return;
         }
+        rail_air(rows, sink, styles.paints.bar);
         group.members.paint_members(rows, sink, styles, folds, open);
     }
 
@@ -4587,6 +4631,67 @@ pub(crate) mod rows {
             );
         }
 
+        /// An open call in an open run keeps a blank row under what it shows,
+        /// so the next member's row does not sit on its last line.
+        #[test]
+        fn open_call_in_an_open_run_keeps_a_blank_row_under_its_output() {
+            let mut app = app(true);
+            let fold = app.folds.add();
+            let mut ask = answered(
+                "1",
+                "ask",
+                r#"{"questions":[{"q":"Which language?","options":[{"label":"Rust"},{"label":"Go"}]}]}"#,
+                3,
+            );
+            ask.fold = app.folds.add();
+            let mut read = call("2", "read", r#"{"path":"src/x.rs"}"#);
+            read.fold = app.folds.add();
+            app.folds.toggle(fold);
+            app.folds.toggle(ask.fold);
+            let run = Group::new(vec![ask, read], fold);
+
+            paint_summary(&mut app, &run);
+            let rows = screen_rows(&app);
+            let shown = rows.join("\n");
+            let read = at(&rows, "src/x.rs").expect("the read's row");
+            assert_eq!(
+                rows[read - 1],
+                "\u{2502}",
+                "a blank row above the read:\n{shown}"
+            );
+            assert!(rows[read - 2].ends_with('x'), "the ask's output:\n{shown}");
+        }
+
+        /// An open run keeps a blank row with no fill between its summary card
+        /// and a first member that draws no card, which takes no air itself.
+        #[test]
+        fn open_run_keeps_a_blank_row_above_a_plain_first_member() {
+            let mut app = app(true);
+            let fold = app.folds.add();
+            let run = Group::new(
+                vec![
+                    call("1", "read", r#"{"path":"src/x.rs"}"#),
+                    call("2", "bash", r#"{"command":"ls"}"#),
+                ],
+                fold,
+            );
+            app.folds.toggle(fold);
+            let surface = app.style(Role::SurfaceFill, Emphasis::Plain);
+            let last = app.screen.columns() - MARGIN - 1;
+
+            paint_summary(&mut app, &run);
+            let rows = screen_rows(&app);
+            let shown = rows.join("\n");
+            let summary = at(&rows, "\u{2713} read 1").expect("the summary row");
+            let read = at(&rows, "src/x.rs").expect("the read's row");
+            assert_eq!(read, summary + 3, "pad, then a blank row:\n{shown}");
+            assert_eq!(rows[read - 1], "\u{2502}", "{shown}");
+            let pad = u16::try_from(summary + 1).expect("a row");
+            assert_eq!(style(&app, last, pad), surface, "the pad:\n{shown}");
+            let gap = u16::try_from(read - 1).expect("a row");
+            assert_ne!(style(&app, last, gap), surface, "the gap:\n{shown}");
+        }
+
         /// An open run hangs its members from a tree line: the summary's border
         /// is `│` in the middle of column 0, the line runs down the gaps, each
         /// member's first row takes `├───` (the last `└───`), and the members
@@ -5662,11 +5767,11 @@ pub(crate) mod rows {
             app.screen.clear();
             let drawn = app.paint_live(0, ROWS, 0);
             assert_eq!(
-                drawn, 15,
-                "a blank row, the group's padding row, its row and the padding row \
-                 under it, a row and its line per call, a blank row"
+                drawn, 20,
+                "a blank row, the group's padding row, its row, the padding row \
+                 and a blank row under it, a row, its line and a blank row per call"
             );
-            assert_eq!(app.live_rows(), 15, "the count is the rows it draws");
+            assert_eq!(app.live_rows(), 20, "the count is the rows it draws");
             let rows = screen_rows(&app);
             assert!(
                 rows[2].starts_with("\u{2502} ✓ read 3 files \u{b7} grep 2"),
@@ -5682,7 +5787,7 @@ pub(crate) mod rows {
             ];
             let last = wants.len() - 1;
             for (index, want) in wants.into_iter().enumerate() {
-                let line = &rows[4 + 2 * index];
+                let line = &rows[5 + 3 * index];
                 assert!(
                     line.contains(want),
                     "call {index} draws under the group's row, wanted {want:?}:\n{}",
@@ -5696,14 +5801,14 @@ pub(crate) mod rows {
                     "\u{2502}     x"
                 };
                 assert_eq!(
-                    rows[5 + 2 * index],
+                    rows[6 + 3 * index],
                     lead,
                     "the line call {index} printed follows its row:\n{}",
                     rows.join("\n")
                 );
             }
             assert!(
-                rows[14].is_empty(),
+                rows[19].is_empty(),
                 "no row past the last call:\n{}",
                 rows.join("\n")
             );
@@ -6339,6 +6444,33 @@ pub(crate) mod rows {
                 assert_eq!(style(&app, 5, y), surface, "{what} at 4:\n{shown}");
                 assert_ne!(style(&app, 2, y), surface, "{what}'s lead:\n{shown}");
             }
+        }
+
+        /// An open run stored in the ring draws each member's branch whole: the
+        /// line of a row goes in only when the row ends without the member's
+        /// first text, so the branch is not cut behind it.
+        #[test]
+        fn a_stored_open_run_draws_each_branch_whole() {
+            let mut app = app(true);
+            let fold = app.folds.add();
+            let run = Group::new(
+                vec![
+                    call("1", "read", r#"{"path":"src/x.rs"}"#),
+                    call("2", "bash", r#"{"command":"cargo test"}"#),
+                ],
+                fold,
+            );
+            app.folds.toggle(fold);
+            app.pending.push(Item::Group(Box::new(run)));
+            app.commit();
+            app.paint();
+            let rows = screen_rows(&app);
+            let shown = rows.join("\n");
+            let read = at(&rows, "src/x.rs").expect("the read's row");
+            assert!(rows[read].starts_with("├───"), "{shown}");
+            let bash = at(&rows, "$ cargo test").expect("the bash card's title");
+            assert!(rows[bash].starts_with("└───\u{258e}"), "{shown}");
+            assert_eq!(rows[bash - 1], "│   \u{258e}", "the pad:\n{shown}");
         }
 
         #[test]

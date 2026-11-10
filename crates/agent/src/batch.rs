@@ -379,7 +379,11 @@ async fn run_call(
             Planned::Run | Planned::Contain(_) => {}
         }
     }
+    // The call is polled first, so a tool that watches the token answers its
+    // own cancel before the batch drops it: a question that waits reports that
+    // nobody answered instead of vanishing with its id.
     tokio::select! {
+        biased;
         output = tool.run(args, token) => Some(output),
         () = token.cancelled() => None,
     }

@@ -13,6 +13,12 @@ pub trait Terminal {
     /// Terminal size as `(columns, rows)`.
     fn size(&self) -> (u16, u16);
 
+    /// The size of one cell in pixels, read when the size is; `None` when the
+    /// terminal reports no pixel size.
+    fn cell(&self) -> Option<crate::picture::CellShape> {
+        None
+    }
+
     /// Write one whole frame as exactly one write call. A slow pty must not
     /// block the runtime, so this is a future, not a blocking call.
     fn write_frame(&mut self, frame: &[u8]) -> impl Future<Output = io::Result<()>>;

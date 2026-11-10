@@ -14,7 +14,7 @@ use reagent_ai::{
 use crate::archive::Archive;
 use crate::batch::{Note, Outcome, run_all_noted};
 use crate::compact::{Compact, Compacted};
-use crate::event::{Event, TurnEndReason};
+use crate::event::{DropReason, Event, MessageState, TurnEndReason};
 use crate::guard::{Answer, Guard};
 use crate::journal::Journal;
 use crate::journal::record::ApprovalKind;
@@ -23,6 +23,7 @@ use crate::journal::state::State;
 use crate::live::{ClientId, Command, Inbox, SendMode, Settings, Waiting};
 use crate::mask::Mask;
 use crate::policy::{PolicyRun, TurnPolicy, TurnView};
+use crate::question::{Answers, Questions};
 use crate::reread::Ledger;
 use crate::tool::{EffectClass, Identity, Registry};
 use crate::workspace::Workspace;
@@ -113,6 +114,9 @@ pub struct Agent<'a> {
     /// The compaction a client may ask for when the policy is off.
     requested: Option<Compact>,
     guard: Option<Guard>,
+    /// The questions a model's `ask` call waits on, when the session offers
+    /// that tool.
+    questions: Option<Arc<Questions>>,
     ledger: Ledger,
     workspace: Option<&'a dyn Workspace>,
     fingerprint: Option<u64>,
@@ -168,6 +172,7 @@ impl<'a> Agent<'a> {
             compact: None,
             requested: None,
             guard: None,
+            questions: None,
             ledger: Ledger::default(),
             workspace: None,
             fingerprint: None,
@@ -209,6 +214,7 @@ impl<'a> Agent<'a> {
             compact: None,
             requested: None,
             guard: None,
+            questions: None,
             ledger: Ledger::default(),
             workspace: None,
             fingerprint: None,
@@ -258,6 +264,18 @@ impl<'a> Agent<'a> {
     #[must_use]
     pub fn with_guard(mut self, guard: Guard) -> Self {
         self.guard = Some(guard);
+        self
+    }
+
+    /// Waits on `questions` for the answers to an `ask` call (see
+    /// [`Questions`]).
+    ///
+    /// The registry is the one the session's [`crate::question::Ask`] tool was
+    /// built over, so an answer reaches the call whichever clone of the
+    /// registry the loop holds. Without one, an answer is ignored.
+    #[must_use]
+    pub fn with_questions(mut self, questions: Arc<Questions>) -> Self {
+        self.questions = Some(questions);
         self
     }
 
@@ -333,13 +351,20 @@ impl<'a> Agent<'a> {
         let run = self.token.child_token();
         let session = std::mem::replace(&mut self.token, run);
         // The clients of the session answer the calls the rules send to a
-        // person; a run without an inbox keeps refusing them.
+        // person and the questions the model asks; a run without an inbox
+        // keeps refusing the first and answers the second itself.
         if let Some(guard) = self.guard.as_mut() {
             guard.listen(events.clone());
+        }
+        if let Some(questions) = self.questions.as_ref() {
+            questions.listen(events.clone());
         }
         self.run_inner(history, journal, events, Some(inbox)).await;
         if let Some(guard) = self.guard.as_mut() {
             guard.hush();
+        }
+        if let Some(questions) = self.questions.as_ref() {
+            questions.hush();
         }
         self.token = session;
     }
@@ -554,14 +579,18 @@ impl<'a> Agent<'a> {
         let mut drained = Drained::default();
         let mut pending = inbox.take_pending().into_iter();
         while let Some(waiting) = pending.next() {
+            let id = waiting.message;
             let client = waiting.client;
             let message = waiting.message();
             if let Err(error) = write(journal, &message) {
-                inbox.restore(Waiting::restored(client, message), pending);
+                inbox.restore(Waiting::restored(id, client, message), pending);
                 drained.error = Some(error);
                 break;
             }
             history.push(message);
+            // The message joined the turn, so its clients hear that here,
+            // before the events of the request that carries it.
+            self.landed(id, events).await;
             drained.steered = true;
         }
         self.apply_held(inbox, events).await;
@@ -617,16 +646,22 @@ impl<'a> Agent<'a> {
         while let Some(command) = inbox.ready() {
             match command {
                 Command::Send {
+                    message,
                     client,
                     text,
                     blocks,
                     mode,
                 } => {
-                    self.accept(Waiting::new(client, text, blocks), mode, inbox, events)
-                        .await;
+                    self.accept(
+                        Waiting::new(message, client, text, blocks),
+                        mode,
+                        inbox,
+                        events,
+                    )
+                    .await;
                 }
                 Command::Cancel { .. } => {
-                    inbox.clear_waiting();
+                    self.drop_waiting(inbox, events).await;
                     self.token.cancel();
                     return true;
                 }
@@ -635,6 +670,11 @@ impl<'a> Agent<'a> {
                 Command::Approve { client, id, answer } => {
                     self.approve(client, id, answer, events).await;
                 }
+                Command::Answer {
+                    client,
+                    id,
+                    answers,
+                } => self.answered(client, id, answers, events).await,
             }
         }
         false
@@ -775,13 +815,19 @@ impl<'a> Agent<'a> {
     ) {
         match command {
             Command::Send {
+                message,
                 client,
                 text,
                 blocks,
                 mode,
             } => {
-                self.accept(Waiting::new(client, text, blocks), mode, inbox, events)
-                    .await;
+                self.accept(
+                    Waiting::new(message, client, text, blocks),
+                    mode,
+                    inbox,
+                    events,
+                )
+                .await;
             }
             Command::Set { settings, .. } => self.set(settings, events).await,
             // No run is open to compact before a request, so it runs at once.
@@ -804,9 +850,14 @@ impl<'a> Agent<'a> {
             Command::Approve { client, id, answer } => {
                 self.approve(client, id, answer, events).await;
             }
+            Command::Answer {
+                client,
+                id,
+                answers,
+            } => self.answered(client, id, answers, events).await,
             // Nothing is running to stop; the session stays open, and what
             // waited for a run is dropped as a cancel during a run drops it.
-            Command::Cancel { .. } => inbox.clear_waiting(),
+            Command::Cancel { .. } => self.drop_waiting(inbox, events).await,
         }
     }
 
@@ -823,6 +874,7 @@ impl<'a> Agent<'a> {
         events: &mpsc::Sender<Event>,
     ) {
         let event = Event::UserMessage {
+            message: waiting.message,
             client: waiting.client,
             mode,
             text: waiting.text.clone(),
@@ -840,6 +892,30 @@ impl<'a> Agent<'a> {
         match mode {
             SendMode::Steer => inbox.steer(waiting),
             SendMode::Queue => inbox.queue(waiting),
+        }
+    }
+
+    /// Tells every client that the message `message` is in the conversation,
+    /// once per message, before the events of the request that carries it.
+    pub(crate) async fn landed(&self, message: u64, events: &mpsc::Sender<Event>) {
+        let event = Event::MessageState {
+            message,
+            state: MessageState::Landed,
+            reason: None,
+        };
+        let _ = emit(events, &self.token, event).await;
+    }
+
+    /// Tells every client that a cancel dropped each message the inbox waits
+    /// with, once per message.
+    pub(crate) async fn drop_waiting(&self, inbox: &mut Inbox, events: &mpsc::Sender<Event>) {
+        for waiting in inbox.clear_waiting() {
+            let event = Event::MessageState {
+                message: waiting.message,
+                state: MessageState::Dropped,
+                reason: Some(DropReason::Cancelled),
+            };
+            let _ = emit(events, &self.token, event).await;
         }
     }
 
@@ -957,16 +1033,22 @@ impl<'a> Agent<'a> {
     async fn take_stream(&self, command: Command, inbox: &mut Inbox, events: &mpsc::Sender<Event>) {
         match command {
             Command::Send {
+                message,
                 client,
                 text,
                 blocks,
                 mode,
             } => {
-                self.accept(Waiting::new(client, text, blocks), mode, inbox, events)
-                    .await;
+                self.accept(
+                    Waiting::new(message, client, text, blocks),
+                    mode,
+                    inbox,
+                    events,
+                )
+                .await;
             }
             Command::Cancel { .. } => {
-                inbox.clear_waiting();
+                self.drop_waiting(inbox, events).await;
                 self.token.cancel();
             }
             Command::Set { settings, .. } => inbox.hold(settings),
@@ -974,6 +1056,11 @@ impl<'a> Agent<'a> {
             Command::Approve { client, id, answer } => {
                 self.approve(client, id, answer, events).await;
             }
+            Command::Answer {
+                client,
+                id,
+                answers,
+            } => self.answered(client, id, answers, events).await,
         }
     }
 
@@ -995,6 +1082,28 @@ impl<'a> Agent<'a> {
         };
         if !routed {
             let message = format!("approval {id} is already resolved");
+            emit(events, &self.token, Event::Error(Text::from(message))).await;
+        }
+    }
+
+    /// Routes a client's answer to the question that waits for it.
+    ///
+    /// An answer to a question no call waits for any more is reported to every
+    /// client with its id, so nobody believes the model heard it. A session
+    /// with no question registry has no call that asks, so an answer is
+    /// ignored.
+    async fn answered(
+        &self,
+        client: ClientId,
+        id: u64,
+        answers: Answers,
+        events: &mpsc::Sender<Event>,
+    ) {
+        let Some(questions) = self.questions.as_ref() else {
+            return;
+        };
+        if !questions.answer(client, id, answers) {
+            let message = format!("question {id} is already resolved");
             emit(events, &self.token, Event::Error(Text::from(message))).await;
         }
     }
@@ -1051,12 +1160,18 @@ impl<'a> Agent<'a> {
         if let Some(guard) = self.guard.as_mut() {
             guard.listen(events.clone());
         }
+        if let Some(questions) = self.questions.as_ref() {
+            questions.listen(events.clone());
+        }
         self.live = true;
         let reason = self
             .run_pending_inner(history, journal, events, pending, Some(inbox))
             .await;
         if let Some(guard) = self.guard.as_mut() {
             guard.hush();
+        }
+        if let Some(questions) = self.questions.as_ref() {
+            questions.hush();
         }
         self.token = session;
         reason
@@ -5828,6 +5943,7 @@ mod tests {
                     },
                 },
                 Command::Send {
+                    message: 1,
                     client: 1,
                     text: Text::from("say more"),
                     blocks: Vec::new(),

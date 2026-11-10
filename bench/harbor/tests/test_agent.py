@@ -70,6 +70,7 @@ def test_the_command_passes_the_instruction_on_stdin_not_argv(
     # reagent reads the task from stdin: `-p -`, never the text itself.
     assert args == [
         "--json",
+        "--no-serve",
         "--cwd",
         "/app dir",
         "--model",
@@ -89,6 +90,13 @@ def test_the_command_adds_the_policy_flag(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     args = json.loads((tmp_path / "reagent.args").read_text())
     assert args[args.index("--policy") + 1] == "completion,budget"
+
+
+def test_the_command_passes_no_serve(tmp_path: Path) -> None:
+    # A benchmark run takes no clients, so it opens no socket.
+    run_command(tmp_path, timeout_sec=None)
+    args = json.loads((tmp_path / "reagent.args").read_text())
+    assert "--no-serve" in args
 
 
 def test_the_command_sets_the_deadline_below_the_timeout(tmp_path: Path) -> None:

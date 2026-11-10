@@ -225,6 +225,7 @@ fn name_of(line: &str) -> &'static str {
         Request::Attach { .. } => "attach",
         Request::Send { .. } => "send",
         Request::Approve { .. } => "approve",
+        Request::Answer { .. } => "answer",
         Request::Cancel => "cancel",
         Request::Detach => "detach",
         Request::Set { .. } => "set",
@@ -3199,6 +3200,15 @@ fn short_result_of_a_grep_counts_matches() {
         right_of("find", r#"{"pattern":"*.rs"}"#, "src/a.rs\nsrc/b.rs\n"),
         "2 files"
     );
+}
+
+/// An `ask` row shows the first question, not the call's JSON.
+#[test]
+fn question_the_ask_row_shows_the_first_question() {
+    let mut tool = super::Tool::new("call-1", "ask");
+    let arguments = r#"{"questions":[{"q":"Which language?","options":[{"label":"Rust"}]},{"q":"Which tests?"}]}"#;
+    tool.set_call("ask", arguments, COLUMNS);
+    assert_eq!(tool.target, "Which language?");
 }
 
 #[test]
@@ -9453,6 +9463,7 @@ fn picture_source() -> crate::picture::Source {
 
 /// The picture of the fixture PNG, the cells it draws as and its source.
 fn picture(room: u32) -> super::Picture {
+    let room = crate::picture::Room::columns(room);
     let source = picture_source();
     super::Picture {
         cells: crate::picture::cells(&source.data, room),

@@ -170,6 +170,18 @@ pub enum Frame<'a> {
         /// The id of the request.
         id: u64,
     },
+    /// The `ask` tool waits for answers: what the card shows.
+    QuestionRequest {
+        /// The id the answer names.
+        id: u64,
+        /// The questions, in the order the model asked them.
+        questions: Vec<Question<'a>>,
+    },
+    /// A question request got its answer, from this client or another.
+    QuestionResolved {
+        /// The id of the request.
+        id: u64,
+    },
     /// Another client joined the session.
     ClientJoined {
         /// The id the worker gave the client.
@@ -187,6 +199,31 @@ pub enum Frame<'a> {
     /// A method or an event type this build does not know, or an answer to a
     /// request: nothing to draw.
     Unknown,
+}
+
+/// One question an `ask` call puts to the person.
+#[derive(Debug, Deserialize)]
+pub struct Question<'a> {
+    /// The question text.
+    #[serde(borrow)]
+    pub q: Cow<'a, str>,
+    /// The answers offered, in the order the card numbers them.
+    #[serde(borrow, default)]
+    pub options: Vec<QuestionOption<'a>>,
+    /// Whether several options may be checked.
+    #[serde(default)]
+    pub multi: bool,
+}
+
+/// One answer a question offers.
+#[derive(Debug, Deserialize)]
+pub struct QuestionOption<'a> {
+    /// The label an answer reads back.
+    #[serde(borrow)]
+    pub label: Cow<'a, str>,
+    /// The short note the card draws after the label, when it has one.
+    #[serde(default, borrow, deserialize_with = "cow")]
+    pub note: Option<Cow<'a, str>>,
 }
 
 /// What an approval request shows the user.
@@ -395,6 +432,38 @@ impl Client {
         if let Some(reason) = reason {
             self.out.extend_from_slice(b",\"reason\":");
             push_str(&mut self.out, reason);
+        }
+        self.out.extend_from_slice(b"}}\n");
+        self.flush().await
+    }
+
+    /// Answers the question request `id`: one list of picks or own text per
+    /// question, in the order they were asked, or `None` to skip them all.
+    pub async fn answer(&mut self, id: u64, answers: Option<&[Vec<String>]>) -> io::Result<()> {
+        let request = self.id();
+        begin(&mut self.out, request, "answer");
+        self.out.extend_from_slice(b"{\"id\":");
+        push_u64(&mut self.out, id);
+        self.out.extend_from_slice(b",\"answers\":");
+        match answers {
+            None => self.out.extend_from_slice(b"null"),
+            Some(lists) => {
+                self.out.push(b'[');
+                for (at, list) in lists.iter().enumerate() {
+                    if at > 0 {
+                        self.out.push(b',');
+                    }
+                    self.out.push(b'[');
+                    for (index, label) in list.iter().enumerate() {
+                        if index > 0 {
+                            self.out.push(b',');
+                        }
+                        push_str(&mut self.out, label);
+                    }
+                    self.out.push(b']');
+                }
+                self.out.push(b']');
+            }
         }
         self.out.extend_from_slice(b"}}\n");
         self.flush().await
@@ -627,6 +696,7 @@ pub fn decode(line: &[u8]) -> Option<Frame<'_>> {
         context_window,
         level,
         mode,
+        questions,
     } = params?;
     Some(match (&*method, kind.as_deref().unwrap_or_default()) {
         ("event", "turn_start") => Frame::TurnStart,
@@ -686,6 +756,11 @@ pub fn decode(line: &[u8]) -> Option<Frame<'_>> {
             saves: save,
         },
         ("approval_resolved", _) => Frame::ApprovalResolved { id: id?.num()? },
+        ("question_request", _) => Frame::QuestionRequest {
+            id: id?.num()?,
+            questions,
+        },
+        ("question_resolved", _) => Frame::QuestionResolved { id: id?.num()? },
         ("closing", _) => Frame::Closing(reason?),
         ("settings", _) => Frame::Settings {
             model: model.unwrap_or_default(),
@@ -785,6 +860,9 @@ struct Params<'a> {
     level: Option<Cow<'a, str>>,
     #[serde(default, borrow, deserialize_with = "cow")]
     mode: Option<Cow<'a, str>>,
+    /// The questions a `question_request` names.
+    #[serde(borrow, default)]
+    questions: Vec<Question<'a>>,
 }
 
 /// One string field of a line: borrowed when the line wrote it verbatim, and
@@ -1523,6 +1601,11 @@ mod tests {
             .approve(9, message::AnswerKind::Refuse, Some("no"))
             .await
             .expect("approve");
+        client
+            .answer(9, Some(&[vec!["sqlite".to_owned()], vec![]]))
+            .await
+            .expect("answer");
+        client.answer(9, None).await.expect("skip");
         client.cancel().await.expect("cancel");
         client.detach().await.expect("detach");
         // The handshake's own line comes first.
@@ -1531,7 +1614,7 @@ mod tests {
             .expect("the handshake")
             .expect("the fake worker");
         let mut got = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..6 {
             let line = timeout(WAIT, fake.sent.recv())
                 .await
                 .expect("a request")
@@ -1544,6 +1627,8 @@ mod tests {
             vec![
                 "Send { text: \"say \\\"hi\\\"\\nnow\", mode: Steer }".to_owned(),
                 "Approve { id: 9, answer: Refuse, reason: Some(\"no\") }".to_owned(),
+                "Answer { id: 9, answers: Some([[\"sqlite\"], []]) }".to_owned(),
+                "Answer { id: 9, answers: None }".to_owned(),
                 "Cancel".to_owned(),
                 "Detach".to_owned(),
             ],
@@ -1845,6 +1930,35 @@ mod tests {
                 assert!(saves.is_empty());
             }
             other => panic!("expected the approval request, got {other:?}"),
+        }
+    }
+
+    /// A question request carries the questions, their options and their notes,
+    /// and a resolved notice names the request it closes.
+    #[test]
+    fn question_request_carries_the_questions_and_their_notes() {
+        match frame(
+            r#"{"jsonrpc":"2.0","method":"question_request","params":{"id":3,"questions":[{"q":"Which database?","options":[{"label":"sqlite"},{"label":"postgres","note":"on the server"}],"multi":false},{"q":"Which stores?","options":[{"label":"redis"}],"multi":true}]}}"#,
+        ) {
+            Some(Frame::QuestionRequest { id, questions }) => {
+                assert_eq!(id, 3);
+                assert_eq!(questions.len(), 2, "one entry per question");
+                let first = &questions[0];
+                assert_eq!(first.q, "Which database?");
+                assert!(!first.multi);
+                assert_eq!(first.options.len(), 2);
+                assert_eq!(first.options[0].label, "sqlite");
+                assert_eq!(first.options[0].note, None, "an option may have no note");
+                assert_eq!(first.options[1].note.as_deref(), Some("on the server"));
+                assert!(questions[1].multi, "a question may take several picks");
+            }
+            other => panic!("expected the question request, got {other:?}"),
+        }
+        match frame(
+            r#"{"jsonrpc":"2.0","method":"question_resolved","params":{"id":3,"client":7}}"#,
+        ) {
+            Some(Frame::QuestionResolved { id }) => assert_eq!(id, 3),
+            other => panic!("expected the resolved question, got {other:?}"),
         }
     }
 

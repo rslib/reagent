@@ -40,6 +40,8 @@ fn method(event: &Event) -> &'static str {
     match event {
         Event::ApprovalRequest(_) => methods::APPROVAL_REQUEST,
         Event::ApprovalResolved { .. } => methods::APPROVAL_RESOLVED,
+        Event::QuestionRequest(_) => methods::QUESTION_REQUEST,
+        Event::QuestionResolved { .. } => methods::QUESTION_RESOLVED,
         _ => methods::EVENT,
     }
 }
@@ -51,6 +53,8 @@ pub(crate) fn kind(event: &Event) -> hub::Kind {
         Event::Committed { .. } => hub::Kind::Committed,
         Event::ApprovalRequest(request) => hub::Kind::ApprovalRequest(request.id),
         Event::ApprovalResolved { id, .. } => hub::Kind::ApprovalResolved(*id),
+        Event::QuestionRequest(request) => hub::Kind::QuestionRequest(request.id),
+        Event::QuestionResolved { id, .. } => hub::Kind::QuestionResolved(*id),
         Event::RunEnd(_) => hub::Kind::RunEnd,
         _ => hub::Kind::Other,
     }

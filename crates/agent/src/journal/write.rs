@@ -681,6 +681,7 @@ async fn commit_events_rise_and_are_one_per_commit() {
     );
     let client = async {
         tx.send(Command::Send {
+            message: 1,
             client: 1,
             text: Text::from("hello"),
             blocks: Vec::new(),
@@ -738,6 +739,7 @@ async fn commit_event_names_a_record_that_is_readable() {
     );
     let client = async {
         tx.send(Command::Send {
+            message: 1,
             client: 1,
             text: Text::from("hello"),
             blocks: Vec::new(),
@@ -832,6 +834,7 @@ async fn a_set_of_the_level_and_the_mode_is_in_the_journal_and_a_resume() {
         .await
         .expect("the session is open");
         tx.send(Command::Send {
+            message: 1,
             client: 1,
             text: Text::from("hello"),
             blocks: Vec::new(),
@@ -897,6 +900,7 @@ async fn a_settings_event_names_what_the_journal_recorded() {
         .await
         .expect("the session is open");
         tx.send(Command::Send {
+            message: 1,
             client: 1,
             text: Text::from("hello"),
             blocks: Vec::new(),
@@ -979,6 +983,7 @@ async fn a_resume_of_a_waiting_approval_asks_the_same_question() {
     let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new())
         .with_guard(asking_guard());
     tx.send(Command::Send {
+        message: 1,
         client: 1,
         text: Text::from("hello"),
         blocks: Vec::new(),
@@ -1253,6 +1258,7 @@ async fn a_set_level_and_mode_survive_a_compaction_base_on_resume() {
         .await
         .expect("the session is open");
         tx.send(Command::Send {
+            message: 1,
             client: 1,
             text: Text::from("go"),
             blocks: Vec::new(),
@@ -1315,6 +1321,7 @@ async fn a_tool_result_commit_event_comes_before_its_result_event() {
     );
     let client = async {
         tx.send(Command::Send {
+            message: 1,
             client: 1,
             text: Text::from("hello"),
             blocks: Vec::new(),

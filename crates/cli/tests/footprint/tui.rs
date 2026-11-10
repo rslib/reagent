@@ -153,10 +153,10 @@ const BUSY_CPU_BUDGET: Duration = Duration::from_millis(100);
 const STILL: Duration = Duration::from_secs(2);
 
 /// How many clients each mode starts, whose smallest start is the one reported:
-/// a start is 12 to 46 ms from run to run, so one sample says nothing. Two, and
-/// not more: every client of this file starts at once in a suite that runs its
-/// tests in parallel, and the file's other cases measure a start too.
-const STARTS: usize = 2;
+/// a start is 12 to 60 ms from run to run on a busy machine, so one sample says
+/// nothing. Two missed the 50 ms budget together under load; the rounds run one
+/// after another, so five adds no clients running at the same time.
+const STARTS: usize = 5;
 
 /// The CPU time an idle client may use over [`IDLE`]. `ps` reads a live
 /// process's clock in 10 ms steps, so a report of 0 is under 10 ms; the budget
@@ -1070,7 +1070,7 @@ async fn the_full_screen_run_holds_the_inline_start_and_idle_budgets() {
     tokio::time::sleep(SETTLE).await;
 
     // The modes alternate, so a busy moment of the machine lands in both, and
-    // each mode's start is the smallest of its rounds: a start is 12 to 46 ms
+    // each mode's start is the smallest of its rounds: a start is 12 to 60 ms
     // from run to run, and the smallest is the mode's own cost.
     let (mut inline, mut full) = (Vec::with_capacity(STARTS), Vec::with_capacity(STARTS));
     let (mut inline_rss, mut full_rss) = (0, 0);

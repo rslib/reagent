@@ -19,6 +19,7 @@ pub mod picture_native;
 pub mod screen;
 pub mod slot;
 pub mod theme;
+pub mod watch;
 
 /// The terminal's input: the tty read with async I/O and the parser that turns
 /// its bytes into events.

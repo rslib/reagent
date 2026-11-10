@@ -2,13 +2,20 @@
 
 use std::io;
 
-use tokio::io::AsyncReadExt;
-
-/// 16 bytes from `/dev/urandom` as 32 lowercase hex characters.
+/// 16 bytes from `/dev/urandom` as 32 lowercase hex characters, read in one
+/// job on the blocking pool.
 pub async fn new_token() -> io::Result<String> {
+    tokio::task::spawn_blocking(new_token_blocking)
+        .await
+        .map_err(io::Error::other)?
+}
+
+/// [`new_token`] for a caller already on the blocking pool.
+#[expect(clippy::disallowed_types, reason = "runs inside spawn_blocking")]
+pub fn new_token_blocking() -> io::Result<String> {
+    use std::io::Read;
     let mut bytes = [0u8; 16];
-    let mut random = tokio::fs::File::open("/dev/urandom").await?;
-    random.read_exact(&mut bytes).await?;
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(hex(&bytes))
 }
 

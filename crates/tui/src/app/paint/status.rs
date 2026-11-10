@@ -59,6 +59,7 @@ const IDLE: &str = "idle";
 const WORKING: &str = "working";
 const INTERRUPT: &str = "esc interrupt";
 const WAITS: &str = "⏸ waits for you";
+const ASKING: &str = "? reagent asks you";
 const ANSWER_KEY: &str = "←→ enter";
 const ANSWER_WORD: &str = "answer";
 const RESYNCED: &str = "resynced";
@@ -92,7 +93,10 @@ impl App {
         if std::mem::take(&mut self.resynced) {
             self.status.push_str(RESYNCED);
         }
-        let (running, paused) = (self.running, self.approval.is_some());
+        let (running, paused) = (
+            self.running,
+            self.approval.is_some() || self.question.is_some(),
+        );
         let now = Instant::now();
         MOTION.with_borrow_mut(|motion| motion.take(running, paused, now));
     }
@@ -107,7 +111,7 @@ impl App {
     /// this clock as well: a stream that stalls leaves the bar and the elapsed
     /// time behind it moving.
     pub(crate) fn next_tick(&self) -> Option<Instant> {
-        if !self.running || self.approval.is_some() {
+        if !self.running || self.approval.is_some() || self.question.is_some() {
             return None;
         }
         let now = Instant::now();
@@ -154,7 +158,17 @@ impl App {
         let plain = self.style(Role::Text, Emphasis::Plain);
         let dim = self.style(Role::Dim, Emphasis::Plain);
         let mut x = PAD;
-        if self.approval.is_some() {
+        if self.question.is_some() {
+            // A question waits, so the run is paused: the glyph, the question,
+            // how long it has waited and what the run is doing.
+            let now = Instant::now();
+            let accent = self.style(Role::Accent, Emphasis::Bold);
+            x = self.screen.put_str_until(x, y, ASKING, accent, width);
+            x = x.saturating_add(1);
+            x = self
+                .screen
+                .put_str_until(x, y, motion.time(now), dim, width);
+        } else if self.approval.is_some() {
             // The box waits, so the run does: the glyph, the wait and the answer.
             let now = Instant::now();
             let warn = self.style(Role::Warn, Emphasis::Bold);

@@ -188,27 +188,39 @@ fn models_of(cwd: &Path, profile: Option<&str>, state: &Path) -> Models {
         .unwrap_or_default();
     let cache = crate::models::cache_dir();
     let folder = paths::sessions_root(state).join(paths::cwd_key(cwd));
-    models_in(&settings, &logins, cache.as_deref(), Some(&folder))
+    let set = |var: &str| std::env::var_os(var).is_some_and(|value| !value.is_empty());
+    models_in(&settings, &logins, &set, cache.as_deref(), Some(&folder))
 }
 
-/// What the sheet lists: each provider `settings` names that can sign in, with
-/// the models `cache` lists for it, and the models the sessions of `folder`
-/// used last.
+/// What the sheet lists: each provider `settings` names that can sign in, then
+/// each built-in preset with no table there that can sign in, with the models
+/// `cache` lists for each, and the models the sessions of `folder` used last.
+/// `set` says whether an environment variable holds a value.
 ///
 /// No network is read: a provider's models are the ones the models cache holds.
 fn models_in(
     settings: &Settings,
     logins: &Logins,
+    set: &dyn Fn(&str) -> bool,
     cache: Option<&Path>,
     folder: Option<&Path>,
 ) -> Models {
+    let bare = Table::default();
+    let presets = reagent_ai::providers::ALL
+        .iter()
+        .filter(|preset| !settings.providers.contains_key(preset.name))
+        .map(|preset| (preset.name, &bare));
+    let tables = settings
+        .providers
+        .iter()
+        .map(|(name, table)| (name.as_str(), table));
     let mut providers = Vec::with_capacity(settings.providers.len());
-    for (name, table) in &settings.providers {
-        let Some(note) = note_of(name, table, logins) else {
+    for (name, table) in tables.chain(presets) {
+        let Some(note) = note_of(name, table, logins, set) else {
             continue;
         };
         providers.push(Provider {
-            name: Arc::from(name.as_str()),
+            name: Arc::from(name),
             note,
             models: cache.map_or_else(Vec::new, |dir| entries_in(dir, name)),
         });
@@ -220,9 +232,14 @@ fn models_in(
 }
 
 /// How `name` signs in, or `None` when it has neither a key nor a saved login.
-fn note_of(name: &str, table: &Table, logins: &Logins) -> Option<Arc<str>> {
+fn note_of(
+    name: &str,
+    table: &Table,
+    logins: &Logins,
+    set: &dyn Fn(&str) -> bool,
+) -> Option<Arc<str>> {
     if let Some(var) = env_var(name, table)
-        && std::env::var_os(var).is_some_and(|value| !value.is_empty())
+        && set(var)
     {
         return Some(Arc::from(format!("key from ${var}")));
     }
@@ -374,12 +391,47 @@ mod tests {
         logins
     }
 
+    /// A variable is set only when it is [`SET`], so the real environment of
+    /// the test, such as a set `OPENROUTER_API_KEY`, lists no preset.
+    fn env(var: &str) -> bool {
+        var == SET
+    }
+
+    #[test]
+    fn models_tui_host_lists_the_presets_that_can_sign_in() {
+        let mut settings = settings();
+        settings
+            .providers
+            .insert("deepseek".to_string(), Table::default());
+        let mut logins = logins();
+        for name in ["chatgpt", "deepseek"] {
+            logins.set(
+                name,
+                Login::Key {
+                    key: Secret::from("sk-saved"),
+                },
+            );
+        }
+        let has = |var: &str| var == "OPENROUTER_API_KEY";
+
+        let models = models_in(&settings, &logins, &has, None, None);
+
+        let names: Vec<&str> = models.providers.iter().map(|one| &*one.name).collect();
+        assert_eq!(
+            names,
+            ["deepseek", "logged", "paid", "chatgpt", "openrouter"],
+            "the tables first, then each preset with a login or a key, once"
+        );
+        assert_eq!(&*models.providers[3].note, "logged in");
+        assert_eq!(&*models.providers[4].note, "key from $OPENROUTER_API_KEY");
+    }
+
     #[test]
     fn models_tui_host_lists_the_providers_that_can_sign_in() {
         let cache_dir = tempfile::tempdir().expect("temp dir");
         cache(cache_dir.path());
 
-        let models = models_in(&settings(), &logins(), Some(cache_dir.path()), None);
+        let models = models_in(&settings(), &logins(), &env, Some(cache_dir.path()), None);
 
         let names: Vec<&str> = models.providers.iter().map(|one| &*one.name).collect();
         assert_eq!(
@@ -436,7 +488,7 @@ mod tests {
         )
         .expect("writes the cache");
 
-        let models = models_in(&settings(), &logins(), Some(cache_dir.path()), None);
+        let models = models_in(&settings(), &logins(), &env, Some(cache_dir.path()), None);
         let plan = models.providers[1].models[0]
             .reasoning
             .as_ref()
@@ -544,6 +596,7 @@ mod tests {
             session: "s1".to_string(),
             cwd: cwd.path().to_path_buf(),
             started_ms: 7,
+            waiting: false,
         };
         discovery::write(&folder, &entry)
             .await

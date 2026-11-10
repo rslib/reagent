@@ -190,7 +190,8 @@ async fn a_missing_key_exits_2() {
         // The user's real config must not change the test.
         .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
         .env("XDG_STATE_HOME", tmp.path().join("state"))
-        .args(["-p", "hi"])
+        // The run's socket serves nothing here and would warn of the temp path.
+        .args(["--no-serve", "-p", "hi"])
         .current_dir(tmp.path())
         .env_remove("ANTHROPIC_API_KEY")
         .output()

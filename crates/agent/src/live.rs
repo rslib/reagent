@@ -18,6 +18,7 @@ use crate::agent_loop::Agent;
 use crate::event::Event;
 use crate::guard::Answer;
 use crate::journal::Journal;
+use crate::question::Answers;
 
 /// The id a caller gives itself, so the events and the journal name it.
 pub type ClientId = u32;
@@ -77,6 +78,10 @@ pub struct Settings {
 pub enum Command {
     /// A message: it steers the run or waits for the next one.
     Send {
+        /// The id the worker gave it, which its
+        /// [`Event::MessageState`](crate::event::Event::MessageState) carries
+        /// too.
+        message: u64,
         /// The client that sent it.
         client: ClientId,
         /// The text of the message.
@@ -118,12 +123,24 @@ pub enum Command {
         /// The answer.
         answer: Answer,
     },
+    /// Answer the questions the model asked with the `ask` tool: one list of
+    /// picks or own text per question, or `None` to skip the whole request.
+    Answer {
+        /// The client that answered.
+        client: ClientId,
+        /// The id of the request, as [`Event::QuestionRequest`] reported it.
+        id: u64,
+        /// The answer of each question, in the order it was asked.
+        answers: Answers,
+    },
 }
 
 /// One message a client sent, waiting for the boundary or the run that carries
 /// it into the conversation.
 #[derive(Debug)]
 pub(crate) struct Waiting {
+    /// The id the worker gave the message.
+    pub(crate) message: u64,
     /// The client that sent it.
     pub(crate) client: ClientId,
     /// The text of the message.
@@ -134,9 +151,11 @@ pub(crate) struct Waiting {
 }
 
 impl Waiting {
-    /// The message `client` sent: its text and the blocks that follow it.
-    pub(crate) fn new(client: ClientId, text: Text, blocks: Vec<Content>) -> Self {
+    /// The message of `client` under the id `message`: its text and the
+    /// blocks that follow it.
+    pub(crate) fn new(message: u64, client: ClientId, text: Text, blocks: Vec<Content>) -> Self {
         Self {
+            message,
             client,
             text,
             blocks,
@@ -158,7 +177,7 @@ impl Waiting {
     /// The message [`Waiting::message`] built, as the waiting message it was,
     /// so a message the journal refused goes back to the inbox with its blocks
     /// and no image is copied.
-    pub(crate) fn restored(client: ClientId, message: Message) -> Self {
+    pub(crate) fn restored(id: u64, client: ClientId, message: Message) -> Self {
         let Message::User { content } = message else {
             unreachable!("a waiting message is a user message")
         };
@@ -168,6 +187,7 @@ impl Waiting {
             _ => Text::default(),
         };
         Self {
+            message: id,
             client,
             text,
             blocks: content.collect(),
@@ -276,11 +296,11 @@ impl Inbox {
         !self.pending.is_empty()
     }
 
-    /// Drops the steer texts and the queued messages: a cancel stops the work a
-    /// client asked for, and a client that wants it again sends it again.
-    pub(crate) fn clear_waiting(&mut self) {
-        self.pending.clear();
-        self.queue.clear();
+    /// Takes the steer texts and the queued messages a cancel drops, oldest
+    /// first: a cancel stops the work a client asked for, and a client that
+    /// wants it again sends it again.
+    pub(crate) fn clear_waiting(&mut self) -> impl Iterator<Item = Waiting> + '_ {
+        self.pending.drain(..).chain(self.queue.drain(..))
     }
 
     /// The settings waiting for a boundary, oldest first.
@@ -333,6 +353,11 @@ pub async fn run_live(
         {
             start.push(first);
         }
+        // The run carries these messages, so each client hears that they
+        // landed before the events of the run itself.
+        for waiting in &start {
+            agent.landed(waiting.message, events).await;
+        }
         history.extend(start.into_iter().map(Waiting::message));
         agent.apply_held(inbox, events).await;
         agent
@@ -370,7 +395,8 @@ mod tests {
     use super::*;
     use crate::agent_loop::AgentConfig;
     use crate::compact::Compact;
-    use crate::event::TurnEndReason;
+    use crate::event::{DropReason, MessageState, TurnEndReason};
+    use crate::question::{Ask, Questions};
     use crate::tool::{Registry, Tool, ToolOutput};
 
     /// One message of a request, as a test reads it back.
@@ -505,6 +531,13 @@ mod tests {
         registry
     }
 
+    /// The `echo` tool and the `ask` tool over `questions`.
+    fn asking_registry(questions: &Arc<Questions>) -> Registry {
+        let mut registry = registry();
+        registry.add(Ask::new(Arc::clone(questions)));
+        registry
+    }
+
     fn config() -> AgentConfig {
         AgentConfig {
             model: "fake-model".into(),
@@ -525,6 +558,11 @@ mod tests {
     }
 
     fn tool_reply(call_id: &str, name: &str) -> Vec<StreamEvent> {
+        args_reply(call_id, name, "{}")
+    }
+
+    /// A reply that calls `name` with `args`.
+    fn args_reply(call_id: &str, name: &str, args: &str) -> Vec<StreamEvent> {
         vec![
             StreamEvent::ToolCallStart {
                 id: Text::from(call_id),
@@ -532,7 +570,7 @@ mod tests {
             },
             StreamEvent::ToolCallDelta {
                 id: Text::from(call_id),
-                partial_json: Text::from("{}"),
+                partial_json: Text::from(args),
             },
             StreamEvent::ToolCallEnd {
                 id: Text::from(call_id),
@@ -541,13 +579,37 @@ mod tests {
         ]
     }
 
+    /// The id the next message of a test takes, so every message of the run
+    /// has its own.
+    static NEXT_MESSAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    /// One message of `text`, under an id of its own.
     fn send(client: ClientId, text: &str, mode: SendMode) -> Command {
         send_with(client, text, Vec::new(), mode)
     }
 
-    /// One message of `text` and the `blocks` that follow it.
+    /// One message of `text` and the `blocks` that follow it, under an id of
+    /// its own.
     fn send_with(client: ClientId, text: &str, blocks: Vec<Content>, mode: SendMode) -> Command {
+        send_as(
+            NEXT_MESSAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            client,
+            text,
+            blocks,
+            mode,
+        )
+    }
+
+    /// The message `id` of `text` and the `blocks` that follow it.
+    fn send_as(
+        id: u64,
+        client: ClientId,
+        text: &str,
+        blocks: Vec<Content>,
+        mode: SendMode,
+    ) -> Command {
         Command::Send {
+            message: id,
             client,
             text: Text::from(text),
             blocks,
@@ -906,6 +968,188 @@ mod tests {
         assert!(
             format!("{:?}", requests[1]).contains("[image 64x48]"),
             "the steered message reaches the next request: {requests:?}"
+        );
+    }
+
+    /// The events of `rx` up to and including `runs` run ends.
+    async fn events_until(rx: &mut Receiver<Event>, runs: usize) -> Vec<Event> {
+        let mut seen = Vec::new();
+        let mut ended = 0;
+        while let Some(event) = rx.recv().await {
+            ended += usize::from(matches!(event, Event::RunEnd(_)));
+            seen.push(event);
+            if ended == runs {
+                return seen;
+            }
+        }
+        panic!("the channel closed after {ended} runs: {seen:?}");
+    }
+
+    /// The place and the state of the one `message_state` event of `message`
+    /// in `seen`, and the reason it names.
+    fn state_of(seen: &[Event], message: u64) -> (usize, MessageState, Option<DropReason>) {
+        let states: Vec<(usize, MessageState, Option<DropReason>)> = seen
+            .iter()
+            .enumerate()
+            .filter_map(|(at, event)| match event {
+                Event::MessageState {
+                    message: id,
+                    state,
+                    reason,
+                } if *id == message => Some((at, *state, *reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states.len(), 1, "one state for message {message}: {seen:?}");
+        states[0]
+    }
+
+    #[tokio::test]
+    async fn message_state_a_steer_lands_under_its_id_before_the_next_request() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![tool_reply("call_1", "echo"), text_reply("done")],
+            vec![vec![send_as(
+                5,
+                7,
+                "use cargo nextest",
+                Vec::new(),
+                SendMode::Steer,
+            )]],
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            let seen = events_until(&mut rx, 1).await;
+            script.close();
+            drop(tx);
+            seen
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        let (_, seen) = tokio::join!(session, driver);
+
+        let told = seen
+            .iter()
+            .position(|event| matches!(event, Event::UserMessage { message: 5, .. }))
+            .expect("the accepted message names its id");
+        let (landed, state, reason) = state_of(&seen, 5);
+        assert_eq!(state, MessageState::Landed);
+        assert_eq!(reason, None, "a landed message names no reason");
+        assert!(landed > told, "the message lands after it is accepted");
+        let next = seen[landed + 1..]
+            .iter()
+            .position(|event| matches!(event, Event::TurnStart))
+            .expect("the request after the steer");
+        assert_eq!(
+            next, 0,
+            "the state comes right before its request: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_state_a_queued_message_lands_when_its_run_starts() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![text_reply("first"), text_reply("second")],
+            vec![vec![send_as(
+                6,
+                7,
+                "add a test",
+                Vec::new(),
+                SendMode::Queue,
+            )]],
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            let seen = events_until(&mut rx, 2).await;
+            script.close();
+            drop(tx);
+            seen
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        let (_, seen) = tokio::join!(session, driver);
+
+        let ended = seen
+            .iter()
+            .position(|event| matches!(event, Event::RunEnd(_)))
+            .expect("the run before it ends");
+        let (landed, state, reason) = state_of(&seen, 6);
+        assert_eq!(state, MessageState::Landed);
+        assert_eq!(reason, None, "a landed message names no reason");
+        assert!(
+            landed > ended,
+            "the queued message lands after the run before it ends"
+        );
+        let next = seen[landed + 1..]
+            .iter()
+            .position(|event| matches!(event, Event::TurnStart))
+            .expect("the run it starts");
+        assert_eq!(next, 0, "the state comes right before its run: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn message_state_a_cancel_drops_the_waiting_messages() {
+        let (tx, mut inbox) = channel();
+        let script = Script::new(
+            vec![tool_reply("call_1", "echo"), text_reply("done")],
+            vec![vec![
+                send_as(5, 7, "use cargo nextest", Vec::new(), SendMode::Steer),
+                send_as(6, 8, "add a test", Vec::new(), SendMode::Queue),
+                Command::Cancel { client: 9 },
+            ]],
+            tx.clone(),
+        );
+        let registry = registry();
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new());
+        let (events, mut rx) = mpsc::channel(256);
+
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            let seen = events_until(&mut rx, 1).await;
+            script.close();
+            drop(tx);
+            seen
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        let (_, seen) = tokio::join!(session, driver);
+
+        for message in [5, 6] {
+            let (_, state, reason) = state_of(&seen, message);
+            assert_eq!(state, MessageState::Dropped);
+            assert_eq!(reason, Some(DropReason::Cancelled));
+        }
+        assert!(
+            !seen.iter().any(|event| matches!(
+                event,
+                Event::MessageState {
+                    message: 5 | 6,
+                    state: MessageState::Landed,
+                    ..
+                }
+            )),
+            "a dropped message never landed: {seen:?}"
+        );
+        assert!(
+            seen.contains(&Event::RunEnd(TurnEndReason::Cancelled)),
+            "the cancel ended the run: {seen:?}"
         );
     }
 
@@ -1434,6 +1678,213 @@ mod tests {
     fn resolved(message: &str) -> impl Fn(&Event) -> bool + use<> {
         let message = message.to_string();
         move |event| matches!(event, Event::Error(error) if error.as_ref() == message)
+    }
+
+    /// Sends the command `next` returns for each question request, and returns
+    /// every event up to the first one `done` accepts.
+    async fn quizzed(
+        rx: &mut Receiver<Event>,
+        tx: &Sender,
+        mut next: impl FnMut(&crate::event::QuestionRequest) -> Option<Command>,
+        done: impl Fn(&Event) -> bool,
+    ) -> Vec<Event> {
+        let mut seen = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let finished = done(&event);
+            if let Event::QuestionRequest(request) = &event
+                && let Some(command) = next(request)
+            {
+                tx.send(command).await.expect("the session is open");
+            }
+            seen.push(event);
+            if finished {
+                return seen;
+            }
+        }
+        panic!("the events ended before the one the test waited for");
+    }
+
+    /// The arguments of one question with two options.
+    const ONE_QUESTION: &str = r#"{"questions":[{"q":"Which database?","options":[{"label":"sqlite"},{"label":"postgres","note":"on the server"}]}]}"#;
+
+    /// The arguments of two questions, the second of which takes several
+    /// picks.
+    const TWO_QUESTIONS: &str = r#"{"questions":[{"q":"Which queue?","options":[{"label":"a"},{"label":"z"}]},{"q":"Which store?","options":[{"label":"b"},{"label":"c"}],"multi":true}]}"#;
+
+    /// The result the call `id` got, as the model reads it.
+    fn result_of(history: &[Message], id: &str) -> String {
+        history
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResult(result) if result.call_id.as_ref() == id => {
+                    Some(result.content.to_string())
+                }
+                _ => None,
+            })
+            .expect("the call has a result")
+    }
+
+    /// The session of one question, driven until `done` accepts an event, and
+    /// the events it saw.
+    async fn asked_session(
+        args: &str,
+        answers: crate::question::Answers,
+        done: impl Fn(&Event) -> bool,
+    ) -> (Vec<Event>, Vec<Message>) {
+        let (tx, mut inbox) = channel();
+        let questions = Questions::new();
+        let script = Script::new(
+            vec![args_reply("call_1", "ask", args), text_reply("done")],
+            vec![],
+            tx.clone(),
+        );
+        let registry = asking_registry(&questions);
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new())
+            .with_questions(Arc::clone(&questions));
+        let (events, mut rx) = mpsc::channel(256);
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            let seen = quizzed(
+                &mut rx,
+                &tx,
+                |request| {
+                    Some(Command::Answer {
+                        client: 7,
+                        id: request.id,
+                        answers: answers.clone(),
+                    })
+                },
+                &done,
+            )
+            .await;
+            script.close();
+            drop(tx);
+            seen
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        let (_, seen) = tokio::join!(session, driver);
+        (seen, history)
+    }
+
+    #[tokio::test]
+    async fn question_the_session_asks_and_an_answer_is_the_result() {
+        let (seen, history) = asked_session(
+            ONE_QUESTION,
+            Some(vec![vec!["sqlite".to_owned()]]),
+            |event| matches!(event, Event::ToolResult { id, .. } if id.as_ref() == "call_1"),
+        )
+        .await;
+
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                Event::QuestionRequest(request)
+                    if request.questions.len() == 1
+                        && request.questions[0].q.as_ref() == "Which database?"
+                        && request.questions[0].options.len() == 2
+            )),
+            "the session sent the questions: {seen:?}"
+        );
+        assert!(
+            seen.contains(&Event::QuestionResolved { id: 0, client: 7 }),
+            "the answering client is named: {seen:?}"
+        );
+        let result = result_of(&history, "call_1");
+        assert!(result.contains("Q: Which database?"), "{result}");
+        assert!(result.contains("A: sqlite"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn question_a_skipped_question_gives_the_fallback_text() {
+        let (seen, history) = asked_session(
+            ONE_QUESTION,
+            None,
+            |event| matches!(event, Event::ToolResult { id, .. } if id.as_ref() == "call_1"),
+        )
+        .await;
+
+        assert!(
+            seen.contains(&Event::QuestionResolved { id: 0, client: 7 }),
+            "the skipping client is named: {seen:?}"
+        );
+        let result = result_of(&history, "call_1");
+        assert_eq!(
+            result, "No answer; decide yourself and state the choice.",
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn question_two_questions_give_two_pairs_of_lines() {
+        let (_, history) = asked_session(
+            TWO_QUESTIONS,
+            Some(vec![
+                vec!["a".to_owned()],
+                vec!["b".to_owned(), "c".to_owned()],
+            ]),
+            |event| matches!(event, Event::ToolResult { id, .. } if id.as_ref() == "call_1"),
+        )
+        .await;
+
+        let result = result_of(&history, "call_1");
+        assert!(result.contains("Q: Which queue?"), "{result}");
+        assert!(result.contains("A: a"), "{result}");
+        assert!(result.contains("Q: Which store?"), "{result}");
+        assert!(result.contains("A: b, c"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn question_a_cancel_while_the_question_waits_ends_the_run_as_cancelled() {
+        let (tx, mut inbox) = channel();
+        let questions = Questions::new();
+        let script = Script::new(
+            vec![
+                args_reply("call_1", "ask", ONE_QUESTION),
+                text_reply("done"),
+            ],
+            vec![],
+            tx.clone(),
+        );
+        let registry = asking_registry(&questions);
+        let mut history = Vec::new();
+        let mut agent = Agent::new(&script, &registry, config(), CancellationToken::new())
+            .with_questions(Arc::clone(&questions));
+        let (events, mut rx) = mpsc::channel(256);
+        let driver = async {
+            tx.send(send(1, "hello", SendMode::Steer))
+                .await
+                .expect("the session is open");
+            let seen = quizzed(
+                &mut rx,
+                &tx,
+                |_| Some(Command::Cancel { client: 7 }),
+                |event| matches!(event, Event::RunEnd(TurnEndReason::Cancelled)),
+            )
+            .await;
+            script.close();
+            drop(tx);
+            seen
+        };
+        let session = run_live(&mut agent, &mut history, None, &events, &mut inbox);
+        let (_, seen) = tokio::join!(session, driver);
+
+        assert!(
+            seen.contains(&Event::QuestionResolved { id: 0, client: 0 }),
+            "the cancel resolved the question with no client: {seen:?}"
+        );
+        assert_eq!(
+            result_of(&history, "call_1"),
+            "No answer; decide yourself and state the choice.",
+            "the cancel was answered by the tool"
+        );
+        assert_eq!(
+            script.requests().len(),
+            1,
+            "the cancelled turn made no second request"
+        );
     }
 
     #[tokio::test]
