@@ -71,6 +71,19 @@ impl Home {
             .expect("the entry");
     }
 
+    /// Writes one plugin folder whose manifest grants `permissions`.
+    async fn plugin_with(&self, folder: &str, permissions: &str, entry: &str) {
+        self.plugin(folder, entry).await;
+        tokio::fs::write(
+            self.plugins().join(folder).join("package.json"),
+            format!(
+                r#"{{"name": "{folder}", "reagent": {{"entry": "index.js", "permissions": {permissions}}}}}"#
+            ),
+        )
+        .await
+        .expect("the manifest");
+    }
+
     /// Writes a fake provider script and returns its `--provider` value.
     async fn script(&self, body: &str) -> String {
         let path = self.root.path().join("script.json");
@@ -198,6 +211,303 @@ async fn a_plugin_tool_answers_the_model() {
     assert!(
         results.iter().any(|text| text == "HI"),
         "no HI in {results:?}"
+    );
+}
+
+/// A plugin whose `peek` tool reads a file through `node:fs`.
+const PEEK: &str = r#"
+import { readFileSync } from "node:fs";
+export default function (reagent) {
+  reagent.registerTool({
+    name: "peek",
+    description: "Reads a file.",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    },
+    run: (args) => readFileSync(args.path, "utf8"),
+  });
+}
+"#;
+
+/// A plugin whose `get` tool fetches a URL and answers its status and text.
+const GET: &str = r#"
+export default function (reagent) {
+  reagent.registerTool({
+    name: "get",
+    description: "Fetches a URL.",
+    parameters: {
+      type: "object",
+      properties: { url: { type: "string" } },
+      required: ["url"],
+    },
+    run: async (args) => {
+      const response = await fetch(args.url);
+      return `${response.status} ${await response.text()}`;
+    },
+  });
+}
+"#;
+
+/// A loopback HTTP server that answers every request with `pong` and counts
+/// the connections it accepted.
+async fn pong_server() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port");
+    let port = listener.local_addr().expect("its address").port();
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = std::sync::Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte).await {
+                        Ok(1) => head.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\npong",
+                    )
+                    .await;
+            });
+        }
+    });
+    (port, seen)
+}
+
+#[tokio::test]
+async fn node_fetch_reaches_a_listed_host_and_is_refused_another() {
+    let (port, seen) = pong_server().await;
+    let home = Home::new();
+    home.plugin_with("get", r#"{"net": ["127.0.0.1"]}"#, GET)
+        .await;
+    let url = format!("http://127.0.0.1:{port}/ping");
+    let fake = home
+        .script(&call_script("get", &format!(r#"{{"url": "{url}"}}"#)))
+        .await;
+    let output = home
+        .run(&["--json", "--no-serve", "--provider", &fake, "-p", "get"])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let fetched = lines(&output);
+    assert_eq!(tool_result(&fetched)["is_error"], false, "{fetched:?}");
+    let results = home.tool_results(&session(&fetched)).await;
+    assert!(
+        results.iter().any(|text| text == "200 pong"),
+        "no pong in {results:?}"
+    );
+    let before = seen.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(before >= 1, "the listed server saw no connection");
+
+    let url = format!("http://localhost:{port}/ping");
+    let fake = home
+        .script(&call_script("get", &format!(r#"{{"url": "{url}"}}"#)))
+        .await;
+    let output = home
+        .run(&["--json", "--no-serve", "--provider", &fake, "-p", "get"])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let refused = lines(&output);
+    assert_eq!(tool_result(&refused)["is_error"], true, "{refused:?}");
+    let results = home.tool_results(&session(&refused)).await;
+    assert!(
+        results
+            .iter()
+            .any(|text| text.contains("may not fetch from localhost")),
+        "no refusal in {results:?}"
+    );
+    assert_eq!(
+        seen.load(std::sync::atomic::Ordering::SeqCst),
+        before,
+        "the refused fetch reached the server"
+    );
+}
+
+#[tokio::test]
+async fn node_a_plugin_reads_an_allowed_file_and_is_refused_another() {
+    let home = Home::new();
+    home.plugin_with("peek", r#"{"fs": {"read": ["allowed"]}}"#, PEEK)
+        .await;
+    let work = home.work();
+    tokio::fs::create_dir_all(work.join("allowed"))
+        .await
+        .expect("the allowed folder");
+    tokio::fs::write(work.join("allowed").join("a.txt"), "open")
+        .await
+        .expect("the allowed file");
+    tokio::fs::write(work.join("other.txt"), "closed")
+        .await
+        .expect("the other file");
+
+    let fake = home
+        .script(&call_script("peek", r#"{"path": "allowed/a.txt"}"#))
+        .await;
+    let output = home
+        .run(&["--json", "--no-serve", "--provider", &fake, "-p", "peek"])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let read = lines(&output);
+    let result = tool_result(&read);
+    assert_eq!(result["is_error"], false, "{result}");
+    let results = home.tool_results(&session(&read)).await;
+    assert!(
+        results.iter().any(|text| text == "open"),
+        "no file text in {results:?}"
+    );
+
+    let fake = home
+        .script(&call_script("peek", r#"{"path": "other.txt"}"#))
+        .await;
+    let output = home
+        .run(&["--json", "--no-serve", "--provider", &fake, "-p", "peek"])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let refused = lines(&output);
+    let result = tool_result(&refused);
+    assert_eq!(result["is_error"], true, "{result}");
+    let results = home.tool_results(&session(&refused)).await;
+    assert!(
+        results
+            .iter()
+            .any(|text| text.contains("has no fs read permission") && text.contains("other.txt")),
+        "no refusal in {results:?}"
+    );
+    assert!(
+        !results.iter().any(|text| text.contains("closed")),
+        "the refused file leaked: {results:?}"
+    );
+}
+
+/// A plugin whose `sh` tool runs one shell line and answers its stdout.
+const SH: &str = r#"
+import { execFile } from "node:child_process";
+export default function (reagent) {
+  reagent.registerTool({
+    name: "sh",
+    description: "Runs a shell line.",
+    parameters: {
+      type: "object",
+      properties: { line: { type: "string" } },
+      required: ["line"],
+    },
+    run: (args) =>
+      new Promise((resolve, reject) => {
+        execFile("sh", ["-c", args.line], (error, stdout) =>
+          error ? reject(error) : resolve(stdout));
+      }),
+  });
+}
+"#;
+
+impl Home {
+    /// Writes the global `config.toml` of the run.
+    async fn config(&self, text: &str) {
+        let dir = self.root.path().join("config").join("reagent");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("the config folder");
+        tokio::fs::write(dir.join("config.toml"), text)
+            .await
+            .expect("the config");
+    }
+}
+
+/// A file outside every folder a sandboxed child may write: the temp folder is
+/// writable for a child, so it lives in the target folder.
+fn outside(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join(name)
+}
+
+#[tokio::test]
+async fn node_child_runs_a_listed_program_under_the_sandbox() {
+    let home = Home::new();
+    home.config("[sandbox]\nmode = \"on\"\n").await;
+    home.plugin_with("shell", r#"{"run": ["sh"], "fs": {"write": ["out"]}}"#, SH)
+        .await;
+    tokio::fs::create_dir_all(home.work().join("out"))
+        .await
+        .expect("the write folder");
+    let escape = outside(&format!("node-child-{}.txt", std::process::id()));
+    let _ = tokio::fs::remove_file(&escape).await;
+    let (port, seen) = pong_server().await;
+    // `curl` may be missing; then nothing connects either way.
+    let line = format!(
+        "echo in > out/a; echo x > {}; curl -s -m 3 http://127.0.0.1:{port}/ >/dev/null 2>&1; echo ran",
+        escape.display()
+    );
+    let fake = home
+        .script(&call_script(
+            "sh",
+            &serde_json::json!({ "line": line }).to_string(),
+        ))
+        .await;
+    let output = home
+        .run(&["--json", "--no-serve", "--provider", &fake, "-p", "sh"])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let ran = lines(&output);
+    let results = home.tool_results(&session(&ran)).await;
+    assert!(
+        !escape.exists(),
+        "the child wrote outside its folders: {results:?}"
+    );
+    assert_eq!(
+        seen.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a child with no `*` in `net` reached the network: {results:?}"
+    );
+    // The sandbox cannot start everywhere (inside another sandbox, in a plain
+    // container); then the start is refused and nothing ran at all.
+    if results
+        .iter()
+        .any(|text| text.contains("the sandbox could not start"))
+    {
+        eprintln!("the sandbox did not start here: {results:?}");
+        return;
+    }
+    assert!(
+        results.iter().any(|text| text.contains("ran")),
+        "the child did not run: {results:?}"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(home.work().join("out").join("a"))
+            .await
+            .expect("the child wrote in its folder"),
+        "in\n"
+    );
+}
+
+#[tokio::test]
+async fn node_child_is_refused_with_the_sandbox_off() {
+    let home = Home::new();
+    home.plugin_with("shell", r#"{"run": ["sh"], "fs": {"write": ["./"]}}"#, SH)
+        .await;
+    let fake = home
+        .script(&call_script("sh", r#"{"line": "echo x > ran.txt"}"#))
+        .await;
+    let output = home
+        .run(&["--json", "--no-serve", "--provider", &fake, "-p", "sh"])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let refused = lines(&output);
+    assert_eq!(tool_result(&refused)["is_error"], true, "{refused:?}");
+    let results = home.tool_results(&session(&refused)).await;
+    assert!(
+        results
+            .iter()
+            .any(|text| text.contains("no sandbox is on in this run")),
+        "no refusal in {results:?}"
+    );
+    assert!(
+        !home.work().join("ran.txt").exists(),
+        "a child ran with the sandbox off"
     );
 }
 

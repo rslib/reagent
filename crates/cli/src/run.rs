@@ -20,6 +20,7 @@ use reagent_agent::archive::{Archive, Expand};
 use reagent_agent::compact::Compact;
 use reagent_agent::event::{Event, TurnEndReason};
 use reagent_agent::guard::Guard;
+use reagent_agent::hook::{EventHook, Seen};
 use reagent_agent::policy::TurnPolicy;
 use reagent_agent::policy::budget::Budget;
 use reagent_agent::policy::completion::Completion;
@@ -644,7 +645,17 @@ pub async fn run(mut args: Args) -> ExitCode {
     // hook: its loop stays the one it was.
     let mut plugins: Option<Arc<Plugins>> = None;
     if let Some(dir) = args.plugins_dir.as_deref() {
-        let (loaded, notes) = Plugins::load(dir).await;
+        // The state folder the sessions use, whose `plugins` folder holds each
+        // plugin's cookies, beside their `sessions` folder.
+        let state = crate::session::state_home()
+            .map_or_else(std::env::temp_dir, |home| home.join("reagent"));
+        // The helper every child process of a plugin starts through, and none
+        // when this run has no sandbox or this program cannot name itself.
+        let sandbox = match args.sandbox {
+            SandboxMode::Off => None,
+            SandboxMode::Auto | SandboxMode::On => std::env::current_exe().ok(),
+        };
+        let (loaded, notes) = Plugins::load(dir, &state, sandbox).await;
         for note in notes {
             eprintln!("reagent: {note}");
         }
@@ -754,7 +765,9 @@ pub async fn run(mut args: Args) -> ExitCode {
         guard
     });
     if let Some(plugins) = &plugins {
-        agent = agent.with_turn_hook(plugins.clone());
+        agent = agent
+            .with_turn_hook(plugins.clone())
+            .with_event_hook(Arc::new(PluginEvents(Arc::clone(plugins))));
     }
     if let Some(questions) = &questions {
         agent = agent.with_questions(Arc::clone(questions));
@@ -784,7 +797,6 @@ pub async fn run(mut args: Args) -> ExitCode {
         socket,
         billing,
         context_window: args.context_window,
-        plugins: plugins.as_ref().map(Arc::clone),
     };
     // The answer lines of the run's stdin client, when it has one, and the end
     // its session reports once it is over.
@@ -920,19 +932,18 @@ pub async fn run(mut args: Args) -> ExitCode {
         // kept as written, then one note line and one image per image. A file
         // that is not an image adds nothing, and one that cannot be prepared
         // stops the run before any request.
+        let blocks = match crate::attach::blocks(&cwd, &text).await {
+            Ok(blocks) => blocks,
+            Err(message) => {
+                eprintln!("reagent: {message}");
+                stop_servers(servers).await;
+                return ExitCode::from(1);
+            }
+        };
         if let Some(worker) = worker.as_mut() {
             // A worker's task is its own message, as if a client had sent it.
-            worker.task(text).await;
+            worker.task(text, blocks).await;
         } else {
-            let attached = crate::attach::blocks(&cwd, &text).await;
-            let blocks = match attached {
-                Ok(blocks) => blocks,
-                Err(message) => {
-                    eprintln!("reagent: {message}");
-                    stop_servers(servers).await;
-                    return ExitCode::from(1);
-                }
-            };
             if blocks.is_empty() {
                 history.push(reagent_ai::Message::user(text));
             } else {
@@ -1237,9 +1248,6 @@ struct Report {
     socket: Option<String>,
     billing: Option<Billing>,
     context_window: Option<u64>,
-    /// The plugins of the run, `None` when it loaded none: then the loop does
-    /// nothing per event.
-    plugins: Option<Arc<Plugins>>,
 }
 
 /// The next thing the drain loop takes: a batch of events, or one answer line
@@ -1249,38 +1257,27 @@ enum Step {
     Line(Option<Vec<u8>>),
 }
 
-/// Hands one agent event to the plugins' listeners.
-///
-/// `calls` holds the calls that started and have not reported yet, so a
-/// `tool_end` names its tool: the result event carries the id, not the name.
-fn plugin_event(plugins: &Plugins, event: &Event, calls: &mut Vec<(Text, Text)>) {
-    match event {
-        Event::TurnStart => plugins.event("turn_start", serde_json::json!({})),
-        Event::ToolCallReady { id, name, .. } => calls.push((id.clone(), name.clone())),
-        Event::ToolResult { id, is_error, .. } => {
-            let name = match calls.iter().position(|(call, _)| call == id) {
-                Some(at) => calls.swap_remove(at).1,
-                // A resumed session's calls started in another run.
-                None => Text::from(""),
-            };
-            plugins.event(
+/// Hands the loop's events to the plugins' listeners, in loop order, so a
+/// listener sees the end of a turn before a call of the next turn runs.
+struct PluginEvents(Arc<Plugins>);
+
+impl EventHook for PluginEvents {
+    fn seen(&self, event: Seen<'_>) {
+        match event {
+            Seen::TurnStart => self.0.event("turn_start", serde_json::json!({})),
+            Seen::ToolEnd { tool, is_error } => self.0.event(
                 "tool_end",
-                serde_json::json!({ "tool": name.as_ref(), "isError": is_error }),
-            );
-        }
-        Event::TurnEnd(reason) => {
-            plugins.event(
+                serde_json::json!({ "tool": tool, "isError": is_error }),
+            ),
+            Seen::TurnEnd(reason) => self.0.event(
                 "turn_end",
                 serde_json::json!({ "reason": reason_word(reason) }),
-            );
-        }
-        Event::RunEnd(reason) => {
-            plugins.event(
+            ),
+            Seen::RunEnd(reason) => self.0.event(
                 "run_end",
                 serde_json::json!({ "reason": reason_word(reason) }),
-            );
+            ),
         }
-        _ => {}
     }
 }
 
@@ -1327,9 +1324,6 @@ async fn drain<W: AsyncWrite + Unpin>(
     let mut ended = false;
     // The prompt size of the last turn: how full the context is now.
     let mut context_tokens = 0u64;
-    // The calls that started and have not reported yet, so a `tool_end` event
-    // names its tool. A call a resumed session left open has no start here.
-    let mut calls: Vec<(Text, Text)> = Vec::new();
 
     let mut buf = Vec::with_capacity(512);
     // Whether the start line has gone into a batch; it is written once, with
@@ -1428,9 +1422,6 @@ async fn drain<W: AsyncWrite + Unpin>(
                         ended = !steered;
                     }
                     _ => {}
-                }
-                if let Some(plugins) = report.plugins.as_deref() {
-                    plugin_event(plugins, &event, &mut calls);
                 }
                 if json {
                     // A steered run's caller answers its approvals, so it needs
@@ -3398,7 +3389,6 @@ mod tests {
             socket: None,
             billing: None,
             context_window: None,
-            plugins: None,
         };
         drain(rx, None, None, Out::with_writer(sink.clone()), report).await;
     }
@@ -3436,7 +3426,6 @@ mod tests {
             socket: None,
             billing: None,
             context_window: None,
-            plugins: None,
         };
         let reason = drain(rx, None, None, Out::with_writer(sink.clone()), report).await;
         assert_eq!(reason, TurnEndReason::EndTurn);

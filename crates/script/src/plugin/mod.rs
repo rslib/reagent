@@ -8,15 +8,15 @@
 
 mod api;
 mod manifest;
+mod node;
 mod runtime;
 
 #[cfg(test)]
 mod tests;
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +27,7 @@ use reagent_agent::tool::{Tool, ToolOutput};
 use reagent_ai::{Content, Text, ToolSpec};
 use serde_json::Value as JsonValue;
 use tokio::sync::Notify;
+use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
 use runtime::{CallReply, Job, RunReply, ToolInfo};
@@ -276,7 +277,7 @@ struct Sent {
 /// Every loaded plugin, and the one thread they run on.
 pub struct Plugins {
     /// The plugin thread's queue.
-    jobs: SyncSender<Job>,
+    jobs: Sender<Job>,
     /// The notes the plugins raised, drained by [`Plugins::take_notes`].
     notes: Arc<Mutex<Notes>>,
     /// The panels and the texts the plugins sent, shared with the thread.
@@ -303,8 +304,48 @@ impl Plugins {
     /// Loads every plugin under `root`; the notes say which ones failed.
     ///
     /// `root` that does not exist means no plugins, and no note. The answer
-    /// is `None` when no plugin loaded.
-    pub async fn load(root: &Path) -> (Option<Arc<Self>>, Vec<String>) {
+    /// is `None` when no plugin loaded. `state` is the state folder the
+    /// sessions use: a plugin's cookies are saved under it. `sandbox` is the
+    /// helper program every child process of a plugin starts through, which is
+    /// `None` when this run has no sandbox.
+    pub async fn load(
+        root: &Path,
+        state: &Path,
+        sandbox: Option<PathBuf>,
+    ) -> (Option<Arc<Self>>, Vec<String>) {
+        // The folder the run works in, which is the one a plugin's relative
+        // path resolves against.
+        let session = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::load_with(root, &session, state, sandbox).await
+    }
+
+    /// Loads every plugin under `root` with no sandbox helper, with `session`
+    /// the folder a relative path of a plugin resolves against and `state` the
+    /// folder its cookies are saved under.
+    #[cfg_attr(
+        not(all(test, feature = "node")),
+        expect(
+            dead_code,
+            reason = "the node module tests load with no sandbox helper"
+        )
+    )]
+    pub(crate) async fn load_in(
+        root: &Path,
+        session: &Path,
+        state: &Path,
+    ) -> (Option<Arc<Self>>, Vec<String>) {
+        Self::load_with(root, session, state, None).await
+    }
+
+    /// Loads every plugin under `root`, with `session` the folder a relative
+    /// path of a plugin resolves against, `state` the folder its cookies are
+    /// saved under and `sandbox` the helper every child process starts through.
+    pub(crate) async fn load_with(
+        root: &Path,
+        session: &Path,
+        state: &Path,
+        sandbox: Option<PathBuf>,
+    ) -> (Option<Arc<Self>>, Vec<String>) {
         let present = tokio::fs::metadata(root)
             .await
             .is_ok_and(|meta| meta.is_dir());
@@ -321,9 +362,12 @@ impl Plugins {
         let (reply, answer) = tokio::sync::oneshot::channel();
         let job = Job::Load {
             root: root.to_path_buf(),
+            session: session.to_path_buf(),
+            state: state.to_path_buf(),
+            sandbox,
             reply,
         };
-        if jobs.send(job).is_err() {
+        if jobs.send(job).await.is_err() {
             return (None, drain(&notes));
         }
         let Ok(report) = answer.await else {
@@ -393,7 +437,7 @@ impl Plugins {
             args: args.to_string(),
             reply,
         };
-        if self.jobs.send(job).is_err() {
+        if self.jobs.send(job).await.is_err() {
             return Some("plugins: the plugin runtime stopped".into());
         }
         match answer.await {
@@ -482,7 +526,7 @@ impl fmt::Debug for Plugins {
 #[derive(Clone)]
 pub struct PluginTool {
     /// The plugin thread's queue.
-    jobs: SyncSender<Job>,
+    jobs: Sender<Job>,
     /// The spec the model sees.
     spec: ToolSpec,
 }
@@ -512,7 +556,7 @@ impl Tool for PluginTool {
                 args: args.to_string(),
                 reply,
             };
-            if self.jobs.send(job).is_err() {
+            if self.jobs.send(job).await.is_err() {
                 return ToolOutput::error("the plugin runtime stopped");
             }
             let out = tokio::select! {
@@ -543,7 +587,7 @@ impl CallHook for Plugins {
                 args: args.to_string(),
                 reply,
             };
-            if self.jobs.send(job).is_err() {
+            if self.jobs.send(job).await.is_err() {
                 return CallVerdict::Keep;
             }
             match tokio::time::timeout(CHAIN_TIME, answer).await {
@@ -577,7 +621,7 @@ impl CallHook for Plugins {
                 is_error: output.is_error,
                 reply,
             };
-            if self.jobs.send(job).is_err() {
+            if self.jobs.send(job).await.is_err() {
                 return output;
             }
             match tokio::time::timeout(CHAIN_TIME, answer).await {
@@ -617,7 +661,7 @@ impl TurnHook for Plugins {
                 text,
                 reply,
             };
-            if self.jobs.send(job).is_err() {
+            if self.jobs.send(job).await.is_err() {
                 return None;
             }
             let follow = match tokio::time::timeout(CHAIN_TIME, answer).await {

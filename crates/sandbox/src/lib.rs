@@ -1,5 +1,6 @@
 //! OS sandboxes for one process and its children: a Seatbelt profile on macOS
-//! and Landlock on Linux, with a seccomp filter when the network is off.
+//! and Landlock on Linux, with a seccomp filter when the network is off. One
+//! more seccomp filter keeps a child in the process group it was put in.
 
 use std::path::PathBuf;
 
@@ -128,6 +129,34 @@ pub fn restrict(network: bool, write: &[PathBuf]) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuses a new session or process group inside a sandbox, so a child cannot
+/// leave the process group reagent signals.
+///
+/// Linux on x86_64 and aarch64 installs one more seccomp filter, on top of the
+/// network one, whose `setsid` and `setpgid` answer `EPERM`. The two filters
+/// stack, so this keeps working whether the network filter is on or off. On
+/// macOS nothing is installed and `Ok` is the answer: a Seatbelt profile
+/// cannot refuse these calls. On every other Linux architecture nothing is
+/// installed either, for the same reason as the network filter: no filter
+/// exists there for these syscalls, and failing would drop the whole sandbox.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn keep_group() -> Result<(), String> {
+    seccomp::deny_group_escape()
+}
+
+/// No way to refuse a new session exists on this system, so this does nothing.
+/// See the Linux version for what the filter does where it exists.
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+pub fn keep_group() -> Result<(), String> {
+    Ok(())
+}
+
 /// The seccomp filter of a sandbox with no network.
 ///
 /// Landlock refuses TCP only: UDP rights come in Linux 7.2, and no Landlock
@@ -235,9 +264,42 @@ mod seccomp {
         program
     }
 
-    /// Installs the filter on this thread; every child it starts keeps it.
-    pub(crate) fn deny_ip_sockets() -> Result<(), String> {
-        let mut program = program();
+    /// The program of a sandbox whose children stay in their process group:
+    /// `setsid` and `setpgid` answer `EPERM`, everything else is allowed.
+    pub(crate) fn group_program() -> Vec<sock_filter> {
+        // The instructions before the two returns.
+        #[cfg(target_arch = "x86_64")]
+        const HEAD: usize = 6;
+        #[cfg(target_arch = "aarch64")]
+        const HEAD: usize = 5;
+        let (deny, allow) = (HEAD, HEAD + 1);
+        let to = |from: usize, target: usize| (target - from - 1) as u8;
+        let mut program = Vec::with_capacity(HEAD + 2);
+        program.push(load(AUDIT_ARCH));
+        program.push(jump(BPF_JEQ, ARCH, 0, to(1, deny)));
+        program.push(load(NR));
+        #[cfg(target_arch = "x86_64")]
+        program.push(jump(BPF_JGE, X32_BIT, to(program.len(), deny), 0));
+        let at = program.len();
+        program.push(jump(BPF_JEQ, libc::SYS_setsid as u32, to(at, deny), 0));
+        let at = program.len();
+        // The last test sits right before the deny return, so a miss must skip
+        // over it to the allow.
+        program.push(jump(
+            BPF_JEQ,
+            libc::SYS_setpgid as u32,
+            to(at, deny),
+            to(at, allow),
+        ));
+        debug_assert_eq!(program.len(), HEAD);
+        program.push(ret(errno(libc::EPERM)));
+        program.push(ret(SECCOMP_RET_ALLOW));
+        program
+    }
+
+    /// Installs one filter program on this thread, on top of what is there
+    /// already; every child it starts keeps it.
+    fn install(mut program: Vec<sock_filter>, what: &str) -> Result<(), String> {
         let filter = sock_fprog {
             len: program.len() as u16,
             filter: program.as_mut_ptr(),
@@ -254,13 +316,20 @@ mod seccomp {
                 &filter as *const sock_fprog,
             ) != 0
             {
-                return Err(format!(
-                    "the network filter: {}",
-                    std::io::Error::last_os_error()
-                ));
+                return Err(format!("{what}: {}", std::io::Error::last_os_error()));
             }
         }
         Ok(())
+    }
+
+    /// Installs the filter that refuses a new session or process group.
+    pub(crate) fn deny_group_escape() -> Result<(), String> {
+        install(group_program(), "the process group filter")
+    }
+
+    /// Installs the filter on this thread; every child it starts keeps it.
+    pub(crate) fn deny_ip_sockets() -> Result<(), String> {
+        install(program(), "the network filter")
     }
 }
 
@@ -432,5 +501,72 @@ mod tests {
         });
         // Without the filter, a kernel without x32 says ENOSYS instead.
         assert_eq!(errno, Some(libc::EACCES));
+    }
+
+    /// Runs `body` on a thread of its own with the filter that keeps a child in
+    /// its process group, so the rest of the test process keeps its own.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn grouped<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::spawn(move || {
+            keep_group().expect("the filter installs");
+            body()
+        })
+        .join()
+        .expect("the filtered thread")
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn keep_group_refuses_setsid() {
+        let refused = grouped(|| {
+            // SAFETY: plain syscalls that the filter answers with EPERM.
+            let session = unsafe { libc::syscall(libc::SYS_setsid) };
+            let session = if session < 0 {
+                std::io::Error::last_os_error().raw_os_error()
+            } else {
+                None
+            };
+            // SAFETY: setpgid takes two plain integers.
+            let group = unsafe { libc::setpgid(0, 0) };
+            let group = if group < 0 {
+                std::io::Error::last_os_error().raw_os_error()
+            } else {
+                None
+            };
+            (session, group)
+        });
+        assert_eq!(refused, (Some(libc::EPERM), Some(libc::EPERM)));
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn keep_group_keeps_fork() {
+        let (forked, status) = grouped(|| {
+            // SAFETY: plain syscalls; the child leaves at once, with no lock of
+            // the test process held and nothing to unwind.
+            let child = unsafe { libc::fork() };
+            if child == 0 {
+                unsafe { libc::_exit(0) }
+            }
+            if child < 0 {
+                return (child, -1);
+            }
+            let mut status = 0;
+            unsafe { libc::waitpid(child, &mut status, 0) };
+            (child, status)
+        });
+        assert!(forked > 0, "fork answered {forked}");
+        assert_eq!(status, 0);
     }
 }

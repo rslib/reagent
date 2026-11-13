@@ -16,6 +16,9 @@ const UNAVAILABLE: u8 = 125;
 pub struct Policy {
     /// Whether the program may open network connections.
     pub network: bool,
+    /// Whether the program may not leave the process group the helper put it
+    /// in: `setsid` and `setpgid` answer `EPERM` where that can be refused.
+    pub keep_group: bool,
     /// Folders the program may write, besides what it can read, as the caller
     /// named them: they are resolved per run below.
     pub write: Vec<PathBuf>,
@@ -25,6 +28,10 @@ pub struct Policy {
     /// The `bash` the caller resolved, when it did: the helper runs it as it
     /// is instead of searching `PATH` for it on every start.
     pub shell: Option<PathBuf>,
+    /// Whether the program starts with no environment at all.
+    pub clear_env: bool,
+    /// The variables the program gets, in order, on top of `clear_env`.
+    pub env: Vec<(String, String)>,
     /// The program to run.
     pub program: OsString,
     /// The arguments of the program.
@@ -32,14 +39,18 @@ pub struct Policy {
 }
 
 /// Parses the helper arguments after `--sandbox-exec`:
-/// `[--network] [--shell PATH] [--write DIR]... [--write-resolved DIR]...
+/// `[--network] [--keep-group] [--shell PATH] [--write DIR]...
+/// [--write-resolved DIR]... [--env-clear] [--env NAME=VALUE]...
 /// -- PROGRAM ARGS...`.
 pub fn parse_policy(args: impl IntoIterator<Item = OsString>) -> Result<Policy, String> {
     let mut args = args.into_iter();
     let mut network = false;
+    let mut keep_group = false;
     let mut write = Vec::new();
     let mut resolved_write = Vec::new();
     let mut shell = None;
+    let mut clear_env = false;
+    let mut env = Vec::new();
     while let Some(arg) = args.next() {
         if arg == "--" {
             let program = args
@@ -47,14 +58,26 @@ pub fn parse_policy(args: impl IntoIterator<Item = OsString>) -> Result<Policy, 
                 .ok_or_else(|| "no program after --".to_string())?;
             return Ok(Policy {
                 network,
+                keep_group,
                 write,
                 resolved_write,
                 shell,
+                clear_env,
+                env,
                 program,
                 args: args.collect(),
             });
         } else if arg == "--network" {
             network = true;
+        } else if arg == "--keep-group" {
+            keep_group = true;
+        } else if arg == "--env-clear" {
+            clear_env = true;
+        } else if arg == "--env" {
+            let pair = args
+                .next()
+                .ok_or_else(|| "missing value for --env".to_string())?;
+            env.push(env_pair(&pair)?);
         } else if arg == "--shell" {
             let path = args
                 .next()
@@ -78,6 +101,37 @@ pub fn parse_policy(args: impl IntoIterator<Item = OsString>) -> Result<Policy, 
         }
     }
     Err("missing -- before the program".into())
+}
+
+/// One `--env NAME=VALUE` pair, or the reason the helper refuses it: a loader
+/// variable runs code in the helper, before any sandbox is on, so it never
+/// reaches a program through here.
+fn env_pair(pair: &OsString) -> Result<(String, String), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = pair.as_bytes();
+    let shown = pair.to_string_lossy();
+    let Some(at) = bytes.iter().position(|byte| *byte == b'=') else {
+        return Err(format!("--env needs NAME=VALUE: {shown}"));
+    };
+    let (name, value) = bytes.split_at(at);
+    let value = &value[1..];
+    let name = std::str::from_utf8(name)
+        .map_err(|_| format!("--env has a name that is not UTF-8: {shown}"))?;
+    let value = std::str::from_utf8(value)
+        .map_err(|_| format!("--env has a value that is not UTF-8: {shown}"))?;
+    if name.is_empty() {
+        return Err(format!("--env has no name: {shown}"));
+    }
+    if name.contains('=') || name.contains('\0') || value.contains('\0') {
+        return Err(format!("--env has a name with `=` or NUL in it: {shown}"));
+    }
+    if name.starts_with("LD_") || name.starts_with("DYLD_") || name == "GCONV_PATH" {
+        return Err(format!(
+            "--env may not set {name}: its code would run before the sandbox is on"
+        ));
+    }
+    Ok((name.to_string(), value.to_string()))
 }
 
 /// Finds `program` on `PATH` the way a shell would, for a bare name.
@@ -121,11 +175,22 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<Infallible, String> {
     let mut write = policy.resolved_write;
     write.extend(write_folders(&policy.write));
     reagent_sandbox::restrict(policy.network, &write)?;
+    if policy.keep_group {
+        reagent_sandbox::keep_group()?;
+    }
+    let mut command = std::process::Command::new(&policy.program);
+    command.args(&policy.args);
+    // A program the caller sends an environment for gets nothing else: what it
+    // is given here is all it sees.
+    if policy.clear_env {
+        command.env_clear();
+    }
+    for (name, value) in &policy.env {
+        command.env(name, value);
+    }
     // `exec` keeps the pid and passes a signal on to the caller as a signal,
     // so nothing waits for a child and no 128 + signal mapping is needed.
-    let error = std::process::Command::new(&policy.program)
-        .args(&policy.args)
-        .exec();
+    let error = command.exec();
     Err(format!(
         "cannot run {}: {error}",
         policy.program.to_string_lossy()
@@ -171,13 +236,75 @@ mod tests {
             policy,
             Policy {
                 network: true,
+                keep_group: false,
                 write: vec!["/a".into(), "/b".into()],
                 resolved_write: Vec::new(),
                 shell: None,
+                clear_env: false,
+                env: Vec::new(),
                 program: "bash".into(),
                 args: vec!["-c".into(), "x".into()],
             }
         );
+    }
+
+    #[test]
+    fn sandbox_policy_env_clear_and_pairs() {
+        let policy = parse(&[
+            "--env-clear",
+            "--env",
+            "A=1",
+            "--env",
+            "B=two=three",
+            "--",
+            "sh",
+        ])
+        .expect("parses");
+        assert!(policy.clear_env);
+        assert_eq!(
+            policy.env,
+            [
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "two=three".to_string()),
+            ]
+        );
+        // Without the flags nothing changes for the bash tool.
+        let plain = parse(&["--", "sh"]).expect("parses");
+        assert!(!plain.clear_env && plain.env.is_empty());
+        assert!(parse(&["--env"]).unwrap_err().contains("--env"));
+    }
+
+    #[test]
+    fn sandbox_policy_env_pair_needs_a_name_and_a_value() {
+        for pair in ["NAME", "=value", "\u{0}=x", "A=\u{0}"] {
+            let refused = parse(&["--env", pair, "--", "sh"]).unwrap_err();
+            assert!(refused.contains("--env"), "{pair}: {refused}");
+        }
+    }
+
+    #[test]
+    fn sandbox_policy_env_refuses_loader_names() {
+        for pair in [
+            "LD_PRELOAD=/tmp/x.so",
+            "LD_LIBRARY_PATH=/tmp",
+            "DYLD_INSERT_LIBRARIES=/tmp/x.dylib",
+            "DYLD_FRAMEWORK_PATH=/tmp",
+            "GCONV_PATH=/tmp/x",
+        ] {
+            let refused = parse(&["--env", pair, "--", "sh"]).unwrap_err();
+            assert!(
+                refused.contains(pair.split('=').next().unwrap()),
+                "{refused}"
+            );
+        }
+        assert!(parse(&["--env", "PATH=/bin", "--", "sh"]).is_ok());
+    }
+
+    #[test]
+    fn sandbox_policy_keep_group() {
+        let policy = parse(&["--keep-group", "--", "sh"]).expect("parses");
+        assert!(policy.keep_group);
+        assert!(!parse(&["--", "sh"]).expect("parses").keep_group);
     }
 
     #[test]

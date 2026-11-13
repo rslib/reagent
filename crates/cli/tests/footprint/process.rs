@@ -21,9 +21,14 @@ const MAX_RSS_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CPU_MICROS_PER_TURN: u64 = 7_500;
 /// Debug builds run far slower, so the CPU budget is loose there.
 const DEBUG_CPU_FACTOR: u64 = 10;
-/// A debug binary maps far more code: about 17.3 MB peak measured on Linux with
-/// codemode built in (16.3 MB before), so the debug budget is looser too.
-const MAX_DEBUG_RSS_BYTES: u64 = 24 * 1024 * 1024;
+/// A debug binary maps far more code, so the debug budget is looser too: 21.2
+/// MiB peak measured on macOS and 30 MiB on Linux, where the release peak is
+/// 10.8 MiB.
+const MAX_DEBUG_RSS_BYTES: u64 = if cfg!(target_os = "linux") {
+    40 * 1024 * 1024
+} else {
+    24 * 1024 * 1024
+};
 
 /// Peak resident set size over the waited children, in bytes.
 ///

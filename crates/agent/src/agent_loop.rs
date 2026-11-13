@@ -16,7 +16,7 @@ use crate::batch::{Note, Outcome, run_all_noted};
 use crate::compact::{Compact, Compacted};
 use crate::event::{DropReason, Event, MessageState, TurnEndReason};
 use crate::guard::{Answer, Guard};
-use crate::hook::TurnHook;
+use crate::hook::{EventHook, Seen, TurnHook};
 use crate::journal::Journal;
 use crate::journal::record::ApprovalKind;
 use crate::journal::resume::PendingCall;
@@ -111,6 +111,8 @@ pub struct Agent<'a> {
     policies: Vec<Box<dyn TurnPolicy>>,
     /// The async hook that runs when a turn ends, after the policies.
     turn_hook: Option<Arc<dyn TurnHook>>,
+    /// The hook that sees the run's events in loop order.
+    event_hook: Option<Arc<dyn EventHook>>,
     mask: Option<Mask>,
     archive: Option<Arc<Archive>>,
     compact: Option<Compact>,
@@ -168,6 +170,7 @@ impl<'a> Agent<'a> {
             token,
             policies: Vec::new(),
             turn_hook: None,
+            event_hook: None,
             mask: None,
             archive: None,
             tool_choice: ToolChoice::Auto,
@@ -211,6 +214,7 @@ impl<'a> Agent<'a> {
             token,
             policies,
             turn_hook: None,
+            event_hook: None,
             mask: None,
             archive: None,
             tool_choice: ToolChoice::Auto,
@@ -241,6 +245,20 @@ impl<'a> Agent<'a> {
     pub fn with_turn_hook(mut self, hook: Arc<dyn TurnHook>) -> Self {
         self.turn_hook = Some(hook);
         self
+    }
+
+    /// Adds the hook that sees the run's events in loop order.
+    #[must_use]
+    pub fn with_event_hook(mut self, hook: Arc<dyn EventHook>) -> Self {
+        self.event_hook = Some(hook);
+        self
+    }
+
+    /// Hands `event` to the event hook, if there is one.
+    fn saw(&self, event: Seen<'_>) {
+        if let Some(hook) = self.event_hook.as_deref() {
+            hook.seen(event);
+        }
     }
 
     /// Names the config provider id of the starting provider, so a request and
@@ -414,6 +432,7 @@ impl<'a> Agent<'a> {
         {
             let error = journal_error(&error);
             emit(events, &self.token, Event::Error(error)).await;
+            self.saw(Seen::RunEnd(&TurnEndReason::Error));
             emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
             return;
         }
@@ -443,6 +462,7 @@ impl<'a> Agent<'a> {
             if self.token.is_cancelled() || emit(events, &self.token, Event::TurnStart).await {
                 break TurnEndReason::Cancelled;
             }
+            self.saw(Seen::TurnStart);
             turns += 1;
 
             let compacted = match (&self.compact, &self.archive) {
@@ -547,6 +567,7 @@ impl<'a> Agent<'a> {
             if steer_waits && run_end == Some(TurnEndReason::EndTurn) {
                 run_end = None;
             }
+            self.saw(Seen::TurnEnd(&turn_reason));
             let closed = emit(events, &self.token, Event::TurnEnd(turn_reason)).await;
             if let Some(reason) = run_end {
                 break reason;
@@ -571,6 +592,7 @@ impl<'a> Agent<'a> {
             run_reason = TurnEndReason::Cancelled;
         }
         self.completed = turns;
+        self.saw(Seen::RunEnd(&run_reason));
         emit(events, &self.token, Event::RunEnd(run_reason)).await;
     }
 
@@ -1211,6 +1233,7 @@ impl<'a> Agent<'a> {
         if let Err(error) = write_pending(journal, history) {
             let error = journal_error(&error);
             emit(events, &self.token, Event::Error(error)).await;
+            self.saw(Seen::RunEnd(&TurnEndReason::Error));
             emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
             return TurnEndReason::Error;
         }
@@ -1223,6 +1246,7 @@ impl<'a> Agent<'a> {
             }
             mark_recorded(journal, history.len());
             emit(events, &self.token, Event::Error(error)).await;
+            self.saw(Seen::RunEnd(&TurnEndReason::Error));
             emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
             return TurnEndReason::Error;
         }
@@ -1279,10 +1303,15 @@ impl<'a> Agent<'a> {
             emit(events, &self.token, Event::Error(error)).await;
             // The run ends here: the reason the calls ended with is the reason
             // of the run, so the exit code and the list entry say it failed.
+            self.saw(Seen::RunEnd(&TurnEndReason::Error));
             emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
             return TurnEndReason::Error;
         }
         for (call, (bytes, output, is_error, images)) in calls.iter().zip(facts) {
+            self.saw(Seen::ToolEnd {
+                tool: &call.name,
+                is_error,
+            });
             let event = Event::ToolResult {
                 id: call.id.clone(),
                 is_error,
@@ -1416,6 +1445,10 @@ impl<'a> Agent<'a> {
             return TurnOutcome::Error(error);
         }
         for call in calls {
+            self.saw(Seen::ToolEnd {
+                tool: &call.name,
+                is_error: true,
+            });
             let event = Event::ToolResult {
                 id: call.id.clone(),
                 is_error: true,
@@ -1748,6 +1781,10 @@ impl<'a> Agent<'a> {
                 for (call, fact) in calls.iter().zip(facts) {
                     let (bytes, output, is_error, images) =
                         fact.expect("the batch answers every call");
+                    self.saw(Seen::ToolEnd {
+                        tool: &call.name,
+                        is_error,
+                    });
                     let event = Event::ToolResult {
                         id: call.id.clone(),
                         is_error,
@@ -6322,6 +6359,76 @@ mod tests {
             "a PolicyNote event reports the follow-up: {events:?}"
         );
         assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::EndTurn)));
+    }
+
+    /// An event hook that writes down what it saw, one line per event.
+    #[derive(Default)]
+    struct HookRecorder {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl crate::hook::EventHook for HookRecorder {
+        fn seen(&self, event: crate::hook::Seen<'_>) {
+            use crate::hook::Seen;
+            let line = match event {
+                Seen::TurnStart => "turn_start".to_string(),
+                Seen::ToolEnd { tool, is_error } => format!("tool_end {tool} {is_error}"),
+                Seen::TurnEnd(reason) => format!("turn_end {reason:?}"),
+                Seen::RunEnd(reason) => format!("run_end {reason:?}"),
+            };
+            self.seen.lock().expect("recorder lock").push(line);
+        }
+    }
+
+    /// The hook sees each turn start, tool result, turn end and run end once,
+    /// in the order the channel gets them, with the tool's name.
+    #[tokio::test]
+    async fn event_hook_sees_the_channel_events_in_order() {
+        let provider = FakeProvider::new(vec![
+            tool_reply("c1", "echo", r#"{"message":"hi"}"#),
+            tool_reply("c2", "nope", "{}"),
+            text_reply("done"),
+        ]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+        let hook = Arc::new(HookRecorder::default());
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_event_hook(Arc::clone(&hook) as Arc<dyn crate::hook::EventHook>)
+            .run(&mut history, None, &tx)
+            .await;
+
+        let events = drain(tx, &mut rx);
+        let mut names = std::collections::HashMap::new();
+        let from_channel: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallReady { id, name, .. } => {
+                    names.insert(id.clone(), name.clone());
+                    None
+                }
+                Event::TurnStart => Some("turn_start".to_string()),
+                Event::ToolResult { id, is_error, .. } => {
+                    Some(format!("tool_end {} {is_error}", names[id]))
+                }
+                Event::TurnEnd(reason) => Some(format!("turn_end {reason:?}")),
+                Event::RunEnd(reason) => Some(format!("run_end {reason:?}")),
+                _ => None,
+            })
+            .collect();
+        let seen = hook.seen.lock().expect("recorder lock").clone();
+        assert_eq!(seen, from_channel);
+        assert!(
+            seen.contains(&"tool_end echo false".to_string()),
+            "{seen:?}"
+        );
+        assert!(seen.contains(&"tool_end nope true".to_string()), "{seen:?}");
+        assert_eq!(
+            seen.last().map(String::as_str),
+            Some("run_end EndTurn"),
+            "{seen:?}"
+        );
     }
 
     #[tokio::test]

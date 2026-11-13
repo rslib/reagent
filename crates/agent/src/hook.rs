@@ -1,7 +1,8 @@
 //! The seams a plugin changes a run through: a hook around every tool call of
-//! a run, and a hook that runs when a turn ends.
+//! a run, a hook that runs when a turn ends and a hook that sees the run's
+//! events in loop order.
 //!
-//! Neither hook is installed by the agent itself: a registry and a loop with
+//! No hook is installed by the agent itself: a registry and a loop with
 //! no hook behave exactly as they did before these types existed, and a run
 //! that installs one pays only that hook's own work.
 
@@ -9,6 +10,7 @@ use futures_util::future::BoxFuture;
 
 use reagent_ai::Text;
 
+use crate::event::TurnEndReason;
 use crate::policy::TurnView;
 use crate::tool::ToolOutput;
 
@@ -60,4 +62,32 @@ pub trait TurnHook: Send + Sync {
     ///
     /// The view borrows the turn's messages, so it is read, not kept.
     fn turn_end<'a>(&'a self, turn: &'a TurnView<'a>) -> BoxFuture<'a, Option<Text>>;
+}
+
+/// A run event an [`EventHook`] sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seen<'a> {
+    /// A turn starts.
+    TurnStart,
+    /// A tool call has its result.
+    ToolEnd {
+        /// The tool's name.
+        tool: &'a str,
+        /// Whether the result is an error.
+        is_error: bool,
+    },
+    /// A turn ended.
+    TurnEnd(&'a TurnEndReason),
+    /// The run ended.
+    RunEnd(&'a TurnEndReason),
+}
+
+/// Sees the run's events in loop order, before they reach the event channel.
+///
+/// The loop does not wait for the channel's reader, so a hook is how a listener
+/// sees the end of a turn before any call of the next turn runs. `seen` must
+/// not block: it runs inside the loop.
+pub trait EventHook: Send + Sync {
+    /// Takes one event.
+    fn seen(&self, event: Seen<'_>);
 }

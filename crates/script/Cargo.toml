@@ -7,13 +7,21 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+cookie_store = { version = "0.22.1", default-features = false, features = ["serde_json"], optional = true }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+# `timers` stays: `llrt_modules` imports `timers::poll_timers` in its `require`
+# module without a feature gate, so the crate does not compile without it.
+llrt_modules = { git = "https://github.com/awslabs/llrt", rev = "60fce06", default-features = false, features = ["abort", "buffer", "crypto", "crypto-rust", "events", "exceptions", "fs", "os", "path", "process", "stream-web", "timers", "url", "util"], optional = true }
+nix = { version = "0.31.3", default-features = false, features = ["signal", "process"], optional = true }
 reagent-agent.workspace = true
 reagent-ai.workspace = true
+reagent-oauth = { workspace = true, optional = true }
 reagent-tools.workspace = true
-rquickjs = { version = "0.14.0", default-features = false, features = ["loader"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "stream"], optional = true }
+rquickjs = { version = "0.14.0", default-features = false, features = ["futures", "loader"] }
 serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+sha2 = { version = "0.11.1", default-features = false, optional = true }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "sync", "time", "macros", "fs", "io-util"] }
 tokio-util = { version = "0.7.20", default-features = false, features = ["rt"] }
 [lints]
@@ -23,4 +31,7 @@ workspace = true
 dhat = { version = "0.3.3", default-features = false }
 reagent-config.workspace = true
 tempfile = { version = "3.27.0", default-features = false }
-tokio = { version = "1.54.1", default-features = false, features = ["test-util", "rt", "macros"] }
+tokio = { version = "1.54.1", default-features = false, features = ["test-util", "rt", "macros", "net"] }
+
+[features]
+node = ["dep:cookie_store", "dep:llrt_modules", "dep:nix", "dep:reagent-oauth", "dep:reqwest", "dep:sha2", "tokio/net", "tokio/process"]

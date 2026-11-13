@@ -661,3 +661,106 @@ async fn a_long_socket_path_warns_and_runs() {
     .await;
     assert_ne!(listened.status.code(), Some(0), "{listened:?}");
 }
+
+/// A served run that cannot prepare an `@image` file stops before any request
+/// and exits 1, as a plain run does.
+#[tokio::test]
+async fn a_served_run_stops_on_a_broken_image() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let state = state();
+    // A PNG header and nothing decodable after it.
+    let mut broken = b"\x89PNG\r\n\x1a\n".to_vec();
+    broken.extend_from_slice(&[0_u8; 24]);
+    tokio::fs::write(tmp.path().join("bad.png"), &broken)
+        .await
+        .expect("the broken image");
+    let fake = script(tmp.path(), r#"{"replies":[{"text":"a reply"}]}"#).await;
+    let out = output(
+        state.path(),
+        tmp.path(),
+        &["--json", "--provider", &fake, "-p", "look at @bad.png"],
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("bad.png"), "{stderr}");
+    assert!(
+        !stderr.contains("reagent: warning: "),
+        "the run did not serve: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("a reply"), "a request went out: {stdout}");
+}
+
+/// A plugin sees the end of a turn before a call of the next turn runs, also
+/// when the printer is behind: the first reply is larger than the stdout pipe
+/// and the test reads nothing for two seconds.
+#[tokio::test]
+async fn a_listener_sees_the_turn_end_before_the_next_call() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let state = state();
+    let config = tmp.path().join("config");
+    let plugin = config.join("reagent").join("plugins").join("counting");
+    tokio::fs::create_dir_all(&plugin)
+        .await
+        .expect("the plugin folder");
+    tokio::fs::write(
+        plugin.join("package.json"),
+        r#"{"name": "counting", "reagent": {"entry": "index.js"}}"#,
+    )
+    .await
+    .expect("the manifest");
+    // `count` answers one byte more than the turns that ended, so the
+    // `bytes` of its result line carries the count.
+    tokio::fs::write(
+        plugin.join("index.js"),
+        r#"
+let turns = 0;
+export default function (reagent) {
+  reagent.on("turn_end", () => { turns += 1; });
+  reagent.registerTool({ name: "nothing", description: "Does nothing.", parameters: { type: "object" }, run: () => "" });
+  reagent.registerTool({ name: "count", description: "Counts.", parameters: { type: "object" }, run: () => "x".repeat(turns + 1) });
+}
+"#,
+    )
+    .await
+    .expect("the entry");
+    let work = tmp.path().join("work");
+    tokio::fs::create_dir_all(&work)
+        .await
+        .expect("the work folder");
+    let big = "x".repeat(256 * 1024);
+    let fake = script(
+        tmp.path(),
+        &serde_json::json!({"replies": [
+          {"text": big, "calls": [{"id": "n1", "name": "nothing", "arguments": {}}]},
+          {"text": "two", "calls": [{"id": "c1", "name": "count", "arguments": {}}]},
+          {"text": "done"}
+        ]})
+        .to_string(),
+    )
+    .await;
+    let run = start(
+        state.path(),
+        &work,
+        &config,
+        &["--json", "--provider", &fake, "-p", "count the turns"],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (status, out) = run.finish().await;
+    assert_eq!(status.code(), Some(0), "{out}");
+    assert!(
+        out.lines()
+            .next()
+            .is_some_and(|line| line.contains("\"socket\"")),
+        "the run served its socket: {out}"
+    );
+    let counted = out
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|line| line["type"] == "tool_result")
+        .expect("a tool result line");
+    assert_eq!(counted["bytes"], 2, "{out}");
+}

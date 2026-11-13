@@ -2,21 +2,25 @@
 //! the persistent handles of what the plugins registered.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
+use rquickjs::function::{Opt, Rest, This};
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use rquickjs::{
-    Context, Ctx, Error, Exception, Function, IntoJs, Module, Object, Persistent, Promise,
-    Result as JsResult, Runtime, Value,
+    AsyncContext, AsyncRuntime, Ctx, Error, Exception, Function, IntoJs, Module, Object,
+    Persistent, Promise, Result as JsResult, Value,
 };
 use serde_json::Value as JsonValue;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
+use tokio::sync::oneshot::error::TryRecvError;
 
 use super::api::{self, Host, Slot, Staging};
 use super::manifest::{self, Found, Manifest};
@@ -28,17 +32,29 @@ const MEMORY_CAP: usize = 256 * 1024 * 1024;
 /// How long one JS call may run before a note says it is slow.
 const SLOW: Duration = Duration::from_secs(1);
 
-/// How long one JS call may run before the runtime stops it.
+/// How long one slice of JS may run before the runtime stops it: a slice is one
+/// job or one callback, which the host runs between two polls of its own.
 const STOP: Duration = Duration::from_secs(5);
 
-/// The deadline that means no JS call is running.
-const IDLE: u64 = u64::MAX;
+/// How long one plugin tool or command may wait on the promise it handed back.
+/// A hook, a listener and a timer callback wait [`STOP`] instead.
+const LONG: Duration = Duration::from_secs(120);
 
-/// What a plugin call that did not answer says when it was cut short.
-const STOPPED: &str = "the plugin call was stopped after 5 s";
+/// What a plugin call that did not answer says when it was cut short, with the
+/// budget that ended it.
+fn stopped_after(limit: Duration) -> String {
+    format!("the plugin call was stopped after {} s", limit.as_secs())
+}
 
-/// What a plugin waits on that only a promise could settle says.
-const NEVER: &str = "the promise never settles: plugins have no timers or I/O";
+/// The most timers that may be waiting at once.
+const TIMERS: usize = 1024;
+
+/// The most timer futures that may be alive at once, counting the ones a
+/// `clearTimeout` has ended but the scheduler has not dropped yet.
+const RUNNING: usize = 16384;
+
+/// The longest delay a timer may take, in milliseconds: about 24 days.
+const LONGEST: f64 = 2_147_483_647.0;
 
 /// One request the async side makes of the plugin thread.
 pub(crate) enum Job {
@@ -46,6 +62,13 @@ pub(crate) enum Job {
     Load {
         /// The folder to read.
         root: PathBuf,
+        /// The folder a relative path of a plugin resolves against.
+        session: PathBuf,
+        /// The state folder a plugin's cookies are saved under.
+        state: PathBuf,
+        /// The sandbox helper every child process of a plugin starts through,
+        /// and `None` when this run has no sandbox.
+        sandbox: Option<PathBuf>,
         /// Carries the report back.
         reply: oneshot::Sender<LoadReport>,
     },
@@ -170,18 +193,19 @@ pub(crate) struct ResultReply {
 enum Failed {
     /// It threw, with this message.
     Threw(String),
-    /// The watchdog stopped it, and a note already says so.
-    Stopped,
+    /// The watchdog stopped it, or a promise it handed back never settled: a
+    /// note already says so, and this is the budget that ended it.
+    Stopped(Duration),
 }
 
 /// Starts the plugin thread, with the notes the plugins raise.
-pub(crate) fn start(notes: Arc<Mutex<Notes>>) -> Option<(SyncSender<Job>, Arc<Live>)> {
+pub(crate) fn start(notes: Arc<Mutex<Notes>>) -> Option<(Sender<Job>, Arc<Live>)> {
     let wake = match notes.lock() {
         Ok(notes) => notes.wake(),
         Err(broken) => broken.into_inner().wake(),
     };
     let live = Arc::new(Live::new(wake, Arc::clone(&notes)));
-    let (jobs, queue) = sync_channel(super::JOBS);
+    let (jobs, queue) = tokio::sync::mpsc::channel(super::JOBS);
     let hosting = Arc::clone(&live);
     std::thread::Builder::new()
         .name("plugin".into())
@@ -191,61 +215,139 @@ pub(crate) fn start(notes: Arc<Mutex<Notes>>) -> Option<(SyncSender<Job>, Arc<Li
 }
 
 /// The thread's whole life: one runtime, one context, one job at a time.
+///
+/// The thread has a tokio runtime of its own, so a plugin may hand back a
+/// promise that a timer or a future settles: the host waits for it while the
+/// runtime drives its own jobs.
 fn host(queue: Receiver<Job>, notes: Arc<Mutex<Notes>>, live: Arc<Live>) {
-    let Ok(runtime) = Runtime::new() else {
+    // I/O is what a plugin's `fetch` needs: its requests run on this runtime,
+    // on this thread.
+    let started = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build();
+    let Ok(runtime) = started else {
         note(
             &notes,
             "plugins: the JavaScript runtime did not start".into(),
         );
         return;
     };
-    runtime.set_memory_limit(MEMORY_CAP);
-    let watch = Arc::new(Watch::new());
-    runtime.set_interrupt_handler(Some(watch.handler()));
+    // Local tasks run on this thread and are never sent anywhere else, which
+    // is what a QuickJS runtime needs; `block_on` polls them while the host
+    // waits for its next job.
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, serve(queue, notes, live));
+}
+
+/// The async host of the one runtime: sets it up, then answers every job.
+///
+/// Everything from the setup to the last job runs inside one `async_with`, the
+/// rquickjs half of [`AsyncRuntime::drive`]: while the closure waits for the
+/// next job, that future runs the pending promise jobs and polls the futures a
+/// plugin spawned (its timers), and it holds the runtime lock only while it
+/// polls. Driving the runtime as a second task instead would race this one for
+/// that lock, so the pump of the one `async_with` is what drives it.
+async fn serve(mut queue: Receiver<Job>, notes: Arc<Mutex<Notes>>, live: Arc<Live>) {
+    let Ok(runtime) = AsyncRuntime::new() else {
+        note(
+            &notes,
+            "plugins: the JavaScript runtime did not start".into(),
+        );
+        return;
+    };
+    runtime.set_memory_limit(MEMORY_CAP).await;
+    let watch = Rc::new(Watch::new());
+    runtime.set_interrupt_handler(Some(watch.handler())).await;
     let folders = Arc::new(Mutex::new(HashSet::new()));
     let loader = PluginLoader {
         folders: Arc::clone(&folders),
     };
-    runtime.set_loader(loader.clone(), loader);
-    let Ok(context) = Context::full(&runtime) else {
+    runtime.set_loader(loader.clone(), loader).await;
+    let Ok(context) = AsyncContext::full(&runtime).await else {
         note(
             &notes,
             "plugins: the JavaScript context did not start".into(),
         );
         return;
     };
-    let mut engine = Engine::new();
-    while let Ok(job) = queue.recv() {
-        let notes = Arc::clone(&notes);
-        context.with(|ctx| handle(&ctx, &mut engine, &watch, &notes, &live, &folders, job));
-    }
+    context
+        .async_with(async move |ctx| {
+            // The timers of this context, emptied before it ends so no callback
+            // outlives it.
+            let clock = Rc::new(Timers::default());
+            if let Err(error) = timers(&ctx, &clock, &watch, &notes) {
+                note(
+                    &notes,
+                    format!("plugins: the timers did not start: {error}"),
+                );
+            }
+            // The Node modules of this context, and the `process` object they
+            // read, which this holds out of the globals; dropped here, before
+            // the context it belongs to ends.
+            #[cfg(feature = "node")]
+            let held = match super::node::setup(&ctx).await {
+                Ok(held) => Some(held),
+                Err(error) => {
+                    note(
+                        &notes,
+                        format!("plugins: the node modules did not start: {error}"),
+                    );
+                    None
+                }
+            };
+            let mut engine = Engine::new();
+            let mut waiting = Waiting {
+                queue: &mut queue,
+                watch: &watch,
+                notes: &notes,
+                ctx: &ctx,
+                window: None,
+            };
+            while let Some(job) = (&mut waiting).await {
+                handle(&ctx, &mut engine, &watch, &notes, &live, &folders, job).await;
+            }
+            clock.clear();
+            #[cfg(feature = "node")]
+            drop(held);
+        })
+        .await;
 }
 
 /// Answers one job.
-fn handle(
+async fn handle(
     ctx: &Ctx<'_>,
     engine: &mut Engine,
-    watch: &Arc<Watch>,
+    watch: &Rc<Watch>,
     notes: &Arc<Mutex<Notes>>,
     live: &Arc<Live>,
     folders: &Mutex<HashSet<PathBuf>>,
     job: Job,
 ) {
     match job {
-        Job::Load { root: dir, reply } => {
-            let report = load_all(ctx, engine, &dir, watch, notes, live, folders);
+        Job::Load {
+            root: dir,
+            session,
+            state,
+            sandbox,
+            reply,
+        } => {
+            super::node::session(&session);
+            super::node::state(&state);
+            super::node::sandbox(sandbox);
+            let report = load_all(ctx, engine, &dir, watch, notes, live, folders).await;
             let _ = reply.send(report);
         }
         Job::Run { tool, args, reply } => {
-            let out = run_tool(ctx, engine, watch, notes, &tool, &args);
+            let out = run_tool(ctx, engine, watch, notes, &tool, &args).await;
             let _ = reply.send(out);
         }
         Job::Command { name, args, reply } => {
-            let out = run_command(ctx, engine, watch, notes, &name, &args);
+            let out = run_command(ctx, engine, watch, notes, &name, &args).await;
             let _ = reply.send(out);
         }
         Job::Call { tool, args, reply } => {
-            let out = chain_call(ctx, engine, watch, notes, &tool, &args);
+            let out = chain_call(ctx, engine, watch, notes, &tool, &args).await;
             let _ = reply.send(out);
         }
         Job::Result {
@@ -255,7 +357,7 @@ fn handle(
             is_error,
             reply,
         } => {
-            let out = chain_result(ctx, engine, watch, notes, &tool, &args, (text, is_error));
+            let out = chain_result(ctx, engine, watch, notes, &tool, &args, (text, is_error)).await;
             let _ = reply.send(out);
         }
         Job::Turn {
@@ -264,60 +366,124 @@ fn handle(
             text,
             reply,
         } => {
-            let out = chain_turn(ctx, engine, watch, notes, index, ran_tools, &text);
+            let out = chain_turn(ctx, engine, watch, notes, index, ran_tools, &text).await;
             let _ = reply.send(out);
         }
-        Job::Event { name, payload } => fire(ctx, engine, watch, notes, &name, &payload),
+        Job::Event { name, payload } => fire(ctx, engine, watch, notes, &name, &payload).await,
     }
 }
 
-/// The interrupt handler's clock: one deadline for the JS call running now.
+/// The interrupt handler's clock: the windows of JS that run now.
+///
+/// A call may hand back a promise, a timer callback may run while it waits, and
+/// the wait for the next job runs promise jobs: the windows overlap without
+/// nesting last-in-first-out, so each one carries an id and ends by it, and the
+/// handler watches the window whose deadline comes first.
 struct Watch {
     /// When the runtime started, which every deadline counts from.
     start: Instant,
-    /// When the running call began, or 0 when no call began yet.
-    began: AtomicU64,
-    /// When the running call is interrupted, or [`IDLE`].
-    deadline: AtomicU64,
-    /// Whether the running call passed [`SLOW`].
-    slow: AtomicBool,
-    /// Whether the handler stopped the running call.
-    fired: AtomicBool,
+    /// The live windows, in the order they began.
+    arms: RefCell<Vec<Arm>>,
+    /// The id the last window took.
+    last: Cell<u64>,
+    /// When the slice of JS that runs now began: each job and each callback
+    /// gets [`STOP`] of its own, so a call waiting on a promise may wait
+    /// [`LONG`] without letting one job spin that long.
+    slice: Cell<u64>,
+}
+
+/// One window of JS under the watchdog.
+struct Arm {
+    /// What ends the window.
+    id: u64,
+    /// When the window began, in nanoseconds after the runtime's start.
+    began: u64,
+    /// When a promise the window waits on may no longer settle, in the same
+    /// unit.
+    deadline: u64,
+    /// How long the window may wait: [`STOP`] for a hook, a listener and a
+    /// timer callback, [`LONG`] for a tool and a command.
+    limit: Duration,
+    /// Whether the window belongs to the wait for the next job, which has no
+    /// call to name in a note.
+    idle: bool,
+    /// Whether the window passed [`SLOW`].
+    slow: bool,
+    /// The budget the handler stopped the window with.
+    fired: Option<Duration>,
 }
 
 impl Watch {
     fn new() -> Self {
         Self {
             start: Instant::now(),
-            began: AtomicU64::new(0),
-            deadline: AtomicU64::new(IDLE),
-            slow: AtomicBool::new(false),
-            fired: AtomicBool::new(false),
+            arms: RefCell::new(Vec::new()),
+            last: Cell::new(0),
+            slice: Cell::new(0),
         }
     }
 
     /// The handler QuickJS calls while it runs JS.
-    fn handler(self: &Arc<Self>) -> Box<dyn FnMut() -> bool + 'static> {
-        let watch = Arc::clone(self);
+    fn handler(self: &Rc<Self>) -> Box<dyn FnMut() -> bool + 'static> {
+        let watch = Rc::clone(self);
         Box::new(move || watch.check())
     }
 
-    /// Notes that the running call is slow, and stops it past its deadline.
+    /// Notes every window past [`SLOW`], and stops the one whose deadline comes
+    /// first, unless that is a window of the wait the runtime runs under.
     fn check(&self) -> bool {
-        let deadline = self.deadline.load(Ordering::Relaxed);
-        if deadline == IDLE {
+        // No arm is borrowed while JS runs: `begin` and `end` take their borrow
+        // on either side of the window they arm. A borrow that is somehow held
+        // runs the window unarmed rather than panicking on this thread.
+        let Ok(mut arms) = self.arms.try_borrow_mut() else {
+            return false;
+        };
+        // The wait's window covers promise jobs no call asked for, and it notes
+        // their stop itself: a call or a timer callback under way is what the
+        // handler stops.
+        let idle_only = arms.iter().all(|arm| arm.idle);
+        let now = self.elapsed();
+        let slow = SLOW.as_nanos() as u64;
+        // The slice of JS that runs now stops at its own budget, whatever the
+        // window it runs in may wait for.
+        let slice = self.slice.get() + STOP.as_nanos() as u64;
+        let mut first = None;
+        let mut deadline = u64::MAX;
+        let mut budget = STOP;
+        for (at, arm) in arms.iter_mut().enumerate() {
+            // Each window has its own clock: one that began before this window
+            // is slow even while the JS of a later one runs.
+            if now >= arm.began + slow {
+                arm.slow = true;
+            }
+            if !idle_only && arm.idle {
+                continue;
+            }
+            let (fire, limit) = if slice < arm.deadline {
+                (slice, STOP)
+            } else {
+                (arm.deadline, arm.limit)
+            };
+            if fire < deadline {
+                deadline = fire;
+                budget = limit;
+                first = Some(at);
+            }
+        }
+        let Some(first) = first else {
+            return false;
+        };
+        if now < deadline {
             return false;
         }
-        let now = self.elapsed();
-        if now >= deadline {
-            self.fired.store(true, Ordering::Relaxed);
-            return true;
-        }
-        // The call's own start, not the deadline: the note is due at 1 s.
-        if now >= self.began.load(Ordering::Relaxed) + SLOW.as_nanos() as u64 {
-            self.slow.store(true, Ordering::Relaxed);
-        }
-        false
+        arms[first].fired = Some(budget);
+        true
+    }
+
+    /// Starts a new slice of JS: the runtime is about to run the jobs and the
+    /// callbacks of one poll, and each of them gets [`STOP`] of its own.
+    fn touch(&self) {
+        self.slice.set(self.elapsed());
     }
 
     /// How long the runtime has run, in nanoseconds.
@@ -325,54 +491,436 @@ impl Watch {
         self.start.elapsed().as_nanos() as u64
     }
 
-    /// Arms the deadline of the call that is about to run.
-    fn begin(&self) {
-        self.slow.store(false, Ordering::Relaxed);
-        self.fired.store(false, Ordering::Relaxed);
-        let began = self.elapsed();
-        self.began.store(began, Ordering::Relaxed);
-        self.deadline
-            .store(began + STOP.as_nanos() as u64, Ordering::Relaxed);
+    /// Arms the deadline of one call, hook or timer callback about to run, with
+    /// the budget it may wait on its promise.
+    fn begin(&self, limit: Duration) -> u64 {
+        self.arm(limit, false)
     }
 
-    /// Disarms the deadline and reports whether the call was slow or stopped.
-    fn end(&self) -> (bool, bool) {
-        self.deadline.store(IDLE, Ordering::Relaxed);
-        (
-            self.slow.load(Ordering::Relaxed),
-            self.fired.load(Ordering::Relaxed),
-        )
+    /// Arms one window of the wait for the next job.
+    fn begin_idle(&self) -> u64 {
+        self.arm(STOP, true)
+    }
+
+    /// Arms one window, and answers with its id.
+    fn arm(&self, limit: Duration, idle: bool) -> u64 {
+        let began = self.elapsed();
+        self.slice.set(began);
+        let id = self.last.get().wrapping_add(1);
+        self.last.set(id);
+        self.arms.borrow_mut().push(Arm {
+            id,
+            began,
+            deadline: began + limit.as_nanos() as u64,
+            limit,
+            idle,
+            slow: false,
+            fired: None,
+        });
+        id
+    }
+
+    /// Disarms the window with this id, wherever it sits: whether it was slow
+    /// and which budget the handler stopped it with.
+    fn end(&self, id: u64) -> (bool, Option<Duration>) {
+        let mut arms = self.arms.borrow_mut();
+        let Some(at) = arms.iter().position(|arm| arm.id == id) else {
+            return (false, None);
+        };
+        let arm = arms.remove(at);
+        (arm.slow, arm.fired)
+    }
+
+    /// The instant the window with this id is stopped at; [`STOP`] from now when
+    /// it is no longer armed.
+    ///
+    /// A window's promise waits until that window's own deadline, never until
+    /// the deadline of another window that happens to be open beside it.
+    /// The budget of the window with this id: how long it may wait on the
+    /// promise it handed back.
+    fn limit_of(&self, id: u64) -> Duration {
+        let arms = self.arms.borrow();
+        arms.iter()
+            .find(|arm| arm.id == id)
+            .map_or(STOP, |arm| arm.limit)
+    }
+
+    fn deadline_of(&self, id: u64) -> tokio::time::Instant {
+        let arms = self.arms.borrow();
+        let first = arms
+            .iter()
+            .find(|arm| arm.id == id)
+            .map(|arm| arm.deadline)
+            .unwrap_or_else(|| self.elapsed() + STOP.as_nanos() as u64);
+        tokio::time::Instant::from_std(self.start + Duration::from_nanos(first))
     }
 }
 
+/// The wait for the next job, with one window of JS armed for each poll.
+///
+/// While this waits, the runtime runs the promise jobs its plugins queued, and
+/// the interrupt handler only fires within a window: the window of a poll is
+/// what stops a job that never returns, and it ends on the next poll, so the JS
+/// of one poll runs under exactly one deadline. A poll that ran nothing ends
+/// its window without a note.
+struct Waiting<'a, 'js> {
+    /// The queue of jobs.
+    queue: &'a mut Receiver<Job>,
+    /// The watchdog the window belongs to.
+    watch: &'a Watch,
+    /// Where a stopped job leaves its note.
+    notes: &'a Mutex<Notes>,
+    /// The context, whose stopped job leaves an error to take out.
+    ctx: &'a Ctx<'js>,
+    /// The window of the last poll, if it is still armed.
+    window: Option<u64>,
+}
+
+impl Future for Waiting<'_, '_> {
+    type Output = Option<Job>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Job>> {
+        let this = self.get_mut();
+        // The jobs that ran since the last poll ran under that poll's window.
+        this.end();
+        this.watch.touch();
+        this.window = Some(this.watch.begin_idle());
+        if let Poll::Ready(next) = this.queue.poll_recv(cx) {
+            // A job is about to run, and it arms a window of its own.
+            this.end();
+            return Poll::Ready(next);
+        }
+        Poll::Pending
+    }
+}
+
+impl Waiting<'_, '_> {
+    /// Ends the window of the last poll, and notes one it stopped.
+    fn end(&mut self) {
+        let Some(window) = self.window.take() else {
+            return;
+        };
+        if self.watch.end(window).1.is_some() {
+            // The interrupt left the error of the stopped job in the context.
+            self.ctx.catch();
+            note(
+                self.notes,
+                "plugins: a promise job stopped after 5 s".into(),
+            );
+        }
+    }
+}
+
+/// The plugin a call is made for: the index a stop matches, and the name its
+/// notes carry.
+#[derive(Clone, Copy)]
+struct Who<'a> {
+    /// The index of the plugin, which is what a stop of its children matches.
+    index: usize,
+    /// The name of the plugin, which only a message uses.
+    name: &'a str,
+}
+
 /// Runs one JS call under the watchdog, with `what` naming it in a note.
-fn watched<T>(
+///
+/// A call that hands back a promise is awaited here, so the window stays open
+/// while the runtime settles it: a promise nothing settles is stopped after
+/// `limit`, the same as a call that spins, which the slice budget stops after
+/// [`STOP`]. The call gets its window's id, so what it awaits ends at this
+/// window's deadline and no other's.
+async fn watched<T>(
     ctx: &Ctx<'_>,
-    watch: &Arc<Watch>,
+    watch: &Rc<Watch>,
     notes: &Mutex<Notes>,
-    plugin: &str,
+    who: Who<'_>,
     what: &str,
-    call: impl FnOnce() -> Result<T, String>,
+    limit: Duration,
+    call: impl AsyncFnOnce(u64) -> Result<T, Failed>,
 ) -> Result<T, Failed> {
-    watch.begin();
-    let out = call();
-    let (slow, fired) = watch.end();
-    if fired {
+    let since = Instant::now();
+    let window = watch.begin(limit);
+    let out = call(window).await;
+    let (slow, fired) = watch.end(window);
+    if fired.is_some() {
         // The interrupt left the thrown error in the context; take it out.
         ctx.catch();
-        note(notes, format!("plugin {plugin}: {what} stopped after 5 s"));
-        return Err(Failed::Stopped);
+    }
+    let stopped = match (fired, &out) {
+        (Some(budget), _) => Some(budget),
+        (None, Err(Failed::Stopped(budget))) => Some(*budget),
+        _ => None,
+    };
+    if let Some(budget) = stopped {
+        // A call that was stopped leaves no child process behind: every child
+        // its plugin started since it began goes at once. The index decides
+        // which plugin that is, since a name may belong to another one too.
+        super::node::stopped(who.index, since);
+        note(
+            notes,
+            format!(
+                "plugin {}: {what} stopped after {} s",
+                who.name,
+                budget.as_secs()
+            ),
+        );
+        return Err(Failed::Stopped(budget));
     }
     if slow {
-        note(notes, format!("plugin {plugin}: {what} is slow"));
+        note(notes, format!("plugin {}: {what} is slow", who.name));
     }
-    out.map_err(Failed::Threw)
+    out
 }
 
 /// Appends one note for [`super::Plugins::take_notes`].
 pub(super) fn note(notes: &Mutex<Notes>, text: String) {
     if let Ok(mut notes) = notes.lock() {
         notes.push(text);
+    }
+}
+
+/// Sets the timers of this context: reagent's own, since QuickJS has none.
+///
+/// `setTimeout` and `setInterval` hand back an id, and each waiting timer is one
+/// future in the runtime's scheduler, so its callback runs while no job runs and
+/// every callback runs under the watchdog. `queueMicrotask` queues a promise
+/// job, so it runs before the next job the host takes.
+fn timers<'js>(
+    ctx: &Ctx<'js>,
+    waiting: &Rc<Timers<'js>>,
+    watch: &Rc<Watch>,
+    notes: &Arc<Mutex<Notes>>,
+) -> JsResult<()> {
+    for repeat in [false, true] {
+        let set = timer_setter(ctx, Rc::clone(waiting), watch, notes, repeat)?;
+        let name = if repeat { "setInterval" } else { "setTimeout" };
+        ctx.globals().set(name, set)?;
+    }
+    for name in ["clearTimeout", "clearInterval"] {
+        let waiting = Rc::clone(waiting);
+        let clear = Function::new(ctx.clone(), move |id: Opt<f64>| {
+            if let Some(id) = id.0.and_then(id_of) {
+                waiting.stop(id);
+            }
+        })?;
+        ctx.globals().set(name, clear)?;
+    }
+    let queue = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, func: Value<'js>| -> JsResult<()> {
+            let callback = function_of(&ctx, &func, "queueMicrotask")?;
+            let (promise, resolve, _reject) = ctx.promise()?;
+            promise
+                .then()?
+                .call::<_, ()>((This(promise.clone()), callback))?;
+            resolve.call::<_, ()>(())
+        },
+    )?;
+    ctx.globals().set("queueMicrotask", queue)?;
+    // The count of live timer futures, for the test that a cleared timer ends
+    // its future instead of holding it until the end of its delay.
+    #[cfg(test)]
+    {
+        let waiting = Rc::clone(waiting);
+        let count = Function::new(ctx.clone(), move || waiting.running.get() as f64)?;
+        ctx.globals().set("__liveTimers", count)?;
+    }
+    Ok(())
+}
+
+/// The `setTimeout`, or `setInterval`, of one context.
+fn timer_setter<'js>(
+    ctx: &Ctx<'js>,
+    waiting: Rc<Timers<'js>>,
+    watch: &Rc<Watch>,
+    notes: &Arc<Mutex<Notes>>,
+    repeat: bool,
+) -> JsResult<Function<'js>> {
+    let watch = Rc::clone(watch);
+    let notes = Arc::clone(notes);
+    Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>,
+              func: Value<'js>,
+              delay: Opt<f64>,
+              args: Rest<Value<'js>>|
+              -> JsResult<f64> {
+            let name = if repeat { "setInterval" } else { "setTimeout" };
+            let callback = function_of(&ctx, &func, name)?;
+            let delay = delay_of(delay.0);
+            let (cancel, mut cleared) = oneshot::channel();
+            let timer = Timer {
+                cancel,
+                callback,
+                args: args.0,
+            };
+            let Some(id) = waiting.add(timer) else {
+                return Err(Exception::throw_range(&ctx, "too many timers are waiting"));
+            };
+            let waiting = Rc::clone(&waiting);
+            let watch = Rc::clone(&watch);
+            let notes = Arc::clone(&notes);
+            // Counted while the future lives, however it ends, even if the
+            // runtime drops it before its first poll.
+            let alive = Alive(Rc::clone(&waiting));
+            ctx.spawn(async move {
+                let _alive = alive;
+                loop {
+                    // A timer cleared before it was polled ends here, without
+                    // arming a sleep at all.
+                    if !matches!(cleared.try_recv(), Err(TryRecvError::Empty)) {
+                        return;
+                    }
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        _ = &mut cleared => return,
+                    }
+                    // The callback and its arguments wait in the map, so a
+                    // `clearTimeout` frees them at once, even before the
+                    // scheduler polls this future.
+                    let Some((callback, args)) = waiting.next(id, repeat) else {
+                        return;
+                    };
+                    tick(&watch, &notes, &callback, args).await;
+                    if !repeat {
+                        return;
+                    }
+                }
+            });
+            Ok(f64::from(id))
+        },
+    )
+}
+
+/// Runs one timer callback under the watchdog; a throw or a stop is one note.
+///
+/// An interval keeps running after either, so one bad run does not end it.
+async fn tick<'js>(
+    watch: &Watch,
+    notes: &Mutex<Notes>,
+    func: &Function<'js>,
+    args: Vec<Value<'js>>,
+) {
+    let window = watch.begin(STOP);
+    let ctx = func.ctx();
+    let out = match func.call::<_, Value>((Rest(args),)) {
+        Ok(value) => settle(ctx, watch, value, window).await,
+        Err(error) => Err(failure(ctx, error)),
+    };
+    let (_, fired) = watch.end(window);
+    if fired.is_some() {
+        ctx.catch();
+    }
+    match out {
+        Ok(_) => {}
+        Err(Failed::Threw(reason)) if fired.is_none() => {
+            note(notes, format!("plugins: a timer callback threw: {reason}"));
+        }
+        Err(_) => note(notes, "plugins: a timer callback stopped after 5 s".into()),
+    }
+}
+
+/// The function a timer or a microtask names, or a `TypeError`.
+fn function_of<'js>(ctx: &Ctx<'js>, value: &Value<'js>, name: &str) -> JsResult<Function<'js>> {
+    match value.as_function() {
+        Some(func) => Ok(func.clone()),
+        None => Err(Exception::throw_type(
+            ctx,
+            &format!("{name} needs a function"),
+        )),
+    }
+}
+
+/// How long a timer waits: at least 1 ms, and no longer than [`LONGEST`].
+fn delay_of(ms: Option<f64>) -> Duration {
+    let ms = ms.filter(|ms| !ms.is_nan()).unwrap_or(0.0);
+    Duration::from_secs_f64(ms.clamp(1.0, LONGEST) / 1000.0)
+}
+
+/// The timer id a `clearTimeout` names; anything else names no timer.
+fn id_of(id: f64) -> Option<u32> {
+    (id >= 1.0 && id <= f64::from(u32::MAX)).then_some(id as u32)
+}
+
+/// Every timer of the context, by id.
+#[derive(Default)]
+struct Timers<'js> {
+    /// The id the last timer took.
+    last: Cell<u32>,
+    /// The timers waiting now, with what each one runs and the signal that ends
+    /// its future.
+    live: RefCell<HashMap<u32, Timer<'js>>>,
+    /// How many timer futures are alive, ended ones included until the
+    /// scheduler drops them.
+    running: Cell<usize>,
+}
+
+/// One timer that is waiting: its callback and arguments, which live here so a
+/// `clearTimeout` frees them at once, and the signal that ends its future.
+struct Timer<'js> {
+    /// The signal that ends the timer's future.
+    cancel: oneshot::Sender<()>,
+    /// The function the timer runs.
+    callback: Function<'js>,
+    /// The arguments it takes.
+    args: Vec<Value<'js>>,
+}
+
+impl<'js> Timers<'js> {
+    /// Takes an id for one more timer; `None` when too many are waiting or too
+    /// many futures are still alive.
+    fn add(&self, timer: Timer<'js>) -> Option<u32> {
+        let mut waiting = self.live.borrow_mut();
+        if waiting.len() >= TIMERS || self.running.get() >= RUNNING {
+            return None;
+        }
+        let id = self.last.get().wrapping_add(1);
+        self.last.set(id);
+        waiting.insert(id, timer);
+        self.running.set(self.running.get() + 1);
+        Some(id)
+    }
+
+    /// Stops the timer with this id; an id that is not waiting is nothing. The
+    /// callback and its arguments are freed here, before the future that waits
+    /// on them is polled again.
+    fn stop(&self, id: u32) {
+        if let Some(timer) = self.live.borrow_mut().remove(&id) {
+            // The future ends at once instead of at the end of a sleep.
+            let _ = timer.cancel.send(());
+        }
+    }
+
+    /// Takes the callback and arguments of the timer about to run; a repeating
+    /// timer keeps its entry, so it stays waiting and can be cleared, and a
+    /// one-shot's entry is spent.
+    fn next(&self, id: u32, repeat: bool) -> Option<(Function<'js>, Vec<Value<'js>>)> {
+        let mut waiting = self.live.borrow_mut();
+        if repeat {
+            let timer = waiting.get(&id)?;
+            return Some((timer.callback.clone(), timer.args.clone()));
+        }
+        let timer = waiting.remove(&id)?;
+        Some((timer.callback, timer.args))
+    }
+
+    /// Counts one timer future that is gone.
+    fn finished(&self) {
+        self.running.set(self.running.get().saturating_sub(1));
+    }
+
+    /// Drops every timer still waiting, so the callbacks and arguments it holds
+    /// are freed while the context that owns them is still alive.
+    fn clear(&self) {
+        self.live.borrow_mut().clear();
+    }
+}
+
+/// Keeps one timer future counted while it lives, however it ends.
+struct Alive<'js>(Rc<Timers<'js>>);
+
+impl Drop for Alive<'_> {
+    fn drop(&mut self) {
+        self.0.finished();
     }
 }
 
@@ -402,6 +950,8 @@ struct Registered {
     name: String,
     /// The plugin that registered it.
     plugin: String,
+    /// The index of that plugin, which is what a stop matches.
+    index: usize,
     /// The function that runs it.
     run: Persistent<Function<'static>>,
 }
@@ -412,6 +962,8 @@ struct RegisteredCommand {
     name: String,
     /// The plugin that registered it.
     plugin: String,
+    /// The index of that plugin, which is what a stop matches.
+    index: usize,
     /// The function that runs it.
     run: Persistent<Function<'static>>,
 }
@@ -420,6 +972,8 @@ struct RegisteredCommand {
 struct Layer {
     /// The plugin that installed it.
     plugin: String,
+    /// The index of that plugin, which is what a stop matches.
+    index: usize,
     /// The function the layer runs.
     func: Persistent<Function<'static>>,
 }
@@ -428,6 +982,8 @@ struct Layer {
 struct Listener {
     /// The plugin that registered it.
     plugin: String,
+    /// The index of that plugin, which is what a stop matches.
+    index: usize,
     /// The event it waits on.
     event: String,
     /// The function the listener runs.
@@ -450,11 +1006,11 @@ impl Engine {
 }
 
 /// Reads every plugin folder under `root` and loads them in folder order.
-fn load_all(
+async fn load_all(
     ctx: &Ctx<'_>,
     engine: &mut Engine,
     root: &Path,
-    watch: &Arc<Watch>,
+    watch: &Rc<Watch>,
     notes: &Arc<Mutex<Notes>>,
     live: &Arc<Live>,
     folders: &Mutex<HashSet<PathBuf>>,
@@ -496,7 +1052,7 @@ fn load_all(
                     );
                     continue;
                 }
-                match load_one(ctx, engine, &manifest, watch, notes, live, folders) {
+                match load_one(ctx, engine, &manifest, watch, notes, live, folders).await {
                     Ok(owned) => {
                         names.push((manifest.name.clone(), dir));
                         report.loaded += 1;
@@ -506,7 +1062,7 @@ fn load_all(
                     Err(Failed::Threw(reason)) => {
                         note(notes, format!("plugin {folder}: {reason}"));
                     }
-                    Err(Failed::Stopped) => {}
+                    Err(Failed::Stopped(_)) => {}
                 }
             }
         }
@@ -531,11 +1087,11 @@ struct Owned {
 }
 
 /// Runs one plugin's entry, then commits what it registered.
-fn load_one(
+async fn load_one(
     ctx: &Ctx<'_>,
     engine: &mut Engine,
     manifest: &Manifest,
-    watch: &Arc<Watch>,
+    watch: &Rc<Watch>,
     notes: &Arc<Mutex<Notes>>,
     live: &Arc<Live>,
     folders: &Mutex<HashSet<PathBuf>>,
@@ -547,9 +1103,23 @@ fn load_one(
     let source = std::fs::read_to_string(&manifest.entry)
         .map_err(|error| Failed::Threw(format!("{}: {error}", manifest.entry.display())))?;
     // Every plugin's own folder, so its imports resolve inside it and not in
-    // the folder of the plugin that happened to load last.
-    if let Ok(mut folders) = folders.lock() {
-        folders.insert(manifest.dir.clone());
+    // the folder of the plugin that happened to load last. Its place is the
+    // index its Node wrapper modules carry.
+    let index = match folders.lock() {
+        Ok(mut folders) => {
+            let index = folders.len();
+            folders.insert(manifest.dir.clone());
+            index
+        }
+        Err(_) => 0,
+    };
+    match super::node::register(index, manifest) {
+        Ok(lines) => {
+            for line in lines {
+                note(notes, line);
+            }
+        }
+        Err(reason) => return Err(Failed::Threw(reason)),
     }
     let staging = Rc::new(RefCell::new(Staging::default()));
     // Set once the load returned: from then on a panel the plugin makes is
@@ -562,27 +1132,39 @@ fn load_one(
         taken: Rc::clone(&engine.command_names),
         committed: Rc::clone(&committed),
     };
-    watched(ctx, watch, notes, &manifest.name, "load", || {
-        let reagent = api::reagent(
-            ctx,
-            &manifest.name,
-            &manifest.version,
-            &staging,
-            &engine.names,
-            &host,
-        )
-        .map_err(|error| error.to_string())?;
-        let module =
-            Module::declare(ctx.clone(), name, source).map_err(|error| failure(ctx, error))?;
-        let (module, promise) = module.eval().map_err(|error| failure(ctx, error))?;
-        settle_promise(ctx, promise)?;
-        let entry = module
-            .get::<_, Option<Function>>("default")
-            .map_err(|error| failure(ctx, error))?
-            .ok_or_else(|| "the entry has no default export".to_string())?;
-        call1(ctx, &entry, reagent)?;
-        Ok(())
-    })?;
+    watched(
+        ctx,
+        watch,
+        notes,
+        Who {
+            index,
+            name: &manifest.name,
+        },
+        "load",
+        STOP,
+        async |window| {
+            let reagent = api::reagent(
+                ctx,
+                &manifest.name,
+                &manifest.version,
+                &staging,
+                &engine.names,
+                &host,
+            )
+            .map_err(|error| failure(ctx, error))?;
+            let module =
+                Module::declare(ctx.clone(), name, source).map_err(|error| failure(ctx, error))?;
+            let (module, promise) = module.eval().map_err(|error| failure(ctx, error))?;
+            settle_promise(ctx, watch, promise, window).await?;
+            let entry = module
+                .get::<_, Option<Function>>("default")
+                .map_err(|error| failure(ctx, error))?
+                .ok_or_else(|| Failed::Threw("the entry has no default export".into()))?;
+            call1(ctx, watch, window, &entry, reagent).await?;
+            Ok(())
+        },
+    )
+    .await?;
     let mut staged = std::mem::take(&mut *staging.borrow_mut());
     let mut tools = Vec::with_capacity(staged.tools.len());
     for tool in staged.tools.drain(..) {
@@ -595,6 +1177,7 @@ fn load_one(
         engine.tools.push(Registered {
             name: tool.name,
             plugin: manifest.name.clone(),
+            index,
             run: tool.run,
         });
     }
@@ -611,6 +1194,7 @@ fn load_one(
         engine.commands.push(RegisteredCommand {
             name: command.name,
             plugin: manifest.name.clone(),
+            index,
             run: command.run,
         });
     }
@@ -625,6 +1209,7 @@ fn load_one(
     committed.set(true);
     let layer = |func| Layer {
         plugin: manifest.name.clone(),
+        index,
         func,
     };
     engine.call.extend(staged.call.into_iter().map(layer));
@@ -634,6 +1219,7 @@ fn load_one(
         .listeners
         .extend(staged.listeners.into_iter().map(|(event, func)| Listener {
             plugin: manifest.name.clone(),
+            index,
             event,
             func,
         }));
@@ -642,10 +1228,10 @@ fn load_one(
 
 /// Runs one slash command and turns whatever it returned into the text to
 /// show.
-fn run_command(
+async fn run_command(
     ctx: &Ctx<'_>,
     engine: &Engine,
-    watch: &Arc<Watch>,
+    watch: &Rc<Watch>,
     notes: &Mutex<Notes>,
     name: &str,
     args: &str,
@@ -655,27 +1241,43 @@ fn run_command(
     };
     let plugin = registered.plugin.as_str();
     let Some(func) = restore(ctx, &registered.run) else {
-        return Some(format!("plugin {plugin}: command /{name}: {STOPPED}"));
+        return Some(format!(
+            "plugin {plugin}: command /{name}: {}",
+            stopped_after(LONG)
+        ));
     };
     let what = format!("command {name}");
-    let out = watched(ctx, watch, notes, plugin, &what, || {
-        let value = args.into_js(ctx).map_err(|error| failure(ctx, error))?;
-        let value = call1(ctx, &func, value)?;
-        shown(ctx, value)
-    });
+    let out = watched(
+        ctx,
+        watch,
+        notes,
+        Who {
+            index: registered.index,
+            name: plugin,
+        },
+        &what,
+        LONG,
+        async |window| {
+            let value = args.into_js(ctx).map_err(|error| failure(ctx, error))?;
+            let value = call1(ctx, watch, window, &func, value).await?;
+            shown(ctx, value)
+        },
+    )
+    .await;
     match out {
         Ok(text) => text,
         Err(Failed::Threw(reason)) => {
             Some(format!("plugin {plugin}: command /{name} threw: {reason}"))
         }
-        Err(Failed::Stopped) => Some(format!(
-            "plugin {plugin}: command /{name} stopped after 5 s"
+        Err(Failed::Stopped(budget)) => Some(format!(
+            "plugin {plugin}: command /{name} stopped after {} s",
+            budget.as_secs()
         )),
     }
 }
 
 /// The text a command's return value stands for; no value shows nothing.
-fn shown<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Option<String>, String> {
+fn shown<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Option<String>, Failed> {
     if value.is_undefined() || value.is_null() {
         return Ok(None);
     }
@@ -694,10 +1296,10 @@ fn shown<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Option<String>, Strin
 }
 
 /// Runs one plugin tool and turns whatever it returned into a result.
-fn run_tool(
+async fn run_tool(
     ctx: &Ctx<'_>,
     engine: &Engine,
-    watch: &Arc<Watch>,
+    watch: &Rc<Watch>,
     notes: &Mutex<Notes>,
     tool: &str,
     args: &str,
@@ -709,33 +1311,38 @@ fn run_tool(
         };
     };
     let Some(func) = restore(ctx, &registered.run) else {
-        return stopped();
+        return stopped(LONG);
     };
     let parsed = args_object(args);
     let out = watched(
         ctx,
         watch,
         notes,
-        &registered.plugin,
+        Who {
+            index: registered.index,
+            name: &registered.plugin,
+        },
         &format!("tool {tool}"),
-        || {
-            let arguments = api::from_json(ctx, &parsed).map_err(|error| error.to_string())?;
-            let context = Object::new(ctx.clone()).map_err(|error| error.to_string())?;
+        LONG,
+        async |window| {
+            let arguments = api::from_json(ctx, &parsed).map_err(|error| failure(ctx, error))?;
+            let context = Object::new(ctx.clone()).map_err(|error| failure(ctx, error))?;
             context
                 .set("tool", tool)
                 .and_then(|_| context.set("plugin", registered.plugin.as_str()))
-                .map_err(|error| error.to_string())?;
-            let value = call2(ctx, &func, arguments, context.into_value())?;
+                .map_err(|error| failure(ctx, error))?;
+            let value = call2(ctx, watch, window, &func, arguments, context.into_value()).await?;
             Ok(answered(ctx, value))
         },
-    );
+    )
+    .await;
     match out {
         Ok(reply) => reply,
         Err(Failed::Threw(text)) => RunReply {
             text,
             is_error: true,
         },
-        Err(Failed::Stopped) => stopped(),
+        Err(Failed::Stopped(budget)) => stopped(budget),
     }
 }
 
@@ -771,19 +1378,20 @@ fn answered<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> RunReply {
     }
 }
 
-/// The result a call reports when the runtime could not run it.
-fn stopped() -> RunReply {
+/// The result a call reports when the runtime could not run it, with the budget
+/// that ended it.
+fn stopped(limit: Duration) -> RunReply {
     RunReply {
-        text: STOPPED.into(),
+        text: stopped_after(limit),
         is_error: true,
     }
 }
 
 /// Runs every `tool.call` layer in load order, each on the previous value.
-fn chain_call(
+async fn chain_call(
     ctx: &Ctx<'_>,
     engine: &Engine,
-    watch: &Arc<Watch>,
+    watch: &Rc<Watch>,
     notes: &Mutex<Notes>,
     tool: &str,
     args: &str,
@@ -794,15 +1402,27 @@ fn chain_call(
         let Some(func) = restore(ctx, &layer.func) else {
             continue;
         };
-        let out = watched(ctx, watch, notes, &layer.plugin, "hook tool.call", || {
-            let payload = Object::new(ctx.clone()).map_err(|error| error.to_string())?;
-            payload
-                .set("tool", tool)
-                .and_then(|_| payload.set("args", api::from_json(ctx, &current)?))
-                .map_err(|error| error.to_string())?;
-            let value = call1(ctx, &func, payload.into_value())?;
-            Ok(step(ctx, &layer.plugin, value))
-        });
+        let out = watched(
+            ctx,
+            watch,
+            notes,
+            Who {
+                index: layer.index,
+                name: &layer.plugin,
+            },
+            "hook tool.call",
+            STOP,
+            async |window| {
+                let payload = Object::new(ctx.clone()).map_err(|error| failure(ctx, error))?;
+                payload
+                    .set("tool", tool)
+                    .and_then(|_| payload.set("args", api::from_json(ctx, &current)?))
+                    .map_err(|error| failure(ctx, error))?;
+                let value = call1(ctx, watch, window, &func, payload.into_value()).await?;
+                Ok(step(ctx, &layer.plugin, value))
+            },
+        )
+        .await;
         match out {
             Ok(Step::Keep) => {}
             Ok(Step::Args(next)) => {
@@ -814,7 +1434,7 @@ fn chain_call(
                 notes,
                 format!("plugin {}: hook tool.call threw: {message}", layer.plugin),
             ),
-            Err(Failed::Stopped) => {}
+            Err(Failed::Stopped(_)) => {}
         }
     }
     if changed {
@@ -860,10 +1480,10 @@ fn step<'js>(ctx: &Ctx<'js>, plugin: &str, value: Value<'js>) -> Step {
 }
 
 /// Runs every `tool.result` layer in load order, each on the previous value.
-fn chain_result(
+async fn chain_result(
     ctx: &Ctx<'_>,
     engine: &Engine,
-    watch: &Arc<Watch>,
+    watch: &Rc<Watch>,
     notes: &Mutex<Notes>,
     tool: &str,
     args: &str,
@@ -876,18 +1496,30 @@ fn chain_result(
         let Some(func) = restore(ctx, &layer.func) else {
             continue;
         };
-        let out = watched(ctx, watch, notes, &layer.plugin, "hook tool.result", || {
-            let payload = Object::new(ctx.clone()).map_err(|error| error.to_string())?;
-            payload
-                .set("tool", tool)
-                .and_then(|_| payload.set("args", api::from_json(ctx, &parsed)?))
-                .and_then(|_| payload.set("text", text.as_str()))
-                .and_then(|_| payload.set("isError", is_error))
-                .map_err(|error| error.to_string())?;
-            let value = call1(ctx, &func, payload.into_value())?;
-            // Reading the answer runs getters, so it stays under the watchdog.
-            Ok(rewritten(value))
-        });
+        let out = watched(
+            ctx,
+            watch,
+            notes,
+            Who {
+                index: layer.index,
+                name: &layer.plugin,
+            },
+            "hook tool.result",
+            STOP,
+            async |window| {
+                let payload = Object::new(ctx.clone()).map_err(|error| failure(ctx, error))?;
+                payload
+                    .set("tool", tool)
+                    .and_then(|_| payload.set("args", api::from_json(ctx, &parsed)?))
+                    .and_then(|_| payload.set("text", text.as_str()))
+                    .and_then(|_| payload.set("isError", is_error))
+                    .map_err(|error| failure(ctx, error))?;
+                let value = call1(ctx, watch, window, &func, payload.into_value()).await?;
+                // Reading the answer runs getters, so it stays under the watchdog.
+                Ok(rewritten(value))
+            },
+        )
+        .await;
         match out {
             Ok((next_text, next_error)) => {
                 if let Some(next) = next_text {
@@ -903,7 +1535,7 @@ fn chain_result(
                 notes,
                 format!("plugin {}: hook tool.result threw: {message}", layer.plugin),
             ),
-            Err(Failed::Stopped) => {}
+            Err(Failed::Stopped(_)) => {}
         }
     }
     ResultReply {
@@ -924,10 +1556,10 @@ fn rewritten<'js>(value: Value<'js>) -> (Option<String>, Option<bool>) {
 }
 
 /// Runs every `turn.end` layer in load order and keeps the follow-ups.
-fn chain_turn(
+async fn chain_turn(
     ctx: &Ctx<'_>,
     engine: &Engine,
-    watch: &Arc<Watch>,
+    watch: &Rc<Watch>,
     notes: &Mutex<Notes>,
     index: u32,
     ran_tools: bool,
@@ -938,16 +1570,27 @@ fn chain_turn(
         let Some(func) = restore(ctx, &layer.func) else {
             continue;
         };
-        let out = watched(ctx, watch, notes, &layer.plugin, "hook turn.end", || {
-            let payload = Object::new(ctx.clone()).map_err(|error| error.to_string())?;
-            payload
-                .set("index", index)
-                .and_then(|_| payload.set("ranTools", ran_tools))
-                .and_then(|_| payload.set("text", text))
-                .map_err(|error| error.to_string())?;
-            let value = call1(ctx, &func, payload.into_value())?;
-            Ok(value)
-        });
+        let out = watched(
+            ctx,
+            watch,
+            notes,
+            Who {
+                index: layer.index,
+                name: &layer.plugin,
+            },
+            "hook turn.end",
+            STOP,
+            async |window| {
+                let payload = Object::new(ctx.clone()).map_err(|error| failure(ctx, error))?;
+                payload
+                    .set("index", index)
+                    .and_then(|_| payload.set("ranTools", ran_tools))
+                    .and_then(|_| payload.set("text", text))
+                    .map_err(|error| failure(ctx, error))?;
+                call1(ctx, watch, window, &func, payload.into_value()).await
+            },
+        )
+        .await;
         match out {
             Ok(value) => {
                 if let Some(next) = value.as_string().and_then(|text| text.to_string().ok())
@@ -960,17 +1603,17 @@ fn chain_turn(
                 notes,
                 format!("plugin {}: hook turn.end threw: {message}", layer.plugin),
             ),
-            Err(Failed::Stopped) => {}
+            Err(Failed::Stopped(_)) => {}
         }
     }
     follow
 }
 
 /// Calls every listener of one event; what they return is ignored.
-fn fire(
+async fn fire(
     ctx: &Ctx<'_>,
     engine: &Engine,
-    watch: &Arc<Watch>,
+    watch: &Rc<Watch>,
     notes: &Mutex<Notes>,
     name: &str,
     payload: &JsonValue,
@@ -984,11 +1627,23 @@ fn fire(
         let Some(func) = restore(ctx, &listener.func) else {
             continue;
         };
-        let out = watched(ctx, watch, notes, &listener.plugin, &what, || {
-            let value = api::from_json(ctx, payload).map_err(|error| error.to_string())?;
-            call1(ctx, &func, value)?;
-            Ok(())
-        });
+        let out = watched(
+            ctx,
+            watch,
+            notes,
+            Who {
+                index: listener.index,
+                name: &listener.plugin,
+            },
+            &what,
+            STOP,
+            async |window| {
+                let value = api::from_json(ctx, payload).map_err(|error| failure(ctx, error))?;
+                call1(ctx, watch, window, &func, value).await?;
+                Ok(())
+            },
+        )
+        .await;
         if let Err(Failed::Threw(message)) = out {
             note(
                 notes,
@@ -998,52 +1653,99 @@ fn fire(
     }
 }
 
-/// Calls a JS function with one argument and settles its promise, if any.
-fn call1<'js>(ctx: &Ctx<'js>, func: &Function<'js>, arg: Value<'js>) -> Result<Value<'js>, String> {
-    match func.call::<_, Value>((arg,)) {
-        Ok(value) => settle(ctx, value),
-        Err(error) => Err(failure(ctx, error)),
-    }
+/// Calls a JS function with one argument and awaits its promise, if any.
+async fn call1<'js>(
+    ctx: &Ctx<'js>,
+    watch: &Watch,
+    window: u64,
+    func: &Function<'js>,
+    arg: Value<'js>,
+) -> Result<Value<'js>, Failed> {
+    let value = func
+        .call::<_, Value>((arg,))
+        .map_err(|error| failure(ctx, error))?;
+    settle(ctx, watch, value, window).await
 }
 
-/// Calls a JS function with two arguments and settles its promise, if any.
-fn call2<'js>(
+/// Calls a JS function with two arguments and awaits its promise, if any.
+async fn call2<'js>(
     ctx: &Ctx<'js>,
+    watch: &Watch,
+    window: u64,
     func: &Function<'js>,
     first: Value<'js>,
     second: Value<'js>,
-) -> Result<Value<'js>, String> {
-    match func.call::<_, Value>((first, second)) {
-        Ok(value) => settle(ctx, value),
-        Err(error) => Err(failure(ctx, error)),
-    }
+) -> Result<Value<'js>, Failed> {
+    let value = func
+        .call::<_, Value>((first, second))
+        .map_err(|error| failure(ctx, error))?;
+    settle(ctx, watch, value, window).await
 }
 
-/// Drives the pending jobs of a value that may be a promise, and answers
-/// with what it settled to.
-fn settle<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Value<'js>, String> {
+/// Awaits a value that may be a promise, and answers with what it settled to.
+async fn settle<'js>(
+    ctx: &Ctx<'js>,
+    watch: &Watch,
+    value: Value<'js>,
+    window: u64,
+) -> Result<Value<'js>, Failed> {
     match value.clone().into_promise() {
-        Some(promise) => settle_promise(ctx, promise),
+        Some(promise) => settle_promise(ctx, watch, promise, window).await,
         None => Ok(value),
     }
 }
 
-/// Drives the pending jobs until `promise` settles; there is no timer or I/O
-/// that could settle it later.
-fn settle_promise<'js>(ctx: &Ctx<'js>, promise: Promise<'js>) -> Result<Value<'js>, String> {
-    match promise.finish::<Value>() {
-        Ok(value) => Ok(value),
-        Err(Error::WouldBlock) => Err(NEVER.into()),
-        Err(error) => Err(failure(ctx, error)),
+/// Awaits a promise while the runtime settles it, until the window armed for
+/// this call reaches its budget: [`LONG`] for a tool or a command, [`STOP`] for
+/// a hook, a listener or a timer callback.
+///
+/// The deadline is the call's own, and the JS that runs between two polls of the
+/// promise is one slice, so a promise that no timer or future can settle is a
+/// stopped call, the same as a call that spins: the caller names it in a note.
+async fn settle_promise<'js>(
+    ctx: &Ctx<'js>,
+    watch: &Watch,
+    promise: Promise<'js>,
+    window: u64,
+) -> Result<Value<'js>, Failed> {
+    let deadline = watch.deadline_of(window);
+    let awaited = Sliced {
+        watch,
+        inner: promise.into_future::<Value>(),
+    };
+    match tokio::time::timeout_at(deadline, awaited).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(failure(ctx, error)),
+        Err(_) => Err(Failed::Stopped(watch.limit_of(window))),
     }
 }
 
-/// The message a QuickJS error carries, with the thrown value when it threw.
-fn failure(ctx: &Ctx<'_>, error: Error) -> String {
+/// A future that starts a slice of JS at every poll: the runtime runs the jobs
+/// that are ready right after a poll, so each batch of them gets [`STOP`] of its
+/// own.
+struct Sliced<'a, F> {
+    /// The watchdog the slice belongs to.
+    watch: &'a Watch,
+    /// What is awaited.
+    inner: F,
+}
+
+impl<F: Future + Unpin> Future for Sliced<'_, F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<F::Output> {
+        let this = self.get_mut();
+        this.watch.touch();
+        Pin::new(&mut this.inner).poll(cx)
+    }
+}
+
+/// The failure a QuickJS error stands for, with what it threw.
+fn failure(ctx: &Ctx<'_>, error: Error) -> Failed {
     if error.is_exception() {
-        api::thrown(ctx, ctx.catch())
+        Failed::Threw(api::thrown(ctx, ctx.catch()))
     } else {
-        error.to_string()
+        Failed::Threw(error.to_string())
     }
 }
 
@@ -1087,6 +1789,11 @@ impl Resolver for PluginLoader {
         name: &str,
         _attributes: Option<ImportAttributes<'js>>,
     ) -> JsResult<String> {
+        // A Node module name, and the modules of a Node wrapper, come first:
+        // they name no file of any plugin folder.
+        if let Some(found) = super::node::resolve(ctx, base, name) {
+            return found;
+        }
         // The importing module says which plugin's folder the import must
         // stay inside, never the plugin that loaded last.
         let base = Path::new(base);
@@ -1112,6 +1819,14 @@ impl Loader for PluginLoader {
         name: &str,
         _attributes: Option<ImportAttributes<'js>>,
     ) -> JsResult<Module<'js, rquickjs::module::Declared>> {
+        // The wrapper of a plugin's Node module, and the raw module it wraps,
+        // are declared here and read no file.
+        #[cfg(feature = "node")]
+        {
+            if let Some(module) = super::node::load(ctx, name) {
+                return module;
+            }
+        }
         #[expect(
             clippy::disallowed_methods,
             reason = "runs on the plugin thread, off the async runtime"

@@ -23,9 +23,13 @@ linux-x86_64 7479296
 # clipboard; 5754096 before it), budget 5799936 set on 2026-10-30.
 # 2026-11-09: 5491072 bytes with only the zstd level 1 compressor, 5705968
 # before.
-darwin-arm64-tui 5799936
+# 2026-11-11: 7059296 bytes with LLRT's Node modules for plugins (feature
+# `node`, on in the default build; 5491072 before), budget 7413760.
+darwin-arm64-tui 7413760
 # linux-x86_64-tui: measured 8404888 bytes on 2026-11-05 (lab workspace, with the
 # native clipboard: wl-clipboard-rs and x11rb; 8093096 before them), budget 8826880.
 # 2026-11-09: 8443528 bytes with only the zstd level 1 compressor, 8617544
 # before (paste-linux).
-linux-x86_64-tui 8826880
+# 2026-11-11: 11338648 bytes with LLRT's Node modules for plugins (feature
+# `node`, on in the default build; 8443528 before), budget 11907072.
+linux-x86_64-tui 11907072

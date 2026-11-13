@@ -17,6 +17,10 @@ use super::{CommandInfo, PanelView, Plugins};
 /// A term for the turn view the turn hook reads.
 const NO_TOOLS: &[(reagent_ai::ToolCall, reagent_ai::ToolResult)] = &[];
 
+/// The longest a test waits for a plugin to reach a state, so a loaded machine
+/// slows a test down instead of failing it.
+const WAIT: Duration = Duration::from_secs(5);
+
 /// Writes one plugin folder: its `package.json` and one file per pair.
 async fn plugin(root: &Path, folder: &str, package: &str, files: &[(&str, &str)]) {
     let dir = root.join(folder);
@@ -45,16 +49,22 @@ fn temp_root() -> TempDir {
     tempfile::tempdir().unwrap()
 }
 
+/// A state folder of its own, kept for the life of the process so a load may
+/// read it.
+fn state() -> PathBuf {
+    tempfile::tempdir().unwrap().keep()
+}
+
 /// Loads the plugins under `root`, which must have loaded some.
 async fn loaded(root: &Path) -> std::sync::Arc<Plugins> {
-    let (plugins, notes) = Plugins::load(root).await;
+    let (plugins, notes) = Plugins::load(root, &state(), None).await;
     plugins.unwrap_or_else(|| panic!("no plugin loaded: {notes:?}"))
 }
 
 /// Loads the plugins under `root`, which must have loaded some, with the notes
 /// the load raised.
 async fn loaded_with_notes(root: &Path) -> (std::sync::Arc<Plugins>, Vec<String>) {
-    let (plugins, notes) = Plugins::load(root).await;
+    let (plugins, notes) = Plugins::load(root, &state(), None).await;
     let plugins = plugins.unwrap_or_else(|| panic!("no plugin loaded: {notes:?}"));
     (plugins, notes)
 }
@@ -211,7 +221,7 @@ async fn a_folder_without_a_manifest_is_skipped() {
     )
     .await
     .unwrap();
-    let (none, notes) = Plugins::load(root.path()).await;
+    let (none, notes) = Plugins::load(root.path(), &state(), None).await;
     assert!(none.is_none(), "a bare folder is no plugin");
     assert!(notes.is_empty(), "a bare folder is skipped in silence");
 
@@ -234,7 +244,7 @@ async fn a_folder_without_a_manifest_is_skipped() {
 async fn a_bad_manifest_gives_a_note() {
     let root = temp_root();
     plugin(root.path(), "broken", "{not json", &[("index.js", "")]).await;
-    let (none, notes) = Plugins::load(root.path()).await;
+    let (none, notes) = Plugins::load(root.path(), &state(), None).await;
     assert!(none.is_none());
     assert!(
         notes.iter().any(|note| note.starts_with("plugin broken: ")),
@@ -249,7 +259,7 @@ async fn a_bad_manifest_gives_a_note() {
         &[("index.js", "")],
     )
     .await;
-    let (none, notes) = Plugins::load(second.path()).await;
+    let (none, notes) = Plugins::load(second.path(), &state(), None).await;
     assert!(none.is_none());
     assert!(
         notes
@@ -429,7 +439,7 @@ async fn a_symlink_out_of_the_plugin_folder_fails() {
     tokio::fs::symlink(outside.path(), root.path().join("linked/lib"))
         .await
         .unwrap();
-    let (plugins, notes) = Plugins::load(root.path()).await;
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
     assert!(
         plugins.is_none(),
         "a link out of the folder is not a plugin: {notes:?}"
@@ -464,7 +474,7 @@ async fn an_import_that_walks_out_of_the_folder_fails() {
         ],
     )
     .await;
-    let (plugins, notes) = Plugins::load(root.path()).await;
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
     assert!(plugins.is_none(), "{notes:?}");
     assert!(
         notes.iter().any(
@@ -492,7 +502,7 @@ async fn an_absolute_import_fails() {
         &[("index.js", source.as_str())],
     )
     .await;
-    let (plugins, notes) = Plugins::load(root.path()).await;
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
     assert!(plugins.is_none(), "{notes:?}");
     assert!(
         notes
@@ -934,7 +944,7 @@ async fn a_plugin_that_hangs_loading_skips_only_itself() {
     )
     .await;
     let started = Instant::now();
-    let (plugins, notes) = Plugins::load(root.path()).await;
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
     let took = started.elapsed();
     let plugins = plugins.unwrap_or_else(|| panic!("no plugin loaded: {notes:?}"));
     assert_eq!(names(&plugins), ["kept"]);
@@ -2242,4 +2252,1025 @@ export default function (r) {
     // The next burst has its own note.
     plugins.command("spam", "").await;
     assert_eq!(plugins.take_notes().len(), 1, "one note per burst");
+}
+
+#[tokio::test]
+async fn async_tool_promise() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "promiser",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.registerTool({
+    name: "now",
+    description: "resolves at once",
+    parameters: { type: "object" },
+    run: () => Promise.resolve("hi"),
+  });
+  r.registerTool({
+    name: "later",
+    description: "resolves on a timer",
+    parameters: { type: "object" },
+    run: () => new Promise((resolve) => setTimeout(() => resolve("later"), 50)),
+  });
+  r.registerTool({
+    name: "micro",
+    description: "resolves in a microtask",
+    parameters: { type: "object" },
+    run: () => new Promise((resolve) => queueMicrotask(() => resolve("micro"))),
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    for (tool, text) in [("now", "hi"), ("later", "later"), ("micro", "micro")] {
+        let out = run(&plugins, tool, "{}").await;
+        assert!(!out.is_error, "{tool}: {}", out.content);
+        assert_eq!(&*out.content, text, "the {tool} promise");
+    }
+}
+
+#[tokio::test]
+async fn async_tool_rejects() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "refuser",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.registerTool({
+    name: "no",
+    description: "rejects",
+    parameters: { type: "object" },
+    run: () => Promise.reject(new Error("boom")),
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    let out = run(&plugins, "no", "{}").await;
+    assert!(out.is_error, "a rejection is an error result");
+    assert!(out.content.contains("boom"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn async_hook_never_settles() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "hangs",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.hook("tool.call", () => new Promise(() => {}));
+  r.registerCommand("fine", { description: "answers", run: () => "fine" });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    let started = Instant::now();
+    let verdict = plugins.before("shout", "{}").await;
+    let took = started.elapsed();
+    assert_eq!(verdict, CallVerdict::Keep, "the call goes on unchanged");
+    assert!(took >= Duration::from_secs(4), "it took {took:?}");
+    assert!(took < Duration::from_secs(6), "it took {took:?}");
+    let notes = plugins.take_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note == "plugin hangs: hook tool.call stopped after 5 s"),
+        "{notes:?}"
+    );
+    // A promise nothing settles does not take the thread with it.
+    assert_eq!(plugins.command("fine", "").await.as_deref(), Some("fine"));
+    assert!(plugins.take_notes().is_empty(), "the answer raised no note");
+}
+
+#[tokio::test]
+async fn async_command_promise() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "promiser",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.registerCommand("later", {
+    description: "answers on a timer",
+    run: () => new Promise((resolve) => setTimeout(() => resolve("later"), 20)),
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    assert_eq!(plugins.command("later", "").await.as_deref(), Some("later"));
+}
+
+#[tokio::test]
+async fn async_timer_panel() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "latecomer",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+let panel;
+export default function (r) {
+  panel = r.ui.panel({ id: "late", title: "Late" });
+  setTimeout(() => panel.set(["from the timer"]), 100);
+}
+"#,
+        )],
+    )
+    .await;
+    // No job is sent: the timer alone must wake the host.
+    let plugins = loaded(root.path()).await;
+    let arrived = async {
+        loop {
+            let panels = plugins.panels();
+            if panels
+                .iter()
+                .any(|view| lines(view) == json!(["from the timer"]))
+            {
+                return;
+            }
+            plugins.changed().await;
+        }
+    };
+    tokio::time::timeout(WAIT, arrived)
+        .await
+        .expect("a panel set in a timer callback wakes changed");
+    let panels = plugins.panels();
+    assert_eq!(
+        lines(panel(&panels, "latecomer/late")),
+        json!(["from the timer"])
+    );
+    let changed = plugins.take_changed_panels();
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert_eq!(changed[0].id, "latecomer/late");
+}
+
+#[tokio::test]
+async fn async_interval_cleared() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "ticker",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+let runs = 0;
+export default function (r) {
+  r.registerCommand("runs", { description: "how many runs", run: () => String(runs) });
+  const id = setInterval(() => {
+    runs += 1;
+    if (runs === 3) clearInterval(id);
+  }, 20);
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    // The interval clears itself on its third run, so the count must reach 3.
+    let started = Instant::now();
+    let mut runs = String::new();
+    while runs != "3" {
+        runs = plugins.command("runs", "").await.unwrap_or_default();
+        assert!(
+            started.elapsed() < WAIT,
+            "the interval ran {runs} times in {} s",
+            WAIT.as_secs()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Cleared, it runs no more: a further wait leaves the count at three.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(plugins.command("runs", "").await.as_deref(), Some("3"));
+}
+
+#[tokio::test]
+async fn async_timer_limit() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "flooder",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.registerCommand("flood", {
+    description: "sets one timer too many",
+    run: () => {
+      let name = "none";
+      try {
+        for (let at = 0; at < 1024; at += 1) setTimeout(() => {}, 10000);
+        setTimeout(() => {}, 10000);
+      } catch (error) {
+        name = error.name;
+      }
+      return name;
+    },
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    assert_eq!(
+        plugins.command("flood", "").await.as_deref(),
+        Some("RangeError")
+    );
+}
+
+#[tokio::test]
+async fn async_timer_throws() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "thrower",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.registerTool({
+    name: "works",
+    description: "still works",
+    parameters: { type: "object" },
+    run: () => "fine",
+  });
+  setTimeout(() => { throw new Error("from the timer"); }, 10);
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    let raised = async {
+        loop {
+            let notes = plugins.take_notes();
+            if !notes.is_empty() {
+                return notes;
+            }
+            plugins.changed().await;
+        }
+    };
+    let notes = tokio::time::timeout(WAIT, raised)
+        .await
+        .expect("a throw in a timer callback raises a note");
+    assert_eq!(notes, ["plugins: a timer callback threw: from the timer"]);
+    let out = run(&plugins, "works", "{}").await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(&*out.content, "fine");
+}
+
+#[tokio::test]
+async fn async_spin_in_timer() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "spinner",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.registerTool({
+    name: "after",
+    description: "runs after the timer was stopped",
+    parameters: { type: "object" },
+    run: () => "after",
+  });
+  setTimeout(() => { for (;;) {} }, 1);
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    // The timer callback spins; its own deadline stops it, and the note says so.
+    tokio::time::timeout(Duration::from_secs(7), plugins.changed())
+        .await
+        .expect("a spinning timer callback is stopped");
+    let notes = plugins.take_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note == "plugins: a timer callback stopped after 5 s"),
+        "{notes:?}"
+    );
+    // The thread survived the stop: the next tool call answers at once.
+    let started = Instant::now();
+    let out = run(&plugins, "after", "{}").await;
+    let took = started.elapsed();
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(&*out.content, "after");
+    assert!(took < Duration::from_secs(1), "it took {took:?}");
+}
+
+#[tokio::test]
+async fn async_timer_not_a_function() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "stringer",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.registerCommand("bad", {
+    description: "hands a string to a timer",
+    run: () => {
+      let name = "none";
+      try {
+        setTimeout("not a function", 1);
+      } catch (error) {
+        name = error.name;
+      }
+      // An id no timer took is nothing, not an error.
+      clearTimeout(9999);
+      clearInterval(9999);
+      queueMicrotask(() => {});
+      return name;
+    },
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    assert_eq!(
+        plugins.command("bad", "").await.as_deref(),
+        Some("TypeError")
+    );
+}
+
+/// Loads the plugins under `root` that answer `/spin` with `"x"` after queueing
+/// a job that never returns, and answer `/fine` at once.
+async fn spinner(root: &Path, queue: &str) {
+    let index = format!(
+        r#"
+export default function (r) {{
+  r.registerCommand("spin", {{
+    description: "queues a job that never returns",
+    run: () => {{
+      {queue}
+      return "x";
+    }},
+  }});
+  r.registerCommand("fine", {{ description: "answers", run: () => "fine" }});
+}}
+"#
+    );
+    plugin(root, "spinner", manifest(), &[("index.js", &index)]).await;
+}
+
+/// Runs `/spin`, then expects the stopped-job note and an answer to `/fine`.
+async fn stopped_job_keeps_the_thread(plugins: &Plugins) {
+    assert_eq!(plugins.command("spin", "").await.as_deref(), Some("x"));
+    // The job runs while the thread waits for its next job: a window of the
+    // idle wait is what stops it.
+    let raised = async {
+        loop {
+            let notes = plugins.take_notes();
+            if !notes.is_empty() {
+                return notes;
+            }
+            plugins.changed().await;
+        }
+    };
+    let notes = tokio::time::timeout(Duration::from_secs(7), raised)
+        .await
+        .expect("a job that spins is stopped");
+    assert_eq!(notes, ["plugins: a promise job stopped after 5 s"]);
+    let started = Instant::now();
+    let out = tokio::time::timeout(Duration::from_secs(8), plugins.command("fine", ""))
+        .await
+        .expect("the thread still answers");
+    assert_eq!(out.as_deref(), Some("fine"));
+    assert!(started.elapsed() < Duration::from_secs(8));
+}
+
+#[tokio::test]
+async fn async_spin_in_microtask() {
+    let root = temp_root();
+    spinner(root.path(), "queueMicrotask(() => { for (;;) {} });").await;
+    let plugins = loaded(root.path()).await;
+    stopped_job_keeps_the_thread(&plugins).await;
+}
+
+#[tokio::test]
+async fn async_spin_in_then() {
+    let root = temp_root();
+    spinner(
+        root.path(),
+        "Promise.resolve().then(() => { for (;;) {} });",
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    stopped_job_keeps_the_thread(&plugins).await;
+}
+
+#[tokio::test]
+async fn async_cleared_timers_free_their_futures() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "churn",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.registerCommand("churn", {
+    description: "sets and clears a hundred thousand long timers",
+    run: async () => {
+      // One call may open at most 16384 timer futures, so each round waits for
+      // the scheduler to drop the futures its clears ended.
+      for (let round = 0; round < 10; round += 1) {
+        for (let at = 0; at < 10000; at += 1) clearTimeout(setTimeout(() => {}, 2e9));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      return "churned";
+    },
+  });
+  r.registerCommand("live", {
+    description: "how many timer futures still wait",
+    run: () => String(__liveTimers()),
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    assert_eq!(
+        plugins.command("churn", "").await.as_deref(),
+        Some("churned")
+    );
+    // A cleared timer ends its future at once, so its sleep, its callback and
+    // its arguments are gone rather than waiting out the two billion ms.
+    let started = Instant::now();
+    loop {
+        let live = plugins.command("live", "").await.unwrap_or_default();
+        if live == "0" {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{live} timer futures still wait 1 s after they were cleared"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn async_timer_limit_frees_slots() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "reuser",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+const fired = () => new Promise((resolve) => {
+  for (let at = 0; at < 1024; at += 1) setTimeout(() => { if (at === 1023) resolve(); }, 1);
+});
+export default function (r) {
+  r.registerCommand("fire", {
+    description: "sets 1024 timers that fire, then 1024 more",
+    run: async () => {
+      await fired();
+      await fired();
+      return "fired";
+    },
+  });
+  r.registerCommand("clear", {
+    description: "sets and clears 1024 timers, then sets 1024 more",
+    run: async () => {
+      for (let at = 0; at < 1024; at += 1) clearTimeout(setTimeout(() => {}, 10000));
+      await fired();
+      return "cleared";
+    },
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    assert_eq!(plugins.command("fire", "").await.as_deref(), Some("fired"));
+    assert_eq!(
+        plugins.command("clear", "").await.as_deref(),
+        Some("cleared")
+    );
+}
+
+#[tokio::test]
+async fn async_deadline_counts_from_the_call() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "latecomer",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.hook("tool.call", () => {
+    const end = Date.now() + 3000;
+    while (Date.now() < end) {}
+    return new Promise(() => {});
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    let started = Instant::now();
+    let verdict = tokio::time::timeout(Duration::from_secs(9), plugins.before("shout", "{}"))
+        .await
+        .expect("the hook answers");
+    let took = started.elapsed();
+    assert_eq!(verdict, CallVerdict::Keep, "the call goes on unchanged");
+    // The promise's deadline counts from the call, not from its return.
+    assert!(
+        took < Duration::from_secs(6),
+        "the deadline started after the spin: {took:?}"
+    );
+    assert!(
+        took >= Duration::from_secs(4),
+        "it stopped too early: {took:?}"
+    );
+    let notes = plugins.take_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note == "plugin latecomer: hook tool.call stopped after 5 s"),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn async_overlapping_windows() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "overlapper",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const burn = (ms) => { const end = Date.now() + ms; while (Date.now() < end) {} };
+export default function (r) {
+  r.registerTool({
+    name: "slow",
+    description: "waits past a second while a timer window opens and closes inside its own",
+    parameters: { type: "object" },
+    run: async () => {
+      // A window that begins after this one and ends after it too, so the two
+      // overlap without nesting: only an id tells them apart.
+      setTimeout(async () => { await sleep(100); r.send("chain done"); }, 1250);
+      await sleep(1300);
+      // The interrupt handler runs in here, and marks this window slow.
+      burn(20);
+      return "slow done";
+    },
+  });
+  r.registerTool({
+    name: "fast",
+    description: "answers at once",
+    parameters: { type: "object" },
+    run: () => "fast done",
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    let out = run(&plugins, "slow", "{}").await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        &*out.content, "slow done",
+        "an intervening window stopped it"
+    );
+    // Wait for the timer window that overlapped the tool's own to end, so a
+    // note it raised would be here.
+    let started = Instant::now();
+    let mut sent = plugins.take_sent();
+    while sent.is_empty() && started.elapsed() < WAIT {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        sent = plugins.take_sent();
+    }
+    assert_eq!(sent, ["chain done"]);
+    // The slow note names the tool call, whose window passed the second; the
+    // timer window that overlapped it is no window's answer.
+    assert_eq!(
+        plugins.take_notes(),
+        ["plugin overlapper: tool slow is slow"]
+    );
+    // The thread is still whole: the next call answers at once.
+    let out = run(&plugins, "fast", "{}").await;
+    assert_eq!(&*out.content, "fast done");
+}
+
+#[tokio::test]
+async fn async_own_deadline() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "owl",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.registerCommand("start", {
+    description: "opens a timer window that waits four seconds inside it",
+    run: () => {
+      setTimeout(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 4500));
+      }, 10);
+      return "started";
+    },
+  });
+  r.registerCommand("wait", {
+    description: "answers through a promise three seconds after it is called",
+    run: () => new Promise((resolve) => setTimeout(() => resolve("waited"), 3000)),
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    assert_eq!(
+        plugins.command("start", "").await.as_deref(),
+        Some("started")
+    );
+    // The timer's window opened first and so does its deadline come first, but
+    // the wait has five seconds of its own.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let started = Instant::now();
+    let answer = tokio::time::timeout(Duration::from_secs(8), plugins.command("wait", ""))
+        .await
+        .expect("the wait answers");
+    assert_eq!(
+        answer.as_deref(),
+        Some("waited"),
+        "another window's deadline cut it short after {:?}",
+        started.elapsed()
+    );
+    let notes = plugins.take_notes();
+    assert!(
+        !notes.iter().any(|note| note.contains("stopped")),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn async_set_clear_loop_is_bounded() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "churner",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.registerCommand("churn", {
+    description: "sets and clears timers until the running futures run out",
+    run: () => {
+      let highest = 0;
+      let name = "none";
+      for (let at = 0; at < 100000; at += 1) {
+        highest = Math.max(highest, __liveTimers());
+        try {
+          clearTimeout(setTimeout(() => {}, 2e9));
+        } catch (error) {
+          name = error.name;
+          break;
+        }
+      }
+      return `${name} ${highest} ${__liveTimers()}`;
+    },
+  });
+  r.registerCommand("again", {
+    description: "sets 1024 timers once the churn is over",
+    run: () => {
+      for (let at = 0; at < 1024; at += 1) setTimeout(() => {}, 2e9);
+      return String(__liveTimers());
+    },
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    let answer = plugins.command("churn", "").await.unwrap_or_default();
+    let mut parts = answer.split(' ');
+    assert_eq!(parts.next(), Some("RangeError"), "the loop ends: {answer}");
+    let highest = parts.next().unwrap_or_default();
+    let highest: usize = highest.parse().unwrap_or_default();
+    assert!(
+        highest <= 16384,
+        "the loop ran {highest} futures before the cap"
+    );
+    assert!(
+        highest >= 16000,
+        "the loop stopped before the cap: {highest}"
+    );
+    // The futures ended when the call did, so the timers that are waiting are
+    // the only ones left.
+    assert_eq!(plugins.command("again", "").await.as_deref(), Some("1024"));
+}
+
+#[cfg(not(feature = "node"))]
+#[tokio::test]
+async fn no_node_module_is_refused_without_the_feature() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "wants_node",
+        manifest(),
+        &[(
+            "index.js",
+            r#"import { join } from "node:path"; export default function (r) { r.registerTool({ name: "joins", description: "joins", parameters: { type: "object" }, run: () => join("a", "b") }); }"#,
+        )],
+    )
+    .await;
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
+    assert!(plugins.is_none(), "{notes:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.starts_with("plugin wants_node: ")
+                && note.contains("node:path")
+                && note.contains("no Node modules")),
+        "{notes:?}"
+    );
+}
+
+#[cfg(not(feature = "node"))]
+#[tokio::test]
+async fn no_node_bare_module_is_refused_without_the_feature() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "wants_fs",
+        manifest(),
+        &[(
+            "index.js",
+            r#"import { readFileSync } from "fs"; export default function (r) { r.registerTool({ name: "reads", description: "reads", parameters: { type: "object" }, run: () => readFileSync("a.txt", "utf8") }); }"#,
+        )],
+    )
+    .await;
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
+    assert!(plugins.is_none(), "{notes:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.starts_with("plugin wants_fs: ")
+                && note.contains("fs")
+                && note.contains("no Node modules")),
+        "{notes:?}"
+    );
+}
+
+#[cfg(not(feature = "node"))]
+#[tokio::test]
+async fn no_node_child() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "wants_child",
+        manifest(),
+        &[(
+            "index.js",
+            r#"import { spawn } from "node:child_process"; export default function (r) { r.registerTool({ name: "runs", description: "runs", parameters: { type: "object" }, run: () => typeof spawn }); }"#,
+        )],
+    )
+    .await;
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
+    assert!(plugins.is_none(), "{notes:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.starts_with("plugin wants_child: ")
+                && note.contains("child_process")
+                && note.contains("no Node modules")),
+        "{notes:?}"
+    );
+}
+
+#[cfg(not(feature = "node"))]
+#[tokio::test]
+async fn no_node_fetch() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "wants_fetch",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (reagent) {
+  reagent.registerTool({
+    name: "looks",
+    description: "Looks the fetch globals up.",
+    parameters: { type: "object" },
+    run() {
+      return `${typeof fetch} ${typeof Request} ${typeof Response} ${typeof Headers}`;
+    },
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    assert_eq!(
+        &*run(&plugins, "looks", "{}").await.content,
+        "undefined undefined undefined undefined"
+    );
+}
+
+/// A plugin with one tool, one command and one `tool.call` hook, each of which
+/// may `await` for a while: `tool`, `command` and `hook` are the bodies.
+fn waits(tool: &str, command: &str, hook: &str) -> String {
+    format!(
+        r#"
+export default function (reagent) {{
+  reagent.hook("tool.call", async () => {{ {hook} }});
+  reagent.registerTool({{
+    name: "slow",
+    description: "Waits.",
+    parameters: {{ type: "object" }},
+    async run() {{ {tool} }}
+  }});
+  reagent.registerCommand("slow", {{ description: "Waits.", async run() {{ {command} }} }});
+}}
+"#
+    )
+}
+
+/// A promise that settles after `ms`.
+const SLEEP: &str = "await new Promise((done) => setTimeout(done, 8000));";
+
+#[tokio::test]
+async fn async_long_tool_waits() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "slow_tool",
+        manifest(),
+        &[(
+            "index.js",
+            &waits(
+                &format!(r#"{SLEEP} return "after 8 s";"#),
+                "return 1;",
+                "return undefined;",
+            ),
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    let started = Instant::now();
+    let out = run(&plugins, "slow", "{}").await;
+    let took = started.elapsed();
+    assert!(!out.is_error, "{:?}", out.content);
+    assert_eq!(&*out.content, "after 8 s");
+    assert!(took >= Duration::from_secs(7), "it took {took:?}");
+    let notes = plugins.take_notes();
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
+#[tokio::test]
+async fn async_long_command_waits() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "slow_command",
+        manifest(),
+        &[(
+            "index.js",
+            &waits(
+                "return 1;",
+                &format!(r#"{SLEEP} return "after 8 s";"#),
+                "return undefined;",
+            ),
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    let started = Instant::now();
+    let text = plugins.command("slow", "").await;
+    let took = started.elapsed();
+    assert_eq!(text.as_deref(), Some("after 8 s"));
+    assert!(took >= Duration::from_secs(7), "it took {took:?}");
+    let notes = plugins.take_notes();
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
+#[tokio::test]
+async fn async_long_spin_still_stops() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "slow_spin",
+        manifest(),
+        &[(
+            "index.js",
+            &waits(
+                r#"await new Promise((done) => setTimeout(done, 100)); while (true) {}"#,
+                "return 1;",
+                "return undefined;",
+            ),
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    let started = Instant::now();
+    let out = run(&plugins, "slow", "{}").await;
+    let took = started.elapsed();
+    assert!(out.is_error, "a stopped tool is an error result");
+    assert!(
+        took < Duration::from_secs(20),
+        "the spin was not stopped early: it took {took:?}"
+    );
+    assert!(took >= Duration::from_secs(4), "it took {took:?}");
+    let notes = plugins.take_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note == "plugin slow_spin: tool slow stopped after 5 s"),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn async_long_hook_keeps_5s() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "slow_hook",
+        manifest(),
+        &[(
+            "index.js",
+            &waits(
+                r#"return "the tool ran";"#,
+                "return 1;",
+                r#"await new Promise((done) => setTimeout(done, 8000)); return undefined;"#,
+            ),
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    let started = Instant::now();
+    let verdict = plugins.before("slow", "{}").await;
+    let took = started.elapsed();
+    assert_eq!(verdict, CallVerdict::Keep, "the call goes on unchanged");
+    assert!(took < Duration::from_secs(6), "it took {took:?}");
+    assert!(took >= Duration::from_secs(4), "it took {took:?}");
+    let notes = plugins.take_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note == "plugin slow_hook: hook tool.call stopped after 5 s"),
+        "{notes:?}"
+    );
+    assert_eq!(&*run(&plugins, "slow", "{}").await.content, "the tool ran");
 }

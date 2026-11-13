@@ -25,6 +25,7 @@ use reagent_agent::live;
 use reagent_agent::live::Inbox;
 use reagent_agent::live::SendMode;
 use reagent_agent::live::Sender;
+use reagent_ai::Content;
 use reagent_ai::Message;
 use reagent_ai::Text;
 use reagent_ai::oauth::session::Session;
@@ -456,17 +457,11 @@ impl Worker {
             .map(|mark| mark.entry.socket.to_string_lossy().into_owned())
     }
 
-    /// Queues the message the worker was started with, as its own.
-    pub(crate) async fn task(&mut self, text: String) {
+    /// Queues the message the worker was started with, as its own, with the
+    /// image blocks its `@path`s named.
+    pub(crate) async fn task(&mut self, text: String, blocks: Vec<Content>) {
         let Some(sender) = self.sender.as_ref() else {
             return;
-        };
-        let blocks = match crate::attach::blocks(&self.cwd, &text).await {
-            Ok(blocks) => blocks,
-            Err(message) => {
-                eprintln!("reagent: {message}");
-                Vec::new()
-            }
         };
         self.shared.queued();
         let message = self.shared.message();

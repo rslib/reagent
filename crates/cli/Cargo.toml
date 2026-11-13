@@ -11,10 +11,12 @@ name = "reagent"
 path = "src/main.rs"
 
 [features]
-default = ["tui"]
+default = ["tui", "node"]
 # The terminal UI. `--no-default-features` builds the headless run and the
 # worker only, which is what the eval and `min` builds use.
 tui = ["dep:reagent-tui"]
+# Node modules for plugins, from LLRT, behind the plugin permission checks.
+node = ["reagent-script/node"]
 testing = ["reagent-ai/testing", "dep:tempfile"]
 
 [dependencies]
