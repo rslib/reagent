@@ -26,11 +26,13 @@ use reagent_protocol::message::PanelLine;
 use reagent_store::list::{Entry, SessionList, State};
 use unicode_width::UnicodeWidthStr;
 
+use crate::client::Skill;
 use crate::keyfile::Foot;
 use crate::keys::Leader;
 use crate::layout::{self, DOCK_COLUMNS, Rect, SIDEBAR_MAX};
 use crate::panels::{
     self, ChangesPanel, ClientsPanel, ContextPanel, PluginPanel, SessionRow, SessionsPanel,
+    SkillsPanel,
 };
 use crate::screen::{Color, Screen};
 use crate::slot::{Role, Sidebar, Text, Update};
@@ -225,6 +227,50 @@ impl App {
             return;
         };
         if panel.left(id) {
+            self.touch();
+        }
+    }
+
+    /// Takes the skills the session found: the Skills panel joins the sidebar
+    /// under the built-in panels and names them, and a session that found none
+    /// adds no panel at all.
+    pub(super) fn skills(&mut self, skills: &[Skill]) {
+        if skills.is_empty() {
+            return;
+        }
+        match self.sidebar.get_mut::<SkillsPanel>() {
+            Some(panel) => panel.set(skills),
+            None => {
+                let mut panel = SkillsPanel::new();
+                panel.set(skills);
+                self.sidebar.add(panel);
+            }
+        }
+        self.touch();
+        // The skills join the `/` list as they join the sidebar.
+        self.set_slash();
+    }
+
+    /// The skills the session found, each as its name, the path of its file and
+    /// its scope, in the order the handshake named them; none when it found
+    /// none.
+    pub(super) fn skill_list(&mut self) -> Vec<(String, String, String)> {
+        let Some(panel) = self.sidebar.get_mut::<SkillsPanel>() else {
+            return Vec::new();
+        };
+        panel
+            .skills()
+            .map(|(name, path, scope)| (name.to_owned(), path.to_owned(), scope.to_owned()))
+            .collect()
+    }
+
+    /// Marks the skill whose file is `path` read in this session, for the Skills
+    /// panel, and redraws only when the mark is new.
+    pub(super) fn mark_skill(&mut self, path: &Path) {
+        let Some(panel) = self.sidebar.get_mut::<SkillsPanel>() else {
+            return;
+        };
+        if panel.read(path) {
             self.touch();
         }
     }

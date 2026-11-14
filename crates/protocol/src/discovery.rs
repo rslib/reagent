@@ -33,6 +33,39 @@ pub fn folder(state: &Path) -> PathBuf {
         .join(format!("v{MAJOR}"))
 }
 
+/// What the run of a worker is doing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum State {
+    /// No run is open.
+    #[default]
+    Idle,
+    /// A run is open and needs nobody.
+    Working,
+    /// A run waits for a person to answer a request.
+    Blocked,
+}
+
+/// The request a run waits for a person to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaitKind {
+    /// An approval of a tool call.
+    Approval,
+    /// An answer to the questions of an `ask` call.
+    Question,
+}
+
+/// The request of a run that waits for a person.
+///
+/// The ids of the approvals and of the questions are counted apart, so the kind
+/// is what names the request with the id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wait {
+    pub kind: WaitKind,
+    pub id: u64,
+}
+
 /// One running worker, as a client finds it. `Debug` hides the token.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -47,6 +80,16 @@ pub struct Entry {
     /// True while the worker's run waits for an approval.
     #[serde(default)]
     pub waiting: bool,
+    /// What the run is doing, which an entry written before this field reads
+    /// as idle.
+    #[serde(default)]
+    pub state: State,
+    /// The request that waits for a person, when one waits.
+    #[serde(default)]
+    pub wait: Option<Wait>,
+    /// The terminal that started the worker, from `HC_TERMINAL_ID`.
+    #[serde(default, rename = "hc_terminal_id")]
+    pub terminal: Option<String>,
 }
 
 impl fmt::Debug for Entry {
@@ -61,6 +104,9 @@ impl fmt::Debug for Entry {
             .field("cwd", &self.cwd)
             .field("started_ms", &self.started_ms)
             .field("waiting", &self.waiting)
+            .field("state", &self.state)
+            .field("wait", &self.wait)
+            .field("terminal", &self.terminal)
             .finish()
     }
 }
@@ -212,6 +258,9 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             started_ms: 7,
             waiting: false,
+            state: State::Idle,
+            wait: None,
+            terminal: None,
         }
     }
 
@@ -388,6 +437,78 @@ mod tests {
         let mut entry = entry("s1", std::process::id(), &folder);
         entry.waiting = true;
         write(&folder, &entry).await.expect("writes");
+        assert_eq!(list(&folder).await, vec![entry]);
+    }
+
+    /// A supervisor reads the state of a run from the entry, so an entry an
+    /// older worker wrote, with none of the three fields, still reads: the run
+    /// is idle and waits for nothing.
+    #[tokio::test]
+    async fn state_an_entry_without_the_fields_reads_idle() {
+        let tmp = TempDir::new().expect("temp");
+        let folder = folder(tmp.path());
+        fs::create_dir_all(&folder).await.expect("creates");
+        let old = format!(
+            concat!(
+                r#"{{"pid":{},"instance":"an-instance","major":{},"token":"{}","#,
+                r#""socket":"/tmp/s1.sock","session":"s1","cwd":"/tmp","started_ms":7}}"#
+            ),
+            std::process::id(),
+            MAJOR,
+            "0123456789abcdef0123456789abcdef",
+        );
+        fs::write(folder.join("s1.json"), old)
+            .await
+            .expect("writes");
+        let listed = list(&folder).await;
+        assert_eq!(listed.len(), 1, "the entry of a live pid is listed");
+        assert_eq!(listed[0].state, State::Idle);
+        assert_eq!(listed[0].wait, None);
+        assert_eq!(listed[0].terminal, None);
+    }
+
+    /// A key of a newer worker is not what drops an entry: `list` keeps the
+    /// ones it parses, and a field it does not know is one of them.
+    #[tokio::test]
+    async fn state_an_entry_with_an_unknown_key_reads() {
+        let tmp = TempDir::new().expect("temp");
+        let folder = folder(tmp.path());
+        fs::create_dir_all(&folder).await.expect("creates");
+        let mut entry = serde_json::to_value(entry("s1", std::process::id(), &folder))
+            .expect("the entry is JSON");
+        entry["from_a_newer_worker"] = serde_json::json!({ "a": 1 });
+        fs::write(
+            folder.join("s1.json"),
+            serde_json::to_vec(&entry).expect("the entry is JSON"),
+        )
+        .await
+        .expect("writes");
+        let listed = list(&folder).await;
+        assert_eq!(listed.len(), 1, "the entry is listed: {listed:?}");
+        assert_eq!(listed[0].session, "s1");
+    }
+
+    #[tokio::test]
+    async fn state_round_trips_with_the_wait_and_the_terminal() {
+        let tmp = TempDir::new().expect("temp");
+        let folder = folder(tmp.path());
+        let mut entry = entry("s1", std::process::id(), &folder);
+        entry.state = State::Blocked;
+        entry.wait = Some(Wait {
+            kind: WaitKind::Question,
+            id: 3,
+        });
+        entry.terminal = Some("t9".to_string());
+        write(&folder, &entry).await.expect("writes");
+        let text = fs::read_to_string(folder.join("s1.json"))
+            .await
+            .expect("reads");
+        assert!(text.contains(r#""state":"blocked""#), "{text}");
+        assert!(
+            text.contains(r#""wait":{"kind":"question","id":3}"#),
+            "{text}"
+        );
+        assert!(text.contains(r#""hc_terminal_id":"t9""#), "{text}");
         assert_eq!(list(&folder).await, vec![entry]);
     }
 

@@ -15,10 +15,11 @@
 //! > Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 //!
 //! It answers the same [`crossterm::event`] types the app already uses, so the
-//! rest of the TUI is unchanged. Two things never reach the keys, because a
+//! rest of the TUI is unchanged. Three things never reach the keys, because a
 //! report would turn into a keypress nobody typed: a cursor position report is
-//! dropped, and the answer to the primary device attributes query the first
-//! frame sends is [`Signal::DeviceAttributes`], which ends its wait.
+//! dropped, the answer to the primary device attributes query the first frame
+//! sends is [`Signal::DeviceAttributes`], which ends its wait, and the answer to
+//! the kitty graphics query it sends inside herdr is [`Signal::Graphics`].
 //!
 //! What is not as crossterm wrote it: crossterm parses one sequence out of a
 //! buffer it clears after each event, so it may build a `String` per CSI
@@ -43,6 +44,12 @@ const BUFFER: usize = 8 * 1024;
 /// The longest answer a terminal sends is `OSC 11;rgb:` with four hex digits a
 /// channel, under thirty bytes.
 const OSC_MAX: usize = 256;
+
+/// The most bytes of an application program command this parser holds before it
+/// drops the rest, by the same rule [`OSC_MAX`] follows: a command that never
+/// ends must not hold the keys behind it. The answer this parser reads is the
+/// kitty graphics one, a few dozen bytes.
+const APC_MAX: usize = OSC_MAX;
 
 /// How many numbers one CSI sequence may carry: a kitty key is
 /// `code:alternate ; modifiers:kind ; text`.
@@ -140,6 +147,14 @@ impl Parser {
                     self.at += len.max(1);
                     return Some(Signal::DeviceAttributes);
                 }
+                Step::Graphics(yes, len) => {
+                    self.at += len.max(1);
+                    return Some(Signal::Graphics(yes));
+                }
+                Step::ProgramStatus(len) => {
+                    self.at += len.max(1);
+                    return Some(Signal::ProgramStatus);
+                }
                 Step::Skip(len) => self.at += len.max(1),
                 Step::Wait => return None,
             }
@@ -148,12 +163,14 @@ impl Parser {
 }
 
 /// What one thing the terminal's bytes said: an event the app handles, or the
-/// answer to one of the first frame's two queries.
+/// answer to one of the first frame's queries.
 ///
-/// Neither answer is a key and neither reaches the key handling: the reader
-/// turns the background into the color the app picks its mode from and the
-/// device attributes into the end of the first frame's wait, and every byte of
-/// both is dropped from the buffer it was parsed out of.
+/// None of the answers is a key and none reaches the key handling: the reader
+/// turns the background into the color the app picks its mode from, the device
+/// attributes into the end of the first frame's wait, the graphics answer into
+/// whether the terminal draws placeholders and the program status answer into
+/// whether the app reports the session's status at all, and every byte of all
+/// four is dropped from the buffer it was parsed out of.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Signal {
     /// A key, a mouse report, a focus change.
@@ -163,6 +180,14 @@ pub enum Signal {
     /// The terminal's answer to the primary device attributes query, `CSI c`:
     /// every terminal answers it, so it ends the first frame's wait.
     DeviceAttributes,
+    /// The terminal's answer to the kitty graphics query the first frame sends
+    /// inside a herdr pane: `true` when it reads the protocol, `false` when it
+    /// answered an error.
+    Graphics(bool),
+    /// The terminal's answer to the program status query, `OSC 7501`: it reads
+    /// the protocol, so the app reports the session's status to it and to no
+    /// other terminal.
+    ProgramStatus,
 }
 
 /// What one look at the input bytes found.
@@ -173,6 +198,10 @@ enum Step {
     Background(Rgb, usize),
     /// The answer to the device attributes query, and how many bytes it took.
     DeviceAttributes(usize),
+    /// The answer to the kitty graphics query, and how many bytes it took.
+    Graphics(bool, usize),
+    /// The answer to the program status query, and how many bytes it took.
+    ProgramStatus(usize),
     /// The bytes end in a partial sequence: wait for the next read.
     Wait,
     /// Bytes that are not an event: drop them and look at what follows.
@@ -243,6 +272,11 @@ fn escape(buffer: &[u8], more: bool) -> Step {
             }
         }
         b']' if buffer[2].is_ascii_digit() => osc(buffer),
+        // An application program command: the kitty graphics answer starts with
+        // `ESC _ G`. A lone `ESC _` at the end of a full read may be its front,
+        // and one that is not followed by `G` is Alt+_ and the keys after it.
+        b'_' if buffer.len() > 2 && buffer[2] == b'G' => apc(buffer),
+        b'_' if buffer.len() == 2 && more => Step::Wait,
         // Two escapes in a row: the first is the key, and the second is looked
         // at again on its own.
         b'\x1b' => Step::Event(Event::Key(KeyCode::Esc.into()), 1),
@@ -257,6 +291,8 @@ fn escape(buffer: &[u8], more: bool) -> Step {
             // to name every arm.
             Step::Background(rgb, len) => Step::Background(rgb, len + 1),
             Step::DeviceAttributes(len) => Step::DeviceAttributes(len + 1),
+            Step::Graphics(yes, len) => Step::Graphics(yes, len + 1),
+            Step::ProgramStatus(len) => Step::ProgramStatus(len + 1),
             Step::Wait => Step::Wait,
             Step::Skip(len) => Step::Skip(len + 1),
         },
@@ -284,11 +320,11 @@ fn ss3(buffer: &[u8]) -> Step {
 
 /// `ESC ]` and the operating system command it starts, up to BEL or ST.
 ///
-/// The answer to the background query becomes [`Signal::Background`]; every
-/// other command, and an answer this parser does not understand, is dropped
-/// whole, so no byte of it is read as a key. A command that runs past
-/// [`OSC_MAX`] bytes is dropped too: the keys behind a terminator that never
-/// comes must arrive.
+/// The answer to the program status query becomes [`Signal::ProgramStatus`] and
+/// the answer to the background query [`Signal::Background`]; every other
+/// command, and an answer this parser does not understand, is dropped whole, so
+/// no byte of it is read as a key. A command that runs past [`OSC_MAX`] bytes is
+/// dropped too: the keys behind a terminator that never comes must arrive.
 fn osc(buffer: &[u8]) -> Step {
     let mut at = 2;
     let (end, len) = loop {
@@ -308,10 +344,58 @@ fn osc(buffer: &[u8]) -> Step {
             Some(_) => at += 1,
         }
     };
-    match background(&buffer[2..end]) {
+    let body = &buffer[2..end];
+    // A terminal that knows the program status protocol answers its query with
+    // `7501;?` and the states and kinds it reads: the app reports to it alone.
+    if body.starts_with(b"7501;?") {
+        return Step::ProgramStatus(len);
+    }
+    match background(body) {
         Some(rgb) => Step::Background(rgb, len),
         None => Step::Skip(len),
     }
+}
+
+/// `ESC _ G` and the kitty graphics answer it starts, up to ST.
+///
+/// The answer to the query the first frame sends inside a herdr pane names the
+/// image it asked about (`i=31`): `OK` says the terminal reads the protocol, and
+/// any other payload is its error. Every other application program command, and
+/// an answer that runs past [`APC_MAX`] bytes, is dropped whole, so no byte of
+/// one is read as a key.
+fn apc(buffer: &[u8]) -> Step {
+    let mut at = 2;
+    let (end, len) = loop {
+        if at >= APC_MAX {
+            return Step::Skip(at);
+        }
+        match buffer.get(at) {
+            None => return Step::Wait,
+            Some(b'\x1b') => match buffer.get(at + 1) {
+                None => return Step::Wait,
+                Some(b'\\') => break (at, at + 2),
+                // An escape that is not ST ends this command as far as this
+                // parser cares: what follows is looked at on its own.
+                Some(_) => return Step::Skip(at),
+            },
+            Some(_) => at += 1,
+        }
+    };
+    match graphics(&buffer[2..end]) {
+        Some(yes) => Step::Graphics(yes, len),
+        None => Step::Skip(len),
+    }
+}
+
+/// The answer the kitty command `body`, from its `G`, carries for image 31:
+/// whether the terminal read the protocol. `None` for a command that answers
+/// another query of the app's, which is dropped.
+fn graphics(body: &[u8]) -> Option<bool> {
+    let body = body.strip_prefix(b"G")?;
+    let at = body.iter().position(|byte| *byte == b';')?;
+    let (keys, payload) = (&body[..at], &body[at + 1..]);
+    let asked = keys.split(|byte| *byte == b',').any(|key| key == b"i=31");
+    asked.then_some(payload == b"OK")
 }
 
 /// The color of an `OSC 11` answer, `11;rgb:red/green/blue`, each channel one to
@@ -981,6 +1065,12 @@ mod tests {
                 Signal::Event(event) => events.push(event),
                 Signal::Background(color) => panic!("{bytes:?} is a key: {color:?}"),
                 Signal::DeviceAttributes => panic!("{bytes:?} is a key: the device attributes"),
+                Signal::Graphics(reads) => {
+                    panic!("{bytes:?} is a key: the graphics answer {reads}")
+                }
+                Signal::ProgramStatus => {
+                    panic!("{bytes:?} is a key: the program status answer")
+                }
             }
         }
         events
@@ -1457,6 +1547,59 @@ mod tests {
     }
 
     #[test]
+    fn program_status_answers_parse_to_their_signal() {
+        // The answer a terminal that knows the program status protocol gives,
+        // ended by ST and by BEL: the app tells the session's status to a
+        // terminal that answered and to no other.
+        for bytes in [
+            &b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\"[..],
+            b"\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x07",
+        ] {
+            let mut parser = Parser::new();
+            assert_eq!(
+                signals(&mut parser, bytes, false),
+                vec![Signal::ProgramStatus],
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn program_status_answer_split_over_two_reads_parses() {
+        let mut parser = Parser::new();
+        assert_eq!(
+            signals(&mut parser, b"\x1b]7501;?:states=idle,working", true),
+            Vec::new(),
+            "the answer waits for its terminator"
+        );
+        assert_eq!(
+            signals(
+                &mut parser,
+                b",done,blocked,error:kinds=permission,question,auth\x1b\\",
+                false
+            ),
+            vec![Signal::ProgramStatus]
+        );
+    }
+
+    #[test]
+    fn program_status_answer_is_not_a_key() {
+        // The query of a terminal that asks, which the app writes and reads
+        // nothing of, and a key right behind the answer.
+        let mut parser = Parser::new();
+        assert_eq!(
+            signals(&mut parser, b"\x1b]7501;?:states=idle\x07a", false),
+            vec![
+                Signal::ProgramStatus,
+                Signal::Event(Event::Key(KeyEvent::new(
+                    KeyCode::Char('a'),
+                    KeyModifiers::NONE
+                ))),
+            ]
+        );
+    }
+
+    #[test]
     fn alt_and_a_bracket_is_a_key_and_not_an_osc() {
         // A command names its number first, so `ESC ]` and anything that is not
         // a digit is Alt+] and the keys after it, not a command that swallows
@@ -1586,6 +1729,107 @@ mod tests {
         assert_eq!(
             signals(&mut parser, b"2c", false),
             vec![Signal::DeviceAttributes]
+        );
+    }
+
+    #[test]
+    fn alt_underscore_is_still_a_key() {
+        // `ESC _` is not the front of an answer unless `G` follows it: it is
+        // Alt+_ and the key after it, as it was.
+        let mut parser = Parser::new();
+        assert_eq!(
+            signals(&mut parser, b"\x1b_x", false),
+            vec![
+                Signal::Event(Event::Key(KeyEvent::new(
+                    KeyCode::Char('_'),
+                    KeyModifiers::ALT
+                ))),
+                Signal::Event(Event::Key(KeyEvent::new(
+                    KeyCode::Char('x'),
+                    KeyModifiers::NONE
+                ))),
+            ]
+        );
+    }
+
+    #[test]
+    fn kitty_answer_ok_is_a_graphics_signal() {
+        // The answer to the kitty graphics query the first frame sends inside
+        // herdr: the terminal reads the protocol.
+        let mut parser = Parser::new();
+        assert_eq!(
+            signals(&mut parser, b"\x1b_Gi=31;OK\x1b\\", false),
+            vec![Signal::Graphics(true)]
+        );
+        assert_eq!(parser.next_event(), None, "the answer is nothing else");
+    }
+
+    #[test]
+    fn kitty_answer_error_is_a_graphics_signal_false() {
+        // A terminal that reads the protocol and cannot give the image says so
+        // with an error: it answered no, which is not the same as no answer.
+        let mut parser = Parser::new();
+        assert_eq!(
+            signals(&mut parser, b"\x1b_Gi=31;ENOENT:no such file\x1b\\", false),
+            vec![Signal::Graphics(false)]
+        );
+        assert_eq!(parser.next_event(), None, "the answer is nothing else");
+    }
+
+    #[test]
+    fn kitty_answer_split_across_reads_waits() {
+        // Every cut of the answer parses to the one signal, whatever byte the
+        // read ended on.
+        let answer = b"\x1b_Gi=31;OK\x1b\\";
+        for cut in 1..answer.len() {
+            let mut parser = Parser::new();
+            let mut all = signals(&mut parser, &answer[..cut], true);
+            all.extend(signals(&mut parser, &answer[cut..], false));
+            assert_eq!(all, vec![Signal::Graphics(true)], "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn kitty_answer_then_device_attributes() {
+        // Inside herdr the kitty query goes out before `CSI c`, so a terminal
+        // that answers both in one read answers them in that order.
+        let mut parser = Parser::new();
+        assert_eq!(
+            signals(&mut parser, b"\x1b_Gi=31;OK\x1b\\\x1b[?62;22c", false),
+            vec![Signal::Graphics(true), Signal::DeviceAttributes]
+        );
+    }
+
+    #[test]
+    fn other_apc_is_dropped() {
+        // An application program command that answers no query of ours is
+        // dropped whole, so no byte of it is read as a key.
+        let mut parser = Parser::new();
+        assert_eq!(
+            signals(&mut parser, b"\x1b_Gi=7;OK\x1b\\a", false),
+            vec![Signal::Event(Event::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE
+            )))]
+        );
+    }
+
+    #[test]
+    fn an_apc_that_never_ends_holds_no_keys() {
+        // An answer with no terminator is dropped at its cap, the bound an
+        // operating system command has, so the keys behind it arrive.
+        let mut parser = Parser::new();
+        let mut command = Vec::from(&b"\x1b_Gi=31;OK"[..]);
+        command.resize(APC_MAX, b'1');
+        let mut events = feed(&mut parser, &command, false);
+        events.extend(feed(&mut parser, b"k", false));
+        assert_eq!(
+            events,
+            vec![Event::Key(KeyEvent::new(
+                KeyCode::Char('k'),
+                KeyModifiers::NONE
+            ))],
+            "the unterminated answer is dropped whole"
         );
     }
 }

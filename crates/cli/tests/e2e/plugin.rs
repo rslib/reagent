@@ -696,6 +696,115 @@ export default function () {
     );
 }
 
+/// The entry of an installed plugin: its `tinied` tool imports the bare name
+/// `tiny` from the file its lockfile names.
+const LOCKED: &str = r#"
+import { tiny } from "tiny";
+export default function (reagent) {
+  reagent.registerTool({
+    name: "tinied",
+    description: "Answers what the tiny module exports.",
+    parameters: { type: "object" },
+    run: () => tiny,
+  });
+}
+"#;
+
+/// The module a lockfile maps the bare name `tiny` to.
+const TINY: &str = "export const tiny = \"tiny-value\";\n";
+
+/// Writes `reagent-lock.json` into the plugin folder `dir`, pinning `files`
+/// and naming `imports`.
+async fn lockfile(dir: &Path, files: &[(&str, &str)], imports: &[(&str, &str)]) {
+    let lock = reagent_script::plugin::lock::Lock {
+        version: reagent_script::plugin::lock::VERSION,
+        requested: "npm:tiny@^1".to_owned(),
+        source: "npm:tiny@1.0.0".to_owned(),
+        commit: None,
+        files: files
+            .iter()
+            .map(|(path, body)| {
+                (
+                    (*path).to_owned(),
+                    reagent_script::plugin::lock::hash(body.as_bytes()),
+                )
+            })
+            .collect(),
+        imports: imports
+            .iter()
+            .map(|(name, path)| ((*name).to_owned(), (*path).to_owned()))
+            .collect(),
+    };
+    // The install writes it the same way, off the async runtime.
+    tokio::task::spawn_blocking({
+        let dir = dir.to_path_buf();
+        move || reagent_script::plugin::lock::write(&dir, &lock)
+    })
+    .await
+    .expect("the lockfile job")
+    .expect("the lockfile");
+}
+
+#[tokio::test]
+async fn lockfile_plugin_runs_only_the_files_it_pinned() {
+    let home = Home::new();
+    home.plugin("locked", LOCKED).await;
+    let dir = home.plugins().join("locked");
+    tokio::fs::create_dir_all(dir.join("deps/tiny"))
+        .await
+        .expect("the deps folder");
+    tokio::fs::write(dir.join("deps/tiny/index.mjs"), TINY)
+        .await
+        .expect("the module");
+    lockfile(
+        &dir,
+        &[("index.js", LOCKED), ("deps/tiny/index.mjs", TINY)],
+        &[("tiny", "deps/tiny/index.mjs")],
+    )
+    .await;
+    let fake = home.script(&call_script("tinied", "{}")).await;
+    let output = home
+        .run(&[
+            "--json",
+            "--no-serve",
+            "--provider",
+            &fake,
+            "-p",
+            "tinied now",
+        ])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let lines = lines(&output);
+    let result = tool_result(&lines);
+    assert_eq!(result["is_error"], false, "{result}");
+    let results = home.tool_results(&session(&lines)).await;
+    assert!(
+        results.iter().any(|text| text == "tiny-value"),
+        "the pinned module did not answer: {results:?}"
+    );
+
+    // One byte of a pinned file changed: the plugin is skipped with a note.
+    tokio::fs::write(
+        dir.join("deps/tiny/index.mjs"),
+        "export const tiny = \"changed\";\n",
+    )
+    .await
+    .expect("the changed module");
+    let quiet = home.script(r#"{"replies": [{"text": "done"}]}"#).await;
+    let output = home
+        .run(&["--json", "--no-serve", "--provider", &quiet, "-p", "hello"])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("reagent: plugin locked")
+                && line.contains("deps/tiny/index.mjs")),
+        "no note for the changed plugin in {stderr}"
+    );
+}
+
 #[tokio::test]
 async fn a_listener_counts_turns() {
     let home = Home::new();

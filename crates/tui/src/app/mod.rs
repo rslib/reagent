@@ -43,6 +43,7 @@ pub use term::Real;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::io::Read as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -53,7 +54,7 @@ use reagent_ai::{AssistantMessage, Content, Message, ToolCall, ToolResult};
 use reagent_protocol::message::{AnswerKind, Mode, PluginCommand};
 use serde::Deserialize;
 
-use crate::client::{Approval, Client, Frame, Initialized, Next};
+use crate::client::{Approval, Client, Frame, Initialized, Next, RunEnd};
 use crate::editor::{Editor, IMAGE_LABEL};
 use crate::highlight::{self, Lang};
 use crate::history::{self, RecentMessages, Tail};
@@ -64,7 +65,7 @@ use crate::keys::{self, Action, Choice, EditKey, HINTS, Keys, Leader, Overlay, q
 use crate::layout::{self, Rect};
 use crate::markdown::Markdown;
 use crate::mouse::Mouse;
-use crate::panels::{ContextPanel, SessionRow, SessionsPanel};
+use crate::panels::{ContextPanel, SessionRow, SessionsPanel, SkillsPanel};
 use crate::picture::{self, Picture, Source as PictureSource, StyleBudget};
 use crate::picture_native::{self, Native, Protocol};
 use crate::screen::{Color, SYNC_PAIR, Screen, Style, Terminal};
@@ -164,8 +165,9 @@ pub struct Options {
     /// The keys file of the config folder, read once at start, or `None` for the
     /// table's own keys.
     pub keys: Option<PathBuf>,
-    /// Where the terminal's answers to the first frame's two queries arrive, for
-    /// a terminal that sends them; `None` draws in the mode the terminal's own.
+    /// Where the terminal's answers to the first frame's queries arrive, for a
+    /// terminal that sends them; `None` draws in the mode the terminal's own and
+    /// reports no status.
     pub background: Option<Background>,
     /// The folder the session runs in, which the docked sidebar shows under
     /// the title; `None` shows no folder.
@@ -223,14 +225,17 @@ impl Exit {
 /// The look a session the app switches to draws with: its theme mode, the
 /// depth, the theme file's colors and whether it draws color at all.
 /// What the session the app switches to keeps from the last one: the look it
-/// drew with, and the keys table it read at its start, which is read once for
-/// the whole run.
+/// drew with, the keys table it read at its start, which is read once for the
+/// whole run, and whether the terminal answered the program status query, which
+/// is asked once too.
 struct Carried {
     /// The mode the last session drew in, its depth, its overrides and whether
     /// the terminal reported a color.
     look: (crate::theme::Mode, Depth, Overrides, bool),
     /// The keys the last session read.
     keys: Option<crate::keyfile::KeyFile>,
+    /// Whether the terminal answered the program status query.
+    program: bool,
 }
 
 /// The session a sheet opened: its worker, the client already connected to it
@@ -248,8 +253,16 @@ struct Switch {
 pub async fn run(mut options: Options, mut terminal: impl Terminal) -> io::Result<Exit> {
     let mut carried: Option<(Carried, Client, Initialized)> = None;
     loop {
-        let (exit, next) = run_session(&mut options, &mut terminal, carried.take()).await?;
+        let (exit, next, program) =
+            run_session(&mut options, &mut terminal, carried.take()).await?;
         let Some(next) = next else {
+            // A terminal that answered the program status query is told the
+            // session is over, once, in the last write of the run: its inbox
+            // drops the entry it listed. A switch keeps the entry, since the
+            // session goes on in another one.
+            if program {
+                terminal.write_frame(term::STATUS_CLEAR).await?;
+            }
             return Ok(exit);
         };
         // The last session left the alternate screen the way a quit does; the
@@ -263,11 +276,14 @@ pub async fn run(mut options: Options, mut terminal: impl Terminal) -> io::Resul
 
 /// Runs one session: the app's setup, its frames and its exit, and the worker
 /// of another session when a sheet picked one.
+///
+/// The last answer says whether the terminal answered the program status query,
+/// so the run that ends tells it the session is over.
 async fn run_session(
     options: &mut Options,
     terminal: &mut impl Terminal,
     carried: Option<(Carried, Client, Initialized)>,
-) -> io::Result<(Exit, Option<Switch>)> {
+) -> io::Result<(Exit, Option<Switch>, bool)> {
     let (carried, (mut client, init)) = match carried {
         Some((carried, client, init)) => (Some(carried), (client, init)),
         None => (
@@ -286,6 +302,9 @@ async fn run_session(
         if let Some(file) = carried.keys {
             app.set_keyfile(file);
         }
+        // The query went out once, so a session the app switched to keeps the
+        // answer: the terminal hears its status too.
+        app.program = carried.program;
     }
     app.state = options.state.clone();
     // The discovery folder of the live workers: a change there is a session
@@ -295,9 +314,14 @@ async fn run_session(
         .state
         .as_deref()
         .and_then(|state| Watch::new(&reagent_protocol::discovery::folder(state)).ok());
+    // When the folder has settled after a change, so its read takes the whole
+    // write. The loop goes on meanwhile: a stall would let the worker's queue
+    // of this client fill during a stream and cut it.
+    let mut settle: Option<tokio::time::Instant> = None;
     app.host = options.host.clone();
     if let Some(cwd) = &options.cwd {
         app.place = sidebar::shown(cwd, std::env::var("HOME").ok().as_deref());
+        app.cwd = Some(cwd.clone());
     }
     if let Some(prices) = options.prices {
         app.set_prices(prices);
@@ -345,11 +369,12 @@ async fn run_session(
     let mut background: Option<Background> = None;
     app.enter(terminal).await;
     if !looked {
-        // The theme file, then the first frame's two queries: the frame waits only
+        // The theme file, then the first frame's queries: the frame waits only
         // for the device attributes answer, which every terminal gives, so it is
         // drawn in the mode the terminal can show within a few milliseconds, and a
         // late background answer draws one more frame in rich mode.
         background = options.background.take();
+        app.background = background.clone();
         // The keys file, read once for the whole run: a session the app
         // switches to keeps the table and its notes show once.
         app.read_keys(options.keys.take()).await;
@@ -406,11 +431,11 @@ async fn run_session(
             opened = open_answer(&mut app.waits.open) => app.opened(opened),
             deleted = delete_answer(&mut app.waits.delete) => app.deleted(deleted.0, deleted.1, deleted.2),
             (request, image) = image_answer(&mut app.image_job) => app.image_pasted(request, image),
+            answer = skill_answer(&mut app.skill_job) => app.skill_arrived(answer),
             found = read_answer(&mut app.reading) => app.sessions_arrived(found).await,
             changed = watch_answer(&mut watch) => match changed {
                 Ok(()) => {
-                    tokio::time::sleep(FOLDER_SETTLE).await;
-                    app.read_sessions();
+                    settle.get_or_insert_with(|| tokio::time::Instant::now() + FOLDER_SETTLE);
                 }
                 // A watch that stops working costs the live marks, which the
                 // turns that end and the frames that arrive read as before.
@@ -419,6 +444,10 @@ async fn run_session(
                     watch = None;
                 }
             },
+            () = wait(settle) => {
+                settle = None;
+                app.read_sessions();
+            }
             frame = client.next_frame() => {
                 match frame {
                     Ok(Next::Frame(frame)) => app.frame(frame),
@@ -466,6 +495,7 @@ async fn run_session(
                         carried: Carried {
                             look,
                             keys: app.keyfile.take(),
+                            program: app.program,
                         },
                         client: next_client,
                         init: next_init,
@@ -516,7 +546,7 @@ async fn run_session(
         Some(error) => Err(error),
         None => {
             closed?;
-            Ok((Exit { code: app.code }, next))
+            Ok((Exit { code: app.code }, next, app.program))
         }
     }
 }
@@ -524,15 +554,28 @@ async fn run_session(
 /// Fills the PNG payload of `picture` for a terminal that draws placeholders,
 /// or drops its source when the image makes no PNG: the picture then keeps its
 /// half-block cells.
-async fn placeholder_picture(picture: &mut Picture) {
+///
+/// `cell` is the pixel size of one cell, when the terminal reported it, and a
+/// typical cell when it did not: a PNG smaller than its cells is made again at
+/// their size. Any other PNG goes out as the journal holds it.
+async fn placeholder_picture(picture: &mut Picture, cell: Option<crate::picture::CellShape>) {
     let Some(source) = picture.source.as_ref() else {
         return;
     };
-    if source.png {
+    let cell = cell.unwrap_or(crate::picture::CellShape::TYPICAL);
+    let box_pixels = picture.cells.as_ref().map(|cells| {
+        (
+            cells.columns.saturating_mul(u32::from(cell.across)),
+            cells.rows.saturating_mul(u32::from(cell.down)),
+        )
+    });
+    let (width, height) = picture.size;
+    let small = box_pixels.is_some_and(|(across, down)| width < across && height < down);
+    if source.png && !small {
         return;
     }
     let data = Arc::clone(&source.data);
-    let made = tokio::task::spawn_blocking(move || picture_native::png_payload(&data))
+    let made = tokio::task::spawn_blocking(move || picture_native::png_payload(&data, box_pixels))
         .await
         .ok()
         .flatten();
@@ -680,6 +723,16 @@ async fn image_answer(
     let result = result.unwrap_or_else(|error| Err(format!("the image job stopped: {error}")));
     match slot.take() {
         Some(job) => (job.request, result),
+        None => std::future::pending().await,
+    }
+}
+
+/// Waits for the read of the skill's file that runs, and stays pending while
+/// none does.
+async fn skill_answer(slot: &mut Option<SkillJob>) -> io::Result<String> {
+    // The job stays in its slot while it runs, as the files' job does.
+    match slot.as_mut() {
+        Some(job) => job.answer().await,
         None => std::future::pending().await,
     }
 }
@@ -2197,6 +2250,11 @@ struct App {
     history: Vec<String>,
     /// What the client has to send for this key.
     commands: VecDeque<Command>,
+    /// The commands the plugins of the session offer, with the words of each, as
+    /// the rows of the `/` list name them.
+    plugins: Vec<(String, String)>,
+    /// The read of a skill's file, while it runs.
+    skill_job: Option<SkillJob>,
     /// The command table the `/` list and the palette open with, built once.
     slash: Arc<[list::Command]>,
     /// The list above the text box, when one is open.
@@ -2266,6 +2324,9 @@ struct App {
     journal: Option<PathBuf>,
     /// The folder the session runs in, as the docked sidebar shows it.
     place: Arc<str>,
+    /// The folder the session runs in, which a relative path of a tool call is
+    /// made absolute against, as the tool makes it.
+    cwd: Option<PathBuf>,
     /// The newest journal record the app read.
     read: u64,
     /// The newest journal record the app drew.
@@ -2364,6 +2425,85 @@ struct App {
     image_ids: Vec<u32>,
     /// The image sequences of the pictures going out, reused.
     images: Vec<u8>,
+    /// Where the terminal's answers to the first frame's queries arrived, for a
+    /// terminal that sent them: the recorded kitty graphics answer is what the
+    /// protocol of a herdr pane is read from, and the program status answer is
+    /// whether the session's status is reported at all. `None` for a terminal
+    /// that was asked nothing.
+    background: Option<Background>,
+    /// The last status the terminal was told, `None` until one went out: a frame
+    /// that finds the session in the same status says nothing.
+    reported: Option<Status>,
+    /// Whether the terminal answered the program status query, so it hears the
+    /// status of the session. It carries over a session switch, since the query
+    /// goes out once.
+    program: bool,
+    /// The status the last run left the session in, until the next one starts.
+    settled: Status,
+    /// Whether a compaction this client asked for goes: `/compact` sets it, and
+    /// its answer or a run that ends clears it.
+    compacting: bool,
+}
+
+/// What the terminal is told of the session with `OSC 7501`, which lists it in
+/// the terminal's inbox.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Status {
+    /// No run goes and none ended since the last report.
+    Idle,
+    /// A run, a message of this client or a compaction goes.
+    Working,
+    /// A run ended with its reply, a stop or the turn limit.
+    Done,
+    /// The session waits on the user: the card on screen, or the one that waits
+    /// behind it.
+    Blocked(Kind),
+    /// A run ended with an error.
+    Error,
+}
+
+/// The card a blocked session waits on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    /// An approval card.
+    Permission,
+    /// A question card.
+    Question,
+}
+
+impl Status {
+    /// The status a run that ended for `end` leaves the session in.
+    fn of(end: RunEnd) -> Status {
+        match end {
+            // The reply is in the transcript, so the session waits on the user.
+            RunEnd::EndTurn | RunEnd::Stopped | RunEnd::MaxTurns | RunEnd::Other => Status::Done,
+            // The run was given up, so nothing of it is done.
+            RunEnd::Cancelled => Status::Idle,
+            // A failure ended it.
+            RunEnd::Error => Status::Error,
+        }
+    }
+
+    /// The `state` value of the report.
+    fn word(self) -> &'static str {
+        match self {
+            Status::Idle => "idle",
+            Status::Working => "working",
+            Status::Done => "done",
+            Status::Blocked(_) => "blocked",
+            Status::Error => "error",
+        }
+    }
+}
+
+impl Kind {
+    /// The `kind` value of the report.
+    fn word(self) -> &'static str {
+        match self {
+            Kind::Permission => "permission",
+            Kind::Question => "question",
+        }
+    }
 }
 
 /// Where the bytes of a pasted image come from.
@@ -2448,6 +2588,74 @@ const IMAGE_EXTS: &[&str] = &[
 
 /// Where this app's own image pastes land: the word a chip stands for.
 const PASTED_WORD: &str = "/pasted/image-";
+
+/// The most of a skill's file the message of its command carries.
+const SKILL_CAP: usize = 64 * 1024;
+
+/// The line that ends a skill's file the cap cut.
+const SKILL_CUT: &str = "[skill file cut at 64 KB]";
+
+/// The prefix a row of the `/` list names a skill with when its plain name is
+/// taken: `/skill:<name>` runs every skill of the session, either way.
+const SKILL_PREFIX: &str = "/skill:";
+
+/// The read of a skill's file, and the message it makes when it answers.
+#[derive(Debug)]
+struct SkillJob {
+    /// The name of the skill, as the handshake names it.
+    name: Arc<str>,
+    /// The absolute path of the skill's file.
+    path: Arc<str>,
+    /// The text the user typed after the command, empty when none.
+    text: String,
+    /// The read's answer, when the job ends.
+    handle: tokio::task::JoinHandle<io::Result<String>>,
+}
+
+impl SkillJob {
+    /// Waits for the read of the skill's file, which runs once.
+    async fn answer(&mut self) -> io::Result<String> {
+        match (&mut self.handle).await {
+            Ok(answer) => answer,
+            Err(error) => Err(io::Error::other(error.to_string())),
+        }
+    }
+}
+
+/// Reads the file of the skill at `path`, at most [`SKILL_CAP`] bytes of it, cut
+/// on a char boundary and closed with the line that says so.
+///
+/// All of it is the work of one blocking job: no frame waits for a file, and a
+/// file larger than the cap costs no read of the rest of it.
+#[expect(clippy::disallowed_types, reason = "runs inside spawn_blocking")]
+fn read_skill(path: &Path) -> io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    // A skill's file is a page of text: the buffer starts at the size of one and
+    // grows only for a larger file, which the cap then cuts.
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    file.take(SKILL_CAP as u64 + 1).read_to_end(&mut bytes)?;
+    let cut = bytes.len() > SKILL_CAP;
+    if cut {
+        bytes.truncate(kept_chars(&bytes));
+    }
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if cut {
+        text.push('\n');
+        text.push_str(SKILL_CUT);
+    }
+    Ok(text.trim_end().to_owned())
+}
+
+/// The length of the longest prefix of `bytes` that is no longer than
+/// [`SKILL_CAP`] and holds no part of a char: a cut that lands inside one backs
+/// off to its first byte.
+fn kept_chars(bytes: &[u8]) -> usize {
+    let mut end = SKILL_CAP.min(bytes.len());
+    while end > 0 && end < bytes.len() && (bytes[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    end
+}
 
 /// Writes the image of `source` into the `pasted` folder of the session at
 /// `folder`, and answers the file it wrote and the number of its chip.
@@ -2655,6 +2863,13 @@ enum Resync {
     Closed,
 }
 
+/// The arguments of a `read` call: the file it takes, as the model wrote it.
+#[derive(Deserialize)]
+struct ReadCall<'a> {
+    #[serde(borrow, default)]
+    path: Option<Cow<'a, str>>,
+}
+
 impl App {
     /// The app for a session whose handshake answered `init`, in the mode the
     /// start chose.
@@ -2709,6 +2924,8 @@ impl App {
             queue: VecDeque::new(),
             history: Vec::new(),
             commands: VecDeque::new(),
+            plugins: Vec::new(),
+            skill_job: None,
             slash: commands::table(None),
             list: None,
             leader_list: List::leader(),
@@ -2737,6 +2954,7 @@ impl App {
             code: 0,
             journal: None,
             place: Arc::from(""),
+            cwd: None,
             read: 0,
             drawn: 0,
             pictured: 0,
@@ -2777,7 +2995,15 @@ impl App {
             image_id: first_image_id(),
             image_ids: Vec::new(),
             images: Vec::new(),
+            background: None,
+            reported: None,
+            program: false,
+            settled: Status::Idle,
+            compacting: false,
         };
+        // The skills the session found, when it found any: a session with none
+        // keeps the sidebar it always had.
+        app.skills(&init.skills);
         // The sidebar the start asks for, and the main area it leaves.
         app.reflow();
         app
@@ -3053,8 +3279,8 @@ impl App {
         let title: Arc<str> = Arc::from(labels.leader());
         self.leader_list.set_keys(list::LeaderKeys { title, grid });
         self.leader_list.set_labels(Some(labels));
-        self.slash = commands::table(Some(labels));
         self.keyfile = Some(file);
+        self.set_slash();
     }
 
     /// Moves the first `count` live entries to the transcript, freezing their
@@ -3294,13 +3520,15 @@ impl App {
                 self.pictures = self.pictures || images > 0;
             }
             Frame::TurnEnd => self.turn_end(false),
-            Frame::RunEnd { at_limit } => {
-                if at_limit {
+            Frame::RunEnd { end } => {
+                if end == RunEnd::MaxTurns {
                     self.note(TURN_LIMIT_LINE.to_string());
                 }
                 // The run ends with every record that carries its images, so no
                 // commit of it asks for another read.
                 self.pictures = false;
+                self.compacting = false;
+                self.settled = Status::of(end);
                 self.turn_end(true);
             }
             Frame::UserMessage { text, images } => {
@@ -3323,6 +3551,11 @@ impl App {
                     "nothing to compact" => message.into_owned(),
                     _ => format!("error: {message}"),
                 };
+                // A failed turn is no status of its own here: the `error` frame
+                // also carries an answer this client asked for, such as a
+                // compaction with nothing to fold in. The compaction it answers
+                // is over all the same.
+                self.compacting = false;
                 self.note(message);
             }
             Frame::Compacted {
@@ -3618,6 +3851,7 @@ impl App {
             self.newest_diff(call, block);
         }
         if self.note_call(id) {
+            self.skill_read(name, arguments);
             self.panels_update(&Update::ToolCall { name, arguments });
         }
     }
@@ -3627,10 +3861,33 @@ impl App {
         if !self.note_call(&call.id) {
             return;
         }
+        self.skill_read(&call.name, &call.arguments);
         self.panels_update(&Update::ToolCall {
             name: call.name.as_ref(),
             arguments: call.arguments.as_ref(),
         });
+    }
+
+    /// Marks the skill a `read` call took as read in this session, for the
+    /// Skills panel: its `path` names the skill's file, made absolute against
+    /// the folder the session runs in when it is relative, as the read tool
+    /// makes it.
+    fn skill_read(&mut self, name: &str, arguments: &str) {
+        if name != "read" {
+            return;
+        }
+        let Ok(call) = serde_json::from_str::<ReadCall<'_>>(arguments) else {
+            return;
+        };
+        let Some(path) = call.path.as_deref() else {
+            return;
+        };
+        let path = Path::new(path);
+        let path = match (&self.cwd, path.is_relative()) {
+            (Some(cwd), true) => Cow::Owned(cwd.join(path)),
+            _ => Cow::Borrowed(path),
+        };
+        self.mark_skill(&path);
     }
 
     /// Whether this is the first time the client shows the call `id`, which it
@@ -3934,7 +4191,11 @@ impl App {
             Some(_) => picture_native::tmux_display().await,
             None => None,
         };
-        let native = picture_native::detect(|name| std::env::var(name).ok(), display.as_deref());
+        let native = picture_native::detect(
+            |name| std::env::var(name).ok(),
+            display.as_deref(),
+            self.background.as_ref().and_then(Background::graphics),
+        );
         self.native = native;
         self.screen.set_native(native);
     }
@@ -3952,7 +4213,7 @@ impl App {
         }
         for (_, _, pictures) in messages.iter_mut() {
             for picture in pictures.iter_mut() {
-                placeholder_picture(picture).await;
+                placeholder_picture(picture, self.cell).await;
             }
         }
     }
@@ -3969,7 +4230,7 @@ impl App {
         }
         for pictures in &mut tail.pictures {
             for picture in pictures.iter_mut() {
-                placeholder_picture(picture).await;
+                placeholder_picture(picture, self.cell).await;
             }
         }
     }
@@ -4643,6 +4904,13 @@ impl App {
             return;
         }
         let text = self.editor.take();
+        self.deliver(text, mode);
+        self.editor_dirty = true;
+    }
+
+    /// Asks the client to send `text` as a message: a steer while a run goes,
+    /// else a queue that starts one.
+    fn deliver(&mut self, text: String, mode: Option<Mode>) {
         let mode = mode.unwrap_or(if self.running {
             Mode::Steer
         } else {
@@ -4656,7 +4924,7 @@ impl App {
         self.commands.push_back(Command::Send { text, mode });
         self.running = true;
         self.status_dirty = true;
-        self.editor_dirty = true;
+        self.dirty = true;
     }
 
     /// Adds the row that holds the message the run takes next: a steer that
@@ -5478,6 +5746,9 @@ impl App {
             text: None,
         })));
         self.checkpoints.push((fold, self.upto));
+        // The compaction this client asked for is over: the row it left is on
+        // screen.
+        self.compacting = false;
         self.dirty = true;
     }
 
@@ -5491,6 +5762,10 @@ impl App {
         }
         let note = note.filter(|note| !note.is_empty()).map(str::to_owned);
         self.commands.push_back(Command::Compact { note });
+        // The session compacts until its answer comes, and that is a run of its
+        // own as far as the terminal's inbox is concerned.
+        self.compacting = true;
+        self.dirty = true;
     }
 
     /// Notes the compaction row the user opened, whose checkpoint text is not on
@@ -5559,26 +5834,133 @@ impl App {
     /// meaning, and the note says which one. A second frame, from a reattach,
     /// replaces the plugin rows rather than adding them again.
     fn plugin_commands(&mut self, commands: &[PluginCommand<'_>]) {
-        let labels = self.keyfile.as_ref().map(keyfile::KeyFile::labels);
-        let mut rows: Vec<list::Command> = commands::table(labels).to_vec();
-        let builtins = rows.len();
+        self.plugins.clear();
         for command in commands {
             let name = format!("/{}", command.name);
-            if rows[..builtins].iter().any(|row| row.name == name) {
+            if commands::builtin(&name) {
                 let note =
                     format!("plugin command {name} skipped: a built-in command has that name");
                 self.note(note);
                 continue;
             }
+            self.plugins.push((name, command.description.to_string()));
+        }
+        self.set_slash();
+    }
+
+    /// Builds the rows the `/` list and the palette open with: the built-ins,
+    /// then the commands the plugins of the session offer, then the skills of
+    /// the session, each under its scope's word.
+    ///
+    /// A skill whose plain name a built-in or a plugin row holds loses it, and
+    /// keeps only its namespaced row: `/skill:<name>` runs every skill.
+    fn set_slash(&mut self) {
+        let labels = self.keyfile.as_ref().map(keyfile::KeyFile::labels);
+        let mut rows: Vec<list::Command> = commands::table(labels).to_vec();
+        for (name, words) in &self.plugins {
             rows.push(list::Command {
-                name: Cow::Owned(name),
-                words: Cow::Owned(command.description.to_string()),
+                name: Cow::Owned(name.clone()),
+                words: Cow::Owned(words.clone()),
                 key: Cow::Borrowed(""),
                 group: commands::PLUGIN_GROUP,
             });
         }
+        let skills = self.skill_list();
+        for (name, _, scope) in &skills {
+            let plain = format!("/{name}");
+            if !rows.iter().any(|row| *row.name == plain) {
+                rows.push(list::Command {
+                    name: Cow::Owned(plain),
+                    words: Cow::Owned(scope.clone()),
+                    key: Cow::Borrowed(""),
+                    group: commands::SKILL_GROUP,
+                });
+            }
+            rows.push(list::Command {
+                name: Cow::Owned(format!("{SKILL_PREFIX}{name}")),
+                words: Cow::Owned(scope.clone()),
+                key: Cow::Borrowed(""),
+                group: commands::SKILL_GROUP,
+            });
+        }
         self.slash = Arc::from(rows);
         self.dirty = true;
+    }
+
+    /// Runs the skill the row `name` names: reads its file in a blocking job,
+    /// and sends the message the read makes when it answers.
+    fn run_skill(&mut self, name: &str, text: &str) {
+        let name = name.strip_prefix(SKILL_PREFIX).unwrap_or(name);
+        let name = name.strip_prefix('/').unwrap_or(name);
+        let Some(path) = self.skill_file(name) else {
+            self.note(format!("unknown skill {name}"));
+            return;
+        };
+        let job = Arc::clone(&path);
+        let handle = tokio::task::spawn_blocking(move || read_skill(Path::new(&*job)));
+        self.skill_job = Some(SkillJob {
+            name: Arc::from(name),
+            path,
+            text: text.to_owned(),
+            handle,
+        });
+    }
+
+    /// The file of the skill `name`, when the session found one by that name.
+    fn skill_file(&mut self, name: &str) -> Option<Arc<str>> {
+        let panel = self.sidebar.get_mut::<SkillsPanel>()?;
+        panel
+            .skills()
+            .find(|(skill, _, _)| *skill == name)
+            .map(|(_, path, _)| Arc::from(path))
+    }
+
+    /// Takes what the read of a skill's file answered: the message that goes
+    /// out, with the text the user typed after the command, or the note of a
+    /// file that cannot be read, and no message.
+    fn skill_arrived(&mut self, answer: io::Result<String>) {
+        let Some(job) = self.skill_job.take() else {
+            return;
+        };
+        let content = match answer {
+            Ok(content) => content,
+            Err(error) => {
+                self.note(format!("skill {}: {error}", job.name));
+                return;
+            }
+        };
+        // The skill the message carries is one the model need not read again.
+        self.mark_skill(Path::new(&*job.path));
+        let mut message = format!(
+            "<skill name=\"{}\" path=\"{}\">\n{content}\n</skill>",
+            job.name, job.path
+        );
+        let text = job.text.trim();
+        if !text.is_empty() {
+            message.push_str("\n\n");
+            message.push_str(text);
+        }
+        self.deliver(message, None);
+    }
+
+    /// Lists the skills of the session in the transcript: the name, the scope
+    /// and the file of each, or one line when the session found none.
+    fn skills_note(&mut self) {
+        let skills = self.skill_list();
+        if skills.is_empty() {
+            self.note("no skills in this session".to_owned());
+            return;
+        }
+        let mut text = format!("skills: {}", skills.len());
+        for (name, path, scope) in &skills {
+            text.push('\n');
+            text.push_str(name);
+            text.push_str(" (");
+            text.push_str(scope);
+            text.push_str(") ");
+            text.push_str(path);
+        }
+        self.note(text);
     }
 
     /// Takes the picked row of the open list: a file inserts its path, a
@@ -5647,7 +6029,7 @@ impl App {
     /// Runs the command line the box holds whole, and answers whether it did;
     /// a line that names no command is sent as a message.
     fn run_line(&mut self) -> bool {
-        let (index, plugin) = {
+        let (index, rest) = {
             let (before, after) = self.editor.chunks();
             if !after.is_empty() {
                 return false;
@@ -5659,14 +6041,15 @@ impl App {
             let Some(index) = self.slash.iter().position(|command| command.name == name) else {
                 return false;
             };
-            let plugin = self.slash[index].group == commands::PLUGIN_GROUP;
+            // A plugin's command and a skill take the rest of the line as it
+            // was typed, after the name and one space.
+            let rest = self.slash[index].group == commands::PLUGIN_GROUP
+                || self.slash[index].group == commands::SKILL_GROUP;
             self.query.clear();
-            if plugin {
-                // A plugin command takes the rest of the line as it was typed,
-                // after the name and one space.
+            if rest {
                 let at = before.find(name).unwrap_or(0) + name.len();
-                let rest = &before[at..];
-                self.query.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+                let text = &before[at..];
+                self.query.push_str(text.strip_prefix(' ').unwrap_or(text));
             } else if name == "/compact" {
                 // The note of a compaction is the rest of the line, as it was typed.
                 let at = before.find(name).unwrap_or(0) + name.len();
@@ -5677,10 +6060,10 @@ impl App {
                 }
                 self.query.push_str(arg);
             }
-            (index, plugin)
+            (index, rest)
         };
         let arg = std::mem::take(&mut self.query);
-        let text = if plugin || !arg.is_empty() {
+        let text = if rest || !arg.is_empty() {
             Some(arg.as_str())
         } else {
             None
@@ -5700,11 +6083,17 @@ impl App {
             return;
         };
         let name = command.name.clone();
-        if command.group == commands::PLUGIN_GROUP {
+        let group = command.group;
+        if group == commands::PLUGIN_GROUP {
             // The rest of the line is the plugin command's own argument.
             let name = name.strip_prefix('/').unwrap_or(&name).to_owned();
             let args = arg.unwrap_or_default().to_owned();
             self.commands.push_back(Command::Plugin { name, args });
+            return;
+        }
+        if group == commands::SKILL_GROUP {
+            // The rest of the line goes after the block of the skill's file.
+            self.run_skill(&name, arg.unwrap_or_default());
             return;
         }
         match &*name {
@@ -5739,6 +6128,7 @@ impl App {
             "/compact" => self.compact(arg),
             "/login" => self.open_login(),
             "/help" => self.open_help(),
+            "/skills" => self.skills_note(),
             _ => self.note(format!("unknown command {name}")),
         }
     }
@@ -5804,12 +6194,68 @@ impl App {
         if !self.clipboard.is_empty() {
             self.frame.append(&mut self.clipboard);
         }
+        // What the terminal's inbox lists goes out with the same write, once per
+        // change of the status, and nothing at all for a terminal that did not
+        // ask.
+        self.report();
         self.arm_tick();
         self.arm_pictures();
         if self.frame.len() == SYNC_PAIR {
             return Ok(());
         }
         terminal.write_frame(&self.frame).await
+    }
+
+    /// Appends the report of the session's status to the frame when the terminal
+    /// answered the program status query and has not been told this status yet.
+    ///
+    /// A frame that reports nothing allocates nothing: the bytes are built only
+    /// on a change, and a change is what draws a frame of its own.
+    fn report(&mut self) {
+        if !self.program {
+            // The reader records the answer on the handle the app holds. A
+            // terminal that never answered is never told anything.
+            self.program = self
+                .background
+                .as_ref()
+                .is_some_and(Background::program_status);
+            if !self.program {
+                return;
+            }
+        }
+        let status = self.status();
+        if self.reported == Some(status) {
+            return;
+        }
+        self.reported = Some(status);
+        self.frame.extend_from_slice(b"\x1b]7501;state=");
+        self.frame.extend_from_slice(status.word().as_bytes());
+        self.frame.extend_from_slice(b":app=reagent");
+        if let Status::Blocked(kind) = status {
+            self.frame.extend_from_slice(b":kind=");
+            self.frame.extend_from_slice(kind.word().as_bytes());
+        }
+        // The session the entry is for, in base64: a terminal lists several.
+        use base64::Engine;
+        self.frame.extend_from_slice(b":msg=");
+        let msg = base64::engine::general_purpose::STANDARD.encode(&self.session);
+        self.frame.extend_from_slice(msg.as_bytes());
+        self.frame.extend_from_slice(b"\x1b\\");
+    }
+
+    /// The status the session is in now: a card that waits blocks it, whatever
+    /// else goes, and a run that goes is working.
+    fn status(&self) -> Status {
+        if self.approval.is_some() || !self.queue.is_empty() {
+            return Status::Blocked(Kind::Permission);
+        }
+        if self.question.is_some() || !self.questions.is_empty() {
+            return Status::Blocked(Kind::Question);
+        }
+        if self.running || self.compacting {
+            return Status::Working;
+        }
+        self.settled
     }
 
     /// Whether a box or a panel covers the rows of the transcript this frame:

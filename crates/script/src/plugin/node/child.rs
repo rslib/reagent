@@ -243,66 +243,26 @@ impl ModuleDef for ChildHost {
     }
 }
 
-/// Where the code the wrapper was called from stands: in a plugin's own module,
-/// in the wrapper's frames and the native frames this host runs in, or in a
-/// script that is no plugin's module at all.
-enum Caller {
-    /// A module of the plugin at this index.
-    Plugin(usize),
-    /// Only the wrapper's frames and the native frames of this host.
-    Wrapper,
-    /// A script or module that is no plugin's: it acts for nobody.
-    Foreign,
+/// The index of the plugin whose runtime runs this call: a runtime holds one
+/// plugin's code and no other's, so every frame of it acts for that plugin,
+/// `eval` code and the body of a `new Function` included.
+fn caller(ctx: &Ctx<'_>) -> Option<usize> {
+    super::index_of(ctx)
 }
 
-/// Who the JS stack stands for, read from the module every frame is in and
-/// never from an argument a plugin could choose.
-fn caller(ctx: &Ctx<'_>) -> Caller {
-    for level in 0..8 {
-        let Some(atom) = ctx.script_or_module_name(level) else {
-            continue;
-        };
-        let Ok(name) = atom.to_string() else {
-            continue;
-        };
-        // The wrapper of this host is one frame, or a few when a listener it
-        // called runs; the plugin's own module is the one behind them.
-        if name.starts_with(super::WRAPPER) {
-            continue;
-        }
-        if let Some(index) = super::index_of(&name) {
-            return Caller::Plugin(index);
-        }
-        return Caller::Foreign;
-    }
-    Caller::Wrapper
-}
-
-/// `owner()`: the index of the plugin whose code called the wrapper, and none
-/// when the call comes from a script that is no plugin's.
+/// `owner()`: the index of the plugin whose runtime runs this call.
 fn owner(ctx: Ctx<'_>) -> Option<u32> {
-    match caller(&ctx) {
-        Caller::Plugin(index) => u32::try_from(index).ok(),
-        Caller::Wrapper | Caller::Foreign => None,
-    }
+    u32::try_from(caller(&ctx)?).ok()
 }
 
-/// The plugin a call of this host may act for: the module on the JS stack when
-/// it names a plugin, which must be the child's owner, and the child's owner
-/// when no plugin frame is left, which only the wrapper's own callback does.
+/// The plugin a call of this host may act for: the runtime's plugin, when the
+/// child is that plugin's.
 fn mine(ctx: &Ctx<'_>, id: u64) -> Option<usize> {
-    let found = match caller(ctx) {
-        Caller::Plugin(index) => Some(index),
-        Caller::Wrapper => None,
-        Caller::Foreign => return None,
-    };
+    let found = caller(ctx)?;
     CHILDREN.with(|children| {
         let children = children.borrow();
         let child = children.slots.get(&id)?;
-        match found {
-            Some(index) if index != child.plugin => None,
-            _ => Some(child.plugin),
-        }
+        (child.plugin == found).then_some(found)
     })
 }
 
@@ -1031,7 +991,7 @@ impl ChildState {
 }
 
 thread_local! {
-    /// The children of the plugin thread, freed when the plugins unload.
+    /// The children of the plugin thread, one entry per plugin index.
     static CHILDREN: RefCell<ChildState> = RefCell::new(ChildState::new());
 }
 
@@ -1061,15 +1021,20 @@ pub(super) fn stopped(index: usize, since: Instant) {
     }
 }
 
-/// Kills every child and reaps it: nothing may outlive the context the plugin
-/// thread drops.
-pub(super) fn free() {
+/// Kills every child of one plugin and reaps it: nothing of it may outlive its
+/// context.
+pub(super) fn free(index: usize) {
     let slots: Vec<Child> = CHILDREN.with(|children| {
         let mut children = children.borrow_mut();
-        let next = children.next;
-        let slots = children.slots.drain().map(|(_, child)| child).collect();
-        children.next = next;
-        slots
+        let ids: Vec<u64> = children
+            .slots
+            .iter()
+            .filter(|(_, child)| child.plugin == index)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| children.slots.remove(&id))
+            .collect()
     });
     for child in &slots {
         // A child that has ended has no pid of its own anymore: the system may

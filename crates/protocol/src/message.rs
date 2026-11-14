@@ -127,6 +127,8 @@ impl RpcError {
     pub const WRONG_VERSION: i32 = -32001;
     pub const NOT_INITIALIZED: i32 = -32002;
     pub const BEHIND: i32 = -32003;
+    /// The id an `approve` or an `answer` named is not waiting for a person.
+    pub const NOT_WAITING: i32 = -32004;
 
     pub fn new(code: i32, message: &'static str) -> Self {
         Self {
@@ -169,6 +171,15 @@ impl RpcError {
     pub fn behind() -> Self {
         Self::new(Self::BEHIND, "behind")
     }
+
+    /// The error of an `approve` or an `answer` that names a request of `kind`
+    /// which does not wait: the run raises nothing of that kind with that id.
+    pub fn not_waiting(kind: &str, id: u64) -> Self {
+        Self {
+            code: Self::NOT_WAITING,
+            message: Cow::Owned(format!("{kind} {id} is not waiting")),
+        }
+    }
 }
 
 impl fmt::Display for RpcError {
@@ -194,6 +205,21 @@ pub struct InitializeResult<'a> {
     pub context_window: Option<u64>,
     /// The reasoning level the session sends, when it sends one.
     pub level: Option<&'a str>,
+    /// The skills the run found, in name order. A run that found none sends no
+    /// key at all, so it sends the bytes it sent before the field.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub skills: &'a [SkillInfo<'a>],
+}
+
+/// One skill a session found, as its `initialize` answer names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkillInfo<'a> {
+    /// The skill's name.
+    pub name: &'a str,
+    /// The absolute path of the skill's `SKILL.md`.
+    pub path: &'a str,
+    /// The folder it was found in: `global` or `project`.
+    pub scope: &'a str,
 }
 
 /// What the `settings` notice tells every client: the model the session took,
@@ -602,6 +628,48 @@ pub fn notify(buf: &mut Vec<u8>, method: &str, params: &[u8]) {
     buf.extend_from_slice(b"}\n");
 }
 
+/// Writes a request line into `buf`, copying `params` once as given.
+///
+/// A client builds its `initialize`, its `attach` and the rest with it, so one
+/// line of a client is written here and not by hand.
+pub fn request(buf: &mut Vec<u8>, id: u64, method: &str, params: &[u8]) {
+    let start = buf.len();
+    buf.extend_from_slice(br#"{"jsonrpc":"2.0","id":"#);
+    if serde_json::to_writer(&mut *buf, &id).is_err() {
+        buf.truncate(start);
+        return;
+    }
+    buf.extend_from_slice(br#","method":"#);
+    if serde_json::to_writer(&mut *buf, method).is_err() {
+        buf.truncate(start);
+        return;
+    }
+    buf.extend_from_slice(br#","params":"#);
+    buf.extend_from_slice(params);
+    buf.extend_from_slice(b"}\n");
+}
+
+/// The number of questions of the `question_request` line `line`, or `None`
+/// when `line` is not one.
+///
+/// A worker reads it from the frame of the request that waits to tell an
+/// `answer` whose lists do not match the questions it asks.
+pub fn question_count(line: &[u8]) -> Option<usize> {
+    #[derive(Deserialize)]
+    struct Questions {
+        #[serde(default)]
+        questions: Vec<serde::de::IgnoredAny>,
+    }
+    #[derive(Deserialize)]
+    struct Line<'a> {
+        #[serde(borrow)]
+        method: Cow<'a, str>,
+        params: Questions,
+    }
+    let decoded: Line<'_> = serde_json::from_slice(line).ok()?;
+    (decoded.method == methods::QUESTION_REQUEST).then_some(decoded.params.questions.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,6 +1057,7 @@ mod tests {
                 model: "fi/m",
                 context_window: Some(200_000),
                 level: None,
+                skills: &[],
             },
         );
         assert_eq!(
@@ -1011,6 +1080,7 @@ mod tests {
                 model: "m",
                 context_window: None,
                 level: None,
+                skills: &[],
             },
         );
         assert_eq!(
@@ -1037,9 +1107,72 @@ mod tests {
                 model: "m",
                 context_window: None,
                 level: Some("high"),
+                skills: &[],
             },
         );
         assert!(text(&buf).contains("\"level\":\"high\""), "{}", text(&buf));
+    }
+
+    #[test]
+    fn the_initialize_answer_names_the_skills_of_the_session() {
+        let mut buf = Vec::new();
+        result(
+            &mut buf,
+            5,
+            &InitializeResult {
+                major: 1,
+                version: "0.1.0",
+                session: "s1",
+                client: 1,
+                capabilities: &[],
+                committed: 0,
+                model: "m",
+                context_window: None,
+                level: None,
+                skills: &[SkillInfo {
+                    name: "demo",
+                    path: "/w/.agents/skills/demo/SKILL.md",
+                    scope: "project",
+                }],
+            },
+        );
+        assert_eq!(
+            text(&buf),
+            "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"major\":1,\"version\":\"0.1.0\",\
+             \"session\":\"s1\",\"client\":1,\"capabilities\":[],\"committed\":0,\
+             \"model\":\"m\",\"context_window\":null,\"level\":null,\"skills\":\
+             [{\"name\":\"demo\",\"path\":\"/w/.agents/skills/demo/SKILL.md\",\
+             \"scope\":\"project\"}]}}\n"
+        );
+    }
+
+    #[test]
+    fn an_initialize_answer_with_no_skills_names_no_skills_key() {
+        let mut buf = Vec::new();
+        result(
+            &mut buf,
+            6,
+            &InitializeResult {
+                major: 1,
+                version: "0.1.0",
+                session: "s1",
+                client: 1,
+                capabilities: &[],
+                committed: 0,
+                model: "m",
+                context_window: None,
+                level: None,
+                skills: &[],
+            },
+        );
+        let line = text(&buf);
+        assert!(!line.contains("skills"), "{line}");
+        assert_eq!(
+            line,
+            "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{\"major\":1,\"version\":\"0.1.0\",\
+             \"session\":\"s1\",\"client\":1,\"capabilities\":[],\"committed\":0,\
+             \"model\":\"m\",\"context_window\":null,\"level\":null}}\n"
+        );
     }
 
     #[test]

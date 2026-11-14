@@ -3533,7 +3533,7 @@ pub(crate) mod rows {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         use reagent_ai::{AssistantMessage, Content, Message, Text, ToolCall, ToolResult};
 
-        use crate::client::{Frame, Initialized};
+        use crate::client::{Frame, Initialized, RunEnd};
         use crate::theme::{Depth, Mode, Rgb};
 
         use super::super::SPANS;
@@ -5584,7 +5584,9 @@ pub(crate) mod rows {
                 "the summary row comes at the run's end:\n{}",
                 rows.join("\n")
             );
-            app.frame(Frame::RunEnd { at_limit: false });
+            app.frame(Frame::RunEnd {
+                end: RunEnd::EndTurn,
+            });
             app.commit();
             let rows = painted(&mut app);
             assert!(
@@ -5621,7 +5623,9 @@ pub(crate) mod rows {
                 "the thought draws in its order:\n{}",
                 rows.join("\n")
             );
-            app.frame(Frame::RunEnd { at_limit: false });
+            app.frame(Frame::RunEnd {
+                end: RunEnd::EndTurn,
+            });
             app.commit();
             let rows = painted(&mut app);
             assert!(
@@ -5651,7 +5655,9 @@ pub(crate) mod rows {
             });
             app.commit();
             turn(&mut app, "2", "bash", r#"{"command":"cargo clippy"}"#, "ok");
-            app.frame(Frame::RunEnd { at_limit: false });
+            app.frame(Frame::RunEnd {
+                end: RunEnd::EndTurn,
+            });
             app.commit();
             let rows = painted(&mut app);
             let user = at(&rows, "and the lints").expect("the message draws");
@@ -5674,7 +5680,9 @@ pub(crate) mod rows {
         fn summary_one_call_run_keeps_its_row() {
             let mut app = app(true);
             turn(&mut app, "1", "bash", r#"{"command":"cargo test"}"#, "ok");
-            app.frame(Frame::RunEnd { at_limit: false });
+            app.frame(Frame::RunEnd {
+                end: RunEnd::EndTurn,
+            });
             app.commit();
             let rows = painted(&mut app);
             assert!(

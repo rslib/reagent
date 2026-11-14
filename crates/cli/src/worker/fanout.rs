@@ -15,14 +15,29 @@ use crate::json;
 pub(crate) struct Encoder {
     line: Vec<u8>,
     frame: Vec<u8>,
+    /// The model a usage line names, as the session runs it now.
+    model: Option<Arc<str>>,
+    /// The reagent provider id that serves it, as the session runs it now.
+    provider: Option<Arc<str>>,
 }
 
 impl Encoder {
+    /// Takes the model and the provider a usage line names: the ones the
+    /// session runs after a `set`, so the line that follows it names them.
+    pub(crate) fn names(&mut self, provider: Option<Arc<str>>, model: Option<Arc<str>>) {
+        self.model = model;
+        self.provider = provider;
+    }
+
     /// Encodes one event into one frame: its line, wrapped as the `params` of
     /// the method that carries it.
     pub(crate) fn frame(&mut self, event: &Event) -> Frame {
         self.line.clear();
-        json::write_worker_line(&mut self.line, event);
+        let names = json::Names {
+            model: self.model.as_deref(),
+            provider: self.provider.as_deref(),
+        };
+        json::write_worker_line(&mut self.line, event, names);
         // The frame carries the line without the newline that ends it.
         assert_eq!(
             self.line.pop(),

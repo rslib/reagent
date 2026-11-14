@@ -25,11 +25,14 @@ linux-x86_64 7479296
 # before.
 # 2026-11-11: 7059296 bytes with LLRT's Node modules for plugins (feature
 # `node`, on in the default build; 5491072 before), budget 7413760.
-darwin-arm64-tui 7413760
+# 2026-11-13: the TUI lines rose to the measured size plus 1% after the skills
+# panel and plugin installs (darwin-arm64-tui 7,492,080, linux-x86_64-tui
+# 12,058,296).
+darwin-arm64-tui 7567001
 # linux-x86_64-tui: measured 8404888 bytes on 2026-11-05 (lab workspace, with the
 # native clipboard: wl-clipboard-rs and x11rb; 8093096 before them), budget 8826880.
 # 2026-11-09: 8443528 bytes with only the zstd level 1 compressor, 8617544
 # before (paste-linux).
 # 2026-11-11: 11338648 bytes with LLRT's Node modules for plugins (feature
 # `node`, on in the default build; 8443528 before), budget 11907072.
-linux-x86_64-tui 11907072
+linux-x86_64-tui 12178879

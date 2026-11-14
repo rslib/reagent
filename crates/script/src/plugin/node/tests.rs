@@ -3676,10 +3676,10 @@ export default function (reagent) {{
     plugin(root.path(), "b", "{}", &[("index.js", thief.as_str())]).await;
     let plugins = loaded(root.path(), session.path()).await;
     assert_eq!(&*run(&plugins, "plant").await.content, "planted");
-    // The plugin that runs the planted builtin does not fetch as b: the fetch
-    // of a script that is no plugin's module is refused before a connection.
-    assert_eq!(&*run(&plugins, "map").await.content, "0");
-    assert_eq!(&*run(&plugins, "stolen").await.content, "TypeError");
+    // a's own runtime is untouched by what b planted: its `map` is the real
+    // one, and nothing of b's fetch ran.
+    assert_eq!(&*run(&plugins, "map").await.content, "1");
+    assert_eq!(&*run(&plugins, "stolen").await.content, "undefined");
     let mut connections = server.connections();
     assert_eq!(connections, 0, "the planted fetch reached the server");
     // a's own fetch still works, and its response is still a's.
@@ -4114,4 +4114,145 @@ async fn fetch_star_resolver_refuses_private() {
         panic!("localhost resolved as a public address");
     };
     assert!(error.to_string().contains("localhost"), "{error}");
+}
+
+// The runtimes of the plugins: the Node state each one patches, and the code
+// `eval` and `new Function` run, belong to the plugin that runs it.
+
+#[tokio::test]
+async fn runtime_patched_buffer_stays_in_its_plugin() {
+    let server = Server::start(|_| Answer::text("the body")).await;
+    let url = server.at("127.0.0.1", "/count");
+    let root = temp_root();
+    let session = temp_root();
+    plugin(
+        root.path(),
+        "a",
+        "{}",
+        &[(
+            "index.js",
+            r#"const original = Buffer.from;
+globalThis.count = 0;
+Buffer.from = function (...args) {
+  globalThis.count += 1;
+  return original.apply(this, args);
+};
+export default function (reagent) {
+  reagent.registerTool({
+    name: "count",
+    description: "Reads how often its Buffer.from ran.",
+    parameters: { type: "object" },
+    run() { return String(globalThis.count ?? 0); },
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let fetcher = format!(
+        r#"export default function (reagent) {{
+  reagent.registerTool({{
+    name: "send",
+    description: "Fetches with a string body.",
+    parameters: {{ type: "object" }},
+    async run() {{
+      const body = Buffer.from("hello").toString();
+      const out = await fetch("{url}", {{ method: "POST", body }});
+      return await out.text();
+    }},
+  }});
+}}
+"#
+    );
+    plugin(
+        root.path(),
+        "b",
+        r#"{"net": ["127.0.0.1"]}"#,
+        &[("index.js", &fetcher)],
+    )
+    .await;
+    let plugins = loaded(root.path(), session.path()).await;
+    assert_eq!(&*run(&plugins, "send").await.content, "the body");
+    assert_eq!(&*run(&plugins, "count").await.content, "0");
+}
+
+#[tokio::test]
+async fn runtime_eval_fetch_acts_for_its_plugin() {
+    let server = Server::start(|_| Answer::text("the body")).await;
+    let url = server.at("127.0.0.1", "/eval");
+    let root = temp_root();
+    let session = temp_root();
+    let source = format!(
+        r#"export default function (reagent) {{
+  reagent.registerTool({{
+    name: "evaluated",
+    description: "Fetches from eval code.",
+    parameters: {{ type: "object" }},
+    async run() {{
+      const out = await eval(`fetch("{url}")`);
+      return await out.text();
+    }},
+  }});
+  reagent.registerTool({{
+    name: "made",
+    description: "Fetches from the body of a new Function.",
+    parameters: {{ type: "object" }},
+    async run() {{
+      const run = new Function(`return fetch("{url}")`);
+      const out = await run();
+      return await out.text();
+    }},
+  }});
+}}
+"#
+    );
+    plugin(
+        root.path(),
+        "e",
+        r#"{"net": ["127.0.0.1"]}"#,
+        &[("index.js", &source)],
+    )
+    .await;
+    let plugins = loaded(root.path(), session.path()).await;
+    assert_eq!(&*run(&plugins, "evaluated").await.content, "the body");
+    assert_eq!(&*run(&plugins, "made").await.content, "the body");
+}
+
+#[tokio::test]
+async fn runtime_of_a_plugin_that_fails_to_load_ends() {
+    let root = temp_root();
+    let session = temp_root();
+    tokio::fs::create_dir_all(session.path().join("out"))
+        .await
+        .unwrap();
+    let dying = r#"import { writeFileSync } from "fs";
+let count = 0;
+setInterval(() => { count += 1; writeFileSync("out/tick.txt", `${count}`); }, 5);
+export default function () { throw new Error("no load"); }
+"#;
+    plugin(
+        root.path(),
+        "dying",
+        r#"{"fs": {"write": ["out"]}}"#,
+        &[("index.js", dying)],
+    )
+    .await;
+    plugin(
+        root.path(),
+        "kept",
+        "{}",
+        &[("index.js", &entry("", r#"return "kept";"#))],
+    )
+    .await;
+    let plugins = loaded(root.path(), session.path()).await;
+    let tick = session.path().join("out/tick.txt");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before = tokio::fs::read_to_string(&tick).await.unwrap_or_default();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after = tokio::fs::read_to_string(&tick).await.unwrap_or_default();
+    assert_eq!(
+        before, after,
+        "the interval of a plugin that did not load still runs"
+    );
+    assert_eq!(&*run(&plugins, "try").await.content, "kept");
 }

@@ -7,6 +7,9 @@
 //! plugin never takes the run down with it.
 
 mod api;
+#[cfg(feature = "node")]
+pub mod install;
+pub mod lock;
 mod manifest;
 mod node;
 mod runtime;

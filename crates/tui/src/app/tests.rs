@@ -27,11 +27,12 @@ use unicode_width::UnicodeWidthStr;
 
 use super::sheet::Mark;
 use super::{App, Exit, HostHandle, Options, run};
-use crate::client::{Frame, Initialized};
+use crate::client::{Frame, Initialized, RunEnd, Scope, Skill};
 use crate::history::{Recent, RecentMessages};
 use crate::host::{
     FakeHost, Files, Host, HostFuture, LoginStep, Model, Models, Opened, Provider, Target,
 };
+use crate::input::Background;
 use crate::mouse::Selection;
 use crate::panels::{ContextPanel, SessionRow};
 use crate::screen::Terminal;
@@ -1944,6 +1945,276 @@ async fn two_ctrl_c_presses_detach_and_end_the_session() {
         .expect("the app does not panic")
         .expect("the app does not fail");
     assert_eq!(exit, Exit { code: 0 });
+}
+
+/// The report the terminal gets of one status of the session `id`, with the
+/// `kind` of the card it waits on when it is blocked.
+fn report(id: &str, state: &str, kind: Option<&str>) -> String {
+    use base64::Engine;
+    let kind = kind.map(|kind| format!(":kind={kind}")).unwrap_or_default();
+    let msg = base64::engine::general_purpose::STANDARD.encode(id);
+    format!("\x1b]7501;state={state}:app=reagent{kind}:msg={msg}\x1b\\")
+}
+
+/// The report that leaves the session, once, when the app exits.
+const CLEAR: &str = "\x1b]7501;state=clear:app=reagent\x1b\\";
+
+/// The front of every report, and nothing of the query the app asks with.
+const REPORT: &str = "\x1b]7501;state=";
+
+/// A terminal handle that answered the program status query, as a terminal
+/// that knows the protocol does.
+fn answered() -> Background {
+    let answer = Background::default();
+    answer.record_program_status();
+    answer
+}
+
+/// The options of a test whose terminal answered the program status query.
+fn reporting() -> Options {
+    Options {
+        background: Some(answered()),
+        ..options()
+    }
+}
+
+/// Every report the terminal was told, in order.
+fn reports(bytes: &Arc<Mutex<Vec<u8>>>) -> Vec<String> {
+    let held = bytes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut reports = Vec::new();
+    let mut at = 0;
+    while let Some(found) = held[at..]
+        .windows(REPORT.len())
+        .position(|window| window == REPORT.as_bytes())
+    {
+        let start = at + found;
+        let Some(len) = held[start..]
+            .windows(2)
+            .position(|window| window == b"\x1b\\")
+        else {
+            break;
+        };
+        reports.push(String::from_utf8_lossy(&held[start..start + len + 2]).into_owned());
+        at = start + len + 2;
+    }
+    reports
+}
+
+/// Waits until the terminal was told exactly `want`, and fails with what it got.
+async fn wait_reports(bytes: &Arc<Mutex<Vec<u8>>>, want: &[String]) {
+    let start = tokio::time::Instant::now();
+    loop {
+        let got = reports(bytes);
+        if got == want {
+            return;
+        }
+        assert!(
+            start.elapsed() < WAIT,
+            "waited {WAIT:?} for the reports {want:?}, and the terminal got {got:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// The terminal that answered the program status query hears the status of the
+/// session: working while a run goes, blocked while an approval card waits,
+/// working once it is answered and done when the run ends, once per change.
+#[tokio::test]
+async fn program_status_reports_each_change_once() {
+    let harness = Harness::start(reporting(), Fake::start("sess", 0));
+    let mut want = vec![report("sess", "idle", None)];
+    wait_reports(&harness.bytes, &want).await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    want.push(report("sess", "working", None));
+    wait_reports(&harness.bytes, &want).await;
+    harness.fake.notify(
+        "approval_request",
+        &json!({ "id": 1, "tool": "Bash", "call": "make", "rule": "default" }),
+    );
+    want.push(report("sess", "blocked", Some("permission")));
+    wait_reports(&harness.bytes, &want).await;
+    harness.fake.notify(
+        "approval_resolved",
+        &json!({ "id": 1, "client": 2, "answer": "once" }),
+    );
+    want.push(report("sess", "working", None));
+    wait_reports(&harness.bytes, &want).await;
+    harness
+        .fake
+        .event(json!({ "type": "run_end", "reason": "end_turn" }));
+    want.push(report("sess", "done", None));
+    wait_reports(&harness.bytes, &want).await;
+    // A frame whose status the terminal already heard says nothing, and a run
+    // that ends twice reports once.
+    harness
+        .fake
+        .event(json!({ "type": "run_end", "reason": "end_turn" }));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(reports(&harness.bytes), want, "no report repeats");
+}
+
+/// A question card blocks the session too, with its own kind.
+#[tokio::test]
+async fn program_status_reports_a_question_card_as_blocked_question() {
+    let harness = Harness::start(reporting(), Fake::start("sess", 0));
+    wait_reports(&harness.bytes, &[report("sess", "idle", None)]).await;
+    harness.fake.notify(
+        "question_request",
+        &json!({
+            "id": 3,
+            "questions": [{ "q": "Which database?", "options": [{ "label": "sqlite" }], "multi": false }],
+        }),
+    );
+    wait_reports(
+        &harness.bytes,
+        &[
+            report("sess", "idle", None),
+            report("sess", "blocked", Some("question")),
+        ],
+    )
+    .await;
+}
+
+/// A cancelled run leaves the session idle, and its status goes back to the one
+/// the terminal heard before the run.
+#[tokio::test]
+async fn program_status_reports_a_cancel_as_idle() {
+    let harness = Harness::start(reporting(), Fake::start("sess", 0));
+    wait_reports(&harness.bytes, &[report("sess", "idle", None)]).await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    wait_reports(
+        &harness.bytes,
+        &[
+            report("sess", "idle", None),
+            report("sess", "working", None),
+        ],
+    )
+    .await;
+    harness
+        .fake
+        .event(json!({ "type": "run_end", "reason": "cancelled" }));
+    wait_reports(
+        &harness.bytes,
+        &[
+            report("sess", "idle", None),
+            report("sess", "working", None),
+            report("sess", "idle", None),
+        ],
+    )
+    .await;
+}
+
+/// A run that ended with an error is reported as one, and an error frame, which
+/// also carries a compaction with nothing to fold in, is not.
+#[tokio::test]
+async fn program_status_reports_an_error_reason_as_error() {
+    let harness = Harness::start(reporting(), Fake::start("sess", 0));
+    wait_reports(&harness.bytes, &[report("sess", "idle", None)]).await;
+    harness
+        .fake
+        .event(json!({ "type": "error", "message": "nothing to compact" }));
+    harness.fake.event(json!({ "type": "turn_start" }));
+    wait_reports(
+        &harness.bytes,
+        &[
+            report("sess", "idle", None),
+            report("sess", "working", None),
+        ],
+    )
+    .await;
+    harness
+        .fake
+        .event(json!({ "type": "run_end", "reason": "error" }));
+    wait_reports(
+        &harness.bytes,
+        &[
+            report("sess", "idle", None),
+            report("sess", "working", None),
+            report("sess", "error", None),
+        ],
+    )
+    .await;
+}
+
+/// A terminal that never answered the program status query is told nothing.
+#[tokio::test]
+async fn program_status_says_nothing_to_a_terminal_that_never_answered() {
+    let harness = Harness::new_session(Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness
+        .fake
+        .event(json!({ "type": "run_end", "reason": "end_turn" }));
+    // A frame after the run end is the one a report would have gone out in.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let raw = raw(&harness.bytes);
+    assert!(
+        !raw.contains("\x1b]7501;"),
+        "no query and no report go out: {raw:?}"
+    );
+}
+
+/// A terminal that answered the query is told the session is over, once, on the
+/// way out.
+#[tokio::test]
+async fn program_status_clears_once_at_the_exit() {
+    let harness = Harness::start(reporting(), Fake::start("sess", 0));
+    wait_reports(&harness.bytes, &[report("sess", "idle", None)]).await;
+    harness.send(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    wait_text(&harness.bytes, "Ctrl+C again to quit").await;
+    harness.send(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    timeout(WAIT, harness.handle)
+        .await
+        .expect("the app ends")
+        .expect("the app does not panic")
+        .expect("the app does not fail");
+    assert_eq!(
+        reports(&harness.bytes),
+        [report("sess", "idle", None), CLEAR.to_owned()],
+        "one clear, and no second one"
+    );
+}
+
+/// A session switch keeps the answered flag, reports the status of the session
+/// it switched to, and does not clear: only the exit does.
+#[tokio::test]
+async fn program_status_does_not_clear_on_a_session_switch() {
+    let state = tempfile::tempdir().expect("a state folder");
+    let second = Fake::start("other", 0);
+    let host = FakeHost::new().with_open(Ok(Opened {
+        socket: second.socket.clone(),
+        token: TOKEN.to_owned(),
+        session_dir: None,
+    }));
+    let mut options = with_other_session(state.path(), host);
+    options.background = Some(answered());
+    let harness = Harness::start(options, Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    open_the_other_session(&harness).await;
+    harness.press(KeyCode::Enter);
+    wait_reports(
+        &harness.bytes,
+        &[report("sess", "idle", None), report("other", "idle", None)],
+    )
+    .await;
+    harness.send(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    wait_text(&harness.bytes, "Ctrl+C again to quit").await;
+    harness.send(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    timeout(WAIT, harness.handle)
+        .await
+        .expect("the app ends")
+        .expect("the app does not panic")
+        .expect("the app does not fail");
+    assert_eq!(
+        reports(&harness.bytes),
+        [
+            report("sess", "idle", None),
+            report("other", "idle", None),
+            CLEAR.to_owned(),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -4741,8 +5012,8 @@ fn plugin_commands_show_in_the_slash_list() {
     }]));
     assert_eq!(
         app.slash.len(),
-        12,
-        "the plugin row joins the eleven built-ins"
+        13,
+        "the plugin row joins the twelve built-ins"
     );
     type_keys(&mut app, "/de");
     app.paint();
@@ -4881,7 +5152,7 @@ fn a_plugin_command_named_like_a_built_in_is_skipped() {
         name: Cow::Borrowed("model"),
         description: Cow::Borrowed("pick a model for me"),
     }]));
-    assert_eq!(app.slash.len(), 11, "no row joins the table");
+    assert_eq!(app.slash.len(), 12, "no row joins the table");
     assert_eq!(
         note_rows(&app),
         ["plugin command /model skipped: a built-in command has that name".to_owned()]
@@ -4908,11 +5179,11 @@ fn a_second_plugin_commands_frame_replaces_the_rows() {
     };
     app.frame(Frame::PluginCommands(commands("deploy")));
     app.frame(Frame::PluginCommands(commands("deploy")));
-    assert_eq!(app.slash.len(), 12, "the same frame twice adds one row");
+    assert_eq!(app.slash.len(), 13, "the same frame twice adds one row");
     app.frame(Frame::PluginCommands(commands("echo")));
     let names: Vec<&str> = app.slash.iter().map(|row| &*row.name).collect();
-    assert_eq!(names.len(), 12, "one plugin row: {names:?}");
-    assert_eq!(names[11], "/echo");
+    assert_eq!(names.len(), 13, "one plugin row: {names:?}");
+    assert_eq!(names[12], "/echo");
     assert!(
         !names.contains(&"/deploy"),
         "the old row is gone: {names:?}"
@@ -5084,7 +5355,9 @@ fn one_rule_per_run_after_three_steps() {
             "the step {step} of the run ended, and no rule came with it"
         );
     }
-    app.frame(Frame::RunEnd { at_limit: false });
+    app.frame(Frame::RunEnd {
+        end: RunEnd::EndTurn,
+    });
     let rules = rules(&app);
     assert_eq!(rules.len(), 1, "the run draws one rule");
     assert_eq!(rules[0].tokens, 3_300, "the rule sums the run's tokens");
@@ -5106,7 +5379,9 @@ fn one_rule_per_run_on_a_cancelled_run() {
     });
     // A run the user cancels stops mid-thought: the worker ends it with its
     // `run_end` and no turn end of its own.
-    app.frame(Frame::RunEnd { at_limit: false });
+    app.frame(Frame::RunEnd {
+        end: RunEnd::EndTurn,
+    });
     let rules = rules(&app);
     assert_eq!(rules.len(), 1, "a cancelled run draws one rule");
     assert_eq!(rules[0].tokens, 250, "with the tokens of the call it made");
@@ -9288,10 +9563,14 @@ fn turn_limit_stop_shows_a_line_only_at_the_limit() {
     let notes = |app: &App| format!("{:?}", app.pending);
     let mut app = bare();
     app.frame(Frame::TurnStart);
-    app.frame(Frame::RunEnd { at_limit: false });
+    app.frame(Frame::RunEnd {
+        end: RunEnd::EndTurn,
+    });
     assert!(!notes(&app).contains("stopped at the"), "{}", notes(&app));
     app.frame(Frame::TurnStart);
-    app.frame(Frame::RunEnd { at_limit: true });
+    app.frame(Frame::RunEnd {
+        end: RunEnd::MaxTurns,
+    });
     assert!(notes(&app).contains("stopped at the"), "{}", notes(&app));
 }
 
@@ -9702,7 +9981,9 @@ fn picture_flag_follows_a_live_frame() {
     assert!(app.pictures, "a result of images names its pictures");
     app.frame(Frame::Committed(2));
     assert!(app.pictures_wait, "and its record owes the read");
-    app.frame(Frame::RunEnd { at_limit: false });
+    app.frame(Frame::RunEnd {
+        end: RunEnd::EndTurn,
+    });
     assert!(!app.pictures, "the end of the run ends its pictures");
     app.pictures_wait = false;
     app.frame(Frame::Committed(3));
@@ -9773,6 +10054,7 @@ fn picture(room: u32) -> super::Picture {
     super::Picture {
         cells: crate::picture::cells(&source.data, room),
         chip: "▣ image 64x48 · 3 KB".to_owned(),
+        size: (64, 48),
         source: Some(source),
     }
 }
@@ -10008,4 +10290,359 @@ async fn native_picture_lands_on_its_half_block_cells() {
         "the image goes to row {row} column {column}: {:?}",
         String::from_utf8_lossy(before)
     );
+}
+
+/// The skills the skills tests start an app with: one of the project, one of
+/// the global config folder.
+fn skills() -> Vec<Skill> {
+    vec![
+        Skill {
+            name: Arc::from("demo"),
+            path: Arc::from("/work/.agents/skills/demo/SKILL.md"),
+            scope: Scope::Project,
+        },
+        Skill {
+            name: Arc::from("tidy"),
+            path: Arc::from("/cfg/reagent/skills/tidy/SKILL.md"),
+            scope: Scope::Global,
+        },
+    ]
+}
+
+/// An app in full screen at 160 columns, its sidebar docked, with the skills
+/// the worker found.
+fn skilled(skills: Vec<Skill>) -> App {
+    let init = Initialized {
+        session: "sess-skills".to_owned(),
+        skills,
+        ..Initialized::default()
+    };
+    let mut app = App::new(&init, (160, 40), true);
+    app.screen.resize(160, 40);
+    app.reflow();
+    app
+}
+
+/// The panel lists the skills the handshake named, each with its scope, on the
+/// rows of the sidebar.
+#[test]
+fn the_skills_panel_lists_the_skills_of_the_session() {
+    let mut app = skilled(skills());
+    let screen = painted(&mut app);
+    for wanted in ["Skills", "demo", "project", "tidy", "global"] {
+        assert!(screen.contains(wanted), "{wanted:?} is missing:\n{screen}");
+    }
+    let demo = screen
+        .lines()
+        .find(|row| row.contains("demo"))
+        .expect("a row for demo");
+    assert!(
+        demo.contains("project"),
+        "the scope is on the row: {demo:?}"
+    );
+    let tidy = screen
+        .lines()
+        .find(|row| row.contains("tidy"))
+        .expect("a row for tidy");
+    assert!(tidy.contains("global"), "the scope is on the row: {tidy:?}");
+}
+
+#[test]
+fn a_read_call_marks_the_skills_line_it_took() {
+    let mut app = skilled(skills());
+    app.frame(Frame::ToolStart {
+        id: Cow::Borrowed("c1"),
+        name: Cow::Borrowed("read"),
+    });
+    app.frame(Frame::ToolCallReady {
+        id: Cow::Borrowed("c1"),
+        name: Cow::Borrowed("read"),
+        arguments: Cow::Borrowed(r#"{"path":"/work/.agents/skills/demo/SKILL.md"}"#),
+    });
+    let screen = painted(&mut app);
+    let demo = screen
+        .lines()
+        .find(|row| row.contains("demo"))
+        .expect("a row for demo");
+    assert!(
+        demo.contains('•'),
+        "the skill the read took is marked: {demo:?}"
+    );
+    let tidy = screen
+        .lines()
+        .find(|row| row.contains("tidy"))
+        .expect("a row for tidy");
+    assert!(!tidy.contains('•'), "an unread skill is not: {tidy:?}");
+}
+
+#[test]
+fn a_read_replayed_on_attach_marks_the_skills_line() {
+    let mut app = skilled(skills());
+    // The replay of a session hands the calls of its messages to the panels.
+    app.feed_call(&ToolCall {
+        id: Text::from("c1"),
+        name: Text::from("read"),
+        arguments: Text::from(r#"{"path":"/cfg/reagent/skills/tidy/SKILL.md"}"#),
+    });
+    let screen = painted(&mut app);
+    let tidy = screen
+        .lines()
+        .find(|row| row.contains("tidy"))
+        .expect("a row for tidy");
+    assert!(tidy.contains('•'), "the replayed read is marked: {tidy:?}");
+}
+
+#[test]
+fn an_app_with_no_skills_has_no_skills_panel() {
+    let mut app = skilled(Vec::new());
+    let screen = painted(&mut app);
+    assert!(!screen.contains("Skills"), "no panel:\n{screen}");
+    assert!(
+        screen.contains("Context"),
+        "the other panels stay:\n{screen}"
+    );
+}
+
+/// A skill `name` whose file holds `body`, written in `dir` and named by the
+/// handshake the way the worker names it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test writes the skill files it reads"
+)]
+fn written_skill(dir: &Path, name: &str, body: &str, scope: Scope) -> Skill {
+    let path = dir.join(name).join("SKILL.md");
+    std::fs::create_dir_all(path.parent().expect("the folder of the skill"))
+        .expect("the skill folder");
+    std::fs::write(&path, body).expect("the skill file");
+    Skill {
+        name: Arc::from(name),
+        path: Arc::from(path.to_str().expect("a path of text")),
+        scope,
+    }
+}
+
+/// The name, the group and the words of each row of the `/` list of `app`.
+fn slash_rows(app: &App) -> Vec<(String, &'static str, String)> {
+    app.slash
+        .iter()
+        .map(|row| (row.name.to_string(), row.group, row.words.to_string()))
+        .collect()
+}
+
+/// Waits for the read of a skill's file the app started, and hands the app its
+/// answer, as the branch of the loop does.
+async fn skill_read(app: &mut App) {
+    assert!(app.skill_job.is_some(), "the read of a skill's file runs");
+    let answer = super::skill_answer(&mut app.skill_job).await;
+    app.skill_arrived(answer);
+}
+
+/// The one message the app asked the client to send, and nothing else.
+fn one_message(app: &mut App) -> String {
+    let sent: Vec<String> = app
+        .commands
+        .drain(..)
+        .map(|command| match command {
+            super::Command::Send { text, .. } => text,
+            other => panic!("a skill sends one message, not {other:?}"),
+        })
+        .collect();
+    assert_eq!(sent.len(), 1, "one message goes out: {sent:?}");
+    sent.into_iter().next().expect("the message")
+}
+
+/// The block a skill's message starts with, for the file `path`.
+fn block_head(name: &str, path: &str) -> String {
+    format!("<skill name=\"{name}\" path=\"{path}\">\n")
+}
+
+#[tokio::test]
+async fn skill_command_rows_join_the_slash_list() {
+    let dir = tempfile::tempdir().expect("a folder");
+    let tidy = written_skill(dir.path(), "tidy", "TIDY-BODY\n", Scope::Project);
+    let model = written_skill(dir.path(), "model", "MODEL-BODY\n", Scope::Global);
+    let mut app = skilled(vec![tidy, model.clone()]);
+    let rows = slash_rows(&app);
+    let at = rows
+        .iter()
+        .position(|row| row.0 == "/tidy")
+        .unwrap_or_else(|| panic!("a row of the skill: {rows:?}"));
+    assert_eq!(rows[at].1, "skill", "the group of a skill row: {rows:?}");
+    assert_eq!(
+        rows[at].2, "project",
+        "the scope is the words of the row: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.0 == "/model" && row.1 == "skill"),
+        "a built-in wins the name, so the skill takes no plain row: {rows:?}"
+    );
+    let namespaced = rows
+        .iter()
+        .position(|row| row.0 == "/skill:model")
+        .unwrap_or_else(|| panic!("the namespaced row of the skill: {rows:?}"));
+    assert_eq!(
+        rows[namespaced].1, "skill",
+        "the namespaced row joins the same group: {rows:?}"
+    );
+    assert_eq!(rows[namespaced].2, "global", "with its scope: {rows:?}");
+    let quit = rows
+        .iter()
+        .position(|row| row.0 == "/quit")
+        .expect("the /quit row");
+    let first = rows
+        .iter()
+        .position(|row| row.1 == "skill")
+        .unwrap_or_else(|| panic!("a row of a skill: {rows:?}"));
+    assert!(
+        first > quit,
+        "the skills come after the built-ins: {rows:?}"
+    );
+    // The `/` list that opens while typing shows the skill, like a plugin row.
+    type_keys(&mut app, "/tid");
+    app.paint();
+    let screen = screen_text(&app);
+    let row = screen
+        .lines()
+        .find(|row| row.contains("/tidy"))
+        .unwrap_or_else(|| panic!("the skill row draws:\n{screen}"));
+    assert!(
+        row.contains("project"),
+        "the scope draws beside it:\n{screen}"
+    );
+
+    // `/skill:<name>` reaches the skill whose name a built-in holds.
+    let mut app = skilled(vec![model]);
+    type_keys(&mut app, "/skill:model now");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    skill_read(&mut app).await;
+    let text = one_message(&mut app);
+    assert!(
+        text.starts_with("<skill name=\"model\""),
+        "the message is the skill's block: {text:?}"
+    );
+    assert!(
+        text.ends_with("\n\nnow"),
+        "with the text after it: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn skill_command_sends_the_file_and_the_typed_text() {
+    let dir = tempfile::tempdir().expect("a folder");
+    let tidy = written_skill(
+        dir.path(),
+        "tidy",
+        "---\nname: tidy\n---\n\nTIDY-BODY\n",
+        Scope::Project,
+    );
+    let path = tidy.path.to_string();
+    let mut app = skilled(vec![tidy]);
+    type_keys(&mut app, "/tidy fix the imports");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.skill_job.is_some(), "the read of the file runs");
+    skill_read(&mut app).await;
+    assert_eq!(
+        one_message(&mut app),
+        format!(
+            "{}---\nname: tidy\n---\n\nTIDY-BODY\n</skill>\n\nfix the imports",
+            block_head("tidy", &path)
+        )
+    );
+    // The panel marks the skill the message carries.
+    let screen = painted(&mut app);
+    let row = screen
+        .lines()
+        .find(|row| row.contains("tidy"))
+        .expect("a row for tidy");
+    assert!(row.contains('•'), "the skill is marked read: {row:?}");
+}
+
+#[tokio::test]
+async fn skill_command_with_no_text_sends_the_block_alone() {
+    let dir = tempfile::tempdir().expect("a folder");
+    let tidy = written_skill(dir.path(), "tidy", "TIDY-BODY\n", Scope::Global);
+    let path = tidy.path.to_string();
+    let mut app = skilled(vec![tidy]);
+    type_keys(&mut app, "/tidy");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    skill_read(&mut app).await;
+    assert_eq!(
+        one_message(&mut app),
+        format!("{}TIDY-BODY\n</skill>", block_head("tidy", &path))
+    );
+}
+
+#[tokio::test]
+async fn skill_command_with_a_file_gone_notes_it_and_sends_nothing() {
+    let mut app = skilled(vec![Skill {
+        name: Arc::from("gone"),
+        path: Arc::from("/nowhere/skills/gone/SKILL.md"),
+        scope: Scope::Project,
+    }]);
+    type_keys(&mut app, "/gone");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    skill_read(&mut app).await;
+    assert!(
+        app.commands.is_empty(),
+        "no message goes out: {:?}",
+        app.commands
+    );
+    let note = note_rows(&app).join("\n");
+    assert!(
+        note.starts_with("skill gone: "),
+        "the note names the skill and the error: {note:?}"
+    );
+}
+
+#[tokio::test]
+async fn skill_command_cuts_a_file_over_64_kb() {
+    let dir = tempfile::tempdir().expect("a folder");
+    // Three bytes a char, so the cut lands inside one.
+    let body = "€".repeat(30_000);
+    let big = written_skill(dir.path(), "big", &body, Scope::Global);
+    let path = big.path.to_string();
+    let mut app = skilled(vec![big]);
+    type_keys(&mut app, "/big");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    skill_read(&mut app).await;
+    let text = one_message(&mut app);
+    let head = block_head("big", &path);
+    let content = text
+        .strip_prefix(&head)
+        .unwrap_or_else(|| panic!("the block opens the message: {text:?}"));
+    let content = content
+        .strip_suffix("\n</skill>")
+        .expect("the block ends the message");
+    let kept = content
+        .strip_suffix("\n[skill file cut at 64 KB]")
+        .unwrap_or_else(|| panic!("the cut line ends the block: {content:?}"));
+    assert_eq!(
+        kept.len(),
+        65_535,
+        "the cut keeps the chars before the 64 KB one"
+    );
+    assert!(kept.ends_with('€'), "the cut stays on a char boundary");
+}
+
+#[test]
+fn skill_command_lists_the_skills_of_the_session() {
+    let dir = tempfile::tempdir().expect("a folder");
+    let tidy = written_skill(dir.path(), "tidy", "TIDY-BODY\n", Scope::Project);
+    let demo = written_skill(dir.path(), "demo", "DEMO-BODY\n", Scope::Global);
+    let paths = (tidy.path.to_string(), demo.path.to_string());
+    let mut app = skilled(vec![tidy, demo]);
+    type_keys(&mut app, "/skills");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let note = note_rows(&app).join("\n");
+    for wanted in ["tidy", "project", &paths.0, "demo", "global", &paths.1] {
+        assert!(note.contains(wanted), "{wanted:?} is listed: {note:?}");
+    }
+}
+
+#[test]
+fn skill_command_with_no_skills_says_so() {
+    let mut app = bare();
+    type_keys(&mut app, "/skills");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(note_rows(&app), ["no skills in this session".to_owned()]);
 }

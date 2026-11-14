@@ -1925,6 +1925,10 @@ impl<'a> Agent<'a> {
         let batch_cap = events.max_capacity().min(EVENT_BATCH);
         // Grown on use: a tool turn has a few events, a long answer fills it.
         let mut raw: Vec<(StreamEvent, Option<Event>)> = Vec::new();
+        // The plan limits this call's reply named, which its usage event
+        // carries. They start empty: a call never inherits the limits of the
+        // one before it.
+        let mut limits: Option<Box<reagent_ai::Limits>> = None;
         loop {
             let Some(step) = step(&mut stream, &self.token, inbox.as_deref_mut()).await else {
                 return ConsumeOutcome::Cancelled;
@@ -1940,7 +1944,7 @@ impl<'a> Agent<'a> {
             let Some(item) = item else {
                 return ConsumeOutcome::Finished;
             };
-            let batch = take_ready(&mut stream, item, &mut raw, batch_cap);
+            let batch = take_ready(&mut stream, item, &mut raw, batch_cap, &mut limits);
             // One reservation covers the batch. A cancel while waiting for it
             // stops the run before any event of the batch lands, so the
             // assembler never runs ahead of what the receiver saw. A batch with
@@ -2532,6 +2536,7 @@ fn take_ready(
     first: Result<StreamEvent, Error>,
     raw: &mut Vec<(StreamEvent, Option<Event>)>,
     cap: usize,
+    limits: &mut Option<Box<reagent_ai::Limits>>,
 ) -> Batch {
     raw.clear();
     let mut batch = Batch {
@@ -2544,7 +2549,12 @@ fn take_ready(
         match next {
             Ok(event) => {
                 let closes = matches!(event, StreamEvent::ToolCallEnd { .. });
-                let mapped = stream_event(&event);
+                // The limits come first, before the usage event that carries
+                // them, so the batch always has them by then.
+                if let StreamEvent::Limits(found) = &event {
+                    *limits = Some(found.clone());
+                }
+                let mapped = stream_event(&event, limits);
                 batch.sent += usize::from(mapped.is_some());
                 raw.push((event, mapped));
                 if closes {
@@ -2611,8 +2621,10 @@ async fn reserve<'a>(
 ///
 /// The completed tool call is reported by the [`Assembler`] (which knows the
 /// tool name and its assembled arguments), so `ToolCallEnd` maps to nothing
-/// here.
-fn stream_event(event: &StreamEvent) -> Option<Event> {
+/// here. `limits` is the plan limits of the call in flight, which its usage
+/// event carries: it stays `None`, and allocates nothing, for a reply whose
+/// headers named none.
+fn stream_event(event: &StreamEvent, limits: &Option<Box<reagent_ai::Limits>>) -> Option<Event> {
     Some(match event {
         StreamEvent::TextDelta(text) => Event::TextDelta(text.clone()),
         StreamEvent::ThinkingDelta(text) => Event::ThinkingDelta(text.clone()),
@@ -2620,7 +2632,7 @@ fn stream_event(event: &StreamEvent) -> Option<Event> {
             id: id.clone(),
             name: name.clone(),
         },
-        StreamEvent::Usage(usage) => Event::Usage(*usage),
+        StreamEvent::Usage(usage) => Event::Usage(*usage, limits.clone()),
         _ => return None,
     })
 }
@@ -2984,6 +2996,9 @@ impl Assembler {
                 }
             }
             StreamEvent::Usage(usage) => self.usage = usage,
+            // The plan limits ride on the usage event, never on the reply's
+            // usage: a stored reply carries none.
+            StreamEvent::Limits(_) => {}
             StreamEvent::Stop(reason) => self.stop_reason = Some(reason),
             StreamEvent::Replay(value) => self.replay = Some(value),
         }
@@ -3066,7 +3081,7 @@ mod tests {
         assert_eq!(message.replay.as_deref(), Some(r#"{"responseId":"r1"}"#));
         assert_eq!(message.content, vec![Content::text("hi")]);
         // The value is the wire's own: no channel event carries it.
-        assert!(stream_event(&StreamEvent::Replay("{}".into())).is_none());
+        assert!(stream_event(&StreamEvent::Replay("{}".into()), &None).is_none());
     }
 
     #[test]
@@ -3247,6 +3262,106 @@ mod tests {
             StreamEvent::TextDelta(Text::from(text)),
             StreamEvent::Stop(StopReason::EndTurn),
         ]
+    }
+
+    /// The plan limits a ChatGPT backend sends with its reply's headers.
+    fn limits() -> reagent_ai::Limits {
+        reagent_ai::Limits {
+            primary: Some(reagent_ai::Window {
+                used_percent: 30.0,
+                window_minutes: Some(300),
+                resets_at: Some(1_763_050_000),
+            }),
+            secondary: None,
+        }
+    }
+
+    /// A reply that reports `usage`, with `limits` as the plan limits of its
+    /// response when it names any.
+    fn limited_reply(usage: Usage, limits: Option<reagent_ai::Limits>) -> Vec<StreamEvent> {
+        let mut events = Vec::with_capacity(4);
+        if let Some(limits) = limits {
+            events.push(StreamEvent::Limits(Box::new(limits)));
+        }
+        events.extend([
+            StreamEvent::TextDelta(Text::from("done")),
+            StreamEvent::Usage(usage),
+            StreamEvent::Stop(StopReason::EndTurn),
+        ]);
+        events
+    }
+
+    /// The usage events of `events`, with the plan limits each one carries.
+    fn usages(events: &[Event]) -> Vec<(Usage, Option<Box<reagent_ai::Limits>>)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Usage(usage, limits) => Some((*usage, limits.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn usage_carries_the_limits() {
+        let usage = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            ..Usage::default()
+        };
+        let provider = FakeProvider::new(vec![limited_reply(usage, Some(limits()))]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        let events = drain(tx, &mut rx);
+        let reported = usages(&events);
+        let (reported, carried) = reported.first().expect("the reply reports its usage");
+        // The counts of the reply are the ones it sent, and the limits are the
+        // ones its response's headers named.
+        assert_eq!((reported.input_tokens, reported.output_tokens), (10, 5));
+        assert_eq!(carried.as_deref(), Some(&limits()));
+    }
+
+    #[tokio::test]
+    async fn a_call_carries_no_limits_from_the_one_before_it() {
+        // The first call's headers name limits and the second's name none, so
+        // the second usage carries none: the limits end with their call.
+        let mut first = tool_reply("call-1", "echo", r#"{"message":"hi"}"#);
+        first.insert(0, StreamEvent::Limits(Box::new(limits())));
+        first.insert(
+            first.len() - 1,
+            StreamEvent::Usage(Usage {
+                input_tokens: 10,
+                ..Usage::default()
+            }),
+        );
+        let second = limited_reply(
+            Usage {
+                input_tokens: 20,
+                ..Usage::default()
+            },
+            None,
+        );
+        let provider = FakeProvider::new(vec![first, second]);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        let events = drain(tx, &mut rx);
+        let reported = usages(&events);
+        assert_eq!(reported.len(), 2, "one usage event per call");
+        assert_eq!(reported[0].1.as_deref(), Some(&limits()), "the first call");
+        assert_eq!(reported[1].0.input_tokens, 20);
+        assert_eq!(reported[1].1, None, "the second call named no limits");
     }
 
     fn tool_reply(call_id: &str, name: &str, args: &str) -> Vec<StreamEvent> {

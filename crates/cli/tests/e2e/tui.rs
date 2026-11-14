@@ -40,6 +40,16 @@ const SCROLLBACK: usize = 1000;
 /// looks for.
 const DRAWN: usize = 1 << 20;
 
+/// The program status query the binary asks, and the answer a terminal that
+/// knows the protocol gives it: its states and the kinds of card it reads.
+const PROGRAM_QUERY: &str = "\x1b]7501;?\x1b\\";
+const PROGRAM_ANSWER: &str =
+    "\x1b]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1b\\";
+
+/// How many bytes of the read before a test keeps, so a query that one read
+/// ended in the middle of is still answered.
+const QUERY_TAIL: usize = 16;
+
 /// The folders one test runs in.
 struct Home {
     /// The config home and the project folder.
@@ -214,6 +224,12 @@ impl Tui {
         Tui::spawn(home.command().args(args))
     }
 
+    /// Starts the binary in a terminal that answers the program status query,
+    /// the way a terminal with an inbox does.
+    fn answering(home: &Home, args: &[&str]) -> Tui {
+        Tui::spawn_answering(home.command().args(args), true)
+    }
+
     /// Starts the binary under `script`, which gives it a terminal of its own
     /// as its controlling terminal, the way a shell does: then `/dev/tty`
     /// opens, which it never does for a child handed the test's pty.
@@ -244,11 +260,17 @@ impl Tui {
     }
 
     /// Runs `command` in a new pty and reads what it draws.
+    fn spawn(command: &mut Command) -> Tui {
+        Tui::spawn_answering(command, false)
+    }
+
+    /// Runs `command` in a new pty and reads what it draws, answering the
+    /// program status query when `answers` says the terminal knows it.
     #[expect(
         clippy::disallowed_types,
         reason = "a test drives a pty through the standard library"
     )]
-    fn spawn(command: &mut Command) -> Tui {
+    fn spawn_answering(command: &mut Command, answers: bool) -> Tui {
         let size = Winsize {
             ws_row: ROWS,
             ws_col: COLUMNS,
@@ -273,10 +295,15 @@ impl Tui {
         let screen = Arc::new(Mutex::new(size));
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let mut output = master.try_clone().expect("a terminal handle");
+        let answer = answers.then(|| master.try_clone().expect("a terminal handle"));
         let parsed = Arc::clone(&screen);
         let written = Arc::clone(&bytes);
         std::thread::spawn(move || {
             let mut buffer = [0u8; 8192];
+            // The last bytes of the read before, which a query may have started
+            // in, and whether the query was answered.
+            let mut held: Vec<u8> = Vec::new();
+            let mut asked = false;
             loop {
                 match output.read(&mut buffer) {
                     Ok(0) | Err(_) => return,
@@ -285,10 +312,31 @@ impl Tui {
                             .lock()
                             .expect("the screen lock")
                             .process(&buffer[..read]);
-                        let mut bytes = written.lock().expect("the bytes lock");
-                        if bytes.len() < DRAWN {
-                            bytes.extend_from_slice(&buffer[..read]);
+                        {
+                            let mut bytes = written.lock().expect("the bytes lock");
+                            if bytes.len() < DRAWN {
+                                bytes.extend_from_slice(&buffer[..read]);
+                            }
                         }
+                        // A terminal that knows the program status protocol
+                        // answers its query once, before the binary reports
+                        // anything to it.
+                        let Some(answer) = answer.as_ref() else {
+                            continue;
+                        };
+                        held.extend_from_slice(&buffer[..read]);
+                        if !asked
+                            && held
+                                .windows(PROGRAM_QUERY.len())
+                                .any(|window| window == PROGRAM_QUERY.as_bytes())
+                        {
+                            (&*answer)
+                                .write_all(PROGRAM_ANSWER.as_bytes())
+                                .expect("the answer reaches the binary");
+                            asked = true;
+                        }
+                        let keep = held.len().saturating_sub(QUERY_TAIL);
+                        held.drain(..keep);
                     }
                 }
             }
@@ -992,6 +1040,87 @@ async fn an_approval_box_runs_the_call_on_y() {
     assert!(home.no_worker().await, "the worker stopped on its own");
 }
 
+/// A terminal that answers the program status query hears the session's status:
+/// blocked on the card that waits, with the id of the session it is for, and
+/// the session is cleared when the app exits.
+#[tokio::test]
+async fn program_status_reports_blocked_to_a_terminal_that_answers() {
+    let home = Home::new();
+    home.ask();
+    let provider = home.script(
+        "two",
+        r#"{"replies": [{"calls": [{"name": "bash", "arguments": {"command": "echo hi > ran.txt"}}]},
+            {"text": "the call ran"}]}"#,
+    );
+    let mut tui = Tui::answering(&home, &["--provider", &provider]);
+    tui.until("idle").await;
+    assert!(
+        tui.drew(PROGRAM_QUERY),
+        "the terminal is asked for its status: {}",
+        tui.drawn()
+    );
+
+    tui.keys("run it\r");
+    tui.until("Run this command?").await;
+    // The status the inbox of the terminal lists reagent by: the session waits
+    // on the card, for this session's id.
+    let blocked = "\x1b]7501;state=blocked:app=reagent:kind=permission:msg=";
+    let deadline = Instant::now() + WAIT;
+    while !tui.drew(blocked) {
+        assert!(
+            Instant::now() < deadline,
+            "the report of the card never went out: {}",
+            tui.drawn()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    tui.keys("y");
+    tui.until("the call ran").await;
+    assert_eq!(tui.quit().await, 0, "a normal quit");
+    assert_eq!(
+        tui.count("\x1b]7501;state=clear:app=reagent"),
+        1,
+        "the exit clears the entry once: {}",
+        tui.drawn()
+    );
+    assert!(home.no_worker().await, "the worker stopped on its own");
+}
+
+/// A terminal that does not answer the program status query is told nothing at
+/// all: only a terminal that asked hears a status.
+#[tokio::test]
+async fn program_status_says_nothing_to_a_terminal_that_does_not_answer() {
+    let home = Home::new();
+    home.ask();
+    let provider = home.script(
+        "two",
+        r#"{"replies": [{"calls": [{"name": "bash", "arguments": {"command": "echo hi > ran.txt"}}]},
+            {"text": "the call ran"}]}"#,
+    );
+    let mut tui = Tui::start(&home, &["--provider", &provider]);
+    tui.until("idle").await;
+
+    tui.keys("run it\r");
+    tui.until("Run this command?").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    tui.keys("y");
+    tui.until("the call ran").await;
+    assert_eq!(tui.quit().await, 0, "a normal quit");
+    assert!(
+        tui.drew(PROGRAM_QUERY),
+        "the terminal is asked for its status: {}",
+        tui.drawn()
+    );
+    assert!(
+        !tui.drew("\x1b]7501;state="),
+        "no report goes out to a terminal that did not answer: {}",
+        tui.drawn()
+    );
+    assert!(home.no_worker().await, "the worker stopped on its own");
+}
+
 /// The `ask` tool's card shows the question and its options, Down moves the pick,
 /// Enter answers it, and the run goes on with the answer in the history.
 #[tokio::test]
@@ -1408,6 +1537,54 @@ async fn the_slash_list_shows_the_model_command() {
         rows.iter()
             .any(|row| row.contains('▎') && row.contains("/mo")),
         "the text box still holds `/mo`:\n{}",
+        tui.text()
+    );
+
+    assert_eq!(tui.quit().await, 0, "a normal quit");
+}
+
+/// `/tidy go` sends the body of the skill's file and the text typed after the
+/// command as the message of the turn, so the model's reply follows them in the
+/// transcript.
+#[tokio::test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test writes the skill its project folder holds"
+)]
+async fn skill_command_sends_the_skill_file_to_the_model() {
+    let home = Home::new();
+    let provider = home.script("skill", r#"{"replies": [{"text": "a reply"}]}"#);
+    let folder = home.cwd().join(".agents/skills/tidy");
+    std::fs::create_dir_all(&folder).expect("the skill folder");
+    std::fs::write(
+        folder.join("SKILL.md"),
+        "---\nname: tidy\ndescription: keep the imports tidy\n---\n\nTIDY-BODY\n",
+    )
+    .expect("the skill file");
+    let mut tui = Tui::start(&home, &["--provider", &provider]);
+    tui.until("idle").await;
+
+    tui.keys("/tidy go");
+    tui.keys("\r");
+    tui.until("TIDY-BODY").await;
+    // The reply means the message reached the provider, which got the block the
+    // user never typed, and the words they did follow it.
+    tui.until("a reply").await;
+    let rows = tui.rows();
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("<skill") && row.contains("name=\"tidy\"")),
+        "the block names the skill:\n{}",
+        tui.text()
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("</skill>")),
+        "the block ends after the body:\n{}",
+        tui.text()
+    );
+    assert!(
+        rows.iter().any(|row| row.trim() == "go"),
+        "the typed text follows the block:\n{}",
         tui.text()
     );
 

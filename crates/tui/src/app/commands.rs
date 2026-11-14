@@ -15,9 +15,13 @@ use super::list::Command;
 /// list uses to tell a plugin row from a built-in one.
 pub(crate) const PLUGIN_GROUP: &str = "plugin";
 
+/// The group the palette lists the skills of the session under, and the mark the
+/// `/` list uses to tell a skill row from a built-in one.
+pub(crate) const SKILL_GROUP: &str = "skill";
+
 /// The commands, in the order an empty list shows them, with the key the table
 /// gives each one until a keys file moves it.
-const TABLE: [Command; 11] = [
+const TABLE: [Command; 12] = [
     Command {
         name: Cow::Borrowed("/model"),
         words: Cow::Borrowed("pick the model and the provider"),
@@ -84,7 +88,19 @@ const TABLE: [Command; 11] = [
         key: Cow::Borrowed("ctrl+c ctrl+c"),
         group: "app",
     },
+    Command {
+        name: Cow::Borrowed("/skills"),
+        words: Cow::Borrowed("the skills of this session"),
+        key: Cow::Borrowed(""),
+        group: "skills",
+    },
 ];
+
+/// Whether a built-in row of the table holds `name`, and so keeps its meaning
+/// when a plugin or a skill offers the same one.
+pub(crate) fn builtin(name: &str) -> bool {
+    TABLE.iter().any(|row| &*row.name == name)
+}
 
 /// The commands the app's lists open with, built once and shared: the keys of
 /// `labels` when a keys file was read, and the table's own when none was.

@@ -19,73 +19,84 @@
 # each side-effect tool, and the session list), about 160 to 180 syscalls
 # more per run than before. Find and grep make from 0 to about 11 more
 # blocking threads from run to run, so their proc and mem lines are wide.
-turn io 115
-turn wait 167
-turn fs 189
-turn mem 117
-turn proc 115
-turn other 198
-turn total 658
-tools io 203
-tools wait 384
-tools fs 245
-tools mem 125
-tools proc 126
-tools other 341
-tools total 1219
-bash io 210
-bash wait 373
-bash fs 254
-bash mem 130
-bash proc 145
-bash other 410
-bash total 1256
-codemode io 144
-codemode wait 216
+# The worker writes its discovery entry once more per run, when the run
+# starts (state working, for the Herdr Inbox): 4 fs syscalls more per run,
+# 6 for grep, measured on linux-x86_64; each fs line rose by that much.
+# find fs: 303 to 317 over 8 runs (the high ones right after the suite), so 320.
+# A run looks for two skills folders (the config one and the project's
+# .agents/skills), one fs syscall each even when it is missing: each fs line
+# that was at its count rose by 2, measured on linux-x86_64.
+# Re-made 2026-11-13 from --measure 10 on linux-x86_64, because the wait,
+# total and find fs lines moved from run to run. Every line is the measured
+# budget except the fs lines of the other scenarios, which do not move from
+# run to run and stay at their exact count, so a small fs change still fails.
+turn io 127
+turn wait 193
+turn fs 195
+turn mem 153
+turn proc 161
+turn other 113
+turn total 808
+tools io 225
+tools wait 421
+tools fs 251
+tools mem 143
+tools proc 150
+tools other 121
+tools total 1224
+bash io 232
+bash wait 367
+bash fs 260
+bash mem 147
+bash proc 180
+bash other 162
+bash total 1264
+codemode io 150
+codemode wait 249
 codemode fs 207
 codemode mem 158
-codemode proc 139
-codemode other 271
-codemode total 932
-mcp io 180
-mcp wait 256
-mcp fs 210
-mcp mem 108
-mcp proc 115
-mcp other 318
+codemode proc 141
+codemode other 95
+codemode total 845
+mcp io 201
+mcp wait 293
+mcp fs 216
+mcp mem 119
+mcp proc 128
+mcp other 118
 mcp total 955
-read io 142
-read wait 223
-read fs 204
-read mem 151
-read proc 159
-read other 233
-read total 910
-write io 147
-write wait 214
-write fs 239
-write mem 125
-write proc 126
-write other 243
-write total 887
-edit io 145
-edit wait 198
-edit fs 223
-edit mem 117
-edit proc 115
-edit other 231
-edit total 809
-grep io 177
-grep wait 587
-grep fs 348
+read io 159
+read wait 279
+read fs 210
+read mem 152
+read proc 161
+read other 114
+read total 931
+write io 165
+write wait 272
+write fs 245
+write mem 126
+write proc 128
+write other 111
+write total 925
+edit io 160
+edit wait 265
+edit fs 229
+edit mem 135
+edit proc 139
+edit other 115
+edit total 923
+grep io 197
+grep wait 631
+grep fs 410
 grep mem 236
 grep proc 269
-grep other 336
-grep total 1625
-find io 142
-find wait 348
-find fs 311
-find mem 236
-find proc 269
-find other 277
-find total 1377
+grep other 138
+grep total 1690
+find io 160
+find wait 373
+find fs 370
+find mem 237
+find proc 271
+find other 144
+find total 1415

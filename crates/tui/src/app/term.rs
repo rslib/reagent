@@ -25,16 +25,41 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use super::Terminal;
 use crate::input::{Background, Input};
 
-/// The first frame's two queries: the background (`OSC 11` with `?`) and then
-/// the primary device attributes (`CSI c`).
+/// The first frame's queries: the background (`OSC 11` with `?`), the program
+/// status (`OSC 7501` with `?`) and then the primary device attributes (`CSI c`).
 ///
-/// They go out in one write with the first frame setup, and both answers come
-/// back through the parser as events that never reach the keys. The background
-/// answer picks the mode ([`crate::input::Signal::Background`]); the device
-/// attributes answer ([`crate::input::Signal::DeviceAttributes`]) ends the first
-/// frame's wait, and every terminal gives it, so the wait is a few milliseconds
-/// on a real terminal and the safety limit only covers one that answers neither.
-pub(super) const QUERY: &[u8] = b"\x1b]11;?\x07\x1b[c";
+/// They go out in one write with the first frame setup, and all three answers
+/// come back through the parser as events that never reach the keys. The
+/// background answer picks the mode ([`crate::input::Signal::Background`]); the
+/// program status answer ([`crate::input::Signal::ProgramStatus`]) says whether
+/// the terminal lists the session's status at all, so a terminal that does not
+/// answer it is never told one; the device attributes answer
+/// ([`crate::input::Signal::DeviceAttributes`]) ends the first frame's wait, and
+/// every terminal gives it, so the wait is a few milliseconds on a real terminal
+/// and the safety limit only covers one that answers none.
+pub(super) const QUERY: &[u8] = b"\x1b]11;?\x07\x1b]7501;?\x1b\\\x1b[c";
+
+/// The first frame's queries inside a herdr pane: the background, the kitty
+/// graphics query (`a=q`, `i=31`, a one-pixel image), the program status, and
+/// then the device attributes.
+///
+/// herdr hides the terminal it draws its panes into, so no environment variable
+/// says whether it reads the protocol: the terminal is asked, and the answer
+/// ([`crate::input::Signal::Graphics`]) says whether the placeholders draw. The
+/// kitty query goes out before `CSI c`, so a terminal that answers in order has
+/// answered it by the time the wait the device attributes answer ends.
+///
+/// Outside herdr the bytes stay [`QUERY`]: a terminal that sends no answer would
+/// put its error in the transcript.
+pub(super) const GRAPHICS_QUERY: &[u8] =
+    b"\x1b]11;?\x07\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b]7501;?\x1b\\\x1b[c";
+
+/// The report that leaves the session, once, when the app exits: the terminal
+/// that answered the program status query drops reagent's entry from its inbox.
+///
+/// It goes out after the last frame of the run, so no later write of the app
+/// puts the entry back, and a terminal that never answered is told nothing.
+pub(super) const STATUS_CLEAR: &[u8] = b"\x1b]7501;state=clear:app=reagent\x1b\\";
 
 /// DEC mouse capture on: the wheel, a drag and its release reach the app. Only
 /// full screen takes the mouse, so inline mode keeps the terminal's own

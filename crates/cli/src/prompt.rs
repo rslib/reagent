@@ -79,7 +79,8 @@ fn collect(global: Option<&Path>, repo_root: Option<&Path>, cwd: &Path) -> Strin
     out
 }
 
-fn folders_below(root: &Path, cwd: &Path) -> Option<Vec<PathBuf>> {
+/// The folders from `root` down to `cwd`, `None` when `cwd` is not below `root`.
+pub(crate) fn folders_below(root: &Path, cwd: &Path) -> Option<Vec<PathBuf>> {
     let rest = cwd.strip_prefix(root).ok()?;
     let mut folders = vec![root.to_path_buf()];
     let mut dir = root.to_path_buf();
@@ -210,6 +211,11 @@ mod tests {
             "\n\n# Instructions from ~/.config/reagent/AGENTS.md\n\nglobal rules\
              \n\n# Instructions from AGENTS.md\n\nrepo rules"
         );
+    }
+
+    #[test]
+    fn an_empty_instructions_leaves_the_template_alone() {
+        assert_eq!(system_with("/work", ""), system("/work"));
     }
 
     #[tokio::test]

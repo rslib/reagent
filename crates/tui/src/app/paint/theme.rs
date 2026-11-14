@@ -165,9 +165,15 @@ impl App {
         }
     }
 
-    /// Sends the first frame's two queries, `OSC 11` and then `CSI c`, in one
-    /// write, and waits for the device attributes answer, which every terminal
-    /// gives: that answer, and not a fixed time, is what ends the wait.
+    /// Sends the first frame's queries, `OSC 11`, `OSC 7501` and then `CSI c`,
+    /// in one write, and waits for the device attributes answer, which every
+    /// terminal gives: that answer, and not a fixed time, is what ends the
+    /// wait.
+    ///
+    /// `herdr` adds the kitty graphics query (`a=q`, `i=31`) between the two,
+    /// before `CSI c`: a terminal that answers in order answers it before the
+    /// wait ends, so the frame that draws first already knows whether herdr
+    /// draws its panes with placeholders.
     ///
     /// The color the terminal reported before that answer is the mode, and is
     /// what this returns: rich when an `OSC 11` answer came first, terminal when
@@ -180,18 +186,19 @@ impl App {
         &mut self,
         terminal: &mut impl Terminal,
         answer: Option<&Background>,
+        herdr: bool,
     ) -> Option<Rgb> {
         let answer = answer?;
         if answer.attributes() {
             return answer.color();
         }
+        let query = match herdr {
+            true => super::super::term::GRAPHICS_QUERY,
+            false => super::super::term::QUERY,
+        };
         // The queries go out on a write of their own: the mode's setup is already
         // on its way, and the first frame is drawn once the answer is in.
-        if terminal
-            .write_frame(super::super::term::QUERY)
-            .await
-            .is_err()
-        {
+        if terminal.write_frame(query).await.is_err() {
             return answer.color();
         }
         let deadline = tokio::time::Instant::now() + BACKGROUND_WAIT;
@@ -233,8 +240,8 @@ impl App {
         }
     }
 
-    /// The app's start: the theme file, then the first frame's two queries and
-    /// the wait for the device attributes answer, which every terminal gives.
+    /// The app's start: the theme file, then the first frame's queries and the
+    /// wait for the device attributes answer, which every terminal gives.
     ///
     /// The color an `OSC 11` answer reported before that, if there was one, is
     /// what this returns.
@@ -247,7 +254,8 @@ impl App {
         answer: Option<&Background>,
     ) -> Option<Rgb> {
         self.read_theme(theme).await;
-        self.ask(terminal, answer).await
+        let herdr = crate::picture_native::asks_graphics(|name| std::env::var(name).ok());
+        self.ask(terminal, answer, herdr).await
     }
 
     /// Draws the text box's fill: [`Role::InputFill`]'s background under the rows
@@ -604,7 +612,7 @@ mod tests {
             let answer = Background::default();
             let mut terminal = Answers::new(&answer, None, false);
             let started = std::time::Instant::now();
-            assert_eq!(app.ask(&mut terminal, Some(&answer)).await, None);
+            assert_eq!(app.ask(&mut terminal, Some(&answer), false).await, None);
             let waited = started.elapsed();
             assert!(
                 waited >= Duration::from_millis(50) && waited < Duration::from_millis(500),
@@ -630,7 +638,7 @@ mod tests {
         let started = std::time::Instant::now();
         let asked = tokio::time::timeout(
             Duration::from_millis(40),
-            app.ask(&mut terminal, Some(&answer)),
+            app.ask(&mut terminal, Some(&answer), false),
         );
         assert_eq!(
             asked
@@ -657,7 +665,10 @@ mod tests {
         let answer = Background::default();
         let mut terminal = Answers::new(&answer, Some(DARK), true);
         let started = std::time::Instant::now();
-        assert_eq!(app.ask(&mut terminal, Some(&answer)).await, Some(DARK));
+        assert_eq!(
+            app.ask(&mut terminal, Some(&answer), false).await,
+            Some(DARK)
+        );
         let waited = started.elapsed();
         assert!(
             waited < Duration::from_millis(50),
@@ -677,7 +688,7 @@ mod tests {
             ..Answers::new(&answer, None, true)
         };
         let started = std::time::Instant::now();
-        assert_eq!(app.ask(&mut terminal, Some(&answer)).await, None);
+        assert_eq!(app.ask(&mut terminal, Some(&answer), false).await, None);
         let waited = started.elapsed();
         assert!(
             waited >= Duration::from_millis(5) && waited < Duration::from_millis(50),
@@ -726,6 +737,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn herdr_first_frame_sends_the_kitty_query_before_csi_c() {
+        // Inside herdr the kitty graphics query goes between the background
+        // query and `CSI c`, so a terminal that answers in order answers it
+        // before the wait the device attributes answer ends.
+        let mut app = app();
+        let answer = Background::default();
+        let mut terminal = Answers::new(&answer, None, false);
+        assert_eq!(app.ask(&mut terminal, Some(&answer), true).await, None);
+        assert_eq!(terminal.writes, 1, "every query is one write");
+        assert_eq!(
+            terminal.bytes,
+            b"\x1b]11;?\x07\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b]7501;?\x1b\\\x1b[c",
+            "the kitty query goes out before CSI c"
+        );
+    }
+
+    #[tokio::test]
+    async fn herdr_graphics_answer_does_not_lengthen_the_first_frame() {
+        // The kitty answer and the device attributes answer in one read: the
+        // answer is recorded and the wait ends on `CSI c`, as fast as it does
+        // for a terminal that answers no graphics query.
+        let mut app = app();
+        let answer = Background::default();
+        let mut terminal = Answers {
+            graphics: Some(true),
+            ..Answers::new(&answer, None, true)
+        };
+        let started = std::time::Instant::now();
+        let asked = tokio::time::timeout(
+            Duration::from_millis(40),
+            app.ask(&mut terminal, Some(&answer), true),
+        );
+        assert_eq!(
+            asked
+                .await
+                .expect("the answer ends the wait, not the limit"),
+            None
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(50),
+            "the device attributes answer ended the wait at once: {waited:?}"
+        );
+        assert_eq!(answer.graphics(), Some(true), "the answer is recorded");
+        assert_eq!(terminal.writes, 1, "every query is one write");
+    }
+
     /// A terminal that answers the first frame's two queries the way the reader
     /// of a real one does: it records them into a [`Background`] handle and
     /// sends no key.
@@ -738,6 +797,9 @@ mod tests {
         color: Option<Rgb>,
         /// Whether it answers the device attributes query.
         attributes: bool,
+        /// The answer it gives the kitty graphics query, `None` for a terminal
+        /// that does not answer it.
+        graphics: Option<bool>,
         /// The virtual milliseconds it takes to answer.
         after: u64,
         /// The writes it took.
@@ -777,6 +839,9 @@ mod tests {
             }
             if let Some(color) = self.color {
                 self.answer.record(color);
+            }
+            if let Some(graphics) = self.graphics {
+                self.answer.record_graphics(graphics);
             }
             if self.attributes {
                 self.answer.record_attributes();

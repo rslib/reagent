@@ -50,6 +50,9 @@ pub enum StreamEvent {
     ToolCallEnd { id: Text },
     /// Running token counts for the reply.
     Usage(Usage),
+    /// The plan limits the reply's headers named, sent once, before the other
+    /// events of the reply.
+    Limits(Box<Limits>),
     /// The reply ended, with the reason the provider gave.
     Stop(StopReason),
     /// The wire's own fields for sending the reply back, kept as
@@ -96,6 +99,88 @@ fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .get("retry-after-ms")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+/// The plan limits a ChatGPT backend sends with its reply, from the
+/// `x-codex` headers.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Limits {
+    /// The shorter window, when the reply named one.
+    pub primary: Option<Window>,
+    /// The longer window, when the reply named one.
+    pub secondary: Option<Window>,
+}
+
+/// One limit window of a plan.
+///
+/// The fields are 32-bit to keep the event that carries them small. A value
+/// that does not fit is absent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Window {
+    /// How much of the window the account has used, from 0 to 100.
+    pub used_percent: f32,
+    /// The width of the window in minutes, when the reply named one.
+    pub window_minutes: Option<u32>,
+    /// When the window resets, in Unix seconds, when the reply named it.
+    pub resets_at: Option<u32>,
+}
+
+impl Limits {
+    /// Reads the plan limits of an HTTP response, borrowing `headers` for the
+    /// call only.
+    ///
+    /// `None` when the response named no window. A window whose used-percent
+    /// header is missing or does not parse is absent, and so is a window that
+    /// has used nothing, names no width and no reset: an older backend sends
+    /// three empty headers.
+    pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Option<Self> {
+        let limits = Self {
+            primary: Window::from_headers(headers, "primary"),
+            secondary: Window::from_headers(headers, "secondary"),
+        };
+        (limits.primary.is_some() || limits.secondary.is_some()).then_some(limits)
+    }
+}
+
+// `f32` has no `Eq`, so the markers are written out by hand: a provider never
+// reports a `NaN` percent, and a limit is compared only in tests.
+impl Eq for Limits {}
+
+impl Eq for Window {}
+
+impl Window {
+    /// Reads one window of `headers`, whose names end in `-{name}-...`.
+    fn from_headers(headers: &reqwest::header::HeaderMap, name: &str) -> Option<Self> {
+        let used_percent = header_of(headers, name, "used-percent")?
+            .trim()
+            .parse::<f32>()
+            .ok()?;
+        let window_minutes = header_of(headers, name, "window-minutes")
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        let resets_at =
+            header_of(headers, name, "reset-at").and_then(|value| value.trim().parse::<u32>().ok());
+        // A window nothing is known about is no window: an empty set of
+        // headers would otherwise read as a limit of zero.
+        if used_percent == 0.0 && window_minutes.unwrap_or(0) == 0 && resets_at.is_none() {
+            return None;
+        }
+        Some(Self {
+            used_percent,
+            window_minutes,
+            resets_at,
+        })
+    }
+}
+
+/// The `x-codex-{name}-{field}` header of `headers`, when it is text.
+fn header_of<'a>(
+    headers: &'a reqwest::header::HeaderMap,
+    name: &str,
+    field: &str,
+) -> Option<&'a str> {
+    headers
+        .get(format!("x-codex-{name}-{field}"))
+        .and_then(|value| value.to_str().ok())
 }
 
 /// A provider failure.
@@ -372,6 +457,97 @@ mod tests {
             },
         };
         assert_eq!(error.retry_hint(), Some(Some(Duration::from_millis(2500))));
+    }
+
+    fn limits(used: f32, minutes: &str, reset: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("x-codex-primary-used-percent", used.to_string()),
+            ("x-codex-primary-window-minutes", minutes.to_string()),
+            ("x-codex-primary-reset-at", reset.to_string()),
+        ]
+    }
+
+    fn limited(pairs: &[(&'static str, String)]) -> Option<Limits> {
+        let pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        Limits::from_headers(&headers(&pairs))
+    }
+
+    #[test]
+    fn limits_of_both_windows_read_their_three_headers() {
+        let mut pairs = limits(30.0, "300", "1763050000");
+        pairs.extend([
+            ("x-codex-secondary-used-percent", "75.5".to_string()),
+            ("x-codex-secondary-window-minutes", "10080".to_string()),
+            ("x-codex-secondary-reset-at", "1763140000".to_string()),
+        ]);
+        assert_eq!(
+            limited(&pairs),
+            Some(Limits {
+                primary: Some(Window {
+                    used_percent: 30.0,
+                    window_minutes: Some(300),
+                    resets_at: Some(1_763_050_000),
+                }),
+                secondary: Some(Window {
+                    used_percent: 75.5,
+                    window_minutes: Some(10_080),
+                    resets_at: Some(1_763_140_000),
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn limits_of_the_primary_window_alone_leave_the_secondary_out() {
+        assert_eq!(
+            limited(&limits(12.25, "60", "1763050000")),
+            Some(Limits {
+                primary: Some(Window {
+                    used_percent: 12.25,
+                    window_minutes: Some(60),
+                    resets_at: Some(1_763_050_000),
+                }),
+                secondary: None,
+            })
+        );
+    }
+
+    #[test]
+    fn limits_of_no_headers_are_none() {
+        assert_eq!(Limits::from_headers(&headers(&[])), None);
+    }
+
+    #[test]
+    fn limits_of_a_window_of_zeros_are_none() {
+        assert_eq!(limited(&limits(0.0, "0", "")), None);
+    }
+
+    #[test]
+    fn limits_of_an_unparsable_percent_drop_the_window() {
+        // A percent that does not parse drops the window, whatever the rest
+        // of its headers say.
+        let mut pairs = limits(30.0, "300", "1763050000");
+        pairs[0].1 = "lots".to_string();
+        assert_eq!(limited(&pairs), None);
+        // A missing percent header drops it too, where the width and the
+        // reset alone would have named a window.
+        assert_eq!(
+            limited(&limits(30.0, "300", "1763050000")),
+            Some(Limits {
+                primary: Some(Window {
+                    used_percent: 30.0,
+                    window_minutes: Some(300),
+                    resets_at: Some(1_763_050_000),
+                }),
+                secondary: None,
+            })
+        );
+        let mut pairs = limits(30.0, "300", "1763050000");
+        pairs.remove(0);
+        assert_eq!(limited(&pairs), None);
     }
 
     #[test]

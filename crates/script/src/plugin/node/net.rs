@@ -77,54 +77,16 @@ impl ModuleDef for NetHost {
     }
 }
 
-/// Where the code the wrapper was called from stands: in a plugin's own module,
-/// in the wrapper's frames and the native frames this host runs in, or in a
-/// script that is no plugin's module at all, such as `eval` code or the body of
-/// a `new Function`.
-enum Caller {
-    /// A module of the plugin at this index.
-    Plugin(usize),
-    /// Only the wrapper's frames and the native frames of this host.
-    Wrapper,
-    /// A script or module that is no plugin's: it acts for nobody.
-    Foreign,
+/// The index of the plugin whose runtime runs this call: a runtime holds one
+/// plugin's code and no other's, so every frame of it acts for that plugin,
+/// `eval` code and the body of a `new Function` included.
+fn caller(ctx: &Ctx<'_>) -> Option<usize> {
+    super::index_of(ctx)
 }
 
-/// Who the JS stack stands for, read from the module every frame is in and
-/// never from an argument a plugin could choose.
-fn caller(ctx: &Ctx<'_>) -> Caller {
-    for level in 0..8 {
-        let Some(atom) = ctx.script_or_module_name(level) else {
-            // A native frame runs in no module at all.
-            continue;
-        };
-        let Ok(name) = atom.to_string() else {
-            continue;
-        };
-        // The wrapper itself is one frame, or a few when a body read runs
-        // under a stream callback; the plugin's own module is the one behind
-        // them.
-        if name == NET {
-            continue;
-        }
-        if let Some(index) = super::index_of(&name) {
-            return Caller::Plugin(index);
-        }
-        // Any other script ends the search: `eval` code and `new Function` code
-        // is no plugin's module, so a plugin that swaps a builtin for one of
-        // them cannot have the plugin that runs it act for it.
-        return Caller::Foreign;
-    }
-    Caller::Wrapper
-}
-
-/// `owner()`: the index of the plugin whose code called the wrapper, and none
-/// when the call comes from a script that is no plugin's.
+/// `owner()`: the index of the plugin whose runtime runs this call.
 fn owner(ctx: Ctx<'_>) -> Option<u32> {
-    match caller(&ctx) {
-        Caller::Plugin(index) => u32::try_from(index).ok(),
-        Caller::Wrapper | Caller::Foreign => None,
-    }
+    u32::try_from(caller(&ctx)?).ok()
 }
 
 /// Whether the slot of `id` is held by the plugin at `index`.
@@ -137,24 +99,14 @@ fn owned(id: u64, index: usize) -> bool {
     })
 }
 
-/// The plugin a slot function may act for: the module on the JS stack when it
-/// names a plugin, which must be the entry's owner, and the entry's owner when
-/// no plugin frame is left, which only the wrapper's own callback does.
+/// The plugin a slot function may act for: the runtime's plugin, when the slot
+/// is that plugin's.
 fn mine(ctx: &Ctx<'_>, id: u64) -> Option<usize> {
-    let found = match caller(ctx) {
-        Caller::Plugin(index) => Some(index),
-        Caller::Wrapper => None,
-        // A slot function called from a script that is no plugin's acts for
-        // nobody, whatever slot it names.
-        Caller::Foreign => return None,
-    };
+    let found = caller(ctx)?;
     STATE.with(|net| {
         let net = net.borrow();
         let slot = net.slots.get(&id)?;
-        match found {
-            Some(index) if index != slot.plugin => None,
-            _ => Some(slot.plugin),
-        }
+        (slot.plugin == found).then_some(found)
     })
 }
 
@@ -216,6 +168,7 @@ fn cancel(ctx: Ctx<'_>, id: u64) {
 /// check of each of them. It answers the response's head with the body left in
 /// the slot, or the reason it was refused.
 fn send<'js>(ctx: Ctx<'js>, index: u32, id: u64, request: Object<'js>) -> JsResult<Value<'js>> {
+    let index = super::acting(&ctx, index);
     let by = index as usize;
     if !owned(id, by) {
         let held = ctx.clone();
@@ -1142,19 +1095,37 @@ impl NetState {
 }
 
 thread_local! {
-    /// The net state of the plugin thread, freed when the plugins unload.
+    /// The net state of the plugin thread, one entry per plugin index.
     static STATE: RefCell<NetState> = RefCell::new(NetState::new());
 }
 
-/// Frees every open response and the client: nothing may outlive the context
-/// the plugin thread drops.
-pub(super) fn free() {
+/// Drops the clients every plugin shares, once the last plugin stopped: they
+/// must go while the runtime they ran on is still alive. The ids stay spent.
+pub(super) fn drop_shared() {
     STATE.with(|net| {
         let mut net = net.borrow_mut();
-        // The ids stay spent even when the plugins unload.
         let next = net.next;
         *net = NetState::new();
         net.next = next;
+    });
+}
+
+/// Frees the open responses, the jar and the client count of the plugin at
+/// `index`: nothing of it may outlive its context.
+pub(super) fn free(index: usize) {
+    STATE.with(|net| {
+        let mut net = net.borrow_mut();
+        net.open.remove(&index);
+        drop(net.jars.remove(&index));
+        let mine: Vec<u64> = net
+            .slots
+            .iter()
+            .filter(|(_, slot)| slot.plugin == index)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in mine {
+            drop(net.slots.remove(&id));
+        }
     });
 }
 

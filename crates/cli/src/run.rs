@@ -44,6 +44,7 @@ use reagent_tools::write::Write;
 
 use crate::args::{Args, SandboxMode, TOOL_NAMES};
 use crate::prompt;
+use crate::skills;
 
 /// The tools' working folder, fingerprinted for the completion policy, and
 /// the configured folders the fingerprint leaves out.
@@ -685,13 +686,20 @@ pub async fn run(mut args: Args) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let global_agents = reagent_config::global_dir().map(|dir| dir.join("AGENTS.md"));
-    let instructions = prompt::instructions(
-        global_agents.as_deref(),
-        reagent_config::repo_root(&cwd).as_deref(),
-        &cwd,
-    )
-    .await;
+    let global_dir = reagent_config::global_dir();
+    let global_agents = global_dir.as_ref().map(|dir| dir.join("AGENTS.md"));
+    let repo_root = reagent_config::repo_root(&cwd);
+    let (instructions, skills) = tokio::join!(
+        prompt::instructions(global_agents.as_deref(), repo_root.as_deref(), &cwd),
+        skills::find(global_dir.as_deref(), repo_root.as_deref(), &cwd),
+    );
+    let mut instructions = instructions;
+    instructions.push_str(&skills.prompt);
+    // A client of the session lists the skills the prompt lists, and marks the
+    // ones the model reads.
+    if let Some(worker) = worker.as_mut() {
+        worker.skills(skills.found);
+    }
     let system = prompt::system_with(cwd.to_string_lossy().as_ref(), &instructions);
     let config = AgentConfig {
         model: args.model.clone(),
@@ -797,6 +805,9 @@ pub async fn run(mut args: Args) -> ExitCode {
         socket,
         billing,
         context_window: args.context_window,
+        model: Some(Text::from(args.model.as_str())),
+        provider: args.provider_name.as_deref().map(Text::from),
+        shared: worker.as_ref().map(crate::worker::Worker::shared),
     };
     // The answer lines of the run's stdin client, when it has one, and the end
     // its session reports once it is over.
@@ -1248,6 +1259,13 @@ struct Report {
     socket: Option<String>,
     billing: Option<Billing>,
     context_window: Option<u64>,
+    /// The model the run's requests name, as a live session last set it.
+    model: Option<Text>,
+    /// The reagent provider id that serves them.
+    provider: Option<Text>,
+    /// The session a run that takes clients serves: its settings name the
+    /// model and the provider a `set` changed.
+    shared: Option<Arc<crate::worker::Shared>>,
 }
 
 /// The next thing the drain loop takes: a batch of events, or one answer line
@@ -1324,6 +1342,10 @@ async fn drain<W: AsyncWrite + Unpin>(
     let mut ended = false;
     // The prompt size of the last turn: how full the context is now.
     let mut context_tokens = 0u64;
+    // The model and the provider a usage line names, which a `set` of the
+    // session changes.
+    let mut model = report.model.clone();
+    let mut provider = report.provider.clone();
 
     let mut buf = Vec::with_capacity(512);
     // Whether the start line has gone into a batch; it is written once, with
@@ -1409,9 +1431,18 @@ async fn drain<W: AsyncWrite + Unpin>(
                     // A plain run prints the answer at the end; JSON mode writes the
                     // text on its own line, so it copies nothing.
                     Event::TextDelta(text) if !json => keep_answer(&mut answer, text),
-                    Event::Usage(usage) => {
+                    Event::Usage(usage, _) => {
                         context_tokens = crate::json::context_tokens(usage);
                         sum(&mut total, usage);
+                    }
+                    // A `set` text may carry a `provider/` prefix, so the
+                    // names come from the session, as the worker's lines do.
+                    Event::Settings { .. } => {
+                        if let Some(shared) = report.shared.as_ref() {
+                            let (next_provider, next_model) = shared.names();
+                            provider = next_provider;
+                            model = Some(next_model);
+                        }
                     }
                     Event::Error(message) if !json => eprintln!("reagent: {message}"),
                     Event::TurnEnd(r) => reason = *r,
@@ -1427,6 +1458,10 @@ async fn drain<W: AsyncWrite + Unpin>(
                     // A steered run's caller answers its approvals, so it needs
                     // their ids, and sees where each message it sent lands; a
                     // plain run prints the lines it always printed.
+                    let names = crate::json::Names {
+                        model: model.as_deref(),
+                        provider: provider.as_deref(),
+                    };
                     if report.steered
                         && matches!(
                             event,
@@ -1438,9 +1473,9 @@ async fn drain<W: AsyncWrite + Unpin>(
                                 | Event::MessageState { .. }
                         )
                     {
-                        crate::json::write_line(&mut buf, &event);
+                        crate::json::write_line(&mut buf, &event, names);
                     } else {
-                        crate::json::write_event(&mut buf, &event);
+                        crate::json::write_event(&mut buf, &event, names);
                     }
                     if ended || buf.len() >= JSON_BATCH {
                         let _ = out.write(&buf).await;
@@ -1528,7 +1563,7 @@ fn priced(event: Event, billing: Option<Billing>) -> Event {
     // The clock is read only for an unpriced usage under a peak rule, not for
     // every text delta.
     let timed = billing.is_some_and(|billing| billing.peak.is_some())
-        && matches!(&event, Event::Usage(usage) if usage.cost.is_none());
+        && matches!(&event, Event::Usage(usage, _) if usage.cost.is_none());
     priced_at(event, billing, if timed { now_secs() } else { 0 })
 }
 
@@ -1536,7 +1571,7 @@ fn priced(event: Event, billing: Option<Billing>) -> Event {
 /// peak windows. Chinese public holidays are off-peak and not modeled, so a
 /// holiday run shows the peak price.
 fn priced_at(event: Event, billing: Option<Billing>, at: u64) -> Event {
-    let Event::Usage(usage) = &event else {
+    let Event::Usage(usage, limits) = &event else {
         return event;
     };
     let Some(billing) = billing.filter(|_| usage.cost.is_none()) else {
@@ -1545,7 +1580,7 @@ fn priced_at(event: Event, billing: Option<Billing>, at: u64) -> Event {
     let mut usage = *usage;
     let factor = billing.peak.map_or(1.0, |peak| peak.factor_at(at));
     usage.cost = Some(billing.price.cost(&usage) * factor);
-    Event::Usage(usage)
+    Event::Usage(usage, limits.clone())
 }
 
 /// Adds `delta` into the running `total`.
@@ -3040,16 +3075,19 @@ mod tests {
             cost: Some(0.5),
             ..Usage::default()
         };
-        let filled = priced(Event::Usage(own), Some(Billing { price, peak: None }));
-        assert!(matches!(&filled, Event::Usage(usage) if usage.cost == Some(0.5)));
+        let filled = priced(Event::Usage(own, None), Some(Billing { price, peak: None }));
+        assert!(matches!(&filled, Event::Usage(usage, _) if usage.cost == Some(0.5)));
 
         let unpriced = Usage {
             input_tokens: 1000,
             output_tokens: 500,
             ..Usage::default()
         };
-        let filled = priced(Event::Usage(unpriced), Some(Billing { price, peak: None }));
-        let Event::Usage(usage) = filled else {
+        let filled = priced(
+            Event::Usage(unpriced, None),
+            Some(Billing { price, peak: None }),
+        );
+        let Event::Usage(usage, _) = filled else {
             panic!("a usage event");
         };
         let cost = usage.cost.expect("a filled cost");
@@ -3070,8 +3108,8 @@ mod tests {
             ..Usage::default()
         };
         let billed = billing(Some(config), None, None).expect("a config price bills");
-        let filled = priced_at(Event::Usage(usage), Some(billed), 439_200);
-        let Event::Usage(usage) = filled else {
+        let filled = priced_at(Event::Usage(usage, None), Some(billed), 439_200);
+        let Event::Usage(usage, _) = filled else {
             panic!("a usage event");
         };
         let cost = usage.cost.expect("a filled cost");
@@ -3137,8 +3175,8 @@ mod tests {
         // 02:00 UTC on a Tuesday is a peak hour of the deepseek preset.
         let tuesday_two = 5 * 86_400 + 2 * 3_600;
         let billed = billing(None, Some(deepseek()), Some(&cached)).expect("a price");
-        let doubled = priced_at(Event::Usage(usage), Some(billed), tuesday_two);
-        let Event::Usage(usage) = doubled else {
+        let doubled = priced_at(Event::Usage(usage, None), Some(billed), tuesday_two);
+        let Event::Usage(usage, _) = doubled else {
             panic!("a usage event");
         };
         assert!(
@@ -3147,11 +3185,11 @@ mod tests {
         );
         // Outside the window the price stands as the catalogue listed it.
         let off = priced_at(
-            Event::Usage(usage_again()),
+            Event::Usage(usage_again(), None),
             Some(billed),
             tuesday_two + 3 * 3_600,
         );
-        let Event::Usage(usage) = off else {
+        let Event::Usage(usage, _) = off else {
             panic!("a usage event");
         };
         assert!(
@@ -3166,8 +3204,8 @@ mod tests {
             cache_write: None,
         };
         let billed = billing(Some(config), Some(deepseek()), Some(&cached)).expect("a price");
-        let filled = priced_at(Event::Usage(usage_again()), Some(billed), tuesday_two);
-        let Event::Usage(usage) = filled else {
+        let filled = priced_at(Event::Usage(usage_again(), None), Some(billed), tuesday_two);
+        let Event::Usage(usage, _) = filled else {
             panic!("a usage event");
         };
         assert!(
@@ -3389,6 +3427,9 @@ mod tests {
             socket: None,
             billing: None,
             context_window: None,
+            model: Some(Text::from("fake-model")),
+            provider: Some(Text::from("fake")),
+            shared: None,
         };
         drain(rx, None, None, Out::with_writer(sink.clone()), report).await;
     }
@@ -3402,11 +3443,11 @@ mod tests {
         crate::json::write_start(&mut expected, None, None);
         for _ in 0..1000 {
             let event = Event::TextDelta(Text::from(text.as_str()));
-            crate::json::write_event(&mut expected, &event);
+            crate::json::write_event(&mut expected, &event, crate::json::Names::default());
             tx.send(event).await.expect("the channel takes the event");
         }
         let end = Event::RunEnd(TurnEndReason::EndTurn);
-        crate::json::write_event(&mut expected, &end);
+        crate::json::write_event(&mut expected, &end, crate::json::Names::default());
         tx.send(end).await.expect("the channel takes the event");
         drop(tx);
         crate::json::write_summary(
@@ -3426,6 +3467,9 @@ mod tests {
             socket: None,
             billing: None,
             context_window: None,
+            model: Some(Text::from("fake-model")),
+            provider: Some(Text::from("fake")),
+            shared: None,
         };
         let reason = drain(rx, None, None, Out::with_writer(sink.clone()), report).await;
         assert_eq!(reason, TurnEndReason::EndTurn);

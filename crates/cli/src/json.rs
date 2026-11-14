@@ -57,6 +57,16 @@ enum Line<'a> {
         cache_write: u64,
         cache_hit_rate: f64,
         cost: Option<f64>,
+        /// The model the request of this reply named, when the run knows it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<&'a str>,
+        /// The reagent provider id that served the reply, when the run knows
+        /// it. Not the wire name.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider: Option<&'a str>,
+        /// The plan limits the provider sent with the reply, when it sent any.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limits: Option<LimitsLine>,
     },
     TurnEnd {
         reason: &'static str,
@@ -167,6 +177,64 @@ enum Line<'a> {
     },
 }
 
+/// The names a usage line carries: the model the request named and the reagent
+/// provider id that served it. Both are borrowed from the run, and either one
+/// is left out of the line when the run does not know it.
+#[derive(Clone, Copy, Default)]
+pub struct Names<'a> {
+    /// The model id the request of the reply named.
+    pub model: Option<&'a str>,
+    /// The reagent provider id that served it.
+    pub provider: Option<&'a str>,
+}
+
+/// The plan limits of one reply, as the usage line carries them.
+#[derive(Serialize)]
+struct LimitsLine {
+    /// The plan the limits belong to: the ChatGPT backend's headers carry the
+    /// limits of the ChatGPT plan.
+    plan: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary: Option<WindowLine>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secondary: Option<WindowLine>,
+}
+
+/// One window of the plan limits: what is used and when it resets.
+#[derive(Serialize)]
+struct WindowLine {
+    used_percent: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_minutes: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resets_at: Option<u32>,
+}
+
+/// The plan of the limits the `x-codex` headers name.
+const LIMITS_PLAN: &str = "chatgpt";
+
+impl LimitsLine {
+    /// The line of `limits`, when the reply named any.
+    fn of(limits: Option<&reagent_ai::Limits>) -> Option<Self> {
+        let limits = limits?;
+        Some(Self {
+            plan: LIMITS_PLAN,
+            primary: limits.primary.as_ref().map(WindowLine::of),
+            secondary: limits.secondary.as_ref().map(WindowLine::of),
+        })
+    }
+}
+
+impl WindowLine {
+    fn of(window: &reagent_ai::Window) -> Self {
+        Self {
+            used_percent: window.used_percent,
+            window_minutes: window.window_minutes,
+            resets_at: window.resets_at,
+        }
+    }
+}
+
 /// The rules a save answer would add, borrowed from the request, as the JSON
 /// array a client reads: empty when a save is not possible.
 struct Rules<'a>(Option<&'a str>);
@@ -230,7 +298,7 @@ fn image_lines(images: &[reagent_ai::Image]) -> Vec<ImageLine<'_>> {
 ///
 /// A live session's own events have no `--json` line: `-p --json` prints
 /// exactly the lines it printed before they existed.
-pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
+pub fn write_event(buf: &mut Vec<u8>, event: &Event, names: Names<'_>) {
     if matches!(
         event,
         Event::UserMessage { .. }
@@ -245,13 +313,13 @@ pub fn write_event(buf: &mut Vec<u8>, event: &Event) {
     ) {
         return;
     }
-    write_line(buf, event);
+    write_line(buf, event, names);
 }
 
 /// Appends any agent event, a live session's own too, to `buf` as one JSON
 /// object and a newline: the bytes `--json` prints.
-pub fn write_line(buf: &mut Vec<u8>, event: &Event) {
-    write(buf, event, false);
+pub fn write_line(buf: &mut Vec<u8>, event: &Event, names: Names<'_>) {
+    write(buf, event, names, false);
 }
 
 /// Appends any agent event, a live session's own too, to `buf` as one JSON
@@ -259,13 +327,13 @@ pub fn write_line(buf: &mut Vec<u8>, event: &Event) {
 ///
 /// A tool result's frame carries the tail of its output, so a client draws the
 /// text without reading the journal.
-pub fn write_worker_line(buf: &mut Vec<u8>, event: &Event) {
-    write(buf, event, true);
+pub fn write_worker_line(buf: &mut Vec<u8>, event: &Event, names: Names<'_>) {
+    write(buf, event, names, true);
 }
 
 /// Appends `event` to `buf` as one JSON object and a newline, with the output
 /// tail of a tool result when `tailed` is set.
-fn write(buf: &mut Vec<u8>, event: &Event, tailed: bool) {
+fn write(buf: &mut Vec<u8>, event: &Event, names: Names<'_>, tailed: bool) {
     // The deltas of a streamed answer are the hot path of `--json`: their whole
     // line is written straight into the buffer, with the bytes the serializer
     // writes, instead of going through the serializer once per delta.
@@ -312,13 +380,16 @@ fn write(buf: &mut Vec<u8>, event: &Event, tailed: bool) {
                 images: image_lines(images),
             }
         }
-        Event::Usage(usage) => Line::Usage {
+        Event::Usage(usage, limits) => Line::Usage {
             input: usage.input_tokens,
             output: usage.output_tokens,
             cache_read: usage.cache_read_tokens,
             cache_write: usage.cache_write_tokens,
             cache_hit_rate: cache_hit_rate(usage),
             cost: usage.cost,
+            model: names.model,
+            provider: names.provider,
+            limits: LimitsLine::of(limits.as_deref()),
         },
         Event::TurnEnd(reason) => Line::TurnEnd {
             reason: turn_reason(reason),
@@ -622,7 +693,7 @@ mod tests {
 
     fn line(event: &Event) -> Value {
         let mut buf = Vec::new();
-        write_event(&mut buf, event);
+        write_event(&mut buf, event, Names::default());
         parse_line(&buf)
     }
 
@@ -642,6 +713,112 @@ mod tests {
             reasoning_tokens: 2,
             cost: Some(0.0123),
         }
+    }
+
+    /// The line of `event` as a run that knows its model and provider writes
+    /// it.
+    fn named_line(event: &Event, names: Names<'_>) -> Value {
+        let mut buf = Vec::new();
+        write_event(&mut buf, event, names);
+        parse_line(&buf)
+    }
+
+    /// The plan limits a ChatGPT backend sends: a window of 30% used that
+    /// resets at a known second, and a weekly window that only names its
+    /// width.
+    fn limits() -> reagent_ai::Limits {
+        reagent_ai::Limits {
+            primary: Some(reagent_ai::Window {
+                used_percent: 30.0,
+                window_minutes: Some(300),
+                resets_at: Some(1_763_050_000),
+            }),
+            secondary: Some(reagent_ai::Window {
+                used_percent: 12.5,
+                window_minutes: Some(10_080),
+                resets_at: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_usage_line_with_limits_and_names_carries_exactly_their_keys() {
+        let line = named_line(
+            &Event::Usage(usage(), Some(Box::new(limits()))),
+            Names {
+                model: Some("gpt-5"),
+                provider: Some("chatgpt"),
+            },
+        );
+        assert_eq!(
+            line,
+            json!({
+                "type": "usage",
+                "input": 10,
+                "output": 5,
+                "cache_read": 30,
+                "cache_write": 0,
+                "cache_hit_rate": 0.75,
+                "cost": 0.0123,
+                "model": "gpt-5",
+                "provider": "chatgpt",
+                "limits": {
+                    "plan": "chatgpt",
+                    "primary": {
+                        "used_percent": 30.0,
+                        "window_minutes": 300,
+                        "resets_at": 1763050000i64,
+                    },
+                    "secondary": {
+                        "used_percent": 12.5,
+                        "window_minutes": 10080,
+                    },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_usage_line_without_limits_keeps_its_old_keys() {
+        let line = named_line(&Event::Usage(usage(), None), Names::default());
+        assert!(line.get("limits").is_none(), "{line}");
+        assert!(line.get("model").is_none(), "{line}");
+        assert!(line.get("provider").is_none(), "{line}");
+        assert_eq!(
+            line,
+            json!({
+                "type": "usage",
+                "input": 10,
+                "output": 5,
+                "cache_read": 30,
+                "cache_write": 0,
+                "cache_hit_rate": 0.75,
+                "cost": 0.0123,
+            })
+        );
+    }
+
+    #[test]
+    fn a_usage_line_leaves_out_a_window_the_reply_did_not_name() {
+        let limits = reagent_ai::Limits {
+            primary: None,
+            secondary: Some(reagent_ai::Window {
+                used_percent: 3.5,
+                window_minutes: None,
+                resets_at: Some(1_763_140_000),
+            }),
+        };
+        let line = named_line(
+            &Event::Usage(usage(), Some(Box::new(limits))),
+            Names::default(),
+        );
+        assert_eq!(
+            line["limits"],
+            json!({
+                "plan": "chatgpt",
+                "secondary": { "used_percent": 3.5, "resets_at": 1763140000i64 },
+            })
+        );
     }
 
     /// The events `--json` prints, with the line each one writes, shared so the
@@ -715,7 +892,7 @@ mod tests {
                 json!({ "type": "tool_result", "id": "c3", "is_error": false, "bytes": 12, "images": [{ "media_type": "image/png", "width": 64, "height": 48, "bytes": 2 }] }),
             ),
             (
-                Event::Usage(usage()),
+                Event::Usage(usage(), None),
                 json!({
                     "type": "usage",
                     "input": 10,
@@ -764,9 +941,9 @@ mod tests {
     fn the_worker_line_of_a_result_adds_the_tail_of_its_output() {
         for (event, _) in cases() {
             let mut printed = Vec::new();
-            write_event(&mut printed, &event);
+            write_event(&mut printed, &event, Names::default());
             let mut worker = Vec::new();
-            write_worker_line(&mut worker, &event);
+            write_worker_line(&mut worker, &event, Names::default());
             let mut line = parse_line(&worker);
             // A result keeps its tail in the fields the printed line lacks.
             let tail = line.as_object_mut().and_then(|line| {
@@ -816,7 +993,7 @@ mod tests {
             images: Vec::new(),
         };
         let mut buf = Vec::new();
-        write_worker_line(&mut buf, &event);
+        write_worker_line(&mut buf, &event, Names::default());
         let line = parse_line(&buf);
         let output = line["output"].as_str().expect("a tail");
         assert!(
@@ -834,7 +1011,7 @@ mod tests {
         );
         // The printed line of the same result carries neither.
         let mut printed = Vec::new();
-        write_event(&mut printed, &event);
+        write_event(&mut printed, &event, Names::default());
         let printed = parse_line(&printed);
         assert_eq!(
             printed,
@@ -852,7 +1029,7 @@ mod tests {
             images: Vec::new(),
         };
         let mut buf = Vec::new();
-        write_worker_line(&mut buf, &event);
+        write_worker_line(&mut buf, &event, Names::default());
         let line = parse_line(&buf);
         assert_eq!(line["error"], "boom\n\n");
         assert_eq!(line["output"], "boom\n\n");
@@ -1012,14 +1189,14 @@ mod tests {
         ];
         for (event, expected) in cases {
             let mut printed = Vec::new();
-            write_event(&mut printed, &event);
+            write_event(&mut printed, &event, Names::default());
             assert!(
                 printed.is_empty(),
                 "{event:?} has no --json line but wrote {}",
                 String::from_utf8_lossy(&printed)
             );
             let mut worker = Vec::new();
-            write_line(&mut worker, &event);
+            write_line(&mut worker, &event, Names::default());
             assert_eq!(parse_line(&worker), expected, "{event:?}");
         }
     }
@@ -1034,7 +1211,7 @@ mod tests {
             images: Vec::new(),
         };
         let mut frame = Vec::new();
-        write_worker_line(&mut frame, &event);
+        write_worker_line(&mut frame, &event, Names::default());
         assert_eq!(
             parse_line(&frame),
             json!({ "type": "user_message", "message_id": 5, "client": 7, "mode": "steer", "text": "use cargo nextest" }),
@@ -1046,7 +1223,7 @@ mod tests {
             reason: None,
         };
         let mut frame = Vec::new();
-        write_worker_line(&mut frame, &state);
+        write_worker_line(&mut frame, &state, Names::default());
         assert_eq!(
             parse_line(&frame),
             json!({ "type": "message_state", "message_id": 5, "state": "landed" })
@@ -1159,14 +1336,14 @@ mod tests {
             cost: None,
             ..Usage::default()
         };
-        assert_eq!(line(&Event::Usage(usage))["cost"], Value::Null);
+        assert_eq!(line(&Event::Usage(usage, None))["cost"], Value::Null);
     }
 
     #[test]
     fn a_line_is_one_json_object_and_a_newline() {
         let mut buf = Vec::new();
-        write_event(&mut buf, &Event::TextDelta("x\ny".into()));
-        write_event(&mut buf, &Event::TurnStart);
+        write_event(&mut buf, &Event::TextDelta("x\ny".into()), Names::default());
+        write_event(&mut buf, &Event::TurnStart, Names::default());
         let text = std::str::from_utf8(&buf).unwrap();
         assert_eq!(text.lines().count(), 2);
         assert!(text.ends_with('\n'));
@@ -1205,7 +1382,7 @@ mod tests {
             },
         ] {
             let mut buf = Vec::new();
-            write_event(&mut buf, &event);
+            write_event(&mut buf, &event, Names::default());
             assert!(
                 buf.is_empty(),
                 "{event:?} wrote {}",
@@ -1263,16 +1440,20 @@ mod tests {
     fn json_string_text_delta_line_is_unchanged() {
         for text in ["x", "a \"q\"\n", "", "汉字", "tab\there", "back\\"] {
             let mut buf = Vec::new();
-            write_event(&mut buf, &Event::TextDelta(text.into()));
+            write_event(&mut buf, &Event::TextDelta(text.into()), Names::default());
             assert_eq!(buf, old_line(&Old::TextDelta { text }), "{text:?}");
 
             let mut buf = Vec::new();
-            write_event(&mut buf, &Event::ThinkingDelta(text.into()));
+            write_event(
+                &mut buf,
+                &Event::ThinkingDelta(text.into()),
+                Names::default(),
+            );
             assert_eq!(buf, old_line(&Old::ThinkingDelta { text }), "{text:?}");
         }
         // The exact bytes of the common line.
         let mut buf = Vec::new();
-        write_event(&mut buf, &Event::TextDelta("x".into()));
+        write_event(&mut buf, &Event::TextDelta("x".into()), Names::default());
         assert_eq!(
             std::str::from_utf8(&buf).expect("utf8"),
             "{\"type\":\"text_delta\",\"text\":\"x\"}\n"

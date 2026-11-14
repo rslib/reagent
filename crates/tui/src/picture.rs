@@ -43,6 +43,14 @@ impl CellShape {
     /// so a half-block's two pixels are square.
     pub const HALF_BLOCK: Self = Self { across: 1, down: 2 };
 
+    /// A common cell, which a placeholder image is scaled to when the terminal
+    /// reports no pixel size (herdr reports none): any scale of 4 or more hides
+    /// the seam a terminal draws between rows it smooths one by one.
+    pub const TYPICAL: Self = Self {
+        across: 10,
+        down: 20,
+    };
+
     /// The cell of a window of `columns` by `rows` cells and `width` by `height`
     /// pixels; `None` when a size is 0 or a cell is under one pixel.
     pub fn of_window(columns: u16, rows: u16, width: u16, height: u16) -> Option<Self> {
@@ -209,6 +217,8 @@ pub struct Picture {
     pub cells: Option<Cells>,
     /// The row under them, `▣ image 64x48 · 3 KB`.
     pub chip: String,
+    /// The image's own width and height in pixels.
+    pub size: (u32, u32),
     /// What the terminal needs to draw the image itself, `None` for a picture
     /// the terminal draws only as cells.
     pub source: Option<Source>,
@@ -263,6 +273,7 @@ fn of_image(image: &Image, room: Room) -> Picture {
     Picture {
         cells,
         chip: chip(image),
+        size: (image.width, image.height),
         source,
     }
 }

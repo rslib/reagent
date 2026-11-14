@@ -1,6 +1,6 @@
 //! Events the agent loop emits on its channel.
 
-use reagent_ai::{StopReason, Text, Usage};
+use reagent_ai::{Limits, StopReason, Text, Usage};
 use reagent_config::permissions::PermissionMode;
 
 use crate::guard::Answer;
@@ -82,8 +82,10 @@ pub enum Event {
         /// text results that are almost every call, which allocates nothing.
         images: Vec<reagent_ai::Image>,
     },
-    /// Running token counts for this turn.
-    Usage(Usage),
+    /// Running token counts for this turn, with the plan limits the reply's
+    /// headers named, when they named any. A call that named none carries
+    /// `None`; the limits never come from an earlier call.
+    Usage(Usage, Option<Box<Limits>>),
     /// One provider call ended with a reason.
     TurnEnd(TurnEndReason),
     /// The whole run ended with a reason, once, after the last `TurnEnd`.

@@ -12,7 +12,7 @@ use serde_json::json;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-use super::{CommandInfo, PanelView, Plugins};
+use super::{CommandInfo, PanelView, Plugins, lock};
 
 /// A term for the turn view the turn hook reads.
 const NO_TOOLS: &[(reagent_ai::ToolCall, reagent_ai::ToolResult)] = &[];
@@ -509,6 +509,217 @@ async fn an_absolute_import_fails() {
             .iter()
             .any(|note| note.starts_with("plugin abs: ")
                 && note.contains(shared.to_str().unwrap())),
+        "{notes:?}"
+    );
+}
+
+/// The entry of a plugin that imports the bare name `tiny` and answers what it
+/// exports.
+const LOCKED_ENTRY: &str = r#"
+import { tiny } from "tiny";
+export default function (reagent) {
+  reagent.registerTool({
+    name: "tinied",
+    description: "Answers what the tiny module exports.",
+    parameters: { type: "object" },
+    run: () => tiny,
+  });
+}
+"#;
+
+/// The module a lock maps the bare name `tiny` to.
+const TINY: &str = "export const tiny = \"tiny-value\";\n";
+
+/// Writes the plugin `locked`, whose entry imports the bare name `tiny` from
+/// `deps/tiny/index.mjs` holding `module`, and answers its folder.
+async fn tiny_plugin(root: &Path, module: &str) -> PathBuf {
+    plugin(
+        root,
+        "locked",
+        manifest(),
+        &[("index.js", LOCKED_ENTRY), ("deps/tiny/index.mjs", module)],
+    )
+    .await;
+    root.join("locked")
+}
+
+/// Writes `reagent-lock.json` into the plugin folder `dir`: `files` are the
+/// paths under the folder with their bytes, and `imports` its bare import map.
+async fn lockfile(dir: &Path, files: &[(&str, &str)], imports: &[(&str, &str)]) {
+    let lock = lock::Lock {
+        version: lock::VERSION,
+        requested: "npm:tiny@^1".to_owned(),
+        source: "npm:tiny@1.0.0".to_owned(),
+        commit: None,
+        files: files
+            .iter()
+            .map(|(path, body)| ((*path).to_owned(), lock::hash(body.as_bytes())))
+            .collect(),
+        imports: imports
+            .iter()
+            .map(|(name, path)| ((*name).to_owned(), (*path).to_owned()))
+            .collect(),
+    };
+    // The install writes it the same way, off the async runtime.
+    tokio::task::spawn_blocking({
+        let dir = dir.to_path_buf();
+        move || lock::write(&dir, &lock)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+#[tokio::test]
+async fn lockfile_staging_folder_does_not_load() {
+    // An install stages the plugin under a name that starts with `.` until the
+    // user says yes, and an update parks the old one under such a name: a run
+    // that starts meanwhile must load neither.
+    let root = temp_root();
+    let dir = tiny_plugin(root.path(), TINY).await;
+    lockfile(
+        &dir,
+        &[("index.js", LOCKED_ENTRY), ("deps/tiny/index.mjs", TINY)],
+        &[("tiny", "deps/tiny/index.mjs")],
+    )
+    .await;
+    tokio::fs::rename(&dir, root.path().join(".staging-locked-42"))
+        .await
+        .unwrap();
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
+    assert!(plugins.is_none(), "a staged plugin loaded");
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
+#[tokio::test]
+async fn lockfile_imports_load_the_pinned_file() {
+    let root = temp_root();
+    let dir = tiny_plugin(root.path(), TINY).await;
+    lockfile(
+        &dir,
+        &[("index.js", LOCKED_ENTRY), ("deps/tiny/index.mjs", TINY)],
+        &[("tiny", "deps/tiny/index.mjs")],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    assert_eq!(names(&plugins), ["tinied"]);
+    let out = run(&plugins, "tinied", "{}").await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(&*out.content, "tiny-value");
+}
+
+#[tokio::test]
+async fn lockfile_names_a_changed_file_and_the_plugin_does_not_load() {
+    let root = temp_root();
+    let dir = tiny_plugin(root.path(), TINY).await;
+    lockfile(
+        &dir,
+        &[("index.js", LOCKED_ENTRY), ("deps/tiny/index.mjs", TINY)],
+        &[("tiny", "deps/tiny/index.mjs")],
+    )
+    .await;
+    tokio::fs::write(
+        dir.join("deps/tiny/index.mjs"),
+        "export const tiny = \"changed\";\n",
+    )
+    .await
+    .unwrap();
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
+    assert!(plugins.is_none(), "{notes:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.starts_with("plugin locked: ")
+                && note.contains("deps/tiny/index.mjs")),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn lockfile_that_does_not_pin_the_entry_does_not_load() {
+    let root = temp_root();
+    let dir = tiny_plugin(root.path(), TINY).await;
+    lockfile(
+        &dir,
+        &[("deps/tiny/index.mjs", TINY)],
+        &[("tiny", "deps/tiny/index.mjs")],
+    )
+    .await;
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
+    assert!(plugins.is_none(), "{notes:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.starts_with("plugin locked: ") && note.contains("index.js")),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn lockfile_refuses_a_relative_import_it_does_not_pin() {
+    let root = temp_root();
+    let entry = r#"
+import { extra } from "./extra.js";
+export default function (reagent) {
+  reagent.registerTool({
+    name: "extraed",
+    description: "Answers what the extra module exports.",
+    parameters: { type: "object" },
+    run: () => extra,
+  });
+}
+"#;
+    let extra = "export const extra = \"extra-value\";\n";
+    plugin(
+        root.path(),
+        "locked",
+        manifest(),
+        &[("index.js", entry), ("extra.js", extra)],
+    )
+    .await;
+    lockfile(&root.path().join("locked"), &[("index.js", entry)], &[]).await;
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
+    assert!(plugins.is_none(), "{notes:?}");
+    assert!(
+        notes.iter().any(|note| note.starts_with("plugin locked: ")
+            && note.contains("./extra.js")
+            && note.contains("not in the plugin's lockfile")),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn lockfile_absent_keeps_the_old_bare_import_error() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "nolock",
+        manifest(),
+        &[("index.js", LOCKED_ENTRY), ("deps/tiny/index.mjs", TINY)],
+    )
+    .await;
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
+    assert!(plugins.is_none(), "{notes:?}");
+    assert!(
+        notes.iter().any(|note| note.starts_with("plugin nolock: ")
+            && note.contains("cannot import 'tiny': only relative paths inside the plugin folder")),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn lockfile_that_is_malformed_skips_the_plugin() {
+    let root = temp_root();
+    let dir = tiny_plugin(root.path(), TINY).await;
+    tokio::fs::write(dir.join(lock::FILE), "{not json\n")
+        .await
+        .unwrap();
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
+    assert!(plugins.is_none(), "{notes:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.starts_with("plugin locked: ") && note.contains(lock::FILE)),
         "{notes:?}"
     );
 }
@@ -3273,4 +3484,186 @@ async fn async_long_hook_keeps_5s() {
         "{notes:?}"
     );
     assert_eq!(&*run(&plugins, "slow", "{}").await.content, "the tool ran");
+}
+
+// The runtimes of the plugins: each plugin has a realm of its own, so a builtin
+// it patches, the memory it allocates and the timers it starts stay its own.
+
+#[tokio::test]
+async fn runtime_builtin_stays_in_its_plugin() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "a",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function () {
+  Array.prototype.map = () => "patched";
+  JSON.stringify = () => "patched";
+  globalThis.mark = 1;
+}
+"#,
+        )],
+    )
+    .await;
+    plugin(
+        root.path(),
+        "b",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.registerTool({
+    name: "check",
+    description: "Reads the builtins.",
+    parameters: { type: "object" },
+    run() {
+      return `${[1, 2].map((x) => x * 2).join(",")} ${JSON.stringify({ k: 1 })} ${typeof globalThis.mark}`;
+    },
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    assert_eq!(
+        &*run(&plugins, "check", "{}").await.content,
+        r#"2,4 {"k":1} undefined"#
+    );
+}
+
+#[tokio::test]
+async fn runtime_memory_cap_is_per_plugin() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "big",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.registerTool({
+    name: "grow",
+    description: "Allocates about 100 MiB.",
+    parameters: { type: "object" },
+    run() {
+      const kept = [];
+      for (let i = 0; i < 100; i += 1) kept.push("x".repeat(1 << 20) + i);
+      return String(kept.length);
+    },
+  });
+  r.registerTool({
+    name: "small",
+    description: "Answers.",
+    parameters: { type: "object" },
+    run() {
+      return "ok";
+    },
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    plugin(
+        root.path(),
+        "small",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.registerTool({
+    name: "tiny",
+    description: "Answers.",
+    parameters: { type: "object" },
+    run() {
+      return "fine";
+    },
+  });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    let out = run(&plugins, "grow", "{}").await;
+    assert!(out.is_error, "a call past the cap fails: {out:?}");
+    let notes = plugins.take_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.starts_with("plugin big: out of memory")),
+        "{notes:?}"
+    );
+    // The plugin that filled its runtime keeps working, and so does the one
+    // beside it.
+    assert_eq!(&*run(&plugins, "small", "{}").await.content, "ok");
+    assert_eq!(&*run(&plugins, "tiny", "{}").await.content, "fine");
+}
+
+#[tokio::test]
+async fn runtime_timers_run_per_plugin() {
+    let root = temp_root();
+    for (folder, tool) in [("a", "tick_a"), ("b", "tick_b")] {
+        let index = format!(
+            r#"
+setTimeout(() => {{ globalThis.mark = "{folder}"; }}, 20);
+export default function (r) {{
+  r.registerTool({{
+    name: "{tool}",
+    description: "Reads the timer's mark.",
+    parameters: {{ type: "object" }},
+    run() {{
+      return globalThis.mark ?? "none";
+    }},
+  }});
+}}
+"#
+        );
+        plugin(root.path(), folder, manifest(), &[("index.js", &index)]).await;
+    }
+    let plugins = loaded(root.path()).await;
+    // Every runtime's own pump runs while the other one answers a job.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(&*run(&plugins, "tick_a", "{}").await.content, "a");
+    assert_eq!(&*run(&plugins, "tick_b", "{}").await.content, "b");
+}
+
+#[tokio::test]
+async fn runtime_unload_ends_every_runtime() {
+    let root = temp_root();
+    for folder in ["a", "b", "c"] {
+        plugin(
+            root.path(),
+            folder,
+            manifest(),
+            &[(
+                "index.js",
+                r#"
+setInterval(() => { globalThis.ticks = (globalThis.ticks ?? 0) + 1; }, 10);
+export default function () {}
+"#,
+            )],
+        )
+        .await;
+    }
+    let plugins = loaded(root.path()).await;
+    // The live state the plugin thread holds a copy of: it is free only once
+    // every runtime of the thread is gone.
+    let live = std::sync::Arc::clone(&plugins.live);
+    drop(plugins);
+    let started = Instant::now();
+    while std::sync::Arc::strong_count(&live) > 1 {
+        assert!(
+            started.elapsed() < WAIT,
+            "the plugin thread still holds its runtimes"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

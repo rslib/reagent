@@ -597,6 +597,9 @@ mod tests {
             cwd: cwd.path().to_path_buf(),
             started_ms: 7,
             waiting: false,
+            state: reagent_protocol::discovery::State::Idle,
+            wait: None,
+            terminal: None,
         };
         discovery::write(&folder, &entry)
             .await

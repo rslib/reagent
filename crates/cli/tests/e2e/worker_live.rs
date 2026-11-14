@@ -317,7 +317,21 @@ impl Worker {
         cache: &Path,
         args: &[&str],
     ) -> Worker {
-        let mut child = Command::new(BIN)
+        Worker::start_with_env(state, cwd, config, cache, args, &[]).await
+    }
+
+    /// Starts a worker that also reads `env`, as the terminal or Herdr that
+    /// started it names it.
+    async fn start_with_env(
+        state: &Path,
+        cwd: &Path,
+        config: &Path,
+        cache: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Worker {
+        let mut command = Command::new(BIN);
+        command
             .env("XDG_CONFIG_HOME", config)
             .env("XDG_CACHE_HOME", cache)
             .env("XDG_STATE_HOME", state)
@@ -326,9 +340,11 @@ impl Worker {
             .current_dir(cwd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("the worker starts");
+            .kill_on_drop(true);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let mut child = command.spawn().expect("the worker starts");
         let mut stdout = tokio::io::BufReader::new(child.stdout.take().expect("piped stdout"));
         let mut line = String::new();
         tokio::time::timeout(
@@ -381,6 +397,26 @@ impl Worker {
         );
     }
 
+    /// The entry, once it says `state`: the worker rewrites it after the frame
+    /// of the change went out, so it lands a moment later.
+    async fn marked(
+        &self,
+        state: reagent_protocol::discovery::State,
+    ) -> reagent_protocol::discovery::Entry {
+        let rounds = MARK_WAIT.as_millis() / MARK.as_millis();
+        for _ in 0..rounds {
+            let entry = self.entry().await;
+            if entry.state == state {
+                return entry;
+            }
+            tokio::time::sleep(MARK).await;
+        }
+        panic!(
+            "the entry never said state = {state:?}: {:?}",
+            self.entry().await
+        );
+    }
+
     async fn connect(&self) -> UnixStream {
         tokio::time::timeout(WAIT, UnixStream::connect(self.socket()))
             .await
@@ -427,6 +463,9 @@ struct Client {
     model: String,
     /// The context window the answer to `initialize` named.
     window: Option<u64>,
+    /// The skills the answer to `initialize` named: null when it named none,
+    /// which is a worker with no skill and an answer without the key.
+    skills: Value,
     /// The id of the next request this client sends.
     next: u64,
 }
@@ -444,6 +483,7 @@ impl Client {
             running: false,
             model: String::new(),
             window: None,
+            skills: Value::Null,
             next: 0,
         };
         let request = client
@@ -463,6 +503,7 @@ impl Client {
             .unwrap_or_else(|| panic!("the answer names the model: {answer}"))
             .to_string();
         client.window = answer["result"]["context_window"].as_u64();
+        client.skills = answer["result"]["skills"].clone();
         client
     }
 
@@ -974,9 +1015,11 @@ async fn two_answers_to_one_approval_run_the_call_once() {
             &format!("{{\"id\":{id},\"answer\":\"refuse\",\"reason\":\"no\"}}"),
         )
         .await;
-    assert!(
-        b.answer(refuse).await["result"].is_object(),
-        "a late answer is still taken"
+    let late = b.answer(refuse).await;
+    assert_eq!(
+        late["error"]["message"],
+        format!("approval {id} is not waiting"),
+        "a late answer is refused: {late}"
     );
 
     let from_a = a.until(|frame| is_event(frame, "run_end")).await;
@@ -1096,6 +1139,19 @@ async fn approval_mark_follows_an_answered_approval() {
         worker.session(),
         "the mark is this worker's"
     );
+    assert_eq!(
+        marked.state,
+        reagent_protocol::discovery::State::Blocked,
+        "a run that waits for a person is blocked"
+    );
+    assert_eq!(
+        marked.wait,
+        Some(reagent_protocol::discovery::Wait {
+            kind: reagent_protocol::discovery::WaitKind::Approval,
+            id
+        }),
+        "the entry names the approval the run waits for"
+    );
 
     let once = a
         .request("approve", &format!("{{\"id\":{id},\"answer\":\"once\"}}"))
@@ -1104,7 +1160,110 @@ async fn approval_mark_follows_an_answered_approval() {
         a.answer(once).await["result"].is_object(),
         "the answer is taken"
     );
-    worker.waiting(false).await;
+    let answered = worker.waiting(false).await;
+    assert_eq!(answered.wait, None, "no request waits now");
+    assert!(
+        matches!(
+            answered.state,
+            reagent_protocol::discovery::State::Working | reagent_protocol::discovery::State::Idle
+        ),
+        "the run works again: {:?}",
+        answered.state
+    );
+    let mut worker = worker;
+    worker.kill().await;
+}
+
+/// A worker of the terminal `t9` says so, so a supervisor knows where the run
+/// shows.
+#[tokio::test]
+async fn terminal_a_worker_writes_the_terminal_that_started_it() {
+    let state = state();
+    let cwd = state.path().join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    let provider = script(state.path(), r#"{"replies":[]}"#).await;
+    let worker = Worker::start_with_env(
+        state.path(),
+        &cwd,
+        Path::new("/nonexistent/reagent-test-config"),
+        Path::new("/nonexistent/reagent-test-cache"),
+        &["--provider", &provider],
+        &[("HC_TERMINAL_ID", "t9")],
+    )
+    .await;
+    assert_eq!(worker.entry().await.terminal.as_deref(), Some("t9"));
+    let mut worker = worker;
+    worker.kill().await;
+}
+
+/// A client that answers an id no request waits for reads why at once, and the
+/// run keeps the request it does wait for.
+#[tokio::test]
+async fn stale_an_approve_of_an_id_that_does_not_wait_is_refused() {
+    let state = state();
+    let (worker, mut a, id) = asking(state.path()).await;
+    worker.waiting(true).await;
+
+    let stale = a.request("approve", r#"{"id":99,"answer":"once"}"#).await;
+    let refused = a.answer(stale).await;
+    assert_eq!(refused["error"]["code"], RpcError::NOT_WAITING, "{refused}");
+    assert_eq!(refused["error"]["message"], "approval 99 is not waiting");
+
+    // The request the run waits for is still the one it took, and the run goes
+    // on once a client answers it.
+    let marked = worker.waiting(true).await;
+    assert_eq!(marked.wait.map(|wait| wait.id), Some(id));
+    let once = a
+        .request("approve", &format!("{{\"id\":{id},\"answer\":\"once\"}}"))
+        .await;
+    assert!(a.answer(once).await["result"].is_object());
+    let (text, reason) = a.run_end().await;
+    assert_eq!((text.as_str(), reason.as_str()), ("done", "end_turn"));
+    // The run end is the third write of the entry: no run is open, and nothing
+    // waits.
+    let ended = worker
+        .marked(reagent_protocol::discovery::State::Idle)
+        .await;
+    assert_eq!(ended.wait, None);
+    assert!(!ended.waiting);
+    let mut worker = worker;
+    worker.kill().await;
+}
+
+/// One list of labels per question, so a client that sends another number
+/// answers no question it never read.
+#[tokio::test]
+async fn stale_an_answer_of_the_wrong_number_of_lists_is_invalid_params() {
+    let state = state();
+    let (worker, mut a, id) = asked(state.path()).await;
+    worker.waiting(true).await;
+
+    let wrong = a
+        .request(
+            "answer",
+            &format!("{{\"id\":{id},\"answers\":[[\"sqlite\"],[\"postgres\"]]}}"),
+        )
+        .await;
+    let refused = a.answer(wrong).await;
+    assert_eq!(
+        refused["error"]["code"],
+        RpcError::INVALID_PARAMS,
+        "{refused}"
+    );
+    assert_eq!(
+        refused["error"]["message"],
+        "invalid params: 2 answer lists for 1 questions"
+    );
+
+    // The question waits still, and a skip ends it.
+    let marked = worker.waiting(true).await;
+    assert_eq!(marked.wait.map(|wait| wait.id), Some(id));
+    let answer = a
+        .request("answer", &format!("{{\"id\":{id},\"answers\":null}}"))
+        .await;
+    assert!(a.answer(answer).await["result"].is_object());
+    let (_, reason) = a.run_end().await;
+    assert_eq!(reason, "end_turn");
     let mut worker = worker;
     worker.kill().await;
 }
@@ -1331,6 +1490,53 @@ async fn initialize_names_the_model_of_the_run_and_its_context_window() {
 }
 
 #[tokio::test]
+async fn initialize_names_the_skills_of_the_folder_the_worker_runs_in() {
+    let state = state();
+    let cwd = state.path().join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    let folder = cwd.join(".agents").join("skills").join("demo");
+    tokio::fs::create_dir_all(&folder)
+        .await
+        .expect("the skills folder");
+    tokio::fs::write(
+        folder.join("SKILL.md"),
+        "---\nname: demo\ndescription: a demo skill\n---\n",
+    )
+    .await
+    .expect("the skill file");
+    let provider = script(state.path(), r#"{"replies":[]}"#).await;
+    let worker = Worker::start(state.path(), &cwd, &["--provider", &provider]).await;
+    let token = worker.entry().await.token;
+    let a = Client::initialize(&worker, &token, "a").await;
+    let skills = a.skills.as_array().expect("the answer names the skills");
+    assert_eq!(skills.len(), 1, "{skills:?}");
+    assert_eq!(skills[0]["name"], "demo");
+    assert_eq!(skills[0]["scope"], "project");
+    let path = skills[0]["path"].as_str().expect("a path");
+    let want = tokio::fs::canonicalize(folder.join("SKILL.md"))
+        .await
+        .expect("the skill file");
+    assert_eq!(Path::new(path), want, "the absolute path of the skill file");
+    let mut worker = worker;
+    worker.kill().await;
+}
+
+#[tokio::test]
+async fn a_worker_with_no_skills_names_no_skills_key() {
+    let state = state();
+    let (worker, _) = worker(&state, r#"{"replies":[]}"#).await;
+    let token = worker.entry().await.token;
+    let a = Client::initialize(&worker, &token, "a").await;
+    assert!(
+        a.skills.is_null(),
+        "an answer with no skill has no skills key: {}",
+        a.skills
+    );
+    let mut worker = worker;
+    worker.kill().await;
+}
+
+#[tokio::test]
 async fn a_set_of_another_model_sends_one_settings_notice_to_two_clients() {
     let state = state();
     let cwd = state.path().join("work");
@@ -1442,6 +1648,70 @@ async fn a_set_of_the_model_of_a_named_provider_sends_no_notice_until_another_on
     assert_eq!(
         notice["params"]["model"], "fi/other",
         "the notice names the provider and the model it was set to: {notice}"
+    );
+    let mut worker = worker;
+    worker.kill().await;
+}
+
+/// The usage line of a worker names the bare model id and the reagent provider
+/// id of each call, and the ones a `set` switched to after it.
+#[tokio::test]
+async fn usage_line_names_the_provider_and_the_model_after_a_switch() {
+    let state = state();
+    let cwd = state.path().join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    let usage = r#""usage":{"input":1,"output":1,"cache_read":0,"cache_write":0,"reasoning":0}"#;
+    let one = wire(
+        state.path(),
+        "one.json",
+        &format!(r#"{{"replies":[{{"text":"from one",{usage}}}]}}"#),
+    )
+    .await;
+    let two = wire(
+        state.path(),
+        "two.json",
+        &format!(r#"{{"replies":[{{"text":"from two",{usage}}}]}}"#),
+    )
+    .await;
+    let config = config_of(
+        state.path(),
+        &providers(&format!("wire = \"{one}\""), &format!("wire = \"{two}\"")),
+    )
+    .await;
+    let worker = Worker::start_with(state.path(), &cwd, &config, &["--model", "one/model-a"]).await;
+    let token = worker.entry().await.token;
+    let mut a = Client::initialize(&worker, &token, "a").await;
+    a.attach(a.committed).await;
+
+    let sent = a.request("send", r#"{"text":"go","mode":"queue"}"#).await;
+    assert!(a.answer(sent).await["result"].is_object());
+    let first = events(a.until(|frame| is_event(frame, "run_end")).await);
+    let line = first
+        .iter()
+        .find(|event| event["type"] == "usage")
+        .expect("a usage line of the first run");
+    assert_eq!(
+        (&line["provider"], &line["model"]),
+        (&Value::from("one"), &Value::from("model-a")),
+        "{line}"
+    );
+
+    let set = a.request("set", r#"{"model":"two/model-b"}"#).await;
+    assert!(a.answer(set).await["result"].is_object());
+    a.until(|frame| frame["method"] == "settings").await;
+    let sent = a
+        .request("send", r#"{"text":"again","mode":"queue"}"#)
+        .await;
+    assert!(a.answer(sent).await["result"].is_object());
+    let second = events(a.until(|frame| is_event(frame, "run_end")).await);
+    let line = second
+        .iter()
+        .find(|event| event["type"] == "usage")
+        .expect("a usage line of the second run");
+    assert_eq!(
+        (&line["provider"], &line["model"]),
+        (&Value::from("two"), &Value::from("model-b")),
+        "{line}"
     );
     let mut worker = worker;
     worker.kill().await;
@@ -2696,6 +2966,25 @@ fn ask_script() -> String {
     r#"{"replies":[{"calls":[{"name":"ask","arguments":{"questions":[{"q":"Which database?","options":[{"label":"sqlite"},{"label":"postgres"}]}]}}]},{"text":"done"}]}"#.to_string()
 }
 
+/// A worker whose run asks a question, with `a` attached, and the id of the
+/// question it waits for.
+async fn asked(state: &Path) -> (Worker, Client, u64) {
+    let cwd = state.join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    let provider = script(state, &ask_script()).await;
+    let worker = Worker::start(state, &cwd, &["--provider", &provider]).await;
+    let token = worker.entry().await.token;
+    let mut a = Client::initialize(&worker, &token, "a").await;
+    a.attach(a.committed).await;
+    a.request("send", r#"{"text":"run it","mode":"queue"}"#)
+        .await;
+    let asked = a.until(|frame| frame["method"] == "question_request").await;
+    let id = asked.last().expect("a question").clone()["params"]["id"]
+        .as_u64()
+        .expect("a question id");
+    (worker, a, id)
+}
+
 #[tokio::test]
 async fn ask_a_client_that_attaches_while_a_question_waits_gets_it() {
     let state = state();
@@ -2775,4 +3064,52 @@ async fn ask_a_waiting_question_sets_the_waiting_mark() {
     worker.waiting(false).await;
     let mut worker = worker;
     worker.kill().await;
+}
+
+/// A run the worker starts itself, here the task of a served `-p` run, says
+/// `working` in its entry while it goes, as a run a client sent does.
+#[tokio::test]
+async fn state_a_served_task_says_working() {
+    let state = state();
+    let cwd = state.path().join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    let provider = script(
+        state.path(),
+        &serde_json::json!({"replies": [
+            {"calls": [{"name": "bash", "arguments": {"command": "sleep 3"}}]},
+            {"text": "done"}
+        ]})
+        .to_string(),
+    )
+    .await;
+    let mut run = Command::new(BIN)
+        .env("XDG_CONFIG_HOME", "/nonexistent/reagent-test-config")
+        .env("XDG_CACHE_HOME", "/nonexistent/reagent-test-cache")
+        .env("XDG_STATE_HOME", state.path())
+        .args(["--json", "--provider", &provider, "-p", "go"])
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("the run starts");
+    let folder = reagent_protocol::discovery::folder(state.path());
+    let rounds = MARK_WAIT.as_millis() / MARK.as_millis();
+    let mut seen = None;
+    for _ in 0..rounds {
+        if let Some(entry) = reagent_protocol::discovery::list(&folder).await.pop() {
+            if entry.state == reagent_protocol::discovery::State::Working {
+                seen = Some(entry.state);
+                break;
+            }
+            seen = Some(entry.state);
+        }
+        tokio::time::sleep(MARK).await;
+    }
+    assert_eq!(seen, Some(reagent_protocol::discovery::State::Working));
+    let status = tokio::time::timeout(Duration::from_secs(30), run.wait())
+        .await
+        .expect("the run ends in time")
+        .expect("the run exits");
+    assert!(status.success());
 }

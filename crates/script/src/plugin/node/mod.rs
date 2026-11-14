@@ -15,6 +15,8 @@ use rquickjs::{Ctx, Exception, Result as JsResult};
 #[cfg(feature = "node")]
 use std::cell::RefCell;
 #[cfg(feature = "node")]
+use std::collections::HashMap;
+#[cfg(feature = "node")]
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -130,7 +132,7 @@ pub(super) fn resolve(ctx: &Ctx<'_>, base: &str, name: &str) -> Option<JsResult<
         return Some(Err(unavailable(ctx, name)));
     }
     let module = named(name)?;
-    wrapper(ctx, base, name, module)
+    wrapper(ctx, name, module)
 }
 
 /// The raw module a wrapper imports, and the sibling wrapper it wraps, and
@@ -184,11 +186,11 @@ fn wrapped(_ctx: &Ctx<'_>, _base: &str, _name: &str) -> Option<JsResult<String>>
 /// The wrapper of the Node module `name` names, or the reason a plugin may not
 /// have it.
 #[cfg(feature = "node")]
-fn wrapper(ctx: &Ctx<'_>, base: &str, name: &str, module: &str) -> Option<JsResult<String>> {
+fn wrapper(ctx: &Ctx<'_>, name: &str, module: &str) -> Option<JsResult<String>> {
     if !MODULES.contains(&module) {
         return Some(Err(unavailable(ctx, name)));
     }
-    Some(match index_of(base) {
+    Some(match index_of(ctx) {
         Some(index) => Ok(format!("{WRAPPER}{module}?plugin={index}")),
         None => Err(unavailable(ctx, name)),
     })
@@ -196,7 +198,7 @@ fn wrapper(ctx: &Ctx<'_>, base: &str, name: &str, module: &str) -> Option<JsResu
 
 /// A build without the Node modules refuses every one of these names.
 #[cfg(not(feature = "node"))]
-fn wrapper(ctx: &Ctx<'_>, _base: &str, name: &str, _module: &str) -> Option<JsResult<String>> {
+fn wrapper(ctx: &Ctx<'_>, name: &str, _module: &str) -> Option<JsResult<String>> {
     let reason =
         format!("{name} needs a build with the node modules: this build has no Node modules");
     Some(Err(Exception::throw_message(ctx, &reason)))
@@ -214,20 +216,11 @@ fn unavailable(ctx: &Ctx<'_>, name: &str) -> rquickjs::Error {
     Exception::throw_message(ctx, &format!("{name} is not available to plugins"))
 }
 
-/// The index of the plugin whose folder holds `base`, the module that imports.
+/// The index of the plugin whose runtime runs this call, which [`setup`] stored
+/// in its context: one context holds one plugin's code and no other's.
 #[cfg(feature = "node")]
-fn index_of(base: &str) -> Option<usize> {
-    let base = Path::new(base);
-    NODE.with(|node| {
-        let node = node.borrow();
-        node.plugins
-            .iter()
-            .enumerate()
-            .filter_map(|(index, policy)| Some((index, policy.as_ref()?)))
-            .filter(|(_, policy)| base.starts_with(&policy.own))
-            .max_by_key(|(_, policy)| policy.own.as_os_str().len())
-            .map(|(index, _)| index)
-    })
+fn index_of(ctx: &Ctx<'_>) -> Option<usize> {
+    ctx.userdata::<usize>().map(|index| *index)
 }
 
 /// The declared module of one `reagent:` name, when the name is one of ours.
@@ -235,7 +228,7 @@ fn index_of(base: &str) -> Option<usize> {
 pub(super) fn load<'js>(ctx: &Ctx<'js>, name: &str) -> Option<JsResult<Module<'js, Declared>>> {
     if let Some(rest) = name.strip_prefix(WRAPPER) {
         let (module, _) = rest.split_once("?plugin=")?;
-        if !sealed() {
+        if !sealed(ctx) {
             return Some(Err(Exception::throw_message(
                 ctx,
                 "the node modules did not start",
@@ -347,9 +340,10 @@ impl ModuleDef for Process {
 /// plugin code.
 #[cfg(feature = "node")]
 fn held<'js>(ctx: &Ctx<'js>) -> Option<Object<'js>> {
+    let index = index_of(ctx)?;
     NODE.with(|node| {
         let node = node.borrow();
-        node.process.as_ref()?.clone().restore(ctx).ok()
+        node.process.get(&index)?.clone().restore(ctx).ok()
     })
 }
 
@@ -399,6 +393,7 @@ impl ModuleDef for Checks {
 /// function touches what it checked.
 #[cfg(feature = "node")]
 fn fs_check(ctx: Ctx<'_>, index: u32, access: String, path: String) -> JsResult<String> {
+    let index = acting(&ctx, index);
     check_call(&ctx, index, Wanted::of(&access), &path, Kept::Followed)
 }
 
@@ -406,6 +401,7 @@ fn fs_check(ctx: Ctx<'_>, index: u32, access: String, path: String) -> JsResult<
 /// entry itself, so only the folder resolves and the last name stays as given.
 #[cfg(feature = "node")]
 fn fs_check_last(ctx: Ctx<'_>, index: u32, access: String, path: String) -> JsResult<String> {
+    let index = acting(&ctx, index);
     check_call(&ctx, index, Wanted::of(&access), &path, Kept::Entry)
 }
 
@@ -418,6 +414,7 @@ fn fs_check_open<'js>(
     path: String,
     flags: Opt<Value<'js>>,
 ) -> JsResult<String> {
+    let index = acting(&ctx, index);
     let wanted = match writes(flags.0) {
         true => Wanted::Write,
         false => Wanted::Read,
@@ -438,6 +435,7 @@ fn opens_write(flags: Opt<Value<'_>>) -> bool {
 /// to.
 #[cfg(feature = "node")]
 fn fs_check_temp(ctx: Ctx<'_>, index: u32, prefix: String) -> JsResult<String> {
+    let index = acting(&ctx, index);
     let wanted = Wanted::Write;
     let allowed = NODE.with(|node| {
         let node = node.borrow();
@@ -474,6 +472,7 @@ fn fs_check_temp(ctx: Ctx<'_>, index: u32, prefix: String) -> JsResult<String> {
 /// read.
 #[cfg(feature = "node")]
 fn env_check(ctx: Ctx<'_>, index: u32, name: String) -> JsResult<Option<String>> {
+    let index = acting(&ctx, index);
     match env_value(index, &name) {
         Ok(value) => Ok(value),
         Err(message) => Err(Exception::throw_message(&ctx, &message)),
@@ -484,6 +483,7 @@ fn env_check(ctx: Ctx<'_>, index: u32, name: String) -> JsResult<Option<String>>
 /// it set.
 #[cfg(feature = "node")]
 fn env_has(ctx: Ctx<'_>, index: u32, name: String) -> JsResult<bool> {
+    let index = acting(&ctx, index);
     match env_value(index, &name) {
         Ok(value) => Ok(value.is_some()),
         Err(message) => Err(Exception::throw_message(&ctx, &message)),
@@ -492,7 +492,8 @@ fn env_has(ctx: Ctx<'_>, index: u32, name: String) -> JsResult<bool> {
 
 /// `envNames(index)`: the names of the permission the process has set.
 #[cfg(feature = "node")]
-fn env_names(index: u32) -> Vec<String> {
+fn env_names(ctx: Ctx<'_>, index: u32) -> Vec<String> {
+    let index = acting(&ctx, index);
     NODE.with(|node| {
         let node = node.borrow();
         node.get(index as usize)
@@ -506,6 +507,17 @@ fn env_names(index: u32) -> Vec<String> {
 fn deny_call(ctx: Ctx<'_>, index: u32, what: String) -> JsResult<()> {
     let reason = format!("plugin {} may not call {what}", name_of(index));
     Err(Exception::throw_message(&ctx, &reason))
+}
+
+/// The index a check acts for: the one the wrapper passed when it is the
+/// runtime's own plugin, and an index no plugin holds otherwise, which every
+/// check refuses.
+#[cfg(feature = "node")]
+fn acting(ctx: &Ctx<'_>, index: u32) -> u32 {
+    match index_of(ctx) {
+        Some(own) if own == index as usize => index,
+        _ => u32::MAX,
+    }
 }
 
 /// The path a raw function must use, and the message a refused access throws.
@@ -582,10 +594,16 @@ fn name_of(index: u32) -> String {
 /// Sets the globals the Node modules need, shuts the lookup a promise makes
 /// before it hands over a value, and takes the `process` object back out of the
 /// globals so no plugin code sees one.
+///
+/// The index of the plugin this context belongs to goes into the context, so
+/// every check that runs in it acts for that plugin and no other.
 #[cfg(feature = "node")]
-pub(super) async fn setup<'js>(ctx: &Ctx<'js>) -> JsResult<Held> {
+pub(super) async fn setup<'js>(ctx: &Ctx<'js>, index: usize) -> JsResult<Held> {
     // Made first, so a failed step below still frees what it saved.
-    let held = Held;
+    let held = Held { index };
+    if let Err(error) = ctx.store_userdata(index) {
+        return Err(Exception::throw_message(ctx, &format!("{error:?}")));
+    }
     no_then(ctx)?;
     llrt_modules::buffer::init(ctx)?;
     llrt_modules::url::init(ctx)?;
@@ -601,8 +619,12 @@ pub(super) async fn setup<'js>(ctx: &Ctx<'js>) -> JsResult<Held> {
     fetch(ctx).await?;
     let process: Object = ctx.globals().get("process")?;
     ctx.globals().remove("process")?;
-    NODE.with(|node| node.borrow_mut().process = Some(Persistent::save(ctx, process)));
-    seal_handles(ctx).await?;
+    NODE.with(|node| {
+        node.borrow_mut()
+            .process
+            .insert(index, Persistent::save(ctx, process))
+    });
+    seal_handles(ctx, index).await?;
     Ok(held)
 }
 
@@ -631,7 +653,7 @@ async fn fetch(ctx: &Ctx<'_>) -> JsResult<()> {
 /// `undefined`, and it is frozen. What is left reads or writes through the
 /// descriptor, and the OS refuses a write on one opened for reading.
 #[cfg(feature = "node")]
-async fn seal_handles(ctx: &Ctx<'_>) -> JsResult<()> {
+async fn seal_handles(ctx: &Ctx<'_>, index: usize) -> JsResult<()> {
     let module = Module::declare_def::<llrt_modules::fs::FsPromisesModule, _>(
         ctx.clone(),
         "reagent:seal/fs/promises",
@@ -663,14 +685,22 @@ async fn seal_handles(ctx: &Ctx<'_>) -> JsResult<()> {
     let object: Object = ctx.globals().get("Object")?;
     let freeze: Function = object.get("freeze")?;
     freeze.call::<_, ()>((prototype,))?;
-    NODE.with(|node| node.borrow_mut().chown = Some(Persistent::save(ctx, chown)));
+    NODE.with(|node| {
+        node.borrow_mut()
+            .chown
+            .insert(index, Persistent::save(ctx, chown))
+    });
     Ok(())
 }
 
-/// Whether the file handles are sealed, without which no wrapper loads.
+/// Whether the file handles of this context are sealed, without which no
+/// wrapper loads.
 #[cfg(feature = "node")]
-fn sealed() -> bool {
-    NODE.with(|node| node.borrow().chown.is_some())
+fn sealed(ctx: &Ctx<'_>) -> bool {
+    let Some(index) = index_of(ctx) else {
+        return false;
+    };
+    NODE.with(|node| node.borrow().chown.contains_key(&index))
 }
 
 /// `chownHandle(handle, uid, gid)`: LLRT's own `chown` on a facade's handle,
@@ -682,8 +712,10 @@ fn chown_handle<'js>(
     uid: Value<'js>,
     gid: Value<'js>,
 ) -> JsResult<Value<'js>> {
+    let index = index_of(&ctx)
+        .ok_or_else(|| Exception::throw_message(&ctx, "the file handles are not sealed"))?;
     let chown = NODE
-        .with(|node| node.borrow().chown.clone())
+        .with(|node| node.borrow().chown.get(&index).cloned())
         .ok_or_else(|| Exception::throw_message(&ctx, "the file handles are not sealed"))?
         .restore(&ctx)?;
     chown.call((rquickjs::function::This(handle), uid, gid))
@@ -714,14 +746,24 @@ fn no_then(ctx: &Ctx<'_>) -> JsResult<()> {
 /// that outlives its runtime aborts the process.
 #[cfg(feature = "node")]
 #[must_use = "the state is freed when this drops, which must be before its context"]
-pub(super) struct Held;
+pub(super) struct Held {
+    /// The plugin whose context this is, and the only one this frees.
+    index: usize,
+}
 
 #[cfg(feature = "node")]
 impl Drop for Held {
     fn drop(&mut self) {
-        child::free();
-        net::free();
-        NODE.with(|node| *node.borrow_mut() = State::new());
+        child::free(self.index);
+        net::free(self.index);
+        NODE.with(|node| {
+            let mut node = node.borrow_mut();
+            if let Some(policy) = node.plugins.get_mut(self.index) {
+                *policy = None;
+            }
+            node.process.remove(&self.index);
+            node.chown.remove(&self.index);
+        });
     }
 }
 
@@ -768,6 +810,16 @@ pub(super) fn stopped(index: usize, since: std::time::Instant) {
 /// A build without the Node modules starts no child process.
 #[cfg(not(feature = "node"))]
 pub(super) fn stopped(_index: usize, _since: std::time::Instant) {}
+
+/// Drops what every plugin shared once the last one stopped.
+#[cfg(feature = "node")]
+pub(super) fn drop_shared() {
+    net::drop_shared();
+}
+
+/// A build without the Node modules shares nothing.
+#[cfg(not(feature = "node"))]
+pub(super) fn drop_shared() {}
 
 /// Registers the checks of the plugin at `index`, resolving its permission
 /// roots and the programs of its `run` list once. An entry that names no
@@ -1004,9 +1056,9 @@ fn link(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(feature = "node")]
-/// What the Node layer keeps for the context of this thread: one check state per
-/// plugin index and the `process` object LLRT built. Rust data only, so nothing
-/// here is reachable from JS.
+/// What the Node layer keeps for the objects of this thread, per plugin index:
+/// one check state per plugin and the `process` object LLRT built in its
+/// context. Rust data only, so nothing here is reachable from JS.
 struct State {
     /// One entry per plugin, at the index its wrapper modules carry; a plugin
     /// that failed to load leaves `None`.
@@ -1019,24 +1071,26 @@ struct State {
     /// The sandbox helper every child process starts through, when this run
     /// has a sandbox at all.
     helper: Option<PathBuf>,
-    /// The `process` object, out of the globals so no plugin code sees one.
-    process: Option<Persistent<Object<'static>>>,
-    /// LLRT's own `FileHandle.prototype.chown`, which [`seal_handles`] takes
-    /// off the prototype; only a facade's `chown` calls it, after its check.
-    chown: Option<Persistent<Function<'static>>>,
+    /// The `process` object of each plugin's context, out of the globals so no
+    /// plugin code sees one.
+    process: HashMap<usize, Persistent<Object<'static>>>,
+    /// LLRT's own `FileHandle.prototype.chown` of each plugin's context, which
+    /// [`seal_handles`] takes off the prototype; only a facade's `chown` calls
+    /// it, after its check.
+    chown: HashMap<usize, Persistent<Function<'static>>>,
 }
 
 #[cfg(feature = "node")]
 impl State {
-    /// The empty state of a context that has not loaded a plugin.
-    const fn new() -> Self {
+    /// The empty state of a thread that has not loaded a plugin.
+    fn new() -> Self {
         Self {
             plugins: Vec::new(),
             session: None,
             state: None,
             helper: None,
-            process: None,
-            chown: None,
+            process: HashMap::new(),
+            chown: HashMap::new(),
         }
     }
 
@@ -1048,8 +1102,8 @@ impl State {
 
 #[cfg(feature = "node")]
 thread_local! {
-    /// The state of the one context of this thread, which is the plugin thread.
-    static NODE: RefCell<State> = const { RefCell::new(State::new()) };
+    /// The state of the plugin thread, which every plugin's context shares.
+    static NODE: RefCell<State> = RefCell::new(State::new());
 }
 
 #[cfg(feature = "node")]

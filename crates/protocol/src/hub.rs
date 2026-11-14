@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
+use crate::discovery::WaitKind;
 use crate::message;
 use crate::message::AttachResult;
 use crate::message::methods;
@@ -85,6 +86,15 @@ enum Waits {
     Question(u64),
 }
 
+impl Waits {
+    fn of(kind: WaitKind, id: u64) -> Self {
+        match kind {
+            WaitKind::Approval => Waits::Approval(id),
+            WaitKind::Question => Waits::Question(id),
+        }
+    }
+}
+
 /// One entry of a client's queue: the frame, and whether it is a delta.
 #[derive(Debug)]
 pub struct Entry {
@@ -134,6 +144,9 @@ pub struct Hub {
     uncommitted: Vec<Frame>,
     /// The frames of the requests that wait for a person, by request id.
     waiting: Vec<(Waits, Frame)>,
+    /// The waiting requests a client already answered: the session resolves
+    /// them a moment later, and a second answer in between is refused.
+    answered: Vec<Waits>,
     /// The newest record the journal committed.
     committed: u64,
     /// Whether a run is open, which the answer to `attach` names.
@@ -191,6 +204,38 @@ impl Hub {
         self.committed = self.committed.max(record);
     }
 
+    /// The frame of the request of `kind` with `id` that waits for a person, or
+    /// `None` when no request of that kind waits with that id.
+    ///
+    /// A worker reads it to refuse an `approve` or an `answer` that names a
+    /// request this run does not wait for, before it queues anything.
+    pub fn waiting(&self, kind: WaitKind, id: u64) -> Option<&Frame> {
+        let wants = Waits::of(kind, id);
+        if self.answered.contains(&wants) {
+            return None;
+        }
+        self.waiting
+            .iter()
+            .find_map(|(open, frame)| (*open == wants).then_some(frame))
+    }
+
+    /// Takes the answer of a client to the request of `kind` with `id`: true
+    /// for the first answer to a request that waits, false for any other, so
+    /// two clients that answer at once cannot both decide it.
+    pub fn claim(&mut self, kind: WaitKind, id: u64) -> bool {
+        if self.waiting(kind, id).is_none() {
+            return false;
+        }
+        self.answered.push(Waits::of(kind, id));
+        true
+    }
+
+    /// Forgets a request the session resolved.
+    fn resolve(&mut self, done: Waits) {
+        self.waiting.retain(|(open, _)| *open != done);
+        self.answered.retain(|open| *open != done);
+    }
+
     /// Queues one frame to every attached client, and remembers it where a
     /// client that attaches later catches up from it.
     pub fn send(&mut self, frame: Frame, kind: Kind) {
@@ -201,15 +246,12 @@ impl Hub {
             Kind::QuestionRequest(id) => {
                 self.waiting.push((Waits::Question(id), Arc::clone(&frame)))
             }
-            Kind::ApprovalResolved(id) => self
-                .waiting
-                .retain(|(open, _)| *open != Waits::Approval(id)),
-            Kind::QuestionResolved(id) => self
-                .waiting
-                .retain(|(open, _)| *open != Waits::Question(id)),
+            Kind::ApprovalResolved(id) => self.resolve(Waits::Approval(id)),
+            Kind::QuestionResolved(id) => self.resolve(Waits::Question(id)),
             Kind::Committed => {}
             Kind::RunEnd => {
                 self.waiting.clear();
+                self.answered.clear();
                 self.uncommitted.push(Arc::clone(&frame));
             }
             Kind::Delta | Kind::Other => self.uncommitted.push(Arc::clone(&frame)),
@@ -734,6 +776,21 @@ mod tests {
         );
         hub.send(resolved(4), Kind::ApprovalResolved(4));
         assert!(hub.waiting.is_empty(), "an answered request does not wait");
+    }
+
+    #[test]
+    fn approval_mark_only_the_first_claim_of_a_request_is_taken() {
+        let mut hub = Hub::new();
+        hub.send(asked(4), Kind::ApprovalRequest(4));
+        assert!(hub.claim(WaitKind::Approval, 4), "the first answer");
+        assert!(!hub.claim(WaitKind::Approval, 4), "a second answer");
+        assert!(hub.waiting(WaitKind::Approval, 4).is_none());
+        assert!(
+            !hub.claim(WaitKind::Question, 4),
+            "a question of the same id"
+        );
+        hub.send(resolved(4), Kind::ApprovalResolved(4));
+        assert!(hub.answered.is_empty(), "a resolved request is forgotten");
     }
 
     #[test]

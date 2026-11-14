@@ -182,9 +182,25 @@ pub(crate) mod test_server {
             let (mut socket, _) = listener.accept().await.expect("accept a connection");
             let recorded = read_request(&mut socket).await;
             let _ = sender.send(recorded);
-            answer(&mut socket, body).await;
+            answer(&mut socket, body, "").await;
         });
         (format!("http://{address}"), receiver)
+    }
+
+    /// Serves one request with `body` as an SSE reply that carries the extra
+    /// response `headers`, each one already ending in a CRLF.
+    ///
+    /// Returns the base URL. The server task ends after it answers that one
+    /// request.
+    pub(crate) async fn serve_headers(headers: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a port");
+        let address = listener.local_addr().expect("the bound address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept a connection");
+            let _ = read_request(&mut socket).await;
+            answer(&mut socket, body, headers).await;
+        });
+        format!("http://{address}")
     }
 
     /// Serves `count` requests in order, each with `body` as an SSE reply.
@@ -203,7 +219,7 @@ pub(crate) mod test_server {
                 let (mut socket, _) = listener.accept().await.expect("accept a connection");
                 let recorded = read_request(&mut socket).await;
                 let _ = sender.send(recorded).await;
-                answer(&mut socket, body).await;
+                answer(&mut socket, body, "").await;
             }
         });
         (format!("http://{address}"), receiver)
@@ -256,10 +272,11 @@ pub(crate) mod test_server {
         }
     }
 
-    /// Answers `socket` with `body` as an SSE reply and closes it.
-    async fn answer(socket: &mut TcpStream, body: &str) {
+    /// Answers `socket` with `body` as an SSE reply that carries the extra
+    /// `headers`, and closes it.
+    async fn answer(socket: &mut TcpStream, body: &str, headers: &str) {
         let response = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\n{headers}content-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
             body.len(),
             body
         );

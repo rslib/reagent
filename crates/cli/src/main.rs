@@ -8,10 +8,13 @@ mod login;
 mod mcp;
 mod models;
 mod permissions;
+mod plugin;
 mod prompt;
+mod rpc;
 mod run;
 mod sandbox;
 mod session;
+mod skills;
 mod snapshot;
 #[cfg(feature = "tui")]
 mod tui;
@@ -32,13 +35,15 @@ fn main() -> std::process::ExitCode {
     if let Some(command) = argv.first().and_then(|arg| arg.to_str())
         && matches!(
             command,
-            "login" | "logout" | "mcp" | "permissions" | "session"
+            "login" | "logout" | "mcp" | "permissions" | "plugin" | "rpc" | "session"
         )
     {
         let runtime = runtime();
         let code = match command {
             "mcp" => runtime.block_on(mcp::run(argv[1..].to_vec())),
             "permissions" => runtime.block_on(permissions::run(argv[1..].to_vec())),
+            "plugin" => runtime.block_on(plugin::run(argv[1..].to_vec())),
+            "rpc" => runtime.block_on(rpc::run(argv[1..].to_vec())),
             "session" => runtime.block_on(session::command(argv[1..].to_vec())),
             _ => runtime.block_on(login::run(command, argv[1..].to_vec())),
         };

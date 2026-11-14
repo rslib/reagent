@@ -407,7 +407,10 @@ fn usage() -> &'static str {
         "  login <provider> [--as <name>] [--no-browser]  save a login for a provider;\n",
         "                       openrouter, chatgpt\n",
         "  logout <provider>  drop a saved login\n",
-        "  mcp add|remove|list|login|logout  manage MCP servers (see reagent mcp --help)\n"
+        "  mcp add|remove|list|login|logout  manage MCP servers (see reagent mcp --help)\n",
+        "  plugin add|list|remove|update  install a plugin from npm (see reagent plugin --help)\n",
+        "  rpc <session>  print the requests a live session waits for, then send the request\n",
+        "                       lines of stdin, one request each, and print their replies\n"
     )
 }
 

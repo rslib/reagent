@@ -1,10 +1,10 @@
-//! The one thread every plugin runs on: a QuickJS runtime, its context, and
-//! the persistent handles of what the plugins registered.
+//! The one thread every plugin runs on: for each plugin a QuickJS runtime of its
+//! own, its context, and the persistent handles of what that plugin registered.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -23,11 +23,15 @@ use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 
 use super::api::{self, Host, Slot, Staging};
+use super::lock::{self, Lock};
 use super::manifest::{self, Found, Manifest};
 use super::{CommandInfo, Live, Notes};
 
-/// The most bytes every plugin together may allocate.
-const MEMORY_CAP: usize = 256 * 1024 * 1024;
+/// The most bytes one plugin's runtime may allocate.
+const PLUGIN_MEMORY: usize = 64 * 1024 * 1024;
+
+/// What QuickJS answers when a runtime reaches its memory cap.
+const OUT_OF_MEMORY: &str = "out of memory";
 
 /// How long one JS call may run before a note says it is slow.
 const SLOW: Duration = Duration::from_secs(1);
@@ -214,7 +218,8 @@ pub(crate) fn start(notes: Arc<Mutex<Notes>>) -> Option<(Sender<Job>, Arc<Live>)
     Some((jobs, live))
 }
 
-/// The thread's whole life: one runtime, one context, one job at a time.
+/// The thread's whole life: one runtime and one context per plugin, one job at
+/// a time.
 ///
 /// The thread has a tokio runtime of its own, so a plugin may hand back a
 /// promise that a timer or a future settles: the host waits for it while the
@@ -240,35 +245,552 @@ fn host(queue: Receiver<Job>, notes: Arc<Mutex<Notes>>, live: Arc<Live>) {
     local.block_on(&runtime, serve(queue, notes, live));
 }
 
-/// The async host of the one runtime: sets it up, then answers every job.
+/// The async host of the plugin thread: one runtime per plugin, and the jobs of
+/// every plugin answered in load order.
+///
+/// The host owns no QuickJS runtime of its own: each instance drives the
+/// promise jobs and the spawned futures (its timers) of its own runtime through
+/// the pump of its own `async_with`, while this waits for the next job.
+async fn serve(mut queue: Receiver<Job>, notes: Arc<Mutex<Notes>>, live: Arc<Live>) {
+    let mut fleet = Fleet::new(notes, live);
+    while let Some(job) = queue.recv().await {
+        match job {
+            Job::Load {
+                root,
+                session,
+                state,
+                sandbox,
+                reply,
+            } => {
+                super::node::session(&session);
+                super::node::state(&state);
+                super::node::sandbox(sandbox);
+                let report = fleet.load(&root).await;
+                let _ = reply.send(report);
+            }
+            Job::Run { tool, args, reply } => {
+                let out = fleet.run(&tool, &args).await;
+                let _ = reply.send(out);
+            }
+            Job::Command { name, args, reply } => {
+                let out = fleet.command(&name, &args).await;
+                let _ = reply.send(out);
+            }
+            Job::Call { tool, args, reply } => {
+                let out = fleet.call(&tool, &args).await;
+                let _ = reply.send(out);
+            }
+            Job::Result {
+                tool,
+                args,
+                text,
+                is_error,
+                reply,
+            } => {
+                let out = fleet.result(&tool, &args, (text, is_error)).await;
+                let _ = reply.send(out);
+            }
+            Job::Turn {
+                index,
+                ran_tools,
+                text,
+                reply,
+            } => {
+                let out = fleet.turn(index, ran_tools, &text).await;
+                let _ = reply.send(out);
+            }
+            Job::Event { name, payload } => fleet.event(&name, &payload).await,
+        }
+    }
+    fleet.stop().await;
+}
+
+/// What the host sends one instance: a job of its own plugin, or its share of a
+/// chain the host runs across the plugins.
+enum InJob {
+    /// Runs one of this plugin's tools.
+    Run {
+        /// The tool's name.
+        tool: String,
+        /// Its arguments, as JSON text.
+        args: String,
+        /// Carries the result back.
+        reply: oneshot::Sender<RunReply>,
+    },
+    /// Runs one of this plugin's slash commands.
+    Command {
+        /// The command's name, without the slash.
+        name: String,
+        /// The rest of the user's line, as one string.
+        args: String,
+        /// Carries the text to show back, if any.
+        reply: oneshot::Sender<Option<String>>,
+    },
+    /// Runs this plugin's `tool.call` layers on these arguments.
+    Call {
+        /// The tool's name.
+        tool: String,
+        /// The arguments as they stand, as JSON text.
+        args: String,
+        /// Carries what the layers made of them back.
+        reply: oneshot::Sender<Step>,
+    },
+    /// Runs this plugin's `tool.result` layers on this output.
+    Result {
+        /// The tool's name.
+        tool: String,
+        /// Its arguments, as JSON text.
+        args: String,
+        /// The text the call produced, as it stands.
+        text: String,
+        /// Whether the call failed, as it stands.
+        is_error: bool,
+        /// Carries what the layers replaced back.
+        reply: oneshot::Sender<ResultReply>,
+    },
+    /// Runs this plugin's `turn.end` layers on one turn.
+    Turn {
+        /// The 1-based index of the turn.
+        index: u32,
+        /// Whether the turn ran a tool.
+        ran_tools: bool,
+        /// The assistant reply's text.
+        text: String,
+        /// Carries the follow-up texts back.
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    /// Hands one event to this plugin's listeners.
+    Event {
+        /// The event's name.
+        name: String,
+        /// What the listener sees.
+        payload: JsonValue,
+        /// Answers once every listener of this plugin ran.
+        reply: oneshot::Sender<()>,
+    },
+}
+
+/// What one instance loaded: what the report offers, and which chains it takes
+/// part in.
+struct InstanceLoad {
+    /// The tools and commands it registered.
+    owned: Owned,
+    /// The chains and the events it has a share of.
+    shares: Shares,
+}
+
+/// Which chains one plugin joined, and which events it waits on.
+#[derive(Clone, Copy, Default)]
+struct Shares {
+    /// Whether it installed a `tool.call` layer.
+    call: bool,
+    /// Whether it installed a `tool.result` layer.
+    result: bool,
+    /// Whether it installed a `turn.end` layer.
+    turn: bool,
+    /// A bit per event some listener of its waits on.
+    events: u8,
+}
+
+/// What every instance shares with the thread: where notes go, what the plugins
+/// raise, and the names already taken.
+#[derive(Clone)]
+struct Shared {
+    /// Where a note leaves its text.
+    notes: Arc<Mutex<Notes>>,
+    /// The panels, messages and jobs the plugins raise.
+    live: Arc<Live>,
+    /// Every tool name taken, so a duplicate throws at load.
+    names: Rc<RefCell<HashSet<String>>>,
+    /// Every command name taken, so a duplicate is refused.
+    command_names: Rc<RefCell<HashSet<String>>>,
+}
+
+/// The instances of the plugin thread, in load order, and the maps that find
+/// the one that answers a tool or a command.
+struct Fleet {
+    /// What every instance shares.
+    shared: Shared,
+    /// One entry per plugin that loaded, in load order.
+    instances: Vec<Instance>,
+    /// The position in `instances` of the plugin that owns each tool.
+    tools: HashMap<String, usize>,
+    /// The same for each command.
+    commands: HashMap<String, usize>,
+    /// The Node index the next plugin takes. It only grows: a plugin that
+    /// failed leaves the fleet, and its index is never given again.
+    next: usize,
+}
+
+/// One plugin's task: its queue and the runtime behind it.
+struct Instance {
+    /// The queue of its task.
+    jobs: Sender<InJob>,
+    /// Its task, awaited when the fleet ends.
+    task: tokio::task::JoinHandle<()>,
+    /// Which chains and events it takes part in.
+    shares: Shares,
+}
+
+impl Fleet {
+    fn new(notes: Arc<Mutex<Notes>>, live: Arc<Live>) -> Self {
+        Self {
+            shared: Shared {
+                notes,
+                live,
+                names: Rc::new(RefCell::new(HashSet::new())),
+                command_names: Rc::new(RefCell::new(HashSet::new())),
+            },
+            instances: Vec::new(),
+            tools: HashMap::new(),
+            commands: HashMap::new(),
+            next: 0,
+        }
+    }
+
+    /// Starts one instance per plugin folder under `root`, in folder order.
+    async fn load(&mut self, root: &Path) -> LoadReport {
+        let mut report = LoadReport::default();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "runs on the plugin thread, off the async runtime"
+        )]
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return report;
+        };
+        let mut dirs: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok())
+            // A folder whose name starts with `.` is an install's staging
+            // folder or the one an update set aside: never a plugin to run.
+            .filter(|entry| !entry.file_name().as_encoded_bytes().starts_with(b"."))
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        dirs.sort();
+        // Each name loaded so far and the folder it came from: the manifest name
+        // is what panels are prefixed with, so two plugins may not share it.
+        let mut names: Vec<(String, PathBuf)> = Vec::new();
+        // Every attempted plugin takes an index of its own, whether it loads or
+        // not: its Node state is registered before its first line runs.
+        for dir in dirs {
+            let folder = dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let manifest = match manifest::read(&dir) {
+                Found::Skipped => continue,
+                Found::Bad(reason) => {
+                    note(&self.shared.notes, format!("plugin {folder}: {reason}"));
+                    continue;
+                }
+                Found::Plugin(manifest) => manifest,
+            };
+            // An installed plugin runs only the bytes its install pinned; one
+            // the user wrote has no lockfile and loads as before.
+            let pins = match lock::read(&dir) {
+                Err(reason) => {
+                    note(&self.shared.notes, format!("plugin {folder}: {reason}"));
+                    continue;
+                }
+                Ok(None) => None,
+                Ok(Some(lock)) => match pinned(&manifest, &lock) {
+                    Ok(pins) => Some(Arc::new(pins)),
+                    Err(reason) => {
+                        note(
+                            &self.shared.notes,
+                            format!(
+                                "plugin {folder}: the files differ from its lockfile: {reason}"
+                            ),
+                        );
+                        continue;
+                    }
+                },
+            };
+            let name = manifest.name.clone();
+            if let Some((_, taken)) = names.iter().find(|(taken, _)| *taken == name) {
+                note(
+                    &self.shared.notes,
+                    format!(
+                        "plugin {folder}: the name '{name}' is already taken by the plugin at {}",
+                        taken.display()
+                    ),
+                );
+                continue;
+            }
+            let index = self.next;
+            self.next += 1;
+            let (at, loaded) = self.start(index, manifest, pins);
+            let loaded = loaded.await;
+            if !matches!(loaded, Ok(Ok(_))) {
+                // Its runtime ends on its own; waiting for it here frees its
+                // memory and its Node state before the next plugin starts.
+                if let Some(gone) = self.instances.pop() {
+                    drop(gone.jobs);
+                    let _ = gone.task.await;
+                }
+            }
+            match loaded {
+                Ok(Ok(loaded)) => {
+                    names.push((name, dir));
+                    self.instances[at].shares = loaded.shares;
+                    for tool in &loaded.owned.tools {
+                        self.tools.insert(tool.name.clone(), at);
+                    }
+                    for command in &loaded.owned.commands {
+                        self.commands.insert(command.name.clone(), at);
+                    }
+                    report.loaded += 1;
+                    report.tools.extend(loaded.owned.tools);
+                    report.commands.extend(loaded.owned.commands);
+                    report.call |= loaded.shares.call;
+                    report.result |= loaded.shares.result;
+                    report.turn |= loaded.shares.turn;
+                    report.events |= loaded.shares.events;
+                }
+                Ok(Err(Failed::Threw(reason))) => {
+                    note(&self.shared.notes, format!("plugin {folder}: {reason}"));
+                }
+                Ok(Err(Failed::Stopped(_))) | Err(_) => {}
+            }
+        }
+        report
+    }
+
+    /// Starts the instance of one plugin, and answers the position it took in
+    /// the fleet and the queue its load answers on.
+    fn start(
+        &mut self,
+        index: usize,
+        manifest: Manifest,
+        pins: Option<Arc<Pinned>>,
+    ) -> (usize, oneshot::Receiver<Result<InstanceLoad, Failed>>) {
+        let (jobs, queue) = tokio::sync::mpsc::channel(super::JOBS);
+        let (reply, loaded) = oneshot::channel();
+        let task = tokio::task::spawn_local(instance(
+            index,
+            manifest,
+            pins,
+            queue,
+            self.shared.clone(),
+            reply,
+        ));
+        self.instances.push(Instance {
+            jobs,
+            task,
+            shares: Shares::default(),
+        });
+        (self.instances.len() - 1, loaded)
+    }
+
+    /// Runs one plugin tool on the instance that owns its name.
+    async fn run(&self, tool: &str, args: &str) -> RunReply {
+        let unknown = || RunReply {
+            text: format!("no plugin tool is named '{tool}'"),
+            is_error: true,
+        };
+        let Some(instance) = self.tools.get(tool).and_then(|at| self.instances.get(*at)) else {
+            return unknown();
+        };
+        let (reply, answer) = oneshot::channel();
+        let job = InJob::Run {
+            tool: tool.to_string(),
+            args: args.to_string(),
+            reply,
+        };
+        if instance.jobs.send(job).await.is_err() {
+            return unknown();
+        }
+        match answer.await {
+            Ok(out) => out,
+            Err(_) => unknown(),
+        }
+    }
+
+    /// Runs one slash command on the instance that owns its name.
+    async fn command(&self, name: &str, args: &str) -> Option<String> {
+        let unknown = || Some(format!("plugins: no command is named '/{name}'"));
+        let Some(instance) = self
+            .commands
+            .get(name)
+            .and_then(|at| self.instances.get(*at))
+        else {
+            return unknown();
+        };
+        let (reply, answer) = oneshot::channel();
+        let job = InJob::Command {
+            name: name.to_string(),
+            args: args.to_string(),
+            reply,
+        };
+        if instance.jobs.send(job).await.is_err() {
+            return unknown();
+        }
+        answer.await.ok().unwrap_or_else(unknown)
+    }
+
+    /// Walks the `tool.call` layers in load order, each plugin on the arguments
+    /// the one before it made.
+    async fn call(&self, tool: &str, args: &str) -> CallReply {
+        // The text goes to each plugin as it is, and is written again only
+        // when a layer replaced it: each instance parses what it gets.
+        let mut current: Option<String> = None;
+        for instance in self.instances.iter().filter(|entry| entry.shares.call) {
+            let (reply, answer) = oneshot::channel();
+            let job = InJob::Call {
+                tool: tool.to_string(),
+                args: current.as_deref().unwrap_or(args).to_string(),
+                reply,
+            };
+            if instance.jobs.send(job).await.is_err() {
+                continue;
+            }
+            match answer.await {
+                Ok(Step::Keep) => {}
+                Ok(Step::Args(next)) => current = Some(next.to_string()),
+                Ok(Step::Block(reason)) => return CallReply::Block(reason),
+                Err(_) => {}
+            }
+        }
+        match current {
+            Some(next) => CallReply::Args(next),
+            None => CallReply::Keep,
+        }
+    }
+
+    /// Walks the `tool.result` layers in load order, each plugin on the output
+    /// the one before it made.
+    async fn result(&self, tool: &str, args: &str, first: (String, bool)) -> ResultReply {
+        let (mut text, mut is_error) = first;
+        let mut said = (None, None);
+        for instance in self.instances.iter().filter(|entry| entry.shares.result) {
+            let (reply, answer) = oneshot::channel();
+            let job = InJob::Result {
+                tool: tool.to_string(),
+                args: args.to_string(),
+                text: text.clone(),
+                is_error,
+                reply,
+            };
+            if instance.jobs.send(job).await.is_err() {
+                continue;
+            }
+            let Ok(next) = answer.await else {
+                continue;
+            };
+            if let Some(next) = next.text {
+                text = next.clone();
+                said.0 = Some(next);
+            }
+            if let Some(next) = next.is_error {
+                is_error = next;
+                said.1 = Some(next);
+            }
+        }
+        ResultReply {
+            text: said.0,
+            is_error: said.1,
+        }
+    }
+
+    /// Walks the `turn.end` layers in load order and keeps every follow-up.
+    async fn turn(&self, index: u32, ran_tools: bool, text: &str) -> Vec<String> {
+        let mut follow = Vec::new();
+        for instance in self.instances.iter().filter(|entry| entry.shares.turn) {
+            let (reply, answer) = oneshot::channel();
+            let job = InJob::Turn {
+                index,
+                ran_tools,
+                text: text.to_string(),
+                reply,
+            };
+            if instance.jobs.send(job).await.is_err() {
+                continue;
+            }
+            if let Ok(next) = answer.await {
+                follow.extend(next);
+            }
+        }
+        follow
+    }
+
+    /// Hands one event to every instance that waits on it, in load order.
+    async fn event(&self, name: &str, payload: &JsonValue) {
+        let Some(bit) = api::event_bit(name) else {
+            return;
+        };
+        for instance in self
+            .instances
+            .iter()
+            .filter(|entry| entry.shares.events & bit != 0)
+        {
+            let (reply, answer) = oneshot::channel();
+            let job = InJob::Event {
+                name: name.to_string(),
+                payload: payload.clone(),
+                reply,
+            };
+            if instance.jobs.send(job).await.is_err() {
+                continue;
+            }
+            let _ = answer.await;
+        }
+    }
+
+    /// Ends every instance and waits for each one: every runtime clears its
+    /// timers and frees its Node state before this answers.
+    async fn stop(self) {
+        let mut tasks = Vec::with_capacity(self.instances.len());
+        for instance in self.instances {
+            drop(instance.jobs);
+            tasks.push(instance.task);
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+        super::node::drop_shared();
+    }
+}
+
+/// One plugin's whole life: its own runtime, its own context, its own watchdog,
+/// its own timers and its own Node state, on the plugin thread.
 ///
 /// Everything from the setup to the last job runs inside one `async_with`, the
 /// rquickjs half of [`AsyncRuntime::drive`]: while the closure waits for the
-/// next job, that future runs the pending promise jobs and polls the futures a
-/// plugin spawned (its timers), and it holds the runtime lock only while it
-/// polls. Driving the runtime as a second task instead would race this one for
-/// that lock, so the pump of the one `async_with` is what drives it.
-async fn serve(mut queue: Receiver<Job>, notes: Arc<Mutex<Notes>>, live: Arc<Live>) {
+/// next job, that future runs the pending promise jobs of this runtime and polls
+/// the futures its plugin spawned (its timers), and it holds the runtime lock
+/// only while it polls. Driving a runtime as a second task instead would race
+/// its `async_with` for that lock, so the pump of the one `async_with` is what
+/// drives it.
+async fn instance(
+    index: usize,
+    manifest: Manifest,
+    pins: Option<Arc<Pinned>>,
+    mut queue: Receiver<InJob>,
+    shared: Shared,
+    loaded: oneshot::Sender<Result<InstanceLoad, Failed>>,
+) {
     let Ok(runtime) = AsyncRuntime::new() else {
         note(
-            &notes,
+            &shared.notes,
             "plugins: the JavaScript runtime did not start".into(),
         );
+        let _ = loaded.send(Err(Failed::Stopped(STOP)));
         return;
     };
-    runtime.set_memory_limit(MEMORY_CAP).await;
+    runtime.set_memory_limit(PLUGIN_MEMORY).await;
     let watch = Rc::new(Watch::new());
     runtime.set_interrupt_handler(Some(watch.handler())).await;
-    let folders = Arc::new(Mutex::new(HashSet::new()));
     let loader = PluginLoader {
-        folders: Arc::clone(&folders),
+        folder: manifest.dir.clone(),
+        pins,
     };
     runtime.set_loader(loader.clone(), loader).await;
     let Ok(context) = AsyncContext::full(&runtime).await else {
         note(
-            &notes,
+            &shared.notes,
             "plugins: the JavaScript context did not start".into(),
         );
+        let _ = loaded.send(Err(Failed::Stopped(STOP)));
         return;
     };
     context
@@ -276,9 +798,9 @@ async fn serve(mut queue: Receiver<Job>, notes: Arc<Mutex<Notes>>, live: Arc<Liv
             // The timers of this context, emptied before it ends so no callback
             // outlives it.
             let clock = Rc::new(Timers::default());
-            if let Err(error) = timers(&ctx, &clock, &watch, &notes) {
+            if let Err(error) = timers(&ctx, &clock, &watch, &shared.notes) {
                 note(
-                    &notes,
+                    &shared.notes,
                     format!("plugins: the timers did not start: {error}"),
                 );
             }
@@ -286,26 +808,43 @@ async fn serve(mut queue: Receiver<Job>, notes: Arc<Mutex<Notes>>, live: Arc<Liv
             // read, which this holds out of the globals; dropped here, before
             // the context it belongs to ends.
             #[cfg(feature = "node")]
-            let held = match super::node::setup(&ctx).await {
+            let held = match super::node::setup(&ctx, index).await {
                 Ok(held) => Some(held),
                 Err(error) => {
                     note(
-                        &notes,
+                        &shared.notes,
                         format!("plugins: the node modules did not start: {error}"),
                     );
                     None
                 }
             };
-            let mut engine = Engine::new();
-            let mut waiting = Waiting {
-                queue: &mut queue,
-                watch: &watch,
-                notes: &notes,
-                ctx: &ctx,
-                window: None,
+            let mut engine =
+                Engine::new(Rc::clone(&shared.names), Rc::clone(&shared.command_names));
+            let outcome = load_one(&ctx, &mut engine, &manifest, &watch, &shared, index).await;
+            let shares = Shares {
+                call: !engine.call.is_empty(),
+                result: !engine.result.is_empty(),
+                turn: !engine.turn.is_empty(),
+                events: engine
+                    .listeners
+                    .iter()
+                    .filter_map(|listener| api::event_bit(&listener.event))
+                    .fold(0, |bits, bit| bits | bit),
             };
-            while let Some(job) = (&mut waiting).await {
-                handle(&ctx, &mut engine, &watch, &notes, &live, &folders, job).await;
+            // A plugin that did not load answers no job: its runtime ends here.
+            let serves = outcome.is_ok();
+            let _ = loaded.send(outcome.map(|owned| InstanceLoad { owned, shares }));
+            if serves {
+                let mut waiting = Waiting {
+                    queue: &mut queue,
+                    watch: &watch,
+                    notes: &shared.notes,
+                    ctx: &ctx,
+                    window: None,
+                };
+                while let Some(job) = (&mut waiting).await {
+                    answer(&ctx, &engine, &watch, &shared.notes, job).await;
+                }
             }
             clock.clear();
             #[cfg(feature = "node")]
@@ -314,43 +853,28 @@ async fn serve(mut queue: Receiver<Job>, notes: Arc<Mutex<Notes>>, live: Arc<Liv
         .await;
 }
 
-/// Answers one job.
-async fn handle(
+/// Answers one job of this plugin's queue.
+async fn answer(
     ctx: &Ctx<'_>,
-    engine: &mut Engine,
+    engine: &Engine,
     watch: &Rc<Watch>,
-    notes: &Arc<Mutex<Notes>>,
-    live: &Arc<Live>,
-    folders: &Mutex<HashSet<PathBuf>>,
-    job: Job,
+    notes: &Mutex<Notes>,
+    job: InJob,
 ) {
     match job {
-        Job::Load {
-            root: dir,
-            session,
-            state,
-            sandbox,
-            reply,
-        } => {
-            super::node::session(&session);
-            super::node::state(&state);
-            super::node::sandbox(sandbox);
-            let report = load_all(ctx, engine, &dir, watch, notes, live, folders).await;
-            let _ = reply.send(report);
-        }
-        Job::Run { tool, args, reply } => {
+        InJob::Run { tool, args, reply } => {
             let out = run_tool(ctx, engine, watch, notes, &tool, &args).await;
             let _ = reply.send(out);
         }
-        Job::Command { name, args, reply } => {
+        InJob::Command { name, args, reply } => {
             let out = run_command(ctx, engine, watch, notes, &name, &args).await;
             let _ = reply.send(out);
         }
-        Job::Call { tool, args, reply } => {
+        InJob::Call { tool, args, reply } => {
             let out = chain_call(ctx, engine, watch, notes, &tool, &args).await;
             let _ = reply.send(out);
         }
-        Job::Result {
+        InJob::Result {
             tool,
             args,
             text,
@@ -360,7 +884,7 @@ async fn handle(
             let out = chain_result(ctx, engine, watch, notes, &tool, &args, (text, is_error)).await;
             let _ = reply.send(out);
         }
-        Job::Turn {
+        InJob::Turn {
             index,
             ran_tools,
             text,
@@ -369,7 +893,14 @@ async fn handle(
             let out = chain_turn(ctx, engine, watch, notes, index, ran_tools, &text).await;
             let _ = reply.send(out);
         }
-        Job::Event { name, payload } => fire(ctx, engine, watch, notes, &name, &payload).await,
+        InJob::Event {
+            name,
+            payload,
+            reply,
+        } => {
+            fire(ctx, engine, watch, notes, &name, &payload).await;
+            let _ = reply.send(());
+        }
     }
 }
 
@@ -565,7 +1096,7 @@ impl Watch {
 /// its window without a note.
 struct Waiting<'a, 'js> {
     /// The queue of jobs.
-    queue: &'a mut Receiver<Job>,
+    queue: &'a mut Receiver<InJob>,
     /// The watchdog the window belongs to.
     watch: &'a Watch,
     /// Where a stopped job leaves its note.
@@ -577,9 +1108,9 @@ struct Waiting<'a, 'js> {
 }
 
 impl Future for Waiting<'_, '_> {
-    type Output = Option<Job>;
+    type Output = Option<InJob>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Job>> {
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<InJob>> {
         let this = self.get_mut();
         // The jobs that ran since the last poll ran under that poll's window.
         this.end();
@@ -668,6 +1199,21 @@ async fn watched<T>(
     if slow {
         note(notes, format!("plugin {}: {what} is slow", who.name));
     }
+    if let Err(Failed::Threw(reason)) = &out
+        && reason == OUT_OF_MEMORY
+    {
+        // The call fails, and the plugin keeps its runtime: collecting what it
+        // can leaves room for its next call.
+        ctx.run_gc();
+        note(
+            notes,
+            format!(
+                "plugin {}: out of memory (the cap is {} MiB per plugin)",
+                who.name,
+                PLUGIN_MEMORY >> 20
+            ),
+        );
+    }
     out
 }
 
@@ -752,6 +1298,7 @@ fn timer_setter<'js>(
                 cancel,
                 callback,
                 args: args.0,
+                deadline: tokio::time::Instant::now() + delay,
             };
             let Some(id) = waiting.add(timer) else {
                 return Err(Exception::throw_range(&ctx, "too many timers are waiting"));
@@ -777,7 +1324,7 @@ fn timer_setter<'js>(
                     // The callback and its arguments wait in the map, so a
                     // `clearTimeout` frees them at once, even before the
                     // scheduler polls this future.
-                    let Some((callback, args)) = waiting.next(id, repeat) else {
+                    let Some((callback, args)) = waiting.next(id, repeat, delay) else {
                         return;
                     };
                     tick(&watch, &notes, &callback, args).await;
@@ -863,6 +1410,9 @@ struct Timer<'js> {
     callback: Function<'js>,
     /// The arguments it takes.
     args: Vec<Value<'js>>,
+    /// When its sleep ends: past it, the timer waits only for the scheduler to
+    /// poll the future that runs it.
+    deadline: tokio::time::Instant,
 }
 
 impl<'js> Timers<'js> {
@@ -870,8 +1420,17 @@ impl<'js> Timers<'js> {
     /// many futures are still alive.
     fn add(&self, timer: Timer<'js>) -> Option<u32> {
         let mut waiting = self.live.borrow_mut();
-        if waiting.len() >= TIMERS || self.running.get() >= RUNNING {
-            return None;
+        if self.running.get() >= RUNNING || waiting.len() >= TIMERS {
+            // A timer whose delay has ended holds its entry until the scheduler
+            // polls the future that runs it, and it is not waiting any more.
+            let now = tokio::time::Instant::now();
+            let still = waiting
+                .values()
+                .filter(|timer| timer.deadline > now)
+                .count();
+            if still >= TIMERS || self.running.get() >= RUNNING {
+                return None;
+            }
         }
         let id = self.last.get().wrapping_add(1);
         self.last.set(id);
@@ -893,10 +1452,16 @@ impl<'js> Timers<'js> {
     /// Takes the callback and arguments of the timer about to run; a repeating
     /// timer keeps its entry, so it stays waiting and can be cleared, and a
     /// one-shot's entry is spent.
-    fn next(&self, id: u32, repeat: bool) -> Option<(Function<'js>, Vec<Value<'js>>)> {
+    fn next(
+        &self,
+        id: u32,
+        repeat: bool,
+        delay: Duration,
+    ) -> Option<(Function<'js>, Vec<Value<'js>>)> {
         let mut waiting = self.live.borrow_mut();
         if repeat {
-            let timer = waiting.get(&id)?;
+            let timer = waiting.get_mut(&id)?;
+            timer.deadline = tokio::time::Instant::now() + delay;
             return Some((timer.callback.clone(), timer.args.clone()));
         }
         let timer = waiting.remove(&id)?;
@@ -924,11 +1489,11 @@ impl Drop for Alive<'_> {
     }
 }
 
-/// The plugins that loaded and everything they registered.
+/// Everything one plugin registered.
 struct Engine {
-    /// Every tool name taken, so a duplicate throws at load.
+    /// Every tool name taken on the thread, so a duplicate throws at load.
     names: Rc<RefCell<HashSet<String>>>,
-    /// Every command name taken, so a duplicate is refused.
+    /// Every command name taken on the thread, so a duplicate is refused.
     command_names: Rc<RefCell<HashSet<String>>>,
     /// The tools, in load order.
     tools: Vec<Registered>,
@@ -991,10 +1556,14 @@ struct Listener {
 }
 
 impl Engine {
-    fn new() -> Self {
+    /// The empty engine of one plugin, over the names every plugin shares.
+    fn new(
+        names: Rc<RefCell<HashSet<String>>>,
+        command_names: Rc<RefCell<HashSet<String>>>,
+    ) -> Self {
         Self {
-            names: Rc::new(RefCell::new(HashSet::new())),
-            command_names: Rc::new(RefCell::new(HashSet::new())),
+            names,
+            command_names,
             tools: Vec::new(),
             commands: Vec::new(),
             call: Vec::new(),
@@ -1003,79 +1572,6 @@ impl Engine {
             listeners: Vec::new(),
         }
     }
-}
-
-/// Reads every plugin folder under `root` and loads them in folder order.
-async fn load_all(
-    ctx: &Ctx<'_>,
-    engine: &mut Engine,
-    root: &Path,
-    watch: &Rc<Watch>,
-    notes: &Arc<Mutex<Notes>>,
-    live: &Arc<Live>,
-    folders: &Mutex<HashSet<PathBuf>>,
-) -> LoadReport {
-    let mut report = LoadReport::default();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "runs on the plugin thread, off the async runtime"
-    )]
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return report;
-    };
-    let mut dirs: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
-    dirs.sort();
-    // Each name loaded so far and the folder it came from: the manifest name
-    // is what panels are prefixed with, so two plugins may not share it.
-    let mut names: Vec<(String, PathBuf)> = Vec::new();
-    for dir in dirs {
-        let folder = dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        match manifest::read(&dir) {
-            Found::Skipped => {}
-            Found::Bad(reason) => note(notes, format!("plugin {folder}: {reason}")),
-            Found::Plugin(manifest) => {
-                if let Some((_, taken)) = names.iter().find(|(name, _)| *name == manifest.name) {
-                    note(
-                        notes,
-                        format!(
-                            "plugin {folder}: the name '{}' is already taken by the plugin at {}",
-                            manifest.name,
-                            taken.display()
-                        ),
-                    );
-                    continue;
-                }
-                match load_one(ctx, engine, &manifest, watch, notes, live, folders).await {
-                    Ok(owned) => {
-                        names.push((manifest.name.clone(), dir));
-                        report.loaded += 1;
-                        report.tools.extend(owned.tools);
-                        report.commands.extend(owned.commands);
-                    }
-                    Err(Failed::Threw(reason)) => {
-                        note(notes, format!("plugin {folder}: {reason}"));
-                    }
-                    Err(Failed::Stopped(_)) => {}
-                }
-            }
-        }
-    }
-    report.call = !engine.call.is_empty();
-    report.result = !engine.result.is_empty();
-    report.turn = !engine.turn.is_empty();
-    report.events = engine
-        .listeners
-        .iter()
-        .filter_map(|listener| api::event_bit(&listener.event))
-        .fold(0, |bits, bit| bits | bit);
-    report
 }
 
 /// What one plugin registered, for the load report.
@@ -1092,27 +1588,18 @@ async fn load_one(
     engine: &mut Engine,
     manifest: &Manifest,
     watch: &Rc<Watch>,
-    notes: &Arc<Mutex<Notes>>,
-    live: &Arc<Live>,
-    folders: &Mutex<HashSet<PathBuf>>,
+    shared: &Shared,
+    index: usize,
 ) -> Result<Owned, Failed> {
+    let notes = &shared.notes;
+    let live = &shared.live;
     #[expect(
         clippy::disallowed_methods,
         reason = "runs on the plugin thread, off the async runtime"
     )]
     let source = std::fs::read_to_string(&manifest.entry)
         .map_err(|error| Failed::Threw(format!("{}: {error}", manifest.entry.display())))?;
-    // Every plugin's own folder, so its imports resolve inside it and not in
-    // the folder of the plugin that happened to load last. Its place is the
-    // index its Node wrapper modules carry.
-    let index = match folders.lock() {
-        Ok(mut folders) => {
-            let index = folders.len();
-            folders.insert(manifest.dir.clone());
-            index
-        }
-        Err(_) => 0,
-    };
+    // The Node state of this plugin, at the index its wrapper modules carry.
     match super::node::register(index, manifest) {
         Ok(lines) => {
             for line in lines {
@@ -1387,7 +1874,8 @@ fn stopped(limit: Duration) -> RunReply {
     }
 }
 
-/// Runs every `tool.call` layer in load order, each on the previous value.
+/// Runs this plugin's `tool.call` layers in load order, each on the previous
+/// value, and answers what the last of them made of the arguments.
 async fn chain_call(
     ctx: &Ctx<'_>,
     engine: &Engine,
@@ -1395,7 +1883,7 @@ async fn chain_call(
     notes: &Mutex<Notes>,
     tool: &str,
     args: &str,
-) -> CallReply {
+) -> Step {
     let mut current = args_object(args);
     let mut changed = false;
     for layer in &engine.call {
@@ -1429,7 +1917,7 @@ async fn chain_call(
                 current = next;
                 changed = true;
             }
-            Ok(Step::Block(reason)) => return CallReply::Block(reason),
+            Ok(Step::Block(reason)) => return Step::Block(reason),
             Err(Failed::Threw(message)) => note(
                 notes,
                 format!("plugin {}: hook tool.call threw: {message}", layer.plugin),
@@ -1438,9 +1926,9 @@ async fn chain_call(
         }
     }
     if changed {
-        CallReply::Args(current.to_string())
+        Step::Args(current)
     } else {
-        CallReply::Keep
+        Step::Keep
     }
 }
 
@@ -1744,6 +2232,8 @@ impl<F: Future + Unpin> Future for Sliced<'_, F> {
 fn failure(ctx: &Ctx<'_>, error: Error) -> Failed {
     if error.is_exception() {
         Failed::Threw(api::thrown(ctx, ctx.catch()))
+    } else if matches!(error, Error::Allocation) {
+        Failed::Threw(OUT_OF_MEMORY.to_string())
     } else {
         Failed::Threw(error.to_string())
     }
@@ -1762,23 +2252,13 @@ fn args_object(args: &str) -> JsonValue {
     }
 }
 
-/// Resolves and loads the imports of every plugin, inside its own folder.
+/// Resolves and loads the imports of one plugin, inside its own folder.
 #[derive(Clone)]
 struct PluginLoader {
-    /// The canonical folder of every plugin that loaded.
-    folders: Arc<Mutex<HashSet<PathBuf>>>,
-}
-
-impl PluginLoader {
-    /// The plugin folder `base` belongs to, the deepest one when they nest.
-    fn folder_of(&self, base: &Path) -> Option<PathBuf> {
-        let folders = self.folders.lock().ok()?;
-        folders
-            .iter()
-            .filter(|folder| base.starts_with(folder))
-            .max_by_key(|folder| folder.as_os_str().len())
-            .cloned()
-    }
+    /// The canonical folder of the plugin: the only one its imports name.
+    folder: PathBuf,
+    /// What the plugin's install pinned, when it has a lockfile.
+    pins: Option<Arc<Pinned>>,
 }
 
 impl Resolver for PluginLoader {
@@ -1794,13 +2274,28 @@ impl Resolver for PluginLoader {
         if let Some(found) = super::node::resolve(ctx, base, name) {
             return found;
         }
-        // The importing module says which plugin's folder the import must
-        // stay inside, never the plugin that loaded last.
-        let base = Path::new(base);
-        match self
-            .folder_of(base)
-            .and_then(|folder| resolve_import(&folder, base, name))
+        // A bare name of an installed plugin loads the file its lockfile names,
+        // and no other.
+        if let Some(pins) = &self.pins
+            && !name.starts_with('.')
+            && !name.starts_with('/')
         {
+            let message = match pins.import(name) {
+                Some(path) => return Ok(path.to_string_lossy().into_owned()),
+                None => format!("cannot import '{name}': not in the plugin's lockfile"),
+            };
+            return Err(Exception::throw_message(ctx, &message));
+        }
+        // The runtime holds one plugin's code, so its own folder is the only
+        // one an import of it may stay inside.
+        let base = Path::new(base);
+        match resolve_import(&self.folder, base, name) {
+            // An installed plugin reads only the files its install pinned.
+            Some(path) if self.pins.as_ref().is_some_and(|pins| !pins.pins(&path)) => {
+                let message =
+                    format!("cannot import '{name}': the file is not in the plugin's lockfile");
+                Err(Exception::throw_message(ctx, &message))
+            }
             Some(path) => Ok(path.to_string_lossy().into_owned()),
             None => {
                 let message = format!(
@@ -1853,4 +2348,74 @@ fn resolve_import(root: &Path, base: &Path, name: &str) -> Option<PathBuf> {
     )]
     let path = std::fs::canonicalize(base.parent()?.join(name)).ok()?;
     path.starts_with(root).then_some(path)
+}
+
+/// What the lockfile of an installed plugin pins: the canonical path of every
+/// file its install fetched, and the file each of its bare imports loads.
+struct Pinned {
+    /// The canonical paths of the files the lock pins.
+    files: HashSet<PathBuf>,
+    /// The canonical path each bare import name loads.
+    imports: HashMap<String, PathBuf>,
+}
+
+impl Pinned {
+    /// The files and bare imports of `lock`, as canonical paths inside `dir`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "runs on the plugin thread, off the async runtime"
+    )]
+    fn new(dir: &Path, lock: &Lock) -> Self {
+        // Built once per load, so no import of the plugin touches the disk.
+        let at = |path: &str| std::fs::canonicalize(dir.join(path)).ok();
+        Self {
+            files: lock.files.keys().filter_map(|path| at(path)).collect(),
+            imports: lock
+                .imports
+                .iter()
+                .filter_map(|(name, path)| Some((name.clone(), at(path)?)))
+                .collect(),
+        }
+    }
+
+    /// Whether `path` is one of the pinned files.
+    fn pins(&self, path: &Path) -> bool {
+        self.files.contains(path)
+    }
+
+    /// The file the bare import `name` loads.
+    fn import(&self, name: &str) -> Option<&Path> {
+        self.imports.get(name).map(PathBuf::as_path)
+    }
+}
+
+/// What the lockfile `lock` of `manifest`'s plugin pins, once every file it
+/// names is on disk as its install wrote it.
+fn pinned(manifest: &Manifest, lock: &Lock) -> Result<Pinned, String> {
+    lock.verify(&manifest.dir)?;
+    let entry = lock_path(&manifest.dir, &manifest.entry).ok_or_else(|| {
+        format!(
+            "the entry {} leaves the plugin folder",
+            manifest.entry.display()
+        )
+    })?;
+    if !lock.files.contains_key(&entry) {
+        return Err(format!("the entry {entry} is not in {}", lock::FILE));
+    }
+    Ok(Pinned::new(&manifest.dir, lock))
+}
+
+/// `path` as a lockfile names it from `folder`: with `/` between the parts.
+fn lock_path(folder: &Path, path: &Path) -> Option<String> {
+    let mut out = String::new();
+    for part in path.strip_prefix(folder).ok()?.components() {
+        let Component::Normal(part) = part else {
+            return None;
+        };
+        if !out.is_empty() {
+            out.push('/');
+        }
+        out.push_str(part.to_str()?);
+    }
+    (!out.is_empty()).then_some(out)
 }

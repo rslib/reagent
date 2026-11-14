@@ -1246,7 +1246,7 @@ async fn child_group_ends_with_its_program() {
 }
 
 #[tokio::test]
-async fn child_stop_by_index() {
+async fn child_of_a_failed_twin_ends_at_load() {
     let root = temp_root();
     let session = temp_root();
     let (path, _) = helper(session.path()).await;
@@ -1255,16 +1255,14 @@ async fn child_stop_by_index() {
     let permissions = r#"{"fs": {"write": ["./"]}, "run": ["sleep"]}"#;
     // Two plugins of one name: the loader frees the name of a plugin that
     // failed, so the second one loads with the name of the first. The first
-    // starts its child from a timer, while the call of the second is the one
-    // the watchdog stops: a stop that went by name would take that child with
-    // it.
+    // starts a child and then fails: its runtime ends with its load, and the
+    // child with it, so no child of a dead plugin is left for the stop of the
+    // second to match.
     let armed = format!(
         r#"import {{ spawn }} from "node:child_process";
 {FS}
-setTimeout(() => {{
-  const child = spawn("sleep", ["1000"]);
-  writeFileSync({file:?}, String(child.pid));
-}}, 300);
+const child = spawn("sleep", ["1000"]);
+writeFileSync({file:?}, String(child.pid));
 throw new Error("this plugin fails on purpose");
 "#,
         file = first.to_string_lossy()
@@ -1311,17 +1309,10 @@ export default function (reagent) {{
         notes.iter().any(|note| note.contains("fails on purpose")),
         "{notes:?}"
     );
+    gone(pid_of(&first).await).await;
     let out = run(&plugins, "second").await;
     assert!(out.is_error, "the call was not stopped: {out:?}");
-    let stopped = pid_of(&second).await;
-    gone(stopped).await;
-    // The child of the other plugin of that name, started while this call ran,
-    // is not the one the stop was for.
-    let kept = pid_of(&first).await;
-    assert!(
-        alive(kept),
-        "{kept} was killed by the stop of another plugin"
-    );
+    gone(pid_of(&second).await).await;
 }
 
 #[tokio::test]

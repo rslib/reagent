@@ -32,6 +32,8 @@ use reagent_ai::oauth::session::Session;
 use reagent_config::permissions::PermissionMode;
 use reagent_protocol::discovery;
 use reagent_protocol::discovery::Entry;
+use reagent_protocol::discovery::Wait;
+use reagent_protocol::discovery::WaitKind;
 use reagent_protocol::hub;
 use reagent_protocol::lines::Lines;
 use reagent_protocol::message;
@@ -39,6 +41,7 @@ use reagent_protocol::message::InitializeResult;
 use reagent_protocol::message::MAJOR;
 use reagent_protocol::message::Request;
 use reagent_protocol::message::RpcError;
+use reagent_protocol::message::SkillInfo;
 use reagent_protocol::token;
 use reagent_script::plugin::PanelView;
 use reagent_script::plugin::Plugins;
@@ -279,6 +282,9 @@ fn open(folder: &Path, session: &str, cwd: PathBuf) -> Result<Option<Opened>, St
         cwd,
         started_ms: reagent_store::paths::now_ms(),
         waiting: false,
+        state: discovery::State::Idle,
+        wait: None,
+        terminal: terminal(),
     };
     discovery::write_blocking(folder, &entry)
         .map_err(|error| format!("{}: {error}", folder.display()))?;
@@ -289,6 +295,14 @@ fn open(folder: &Path, session: &str, cwd: PathBuf) -> Result<Option<Opened>, St
         token,
         entry,
     }))
+}
+
+/// The terminal that started this worker, from the `HC_TERMINAL_ID` of its
+/// environment, read once so a supervisor can tell where the run shows.
+fn terminal() -> Option<String> {
+    std::env::var("HC_TERMINAL_ID")
+        .ok()
+        .filter(|id| !id.is_empty())
 }
 
 /// The lock file of `session`, or `None` when another process holds it.
@@ -448,6 +462,18 @@ impl Worker {
     /// and the messages they send go to every client of the session.
     pub(crate) fn plugins(&mut self, plugins: Arc<Plugins>) {
         self.shared.set_plugins(plugins);
+    }
+
+    /// Takes the skills the run found: the `initialize` answer of every client
+    /// names them, and a run that found none names none.
+    pub(crate) fn skills(&mut self, found: Vec<crate::skills::Found>) {
+        self.shared.set_skills(found);
+    }
+
+    /// The shared state of the session: its settings, and the model and the
+    /// provider a usage line names.
+    pub(crate) fn shared(&self) -> Arc<Shared> {
+        Arc::clone(&self.shared)
     }
 
     /// The socket this run takes clients on, when it takes any.
@@ -743,7 +769,7 @@ struct State {
     running: bool,
     /// The approval or the question the open run waits for a person to
     /// answer, if it waits for one.
-    wait: Option<u64>,
+    wait: Option<Wait>,
     /// Whether the worker has queued its own work.
     armed: bool,
     /// The newest record the journal committed.
@@ -804,11 +830,38 @@ impl State {
                 self.wait = None;
                 self.end = *reason;
             }
-            Event::ApprovalRequest(request) => self.wait = Some(request.id),
-            Event::QuestionRequest(request) => self.wait = Some(request.id),
+            Event::ApprovalRequest(request) => {
+                self.wait = Some(Wait {
+                    kind: WaitKind::Approval,
+                    id: request.id,
+                })
+            }
+            Event::QuestionRequest(request) => {
+                self.wait = Some(Wait {
+                    kind: WaitKind::Question,
+                    id: request.id,
+                })
+            }
             Event::ApprovalResolved { .. } | Event::QuestionResolved { .. } => self.wait = None,
             Event::Committed { record } => self.committed = self.committed.max(*record),
             _ => {}
+        }
+    }
+
+    /// What the discovery entry of this worker says of the run: the state a
+    /// supervisor reads, and the request that waits for a person.
+    ///
+    /// It changes on a run start, a run end and a wait, which are the three
+    /// moments the entry is written.
+    fn stamp(&self) -> Stamp {
+        let state = match self.wait {
+            Some(_) => discovery::State::Blocked,
+            None if self.running => discovery::State::Working,
+            None => discovery::State::Idle,
+        };
+        Stamp {
+            state,
+            wait: self.wait,
         }
     }
 
@@ -901,10 +954,18 @@ impl Model {
     }
 }
 
+/// What the discovery entry of one worker says of its run: the state and the
+/// request that waits for a person, if one does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    state: discovery::State,
+    wait: Option<Wait>,
+}
+
 /// The discovery entry of one worker and the folder it goes in.
 ///
-/// Only the run's wait for a person changes it, and only after the frame of
-/// that change has gone to the clients of the session.
+/// The run's state and its wait for a person change it, and only after the
+/// frame of that change has gone to the clients of the session.
 #[derive(Clone)]
 struct Mark {
     folder: PathBuf,
@@ -912,17 +973,24 @@ struct Mark {
 }
 
 impl Mark {
-    /// Writes the entry again, saying whether the run waits for a person.
+    /// Writes the entry again with what the run does now.
     ///
-    /// The write of a value the entry already carries does nothing, and a
-    /// write that fails costs the mark, not the run.
-    async fn waiting(&mut self, waiting: bool) {
-        if self.entry.waiting == waiting {
+    /// The write of a value the entry already carries does nothing, so no
+    /// stream event writes a file, and a write that fails costs the mark, not
+    /// the run.
+    async fn stamp(&mut self, stamp: Stamp) {
+        let waiting = stamp.wait.is_some();
+        if self.entry.state == stamp.state
+            && self.entry.wait == stamp.wait
+            && self.entry.waiting == waiting
+        {
             return;
         }
+        self.entry.state = stamp.state;
+        self.entry.wait = stamp.wait;
         self.entry.waiting = waiting;
         if let Err(error) = discovery::write(&self.folder, &self.entry).await {
-            eprintln!("reagent: warning: could not mark the waiting request: {error}");
+            eprintln!("reagent: warning: could not mark the state of the run: {error}");
         }
     }
 }
@@ -944,6 +1012,9 @@ pub(crate) struct Shared {
     /// The plugins of the run, set once before the servers start: `None` for a
     /// run with no plugins, which sends no frame of its own.
     plugins: OnceLock<Arc<Plugins>>,
+    /// The skills the run found, set once before the servers start: the
+    /// `initialize` answer names them, and a run with none names none.
+    skills: OnceLock<Vec<crate::skills::Found>>,
     /// Bumped on every change of `state`, so a wait wakes on it.
     changed: watch::Sender<u64>,
 }
@@ -958,6 +1029,7 @@ impl Shared {
             stdin: Mutex::new(None),
             held: Mutex::new(None),
             plugins: OnceLock::new(),
+            skills: OnceLock::new(),
             changed,
         }
     }
@@ -971,6 +1043,16 @@ impl Shared {
     /// The plugins of the run, or `None` when the run loaded none.
     fn plugins(&self) -> Option<&Arc<Plugins>> {
         self.plugins.get()
+    }
+
+    /// Takes the skills the run found, for every `initialize` answer to name.
+    fn set_skills(&self, found: Vec<crate::skills::Found>) {
+        let _ = self.skills.set(found);
+    }
+
+    /// The skills the run found, empty when it found none.
+    fn skills(&self) -> &[crate::skills::Found] {
+        self.skills.get().map(Vec::as_slice).unwrap_or_default()
     }
 
     /// The state of a session served by `args`, with the provider and model
@@ -1021,6 +1103,22 @@ impl Shared {
     }
 
     /// The model of the session, locked for one short read or write.
+    /// The reagent provider id that serves the session and the model id a
+    /// usage line names: the provider of its model and the bare id it takes.
+    pub(crate) fn names(&self) -> (Option<Text>, Text) {
+        let model = self.model();
+        let provider = model.provider.clone();
+        let id = match provider
+            .as_deref()
+            .and_then(|provider| model.text.strip_prefix(provider))
+            .and_then(|rest| rest.strip_prefix('/'))
+        {
+            Some(id) => Text::from(id),
+            None => model.text.clone(),
+        };
+        (provider, id)
+    }
+
     fn model(&self) -> MutexGuard<'_, Model> {
         self.model
             .lock()
@@ -1143,15 +1241,14 @@ impl Shared {
 
     /// Takes one event of the run: the state, then the frame every client gets.
     ///
-    /// It says whether the run now waits for a person, and that value is
-    /// `Some` only when the wait began or ended.
-    fn observe(&self, event: &Event, frame: hub::Frame) -> Option<bool> {
-        let waiting = {
+    /// It says what the run does now. The caller compares it with what the
+    /// entry last held: a run the worker starts itself is `running` before
+    /// its first event, so a change seen here alone would miss it.
+    fn observe(&self, event: &Event, frame: hub::Frame) -> Stamp {
+        let stamp = {
             let mut state = self.state();
-            let before = state.wait.is_some();
             state.observe(event);
-            let after = state.wait.is_some();
-            (before != after).then_some(after)
+            state.stamp()
         };
         let mut frames = self.hub();
         if let Event::Committed { record } = event {
@@ -1160,7 +1257,13 @@ impl Shared {
         frames.send(frame, fanout::kind(event));
         drop(frames);
         self.tell();
-        waiting
+        stamp
+    }
+
+    /// The frame of the request of `kind` with `id` that waits for a person, or
+    /// `None` when this run waits for no such request.
+    fn waiting(&self, kind: WaitKind, id: u64) -> Option<hub::Frame> {
+        self.hub().waiting(kind, id).cloned()
     }
 
     /// The id of the next message a client sends, one for every `send` of every
@@ -1499,6 +1602,15 @@ async fn join(
         let model = shared.model();
         (Arc::clone(&model.text), model.window, model.level.clone())
     };
+    let skills: Vec<SkillInfo<'_>> = shared
+        .skills()
+        .iter()
+        .map(|skill| SkillInfo {
+            name: &skill.name,
+            path: &skill.location,
+            scope: skill.scope.as_str(),
+        })
+        .collect();
     let body = InitializeResult {
         major: MAJOR,
         version: env!("CARGO_PKG_VERSION"),
@@ -1509,6 +1621,7 @@ async fn join(
         model: &model,
         context_window,
         level: level.as_deref(),
+        skills: &skills,
     };
     message::result(&mut out, id, &body);
     shared.reply(client, &out);
@@ -1895,6 +2008,15 @@ async fn handle(
             answer,
             reason,
         } => {
+            // A request this run does not wait for is refused here, so a client
+            // that answers a stale id reads why at once instead of waiting for
+            // an error event that never matches its request.
+            if !shared.hub().claim(WaitKind::Approval, ask) {
+                out.clear();
+                message::error(out, id, &RpcError::not_waiting("approval", ask));
+                shared.reply(client, out);
+                return;
+            }
             let approve = live::Command::Approve {
                 client,
                 id: ask,
@@ -1903,6 +2025,30 @@ async fn handle(
             deliver(shared, sender, client, id, out, approve, None).await;
         }
         Request::Answer { id: ask, answers } => {
+            let Some(frame) = shared.waiting(WaitKind::Question, ask) else {
+                out.clear();
+                message::error(out, id, &RpcError::not_waiting("question", ask));
+                shared.reply(client, out);
+                return;
+            };
+            // One list per question: a client that sends another number would
+            // answer a question it never read. `answers: null` skips them all.
+            if let (Some(per), Some(questions)) = (&answers, message::question_count(&frame))
+                && per.len() != questions
+            {
+                let detail = format!("{} answer lists for {questions} questions", per.len());
+                out.clear();
+                message::error(out, id, &RpcError::invalid_params(detail));
+                shared.reply(client, out);
+                return;
+            }
+            // Another client may have answered since the check above.
+            if !shared.hub().claim(WaitKind::Question, ask) {
+                out.clear();
+                message::error(out, id, &RpcError::not_waiting("question", ask));
+                shared.reply(client, out);
+                return;
+            }
             let answer = live::Command::Answer {
                 client,
                 id: ask,
@@ -2348,6 +2494,7 @@ async fn track(
     print: Option<mpsc::Sender<Event>>,
 ) -> TurnEndReason {
     let mut encode = Encoder::default();
+    names_of(&shared, &mut encode);
     let mut writes = Vec::new();
     while let Some(event) = events.recv().await {
         if let Some(print) = &print {
@@ -2394,20 +2541,31 @@ async fn track(
             if let Some(frame) = took_settings(&shared, &applied).await {
                 shared.notice(frame);
             }
+            // The next usage line names the model and the provider the session
+            // runs now.
+            names_of(&shared, &mut encode);
             continue;
         }
         let frame = encode.frame(&event);
-        let waiting = shared.observe(&event, frame);
+        let stamp = shared.observe(&event, frame);
         // The entry follows the frame, so a client of another session marks
-        // this one a moment after the clients here saw the change.
-        if let (Some(waiting), Some(mark)) = (waiting, mark.as_mut()) {
-            mark.waiting(waiting).await;
+        // this one a moment after the clients here saw the change. A stamp the
+        // entry holds already writes nothing.
+        if let Some(mark) = mark.as_mut() {
+            mark.stamp(stamp).await;
         }
     }
     for write in writes {
         let _ = write.await;
     }
     shared.end()
+}
+
+/// Takes the model and the provider the session runs now into `encode`, so a
+/// usage line names them.
+fn names_of(shared: &Shared, encode: &mut Encoder) {
+    let (provider, model) = shared.names();
+    encode.names(provider, Some(model));
 }
 
 /// Adds `rule` to the file of `path`, and warns once when it cannot: a rule
@@ -2468,7 +2626,13 @@ mod tests {
             rule: Text::from("default"),
             save: None,
         })));
-        assert_eq!(state.wait, Some(7));
+        assert_eq!(
+            state.wait,
+            Some(Wait {
+                kind: WaitKind::Approval,
+                id: 7
+            })
+        );
         state.observe(&Event::ApprovalResolved {
             id: 7,
             client: 1,
@@ -2498,7 +2662,10 @@ mod tests {
         state.clients = 0;
         event_turn_start(&mut state);
         assert!(!state.idle(|| now), "a run is open");
-        state.wait = Some(3);
+        state.wait = Some(Wait {
+            kind: WaitKind::Approval,
+            id: 3,
+        });
         assert!(state.idle(|| now), "no client can answer the approval");
     }
 

@@ -2,6 +2,7 @@
 //! program so a test run links and starts one program, not one per file.
 
 mod image;
+mod install;
 mod json;
 mod max_tokens;
 mod mcp;
@@ -11,6 +12,7 @@ mod plugin;
 mod presets;
 mod print;
 mod provider;
+mod rpc;
 mod sandbox;
 mod serve;
 mod session;

@@ -38,6 +38,48 @@ pub struct Initialized {
     pub context_window: Option<u64>,
     /// The reasoning level the session sends, when it sends one.
     pub level: Option<Arc<str>>,
+    /// The skills the session found, in name order. A worker that found none,
+    /// and one older than the field, names none.
+    pub skills: Vec<Skill>,
+}
+
+/// One skill the session found, as its handshake names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skill {
+    /// The skill's name.
+    pub name: Arc<str>,
+    /// The absolute path of the skill's `SKILL.md`.
+    pub path: Arc<str>,
+    /// The folder it was found in.
+    pub scope: Scope,
+}
+
+/// The folder a skill was found in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// The `skills` folder of the global config folder.
+    Global,
+    /// A `.agents/skills` folder of the project.
+    Project,
+}
+
+impl Scope {
+    /// The word the Skills panel shows, which the worker names too.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::Global => "global",
+            Scope::Project => "project",
+        }
+    }
+
+    /// The scope a worker's word names, `global` for one this build does not
+    /// know.
+    fn of(word: Option<&str>) -> Scope {
+        match word {
+            Some("project") => Scope::Project,
+            _ => Scope::Global,
+        }
+    }
 }
 
 /// The worker's answer to `attach`: where the session stands, and whether a run
@@ -103,8 +145,8 @@ pub enum Frame<'a> {
     TurnEnd,
     /// The whole run ended.
     RunEnd {
-        /// Whether the turn limit ended it, so the task may not be done.
-        at_limit: bool,
+        /// Why it ended, which the terminal is told.
+        end: RunEnd,
     },
     /// A client sent a message; every attached client hears it.
     UserMessage {
@@ -215,6 +257,40 @@ pub enum Frame<'a> {
     /// A method or an event type this build does not know, or an answer to a
     /// request: nothing to draw.
     Unknown,
+}
+
+/// Why a run ended, as the `reason` of the worker's `run_end` frame names it.
+///
+/// A word this build does not know is [`RunEnd::Other`]: the run ended all the
+/// same, and a frame that names no reason at all is one too.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RunEnd {
+    /// The model gave its reply.
+    EndTurn,
+    /// The user stopped the run.
+    Stopped,
+    /// The turn limit ended it, so the task may not be done.
+    MaxTurns,
+    /// The run was cancelled, and nothing of it is done.
+    Cancelled,
+    /// A failure ended it.
+    Error,
+    /// A reason this build does not know.
+    Other,
+}
+
+impl RunEnd {
+    /// The end the worker's `reason` word names.
+    fn of(reason: Option<&str>) -> RunEnd {
+        match reason {
+            Some("end_turn") => RunEnd::EndTurn,
+            Some("stopped") => RunEnd::Stopped,
+            Some("max_turns") => RunEnd::MaxTurns,
+            Some("cancelled") => RunEnd::Cancelled,
+            Some("error") => RunEnd::Error,
+            _ => RunEnd::Other,
+        }
+    }
 }
 
 /// One question an `ask` call puts to the person.
@@ -627,6 +703,16 @@ fn read_init(line: &[u8], id: u64) -> io::Result<Option<Initialized>> {
     }
     #[derive(Deserialize)]
     #[serde(bound(deserialize = "'de: 'a"))]
+    struct SkillLine<'a> {
+        #[serde(borrow, default, deserialize_with = "cow")]
+        name: Option<Cow<'a, str>>,
+        #[serde(borrow, default, deserialize_with = "cow")]
+        path: Option<Cow<'a, str>>,
+        #[serde(borrow, default, deserialize_with = "cow")]
+        scope: Option<Cow<'a, str>>,
+    }
+    #[derive(Deserialize)]
+    #[serde(bound(deserialize = "'de: 'a"))]
     struct Result<'a> {
         #[serde(borrow)]
         session: Cow<'a, str>,
@@ -639,6 +725,9 @@ fn read_init(line: &[u8], id: u64) -> io::Result<Option<Initialized>> {
         context_window: Option<u64>,
         #[serde(borrow, default)]
         level: Option<Cow<'a, str>>,
+        /// Absent from the answer of a worker that found no skill.
+        #[serde(borrow, default)]
+        skills: Vec<SkillLine<'a>>,
     }
     let Ok(answer) = serde_json::from_slice::<Answer<'_>>(line) else {
         return Ok(None);
@@ -654,6 +743,15 @@ fn read_init(line: &[u8], id: u64) -> io::Result<Option<Initialized>> {
             model: result.model.as_deref().map(Arc::from),
             context_window: result.context_window,
             level: result.level.as_deref().map(Arc::from),
+            skills: result
+                .skills
+                .iter()
+                .map(|skill| Skill {
+                    name: Arc::from(skill.name.as_deref().unwrap_or_default()),
+                    path: Arc::from(skill.path.as_deref().unwrap_or_default()),
+                    scope: Scope::of(skill.scope.as_deref()),
+                })
+                .collect(),
         })),
         None => Err(io::Error::other("the worker refused the handshake")),
     }
@@ -755,7 +853,7 @@ pub fn decode(line: &[u8]) -> Option<Frame<'_>> {
         },
         ("event", "turn_end") => Frame::TurnEnd,
         ("event", "run_end") => Frame::RunEnd {
-            at_limit: reason.as_deref() == Some("max_turns"),
+            end: RunEnd::of(reason.as_deref()),
         },
         ("event", "user_message") => Frame::UserMessage {
             text: text?,
@@ -1140,7 +1238,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use super::{Attached, Client, Frame, Initialized, Next, decode};
+    use super::{Attached, Client, Frame, Initialized, Next, RunEnd, Scope, Skill, decode};
 
     /// How long a test waits for a frame before it fails.
     const WAIT: Duration = Duration::from_secs(10);
@@ -1348,6 +1446,7 @@ mod tests {
                 model: Some(Arc::from(MODEL)),
                 context_window: Some(WINDOW),
                 level: None,
+                skills: Vec::new(),
             }
         );
         let attached = client.attach(42).await.expect("attach");
@@ -1407,6 +1506,46 @@ mod tests {
             .expect("connect");
         assert_eq!(init.model, None);
         assert_eq!(init.context_window, None);
+    }
+
+    /// The `initialize` answer names the skills the session found, with the
+    /// scope of each: the Skills panel lists them.
+    #[test]
+    fn an_initialize_answer_with_skills_parses_them() {
+        let line = br#"{"jsonrpc":"2.0","id":4,"result":{"session":"s1","client":7,
+            "committed":0,"skills":[{"name":"demo","path":"/w/.agents/skills/demo/SKILL.md",
+            "scope":"project"},{"name":"tidy","path":"/c/skills/tidy/SKILL.md",
+            "scope":"global"}]}}"#;
+        let init = super::read_init(line, 4)
+            .expect("a line reads")
+            .expect("an answer");
+        assert_eq!(
+            init.skills,
+            vec![
+                Skill {
+                    name: Arc::from("demo"),
+                    path: Arc::from("/w/.agents/skills/demo/SKILL.md"),
+                    scope: Scope::Project,
+                },
+                Skill {
+                    name: Arc::from("tidy"),
+                    path: Arc::from("/c/skills/tidy/SKILL.md"),
+                    scope: Scope::Global,
+                },
+            ]
+        );
+    }
+
+    /// A worker that found no skill, or one older than the field, says nothing
+    /// about skills, and the client lists none.
+    #[test]
+    fn an_initialize_answer_without_skills_gives_an_empty_list() {
+        let line =
+            br#"{"jsonrpc":"2.0","id":4,"result":{"session":"s1","client":7,"committed":0}}"#;
+        let init = super::read_init(line, 4)
+            .expect("a line reads")
+            .expect("an answer");
+        assert!(init.skills.is_empty(), "{:?}", init.skills);
     }
 
     /// A settings notice, which the worker sends every client after a model
@@ -1739,13 +1878,17 @@ mod tests {
             frame(
                 r#"{"jsonrpc":"2.0","method":"event","params":{"type":"run_end","reason":"cancelled"}}"#
             ),
-            Some(Frame::RunEnd { at_limit: false })
+            Some(Frame::RunEnd {
+                end: RunEnd::Cancelled
+            })
         ));
         assert!(matches!(
             frame(
                 r#"{"jsonrpc":"2.0","method":"event","params":{"type":"run_end","reason":"max_turns"}}"#
             ),
-            Some(Frame::RunEnd { at_limit: true })
+            Some(Frame::RunEnd {
+                end: RunEnd::MaxTurns
+            })
         ));
         match frame(
             r#"{"jsonrpc":"2.0","method":"event","params":{"type":"text_delta","text":"hello"}}"#,
@@ -1889,6 +2032,34 @@ mod tests {
                 assert_eq!(cached, 0);
             }
             other => panic!("expected the usage, got {other:?}"),
+        }
+    }
+
+    /// The reason a `run_end` names is the frame's own, so the app tells the
+    /// terminal how the run ended; a reason this client does not know, and a
+    /// frame that names none, are still a run that ended.
+    #[test]
+    fn program_status_run_end_reason_parses() {
+        let cases = [
+            ("end_turn", RunEnd::EndTurn),
+            ("stopped", RunEnd::Stopped),
+            ("max_turns", RunEnd::MaxTurns),
+            ("cancelled", RunEnd::Cancelled),
+            ("error", RunEnd::Error),
+            ("budget", RunEnd::Other),
+        ];
+        for (reason, end) in cases {
+            let line = format!(
+                r#"{{"jsonrpc":"2.0","method":"event","params":{{"type":"run_end","reason":"{reason}"}}}}"#
+            );
+            match decode(line.as_bytes()) {
+                Some(Frame::RunEnd { end: got }) => assert_eq!(got, end, "{reason}"),
+                other => panic!("expected the run end of {reason}, got {other:?}"),
+            }
+        }
+        match frame(r#"{"jsonrpc":"2.0","method":"event","params":{"type":"run_end"}}"#) {
+            Some(Frame::RunEnd { end }) => assert_eq!(end, RunEnd::Other),
+            other => panic!("expected a run end, got {other:?}"),
         }
     }
 

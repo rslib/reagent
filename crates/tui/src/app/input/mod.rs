@@ -26,7 +26,7 @@ use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use crossterm::event::Event;
 use tokio::io::unix::AsyncFd;
@@ -53,10 +53,13 @@ const FLAGS: i32 = libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY;
 #[expect(clippy::disallowed_types, reason = "the tty's own descriptor")]
 type Tty = std::fs::File;
 
-/// The terminal's answers to the two queries the first frame sends: the
-/// background (`OSC 11`), which picks the mode, and the device attributes
-/// (`CSI c`), which ends the first frame's wait. The reader, which sees the
-/// bytes, fills them in, and the app, which draws, waits for them.
+/// The terminal's answers to the queries the first frame sends: the background
+/// (`OSC 11`), which picks the mode, the device attributes (`CSI c`), which ends
+/// the first frame's wait, the kitty graphics query, which a herdr pane is asked
+/// and which says whether its placeholders draw, and the program status query
+/// (`OSC 7501`), whose answer says whether the terminal lists the session at all.
+/// The reader, which sees the bytes, fills them in, and the app, which draws,
+/// reads them.
 ///
 /// One handle both records and reads: the app takes one before the tty is even
 /// open, so an answer that arrives late still reaches the frame that repaints
@@ -67,8 +70,8 @@ pub struct Background {
     answer: Arc<Answer>,
 }
 
-/// The color once it arrived, whether the device attributes arrived, and the
-/// waiter either answer wakes.
+/// The color once it arrived, whether the device attributes arrived, the answer
+/// to the kitty graphics query, and the waiter an answer wakes.
 #[derive(Debug)]
 struct Answer {
     /// The color packed as `0x1_00RRGGBB`, or [`NONE`] until the terminal
@@ -78,6 +81,11 @@ struct Answer {
     /// Whether the terminal answered the device attributes query, the answer
     /// that ends the first frame's wait.
     attributes: AtomicBool,
+    /// The kitty graphics answer, one of [`UNANSWERED`], [`YES`] and [`NO`].
+    graphics: AtomicU8,
+    /// Whether the terminal answered the program status query, so the app
+    /// reports the session's status to it.
+    program: AtomicBool,
     /// Wakes the first frame's wait for the device attributes and the loop's
     /// for a color that came late.
     ready: tokio::sync::Notify,
@@ -88,6 +96,8 @@ impl Default for Answer {
         Answer {
             color: AtomicU32::new(NONE),
             attributes: AtomicBool::new(false),
+            graphics: AtomicU8::new(UNANSWERED),
+            program: AtomicBool::new(false),
             ready: tokio::sync::Notify::new(),
         }
     }
@@ -97,6 +107,12 @@ impl Default for Answer {
 /// equal it: a packed color has the bit above its three channels set and no
 /// others.
 const NONE: u32 = u32::MAX;
+
+/// The three states of the kitty graphics answer: none came, the terminal reads
+/// the protocol, and it answered an error.
+const UNANSWERED: u8 = 0;
+const YES: u8 = 1;
+const NO: u8 = 2;
 
 impl Background {
     /// The color the terminal answered with, `None` until it answers.
@@ -134,6 +150,46 @@ impl Background {
             return;
         }
         self.answer.ready.notify_waiters();
+    }
+
+    /// The answer the terminal gave the kitty graphics query the first frame
+    /// sends inside a herdr pane: `Some(true)` when it reads the protocol,
+    /// `Some(false)` when it answered an error, `None` until it answers.
+    pub fn graphics(&self) -> Option<bool> {
+        match self.answer.graphics.load(Ordering::Acquire) {
+            YES => Some(true),
+            NO => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Records the answer to the kitty graphics query, `reads` for a terminal
+    /// that read the protocol, and wakes a frame that waits for it. The first
+    /// answer is the one kept: a terminal answers one query once.
+    pub fn record_graphics(&self, reads: bool) {
+        let answer = if reads { YES } else { NO };
+        if self
+            .answer
+            .graphics
+            .compare_exchange(UNANSWERED, answer, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.answer.ready.notify_waiters();
+    }
+
+    /// Whether the terminal answered the program status query, the answer by
+    /// which it asked to hear the session's status.
+    pub fn program_status(&self) -> bool {
+        self.answer.program.load(Ordering::Acquire)
+    }
+
+    /// Records the answer to the program status query. It wakes nothing: the app
+    /// reads the flag when it draws, and every change of the status draws a frame
+    /// of its own.
+    pub fn record_program_status(&self) {
+        self.answer.program.store(true, Ordering::Release);
     }
 
     /// Waits until the terminal answered the background query, and returns at
@@ -186,7 +242,7 @@ pub struct Input {
     /// The event [`Input::ready`] took out of the parser, which
     /// [`Input::next`] answers first.
     peeked: Option<Event>,
-    /// Where the answers to the first frame's two queries go.
+    /// Where the answers to the first frame's queries go.
     background: Background,
 }
 
@@ -209,10 +265,10 @@ impl Input {
 
     /// Whether [`Input::next`] answers at once, with no wait for the tty.
     ///
-    /// A signal takes no event slot: the answers to the first frame's two
-    /// queries are recorded here, as `next` records them, so no byte of either
-    /// is ever read as a key. Only a whole event counts: a lone `ESC` or the
-    /// front of a sequence waits for the bytes the parser does not have yet.
+    /// A signal takes no event slot: the answers to the first frame's queries
+    /// are recorded here, as `next` records them, so no byte of any is ever read
+    /// as a key. Only a whole event counts: a lone `ESC` or the front of a
+    /// sequence waits for the bytes the parser does not have yet.
     pub fn ready(&mut self) -> bool {
         if self.peeked.is_some() {
             return true;
@@ -225,6 +281,8 @@ impl Input {
                 }
                 Some(Signal::Background(color)) => self.background.record(color),
                 Some(Signal::DeviceAttributes) => self.background.record_attributes(),
+                Some(Signal::Graphics(reads)) => self.background.record_graphics(reads),
+                Some(Signal::ProgramStatus) => self.background.record_program_status(),
                 None => return false,
             }
         }
@@ -233,9 +291,9 @@ impl Input {
     /// The next event: the next whole event in the bytes already read, else the
     /// bytes the tty has, else a window change.
     ///
-    /// The answers to the first frame's two queries are not events: they go into
-    /// the [`Background`] handle and wake the frame that waits for them, so no
-    /// byte of either is ever read as a key.
+    /// The answers to the first frame's queries are not events: they go into the
+    /// [`Background`] handle and wake the frame that waits for them, so no byte
+    /// of any is ever read as a key.
     ///
     /// This is cancel safe. The bytes read stay in the parser and the events
     /// parsed out of them stay in `self`, so a key is not lost when the future
@@ -250,6 +308,8 @@ impl Input {
                     Signal::Event(event) => return Ok(event),
                     Signal::Background(color) => self.background.record(color),
                     Signal::DeviceAttributes => self.background.record_attributes(),
+                    Signal::Graphics(reads) => self.background.record_graphics(reads),
+                    Signal::ProgramStatus => self.background.record_program_status(),
                 }
             }
             let Input {

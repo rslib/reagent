@@ -17,6 +17,10 @@
 //!
 //! [`PluginPanel`] is the one panel a worker drives: the app adds one per id a
 //! JS plugin sets, and hands it the title and the lines of its notice.
+//!
+//! [`SkillsPanel`] is the one panel [`add_builtin`] leaves out: the app adds it
+//! under the others when the handshake named a skill, so a session with none
+//! draws the four panels it always did.
 
 mod changes;
 mod clients;
@@ -24,6 +28,7 @@ mod context;
 mod plugin;
 mod right;
 mod sessions;
+mod skills;
 
 pub use changes::ChangesPanel;
 pub use clients::ClientsPanel;
@@ -31,6 +36,7 @@ pub use context::ContextPanel;
 pub use plugin::PluginPanel;
 pub(crate) use right::Right;
 pub use sessions::{SessionRow, SessionsPanel};
+pub use skills::SkillsPanel;
 
 use crate::slot::Sidebar;
 

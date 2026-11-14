@@ -711,3 +711,57 @@ async fn scripted_deltas_stream_one_event_each() {
         .collect();
     assert_eq!(deltas, ["a", "b", "c"]);
 }
+
+/// The usage line names the model the request carried and the reagent provider
+/// that served it, and a reply that names no plan limits has no `limits` key.
+#[tokio::test]
+async fn cli_json_usage_line_names_the_model_and_the_provider() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let work = tempfile::tempdir().expect("work dir");
+    // A table makes `fi` a provider name, so `fi/m` names both the provider
+    // and the model of the request.
+    let config = tmp.path().join("xdg/reagent");
+    tokio::fs::create_dir_all(&config)
+        .await
+        .expect("config dir");
+    tokio::fs::write(config.join("config.toml"), "[providers.fi]\n")
+        .await
+        .expect("write config");
+    let script = tmp.path().join("script.json");
+    tokio::fs::write(
+        &script,
+        r#"{"replies": [{"text": "done", "usage": {
+            "input": 12, "output": 3, "cache_read": 0, "cache_write": 0, "reasoning": 0
+        }}]}"#,
+    )
+    .await
+    .expect("write script");
+    let work_arg = work.path().display().to_string();
+    let output = Command::new(BIN)
+        .args(["--json", "--model", "fi/m", "--cwd", &work_arg])
+        .arg("--provider")
+        .arg(format!("fake:{}", script.display()))
+        .args(["-p", "hi"])
+        .current_dir(tmp.path())
+        .env("XDG_CONFIG_HOME", tmp.path().join("xdg"))
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .env("XDG_CACHE_HOME", tmp.path().join("cache"))
+        .env("ANTHROPIC_API_KEY", FAKE_KEY)
+        .output()
+        .await
+        .expect("the binary runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = json_lines(&output.stdout);
+    let usage = lines
+        .iter()
+        .find(|line| line["type"] == "usage")
+        .expect("a usage line");
+    assert_eq!(usage["model"], "m", "{usage}");
+    assert_eq!(usage["provider"], "fi", "{usage}");
+    assert!(usage.get("limits").is_none(), "{usage}");
+    assert_eq!(usage["input"], 12, "{usage}");
+}

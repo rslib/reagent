@@ -274,23 +274,39 @@ impl Provider for OpenAiResponses {
                     retry,
                 });
             }
+            let limits = crate::Limits::from_headers(response.headers());
             let bytes = response
                 .bytes_stream()
                 .map_err(|error| Error::Http(error.to_string()));
-            Ok(bytes)
-        })
-        .try_flatten();
+            Ok::<_, Error>((bytes, limits))
+        });
 
-        parse_stream(connect)
+        // The plan limits are in the headers, which are read once, before the
+        // body, so they are the first event of the reply.
+        let events = futures_util::StreamExt::flat_map(connect, |connected| match connected {
+            Ok((bytes, limits)) => parse_stream(bytes, limits),
+            Err(error) => Box::pin(futures_util::stream::iter([Err(error)])),
+        });
+
+        Box::pin(events)
     }
 }
 
 /// Turns response bytes into events, with at most one error per stream.
-fn parse_stream<S>(connect: S) -> BoxStream<'static, Result<StreamEvent, Error>>
+fn parse_stream<S>(
+    connect: S,
+    limits: Option<crate::Limits>,
+) -> BoxStream<'static, Result<StreamEvent, Error>>
 where
     S: futures_util::Stream<Item = Result<Bytes, Error>> + Send + 'static,
 {
-    crate::openai::event_stream(connect, StreamParser::new())
+    let events = crate::openai::event_stream(connect, StreamParser::new());
+    let Some(limits) = limits else {
+        return events;
+    };
+    // One event, before the body's: the plan limits the headers named.
+    let first = futures_util::stream::iter([Ok(StreamEvent::Limits(Box::new(limits)))]);
+    Box::pin(futures_util::StreamExt::chain(first, events))
 }
 
 #[cfg(test)]
@@ -302,7 +318,7 @@ mod tests {
     #[test]
     fn a_transport_error_is_the_only_error() {
         let connect = futures_util::stream::iter([Err(Error::Http("refused".into()))]);
-        let items: Vec<_> = parse_stream(connect)
+        let items: Vec<_> = parse_stream(connect, None)
             .collect::<Vec<_>>()
             .now_or_never()
             .unwrap();
@@ -311,6 +327,81 @@ mod tests {
     }
 
     const EXTRA_REPLY: &str = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+
+    /// A request that names no history, for a server that only reads it.
+    fn request() -> crate::Request<'static> {
+        crate::Request {
+            model: "gpt-x",
+            max_tokens: 16,
+            system: None,
+            tools: &[],
+            tool_choice: crate::ToolChoice::Auto,
+            messages: &[],
+            images: true,
+            reasoning: None,
+            cache_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_event_carries_the_limits_of_the_response_headers() {
+        let base = crate::http::test_server::serve_headers(
+            "x-codex-primary-used-percent: 30\r\n\
+             x-codex-primary-window-minutes: 300\r\n\
+             x-codex-primary-reset-at: 1763050000\r\n\
+             x-codex-secondary-used-percent: 0\r\n\
+             x-codex-secondary-window-minutes: 0\r\n\
+             x-codex-secondary-reset-at: \r\n",
+            EXTRA_REPLY,
+        )
+        .await;
+        let provider = OpenAiResponses::new("test-key", base);
+        let items: Vec<_> = provider.stream(&request()).collect().await;
+        // The limits the headers name are the first event of the reply.
+        let limits = match items.first().expect("the reply's events") {
+            Ok(StreamEvent::Limits(limits)) => **limits,
+            other => panic!("the first event carries the limits, not {other:?}"),
+        };
+        assert_eq!(
+            limits,
+            crate::Limits {
+                primary: Some(crate::Window {
+                    used_percent: 30.0,
+                    window_minutes: Some(300),
+                    resets_at: Some(1_763_050_000),
+                }),
+                secondary: None,
+            }
+        );
+        let usage = items
+            .into_iter()
+            .find_map(|item| match item {
+                Ok(StreamEvent::Usage(usage)) => Some(usage),
+                _ => None,
+            })
+            .expect("a usage event");
+        assert_eq!(usage.input_tokens, 1, "the counts are the body's");
+    }
+
+    #[tokio::test]
+    async fn a_response_with_no_limit_headers_carries_no_limits() {
+        let base = crate::http::test_server::serve_headers("", EXTRA_REPLY).await;
+        let provider = OpenAiResponses::new("test-key", base);
+        let items: Vec<_> = provider.stream(&request()).collect().await;
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, Ok(StreamEvent::Limits(_)))),
+            "a reply with no limit headers sends no limits: {items:?}"
+        );
+        // Its usage still arrives, with no limits of its own.
+        assert!(
+            items.iter().any(
+                |item| matches!(item, Ok(StreamEvent::Usage(usage)) if usage.input_tokens == 1)
+            ),
+            "{items:?}"
+        );
+    }
 
     /// The error one request gets from a server that answers `status` with
     /// `body`, and whether the loop would retry it.

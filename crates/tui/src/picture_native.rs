@@ -52,17 +52,16 @@ pub const PLACEHOLDER_MARKS: [char; 64] = [
     '\u{0612}', '\u{0613}', '\u{0614}', '\u{0615}', '\u{0616}', '\u{0617}', '\u{0657}', '\u{0658}',
 ];
 
-/// A variable each multiplexer sets in its panes: zellij, GNU screen, herdr
-/// and rmaestro. They draw panes with their own terminal emulator and pass no
+/// A variable each multiplexer sets in its panes: zellij, GNU screen and
+/// rmaestro. They draw panes with their own terminal emulator and pass no
 /// tested image protocol, and zellij and rmaestro keep the outer
 /// `TERM_PROGRAM`, so they must be ruled out before it is read.
-const UNTESTED_HOSTS: [&str; 5] = [
-    "ZELLIJ",
-    "STY",
-    "HERDR_PANE_ID",
-    "RMAESTRO_PANE",
-    "ZELLIJ_SESSION_NAME",
-];
+///
+/// herdr sets `HERDR_PANE_ID` in its panes as well, and hides the terminal it
+/// draws them into, so its environment says nothing about the image protocol:
+/// it is asked with the kitty query instead, and answers no image only when
+/// that answer says so (see [`asks_graphics`]).
+const UNTESTED_HOSTS: [&str; 4] = ["ZELLIJ", "STY", "RMAESTRO_PANE", "ZELLIJ_SESSION_NAME"];
 
 /// What the terminal tmux draws into calls itself, in `#{client_termname}` or
 /// `#{client_termtype}`: the terminals that read kitty's placeholders.
@@ -95,6 +94,21 @@ pub struct Native {
     pub tmux: bool,
 }
 
+/// Whether the terminal behind `env` is a herdr pane that must be asked the
+/// kitty graphics query (`a=q`) before any image goes out.
+///
+/// herdr sets `HERDR_PANE_ID` in its panes and `TERM_PROGRAM=herdr`, and hides
+/// the terminal it draws them into, so no variable says whether its Unicode
+/// placeholders draw. Under tmux the pane is tmux's and tmux is asked instead:
+/// the answer of the pane inside it is neither read nor waited for. A host of
+/// [`UNTESTED_HOSTS`] inside the pane wins too, as it draws the pane itself.
+pub fn asks_graphics(env: impl Fn(&str) -> Option<String>) -> bool {
+    let set = |name: &str| env(name).is_some_and(|value| !value.is_empty());
+    !set("TMUX")
+        && !UNTESTED_HOSTS.iter().any(|name| set(name))
+        && (set("HERDR_PANE_ID") || matches!(env("TERM_PROGRAM").as_deref(), Some("herdr")))
+}
+
 /// The protocol of the terminal behind `env`, or `None` when it speaks none
 /// this crate writes.
 ///
@@ -102,10 +116,25 @@ pub struct Native {
 /// printed, or `None` when it could not run. Inside tmux the pictures go out as
 /// placeholders only when tmux passes an escape through and draws into one of
 /// [`PLACEHOLDER_TERMINALS`]: no other protocol goes through it.
-pub fn detect(env: impl Fn(&str) -> Option<String>, tmux: Option<&str>) -> Option<Native> {
+///
+/// `graphics` is the answer the terminal gave the kitty graphics query, `None`
+/// when it gave none. Only a herdr pane outside tmux is read from it: the pane
+/// draws placeholders when its terminal answered the protocol, and no image at
+/// all when it answered an error or nothing.
+pub fn detect(
+    env: impl Fn(&str) -> Option<String>,
+    tmux: Option<&str>,
+    graphics: Option<bool>,
+) -> Option<Native> {
     let set = |name: &str| env(name).is_some_and(|value| !value.is_empty());
     if UNTESTED_HOSTS.iter().any(|name| set(name)) {
         return None;
+    }
+    if asks_graphics(&env) {
+        return (graphics == Some(true)).then_some(Native {
+            protocol: Protocol::Placeholders,
+            tmux: false,
+        });
     }
     if set("TMUX") {
         let mut fields = tmux?.split('|');
@@ -268,15 +297,21 @@ pub fn id_color(id: u32) -> (u8, u8, u8) {
 /// `None` when the bytes are no image.
 ///
 /// The image is decoded with [`Limits::default`], turned by its EXIF
-/// orientation, shrunk so its longest side is at most [`MAX_PIXELS`] and
-/// encoded as PNG. A caller hands this the journal's own base64 when the image
-/// is a PNG already. This does CPU work over the whole picture, so a caller
-/// runs it in `spawn_blocking`.
-pub fn png_payload(png_base64: &str) -> Option<String> {
+/// orientation, grown to `cells` (the pixels of the cells it takes) when it is
+/// smaller on both sides, shrunk so its longest side is at most [`MAX_PIXELS`]
+/// and encoded as PNG. A terminal that stretches a small image smooths each
+/// placeholder row on its own and draws a seam between rows. This does CPU
+/// work over the whole picture, so a caller runs it in `spawn_blocking`.
+pub fn png_payload(png_base64: &str, cells: Option<(u32, u32)>) -> Option<String> {
     let bytes = Bytes::from(STANDARD.decode(png_base64).ok()?);
     let decoded = decode(&bytes, &Limits::default()).ok()?;
     let pixels = apply(decoded.pixels, decoded.orientation);
-    let (width, height) = shrink(pixels.width, pixels.height);
+    let (width, height) = match cells {
+        Some((across, down)) if across > pixels.width && down > pixels.height => {
+            shrink(across, down)
+        }
+        _ => shrink(pixels.width, pixels.height),
+    };
     let pixels = if (width, height) == (pixels.width, pixels.height) {
         pixels
     } else {
@@ -320,8 +355,19 @@ mod tests {
 
     const GRADIENT: &[u8] = include_bytes!("../../image/tests/fixtures/gradient-64x48.png");
 
-    /// The protocol of a terminal with `pairs` as its environment.
+    /// The protocol of a terminal with `pairs` as its environment, which
+    /// answered no graphics query.
     fn detected(pairs: &[(&str, &str)], tmux: Option<&str>) -> Option<Native> {
+        detected_with(pairs, tmux, None)
+    }
+
+    /// The protocol of a terminal with `pairs` as its environment, and the
+    /// answer to the kitty graphics query it gave, if any.
+    fn detected_with(
+        pairs: &[(&str, &str)],
+        tmux: Option<&str>,
+        graphics: Option<bool>,
+    ) -> Option<Native> {
         detect(
             |name| {
                 pairs
@@ -330,6 +376,7 @@ mod tests {
                     .map(|pair| pair.1.to_string())
             },
             tmux,
+            graphics,
         )
     }
 
@@ -420,7 +467,6 @@ mod tests {
             ("ZELLIJ", "0"),
             ("ZELLIJ_SESSION_NAME", "main"),
             ("STY", "1234.pts-0"),
-            ("HERDR_PANE_ID", "p1"),
             ("RMAESTRO_PANE", "pane0001"),
         ] {
             let env = [("TERM_PROGRAM", "rio"), host];
@@ -428,8 +474,89 @@ mod tests {
             let env = [("TMUX", "/tmp/tmux-501/default,1,0"), host];
             assert_eq!(detected(&env, Some("rio|Rio 0.5.28|on")), None, "{host:?}");
         }
-        let herdr = [("TERM_PROGRAM", "herdr")];
-        assert_eq!(detected(&herdr, None), None);
+    }
+
+    #[test]
+    fn detect_inside_herdr_follows_the_graphics_answer() {
+        // herdr hides the terminal it draws its panes with and keeps its name,
+        // so the answer to the kitty query is the one thing that says whether
+        // its placeholders draw.
+        let placeholders = Some(Native {
+            protocol: Protocol::Placeholders,
+            tmux: false,
+        });
+        for env in [[("HERDR_PANE_ID", "w1:p1")], [("TERM_PROGRAM", "herdr")]] {
+            assert_eq!(
+                detected_with(&env, None, Some(true)),
+                placeholders,
+                "{env:?}"
+            );
+            assert_eq!(
+                detected_with(&env, None, Some(false)),
+                None,
+                "the terminal answered an error: {env:?}"
+            );
+            assert_eq!(
+                detected_with(&env, None, None),
+                None,
+                "no answer, no image: {env:?}"
+            );
+        }
+        // Under tmux the pane is tmux's, and the tmux branch decides as it did.
+        let tmux = [
+            ("TMUX", "/tmp/tmux-501/default,1,0"),
+            ("HERDR_PANE_ID", "w1:p1"),
+        ];
+        assert_eq!(
+            detected_with(&tmux, Some("rio|Rio 0.5.28|on"), Some(true)),
+            Some(Native {
+                protocol: Protocol::Placeholders,
+                tmux: true,
+            }),
+            "{tmux:?}"
+        );
+        assert_eq!(
+            detected_with(&tmux, Some("rio|Rio 0.5.28|off"), Some(true)),
+            None
+        );
+    }
+
+    #[test]
+    fn asks_graphics_only_in_herdr_outside_tmux() {
+        fn asks(pairs: &[(&str, &str)]) -> bool {
+            asks_graphics(|name| {
+                pairs
+                    .iter()
+                    .find(|pair| pair.0 == name)
+                    .map(|pair| pair.1.to_string())
+            })
+        }
+        assert!(asks(&[("HERDR_PANE_ID", "w1:p1")]));
+        assert!(asks(&[
+            ("TERM_PROGRAM", "herdr"),
+            ("TERM", "xterm-256color")
+        ]));
+        assert!(
+            !asks(&[
+                ("HERDR_PANE_ID", "w1:p1"),
+                ("TMUX", "/tmp/tmux-501/default,1,0")
+            ]),
+            "tmux in front of the pane answers for it"
+        );
+        assert!(!asks(&[
+            ("TERM_PROGRAM", "herdr"),
+            ("TMUX", "/tmp/tmux-501/default,1,0")
+        ]));
+        assert!(
+            !asks(&[("HERDR_PANE_ID", "w1:p1"), ("ZELLIJ", "0")]),
+            "zellij in the pane draws it, and passes no image"
+        );
+        assert!(!asks(&[("TERM", "xterm-256color")]), "a plain terminal");
+        assert!(
+            !asks(&[("TERM", "xterm-kitty"), ("KITTY_WINDOW_ID", "1")]),
+            "kitty answers the protocol without a query"
+        );
+        assert!(!asks(&[("TERM_PROGRAM", "iTerm.app")]));
     }
 
     #[test]
@@ -538,12 +665,31 @@ mod tests {
 
     #[test]
     fn png_payload_shrinks_the_longest_side() {
-        let payload = png_payload(&STANDARD.encode(GRADIENT)).expect("a payload");
+        let payload = png_payload(&STANDARD.encode(GRADIENT), None).expect("a payload");
         let bytes = STANDARD.decode(&payload).expect("base64");
         let decoded = decode(&Bytes::from(bytes), &Limits::default()).expect("a png");
         assert_eq!((decoded.pixels.width, decoded.pixels.height), (64, 48));
-        assert!(png_payload("not base64!").is_none());
-        assert!(png_payload(&STANDARD.encode(b"these bytes are no image")).is_none());
+        assert!(png_payload("not base64!", None).is_none());
+        assert!(png_payload(&STANDARD.encode(b"these bytes are no image"), None).is_none());
+    }
+
+    /// A terminal that stretches a small image over many cell rows smooths each
+    /// row on its own and draws a seam between rows, so a small image goes out
+    /// at the pixel size of its cells.
+    #[test]
+    fn png_payload_grows_a_small_image_to_its_cells() {
+        let payload = png_payload(&STANDARD.encode(GRADIENT), Some((448, 340))).expect("a payload");
+        let bytes = STANDARD.decode(&payload).expect("base64");
+        let decoded = decode(&Bytes::from(bytes), &Limits::default()).expect("a png");
+        assert_eq!((decoded.pixels.width, decoded.pixels.height), (448, 340));
+        let payload = png_payload(&STANDARD.encode(GRADIENT), Some((32, 24))).expect("a payload");
+        let bytes = STANDARD.decode(&payload).expect("base64");
+        let decoded = decode(&Bytes::from(bytes), &Limits::default()).expect("a png");
+        assert_eq!(
+            (decoded.pixels.width, decoded.pixels.height),
+            (64, 48),
+            "a larger image is the terminal's to shrink"
+        );
     }
 
     #[test]
