@@ -22,10 +22,10 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 
-use super::api::{self, Host, Slot, Staging};
+use super::api::{self, Host, OnTimeout, Slot, Staging};
 use super::lock::{self, Lock};
 use super::manifest::{self, Found, Manifest};
-use super::{CommandInfo, Live, Notes};
+use super::{CommandInfo, Live, Notes, Role};
 
 /// The most bytes one plugin's runtime may allocate.
 const PLUGIN_MEMORY: usize = 64 * 1024 * 1024;
@@ -73,6 +73,8 @@ pub(crate) enum Job {
         /// The sandbox helper every child process of a plugin starts through,
         /// and `None` when this run has no sandbox.
         sandbox: Option<PathBuf>,
+        /// The plugins this load takes: a normal run's, or the gateway's.
+        role: Role,
         /// Carries the report back.
         reply: oneshot::Sender<LoadReport>,
     },
@@ -153,7 +155,7 @@ pub(crate) struct LoadReport {
     /// Whether any plugin installed a `turn.end` layer.
     pub turn: bool,
     /// A bit per event some listener waits on.
-    pub events: u8,
+    pub events: u32,
 }
 
 /// One registered tool, as the async side offers it to the model.
@@ -202,8 +204,12 @@ enum Failed {
     Stopped(Duration),
 }
 
-/// Starts the plugin thread, with the notes the plugins raise.
-pub(crate) fn start(notes: Arc<Mutex<Notes>>) -> Option<(Sender<Job>, Arc<Live>)> {
+/// Starts the plugin thread, with the notes the plugins raise and the run its
+/// hook payloads name.
+pub(crate) fn start(
+    notes: Arc<Mutex<Notes>>,
+    served: Arc<Mutex<Served>>,
+) -> Option<(Sender<Job>, Arc<Live>)> {
     let wake = match notes.lock() {
         Ok(notes) => notes.wake(),
         Err(broken) => broken.into_inner().wake(),
@@ -213,7 +219,7 @@ pub(crate) fn start(notes: Arc<Mutex<Notes>>) -> Option<(Sender<Job>, Arc<Live>)
     let hosting = Arc::clone(&live);
     std::thread::Builder::new()
         .name("plugin".into())
-        .spawn(move || host(queue, notes, hosting))
+        .spawn(move || host(queue, notes, hosting, served))
         .ok()?;
     Some((jobs, live))
 }
@@ -224,7 +230,12 @@ pub(crate) fn start(notes: Arc<Mutex<Notes>>) -> Option<(Sender<Job>, Arc<Live>)
 /// The thread has a tokio runtime of its own, so a plugin may hand back a
 /// promise that a timer or a future settles: the host waits for it while the
 /// runtime drives its own jobs.
-fn host(queue: Receiver<Job>, notes: Arc<Mutex<Notes>>, live: Arc<Live>) {
+fn host(
+    queue: Receiver<Job>,
+    notes: Arc<Mutex<Notes>>,
+    live: Arc<Live>,
+    served: Arc<Mutex<Served>>,
+) {
     // I/O is what a plugin's `fetch` needs: its requests run on this runtime,
     // on this thread.
     let started = tokio::runtime::Builder::new_current_thread()
@@ -242,7 +253,7 @@ fn host(queue: Receiver<Job>, notes: Arc<Mutex<Notes>>, live: Arc<Live>) {
     // is what a QuickJS runtime needs; `block_on` polls them while the host
     // waits for its next job.
     let local = tokio::task::LocalSet::new();
-    local.block_on(&runtime, serve(queue, notes, live));
+    local.block_on(&runtime, serve(queue, notes, live, served));
 }
 
 /// The async host of the plugin thread: one runtime per plugin, and the jobs of
@@ -251,8 +262,13 @@ fn host(queue: Receiver<Job>, notes: Arc<Mutex<Notes>>, live: Arc<Live>) {
 /// The host owns no QuickJS runtime of its own: each instance drives the
 /// promise jobs and the spawned futures (its timers) of its own runtime through
 /// the pump of its own `async_with`, while this waits for the next job.
-async fn serve(mut queue: Receiver<Job>, notes: Arc<Mutex<Notes>>, live: Arc<Live>) {
-    let mut fleet = Fleet::new(notes, live);
+async fn serve(
+    mut queue: Receiver<Job>,
+    notes: Arc<Mutex<Notes>>,
+    live: Arc<Live>,
+    served: Arc<Mutex<Served>>,
+) {
+    let mut fleet = Fleet::new(notes, live, served);
     while let Some(job) = queue.recv().await {
         match job {
             Job::Load {
@@ -260,12 +276,13 @@ async fn serve(mut queue: Receiver<Job>, notes: Arc<Mutex<Notes>>, live: Arc<Liv
                 session,
                 state,
                 sandbox,
+                role,
                 reply,
             } => {
                 super::node::session(&session);
                 super::node::state(&state);
                 super::node::sandbox(sandbox);
-                let report = fleet.load(&root).await;
+                let report = fleet.load(&root, role).await;
                 let _ = reply.send(report);
             }
             Job::Run { tool, args, reply } => {
@@ -389,11 +406,11 @@ struct Shares {
     /// Whether it installed a `turn.end` layer.
     turn: bool,
     /// A bit per event some listener of its waits on.
-    events: u8,
+    events: u32,
 }
 
 /// What every instance shares with the thread: where notes go, what the plugins
-/// raise, and the names already taken.
+/// raise, the names already taken and the run its payloads name.
 #[derive(Clone)]
 struct Shared {
     /// Where a note leaves its text.
@@ -404,6 +421,34 @@ struct Shared {
     names: Rc<RefCell<HashSet<String>>>,
     /// Every command name taken, so a duplicate is refused.
     command_names: Rc<RefCell<HashSet<String>>>,
+    /// The gateway's channel for `reagent.gateway.answer`, and `None` for a
+    /// load that is not the gateway's: the object is absent from a normal
+    /// plugin's `reagent`.
+    gateway: Option<tokio::sync::mpsc::UnboundedSender<super::AnswerAsk>>,
+    /// The folder and the session every hook payload names.
+    served: Arc<Mutex<Served>>,
+}
+
+/// The run a plugin thread serves, as its hook payloads name it: the folder it
+/// works in, which is absolute, and the session it writes.
+#[derive(Default)]
+pub(crate) struct Served {
+    /// The folder, which the host names before the first tool call runs.
+    folder: PathBuf,
+    /// The session id, which a run that keeps none leaves empty.
+    session: Option<String>,
+}
+
+impl Served {
+    /// Names the run the plugins serve.
+    pub(crate) fn name(&mut self, folder: &Path, session: Option<&str>) {
+        if self.folder != folder {
+            self.folder = folder.to_path_buf();
+        }
+        if self.session.as_deref() != session {
+            self.session = session.map(ToOwned::to_owned);
+        }
+    }
 }
 
 /// The instances of the plugin thread, in load order, and the maps that find
@@ -433,13 +478,15 @@ struct Instance {
 }
 
 impl Fleet {
-    fn new(notes: Arc<Mutex<Notes>>, live: Arc<Live>) -> Self {
+    fn new(notes: Arc<Mutex<Notes>>, live: Arc<Live>, served: Arc<Mutex<Served>>) -> Self {
         Self {
             shared: Shared {
                 notes,
                 live,
                 names: Rc::new(RefCell::new(HashSet::new())),
                 command_names: Rc::new(RefCell::new(HashSet::new())),
+                gateway: None,
+                served,
             },
             instances: Vec::new(),
             tools: HashMap::new(),
@@ -449,7 +496,12 @@ impl Fleet {
     }
 
     /// Starts one instance per plugin folder under `root`, in folder order.
-    async fn load(&mut self, root: &Path) -> LoadReport {
+    ///
+    /// A plugin whose role is not the one this load takes is skipped without a
+    /// word: a normal run loads everything but the gateway plugins, and the
+    /// gateway loads only them.
+    async fn load(&mut self, root: &Path, role: Role) -> LoadReport {
+        self.shared.gateway = role.answers();
         let mut report = LoadReport::default();
         #[expect(
             clippy::disallowed_methods,
@@ -485,6 +537,9 @@ impl Fleet {
                 }
                 Found::Plugin(manifest) => manifest,
             };
+            if !role.takes(manifest.role) {
+                continue;
+            }
             // An installed plugin runs only the bytes its install pinned; one
             // the user wrote has no lockfile and loads as before.
             let pins = match lock::read(&dir) {
@@ -843,7 +898,7 @@ async fn instance(
                     window: None,
                 };
                 while let Some(job) = (&mut waiting).await {
-                    answer(&ctx, &engine, &watch, &shared.notes, job).await;
+                    answer(&ctx, &engine, &watch, &shared, job).await;
                 }
             }
             clock.clear();
@@ -854,13 +909,8 @@ async fn instance(
 }
 
 /// Answers one job of this plugin's queue.
-async fn answer(
-    ctx: &Ctx<'_>,
-    engine: &Engine,
-    watch: &Rc<Watch>,
-    notes: &Mutex<Notes>,
-    job: InJob,
-) {
+async fn answer(ctx: &Ctx<'_>, engine: &Engine, watch: &Rc<Watch>, shared: &Shared, job: InJob) {
+    let notes = &shared.notes;
     match job {
         InJob::Run { tool, args, reply } => {
             let out = run_tool(ctx, engine, watch, notes, &tool, &args).await;
@@ -871,7 +921,7 @@ async fn answer(
             let _ = reply.send(out);
         }
         InJob::Call { tool, args, reply } => {
-            let out = chain_call(ctx, engine, watch, notes, &tool, &args).await;
+            let out = chain_call(ctx, engine, watch, shared, &tool, &args).await;
             let _ = reply.send(out);
         }
         InJob::Result {
@@ -881,7 +931,8 @@ async fn answer(
             is_error,
             reply,
         } => {
-            let out = chain_result(ctx, engine, watch, notes, &tool, &args, (text, is_error)).await;
+            let out =
+                chain_result(ctx, engine, watch, shared, &tool, &args, (text, is_error)).await;
             let _ = reply.send(out);
         }
         InJob::Turn {
@@ -1541,6 +1592,11 @@ struct Layer {
     index: usize,
     /// The function the layer runs.
     func: Persistent<Function<'static>>,
+    /// How long the layer has to settle; a `tool.call` layer names its own.
+    limit: Duration,
+    /// What a call does when a `tool.call` layer does not settle in time, or
+    /// throws.
+    on_timeout: OnTimeout,
 }
 
 /// One event listener, with the plugin that registered it.
@@ -1618,6 +1674,8 @@ async fn load_one(
         live: Arc::clone(live),
         taken: Rc::clone(&engine.command_names),
         committed: Rc::clone(&committed),
+        gateway: shared.gateway.clone(),
+        hooks: manifest.permissions.hooks.clone(),
     };
     watched(
         ctx,
@@ -1698,8 +1756,18 @@ async fn load_one(
         plugin: manifest.name.clone(),
         index,
         func,
+        limit: STOP,
+        on_timeout: OnTimeout::Keep,
     };
-    engine.call.extend(staged.call.into_iter().map(layer));
+    engine
+        .call
+        .extend(staged.call.into_iter().map(|staged| Layer {
+            plugin: manifest.name.clone(),
+            index,
+            func: staged.func,
+            limit: staged.timeout,
+            on_timeout: staged.on_timeout,
+        }));
     engine.result.extend(staged.result.into_iter().map(layer));
     engine.turn.extend(staged.turn.into_iter().map(layer));
     engine
@@ -1880,31 +1948,37 @@ async fn chain_call(
     ctx: &Ctx<'_>,
     engine: &Engine,
     watch: &Rc<Watch>,
-    notes: &Mutex<Notes>,
+    shared: &Shared,
     tool: &str,
     args: &str,
 ) -> Step {
     let mut current = args_object(args);
     let mut changed = false;
+    let (folder, session) = run_fields(shared);
     for layer in &engine.call {
         let Some(func) = restore(ctx, &layer.func) else {
             continue;
         };
+        // The layer's own `timeoutMs` is its wait, as a tool's promise wait is
+        // `LONG`; each slice of its JS still stops at `STOP`.
+        let limit = layer.limit;
         let out = watched(
             ctx,
             watch,
-            notes,
+            &shared.notes,
             Who {
                 index: layer.index,
                 name: &layer.plugin,
             },
             "hook tool.call",
-            STOP,
+            limit,
             async |window| {
                 let payload = Object::new(ctx.clone()).map_err(|error| failure(ctx, error))?;
                 payload
                     .set("tool", tool)
                     .and_then(|_| payload.set("args", api::from_json(ctx, &current)?))
+                    .and_then(|_| payload.set("cwd", folder.as_str()))
+                    .and_then(|_| payload.set("session", api::from_json(ctx, &session)?))
                     .map_err(|error| failure(ctx, error))?;
                 let value = call1(ctx, watch, window, &func, payload.into_value()).await?;
                 Ok(step(ctx, &layer.plugin, value))
@@ -1918,11 +1992,30 @@ async fn chain_call(
                 changed = true;
             }
             Ok(Step::Block(reason)) => return Step::Block(reason),
-            Err(Failed::Threw(message)) => note(
-                notes,
-                format!("plugin {}: hook tool.call threw: {message}", layer.plugin),
-            ),
-            Err(Failed::Stopped(_)) => {}
+            // A layer that does not settle in time, or throws, gives the call
+            // the outcome its own `onTimeout` names.
+            Err(Failed::Threw(message)) => match layer.on_timeout {
+                OnTimeout::Block => {
+                    return Step::Block(format!(
+                        "plugin {}: tool.call hook failed: {message}",
+                        layer.plugin
+                    ));
+                }
+                OnTimeout::Keep => note(
+                    &shared.notes,
+                    format!("plugin {}: hook tool.call threw: {message}", layer.plugin),
+                ),
+            },
+            Err(Failed::Stopped(budget)) => match layer.on_timeout {
+                OnTimeout::Block => {
+                    return Step::Block(format!(
+                        "plugin {}: tool.call hook timed out after {} ms",
+                        layer.plugin,
+                        budget.as_millis()
+                    ));
+                }
+                OnTimeout::Keep => {}
+            },
         }
     }
     if changed {
@@ -1930,6 +2023,20 @@ async fn chain_call(
     } else {
         Step::Keep
     }
+}
+
+/// The run's folder and session, as `cwd` and `session` name them in every
+/// payload a hook of a tool call gets: the session is `null` for a run that
+/// keeps none.
+fn run_fields(shared: &Shared) -> (String, JsonValue) {
+    let Ok(served) = shared.served.lock() else {
+        return (String::new(), JsonValue::Null);
+    };
+    let session = match &served.session {
+        Some(id) => JsonValue::String(id.clone()),
+        None => JsonValue::Null,
+    };
+    (served.folder.to_string_lossy().into_owned(), session)
 }
 
 /// What one `tool.call` layer made of a call.
@@ -1972,12 +2079,14 @@ async fn chain_result(
     ctx: &Ctx<'_>,
     engine: &Engine,
     watch: &Rc<Watch>,
-    notes: &Mutex<Notes>,
+    shared: &Shared,
     tool: &str,
     args: &str,
     first: (String, bool),
 ) -> ResultReply {
+    let notes = &shared.notes;
     let parsed = args_object(args);
+    let (folder, session) = run_fields(shared);
     let (mut text, mut is_error) = first;
     let mut said = (None, None);
     for layer in &engine.result {
@@ -2001,6 +2110,8 @@ async fn chain_result(
                     .and_then(|_| payload.set("args", api::from_json(ctx, &parsed)?))
                     .and_then(|_| payload.set("text", text.as_str()))
                     .and_then(|_| payload.set("isError", is_error))
+                    .and_then(|_| payload.set("cwd", folder.as_str()))
+                    .and_then(|_| payload.set("session", api::from_json(ctx, &session)?))
                     .map_err(|error| failure(ctx, error))?;
                 let value = call1(ctx, watch, window, &func, payload.into_value()).await?;
                 // Reading the answer runs getters, so it stays under the watchdog.

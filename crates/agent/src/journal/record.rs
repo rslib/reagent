@@ -15,7 +15,7 @@ use reagent_ai::{Message, Text, Usage};
 use reagent_store::{DecodeError, Decoder, Encoder, Value};
 
 use crate::journal::kinds;
-use crate::journal::registry::{approval, base, call_start, model, settings, turn_end};
+use crate::journal::registry::{approval, base, call_start, model, question, settings, turn_end};
 use crate::journal::state::{LedgerEntry, State};
 use crate::tool::EffectClass;
 
@@ -27,6 +27,11 @@ const APPROVAL_WAIT: u64 = 1;
 const APPROVAL_RUN: u64 = 2;
 /// The kind byte of an approval record a client refused.
 const APPROVAL_REFUSED: u64 = 3;
+
+/// The kind byte of a question record that waits for an answer.
+const QUESTION_ASKED: u64 = 1;
+/// The kind byte of a question record a person answered.
+const QUESTION_ANSWERED: u64 = 2;
 
 /// One journal record, decoded.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,8 +110,36 @@ pub struct Settings {
     pub mode: Option<String>,
 }
 
+/// A question the model asked with the `ask` tool, or the answer a person gave
+/// it.
+///
+/// The question is on the disk before it goes out, so a process that ends
+/// while it waits leaves a question a later process answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Question {
+    /// The question waits for an answer.
+    Asked {
+        /// The tool call the question belongs to.
+        call: String,
+        /// The id the answer names: 32 lowercase hex characters.
+        qid: String,
+        /// The JSON text of the `questions` argument, as the model sent it.
+        questions: String,
+    },
+    /// A person answered the question.
+    Answered {
+        /// The id of the question the answers belong to.
+        qid: String,
+        /// The client that answered.
+        by: String,
+        /// The JSON text of the answers, one list per question.
+        answers: String,
+    },
+}
+
 /// A record of a kind the replayed log does not carry: a call that waits for a
-/// client or the answer it got, or a settings change.
+/// client or the answer it got, a settings change, or a question and its
+/// answer.
 ///
 /// [`decode`] reports these kinds as [`Record::Unknown`], so a build that only
 /// shows the log still reads a log it does not know; the resume and the loop
@@ -117,6 +150,8 @@ pub enum Aside {
     Approval(Approval),
     /// A change of the reasoning level or the permission mode.
     Settings(Settings),
+    /// A question the model asked, or the answer a person gave it.
+    Question(Question),
 }
 
 /// Decodes one record of a kind [`decode`] leaves as [`Record::Unknown`], or
@@ -125,6 +160,7 @@ pub fn decode_aside(kind: u8, payload: &Bytes) -> io::Result<Option<Aside>> {
     match kind {
         kinds::APPROVAL => decode_approval(payload).map(Aside::Approval).map(Some),
         kinds::SETTINGS => decode_settings(payload).map(Aside::Settings).map(Some),
+        kinds::QUESTION => decode_question(payload).map(Aside::Question).map(Some),
         _ => Ok(None),
     }
 }
@@ -229,6 +265,59 @@ pub fn encode_settings(out: &mut Vec<u8>, record: &Settings) {
     if let Some(mode) = &record.mode {
         encoder.str(settings::MODE, mode);
     }
+}
+
+/// Writes one question record: the wait, or the answer a person gave it.
+pub fn encode_question(out: &mut Vec<u8>, record: &Question) {
+    let mut encoder = Encoder::new(out);
+    match record {
+        Question::Asked {
+            call,
+            qid,
+            questions,
+        } => {
+            encoder.u64(question::KIND, QUESTION_ASKED);
+            encoder.str(question::CALL_ID, call);
+            encoder.str(question::QID, qid);
+            encoder.str(question::QUESTIONS, questions);
+        }
+        Question::Answered { qid, by, answers } => {
+            encoder.u64(question::KIND, QUESTION_ANSWERED);
+            encoder.str(question::QID, qid);
+            encoder.str(question::BY, by);
+            encoder.str(question::ANSWERS, answers);
+        }
+    }
+}
+
+fn decode_question(payload: &Bytes) -> io::Result<Question> {
+    let mut decoder = Decoder::new(payload);
+    let mut kind = QUESTION_ASKED;
+    let mut call = String::new();
+    let mut qid = String::new();
+    let mut questions = String::new();
+    let mut by = String::new();
+    let mut answers = String::new();
+    while let Some((field, value)) = next(&mut decoder)? {
+        match field {
+            question::KIND => kind = varint_of(&value)?,
+            question::CALL_ID => call = string_of(&value)?,
+            question::QID => qid = string_of(&value)?,
+            question::QUESTIONS => questions = string_of(&value)?,
+            question::BY => by = string_of(&value)?,
+            question::ANSWERS => answers = string_of(&value)?,
+            _ => {}
+        }
+    }
+    Ok(if kind == QUESTION_ANSWERED {
+        Question::Answered { qid, by, answers }
+    } else {
+        Question::Asked {
+            call,
+            qid,
+            questions,
+        }
+    })
 }
 
 fn decode_call_start(payload: &Bytes) -> io::Result<CallStart> {

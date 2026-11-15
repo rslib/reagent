@@ -680,6 +680,7 @@ fn turn_reason(reason: &TurnEndReason) -> &'static str {
     match reason {
         TurnEndReason::EndTurn => "end_turn",
         TurnEndReason::Cancelled => "cancelled",
+        TurnEndReason::Parked => "parked",
         TurnEndReason::Stopped(_) => "stopped",
         TurnEndReason::MaxTurns => "max_turns",
         TurnEndReason::Error => "error",

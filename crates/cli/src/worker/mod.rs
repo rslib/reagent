@@ -25,6 +25,7 @@ use reagent_agent::live;
 use reagent_agent::live::Inbox;
 use reagent_agent::live::SendMode;
 use reagent_agent::live::Sender;
+use reagent_agent::question::Questions;
 use reagent_ai::Content;
 use reagent_ai::Message;
 use reagent_ai::Text;
@@ -470,6 +471,12 @@ impl Worker {
         self.shared.set_skills(found);
     }
 
+    /// Hands the worker the questions of the run, so a park leaves the question
+    /// the last client could not answer for a later process.
+    pub(crate) fn questions(&self, questions: Arc<Questions>) {
+        self.shared.set_questions(questions);
+    }
+
     /// The shared state of the session: its settings, and the model and the
     /// provider a usage line names.
     pub(crate) fn shared(&self) -> Arc<Shared> {
@@ -566,6 +573,11 @@ impl Worker {
         let (Some(inbox), Some(sender)) = (self.inbox.as_mut(), self.sender.as_ref()) else {
             return TurnEndReason::Error;
         };
+        // The session keeps a journal, so a question it waits for can be
+        // answered later. The registry is taken before the run borrows the
+        // worker.
+        let recorded = journal.is_some();
+        let questions = self.shared.questions().cloned();
         let run = agent.run_pending_with_inbox(history, journal, events, pending, inbox);
         tokio::pin!(run);
         let reason = match self.leaving.as_mut() {
@@ -573,7 +585,9 @@ impl Worker {
                 reason = &mut run => reason,
                 _ = leaving => {
                     self.stopping = true;
-                    let _ = sender.send(live::Command::Cancel { client: WORKER }).await;
+                    if !parked(questions.as_ref(), recorded) {
+                        let _ = sender.send(live::Command::Cancel { client: WORKER }).await;
+                    }
                     run.await
                 }
                 () = stop.cancelled() => {
@@ -650,6 +664,7 @@ impl Worker {
         let mut leaving = self.leaving.take();
         // What the plugins publish reaches the clients while the session lives;
         // a run with no plugins starts no task.
+        let recorded = journal.is_some();
         let mut pump = Pump::start(&shared, sender.as_ref());
         let live = live::run_live(agent, history, journal, events, &mut inbox);
         tokio::pin!(live);
@@ -664,10 +679,13 @@ impl Worker {
         tokio::select! {
             () = &mut live => {}
             _ = leaving => {
-                // A run that waits for an answer no client can give is
-                // cancelled, then the senders go so the session returns.
+                // A run that waits for an answer no client can give is parked
+                // when its question is on the journal, so a later process
+                // answers it, and cancelled otherwise. Then the senders go so
+                // the session returns.
                 end_pump(&mut pump).await;
-                if shared.waits()
+                if !parked(shared.questions(), recorded)
+                    && shared.waits()
                     && let Some(sender) = &sender
                 {
                     let _ = sender.send(live::Command::Cancel { client: WORKER }).await;
@@ -1015,6 +1033,9 @@ pub(crate) struct Shared {
     /// The skills the run found, set once before the servers start: the
     /// `initialize` answer names them, and a run with none names none.
     skills: OnceLock<Vec<crate::skills::Found>>,
+    /// The questions of the run, set once before its tool batch: a worker parks
+    /// the question its run waits for, so a later process answers it.
+    questions: OnceLock<Arc<Questions>>,
     /// Bumped on every change of `state`, so a wait wakes on it.
     changed: watch::Sender<u64>,
 }
@@ -1030,6 +1051,7 @@ impl Shared {
             held: Mutex::new(None),
             plugins: OnceLock::new(),
             skills: OnceLock::new(),
+            questions: OnceLock::new(),
             changed,
         }
     }
@@ -1048,6 +1070,16 @@ impl Shared {
     /// Takes the skills the run found, for every `initialize` answer to name.
     fn set_skills(&self, found: Vec<crate::skills::Found>) {
         let _ = self.skills.set(found);
+    }
+
+    /// Sets the questions of the run, whose first set stays.
+    fn set_questions(&self, questions: Arc<Questions>) {
+        let _ = self.questions.set(questions);
+    }
+
+    /// The questions of the run, or `None` when the run asks none.
+    fn questions(&self) -> Option<&Arc<Questions>> {
+        self.questions.get()
     }
 
     /// The skills the run found, empty when it found none.
@@ -1440,6 +1472,24 @@ async fn stop_clients(acceptor: Option<JoinHandle<()>>) {
         acceptor.abort();
         let _ = acceptor.await;
     }
+}
+
+/// Parks the question a run waits for, when the session keeps a journal and the
+/// question is on it: the run ends `Parked` and a later `reagent answer`
+/// continues the session.
+///
+/// A wait for an approval has no question to park, and a question the journal
+/// does not hold names no id for a later process, so both cancel as they always
+/// did. `recorded` says whether the session keeps a journal.
+fn parked(questions: Option<&Arc<Questions>>, recorded: bool) -> bool {
+    let Some(questions) = questions else {
+        return false;
+    };
+    if !recorded || !questions.parkable() {
+        return false;
+    }
+    questions.park();
+    true
 }
 
 /// Accepts clients until the last one leaves and no run is open, or until the

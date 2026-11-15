@@ -5,18 +5,47 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use rquickjs::function::Opt;
 use rquickjs::{Array, Ctx, Exception, Function, Object, Persistent, Value};
 use serde_json::{Map, Value as JsonValue};
 
 use super::runtime;
-use super::{Live, Notes};
+use super::{AnswerAsk, BY_BYTES, Live, Notes};
 
 /// The events a plugin may listen on.
-const EVENTS: [&str; 5] = ["run_start", "turn_start", "turn_end", "tool_end", "run_end"];
+///
+/// `question_parked` and `question_closed` reach gateway plugins only: a normal
+/// run never fires them.
+const EVENTS: [&str; 10] = [
+    "run_start",
+    "turn_start",
+    "turn_end",
+    "tool_end",
+    "run_end",
+    "usage",
+    "question_parked",
+    "question_closed",
+    "waiting",
+    "waited",
+];
+
+/// What `reagent.gateway.answer` says of a wrong token or a wrong answer list.
+const DENIED: &str = "denied";
+
+/// What `reagent.gateway.answer` says of a question that is no longer open.
+const STALE: &str = "stale";
 
 /// The hooks a plugin may install.
-const HOOKS: [&str; 3] = ["tool.call", "tool.result", "turn.end"];
+pub(crate) const HOOKS: [&str; 3] = ["tool.call", "tool.result", "turn.end"];
+
+/// The `timeoutMs` a `tool.call` layer has when it names none: the 5 s every
+/// hook waited before a layer could name its own.
+const TIMEOUT_MS: u64 = 5_000;
+
+/// The longest `timeoutMs` a `tool.call` layer may name.
+const TIMEOUT_MAX_MS: u64 = 120_000;
 
 /// The roles a panel line may carry; any other role is dropped.
 const ROLES: [&str; 7] = ["text", "dim", "strong", "accent", "good", "warn", "bad"];
@@ -37,7 +66,7 @@ const NO_LINES: &str = "[]";
 const NO_PARAMETERS: &str = r#"{"type":"object","properties":{}}"#;
 
 /// The bit of `"run_start"`, and so on; the low bit is the first event.
-pub(crate) fn event_bit(name: &str) -> Option<u8> {
+pub(crate) fn event_bit(name: &str) -> Option<u32> {
     EVENTS
         .iter()
         .position(|event| *event == name)
@@ -66,6 +95,27 @@ pub(crate) struct StagedCommand {
     pub run: Persistent<Function<'static>>,
 }
 
+/// One `tool.call` layer a plugin installed while it loaded, with the limits it
+/// named.
+pub(crate) struct StagedCall {
+    /// The function the layer runs.
+    pub func: Persistent<Function<'static>>,
+    /// How long the layer has to settle.
+    pub timeout: Duration,
+    /// What the call does when the layer does not settle in time, or throws.
+    pub on_timeout: OnTimeout,
+}
+
+/// What a `tool.call` layer that does not settle in time, or throws, does to
+/// the call.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OnTimeout {
+    /// The call does not run, with a reason that names the plugin.
+    Block,
+    /// The call runs as it is, as a layer that failed always did.
+    Keep,
+}
+
 /// One panel's state, shared by its live JS object and the load that commits
 /// it.
 pub(crate) struct Slot {
@@ -91,7 +141,7 @@ pub(crate) struct Staging {
     /// call finds an existing slot in.
     pub panels: Rc<RefCell<Vec<Rc<RefCell<Slot>>>>>,
     /// Its `tool.call` layers, in registration order.
-    pub call: Vec<Persistent<Function<'static>>>,
+    pub call: Vec<StagedCall>,
     /// Its `tool.result` layers, in registration order.
     pub result: Vec<Persistent<Function<'static>>>,
     /// Its `turn.end` layers, in registration order.
@@ -112,6 +162,11 @@ pub(crate) struct Host {
     /// Whether the plugin's load committed; a panel it makes later goes to
     /// `live` itself, because no load is left to commit it.
     pub committed: Rc<Cell<bool>>,
+    /// The gateway's channel for `reagent.gateway.answer`, and `None` outside
+    /// the gateway: every other plugin gets no `reagent.gateway` at all.
+    pub gateway: Option<tokio::sync::mpsc::UnboundedSender<AnswerAsk>>,
+    /// The hooks the plugin's manifest lets it install.
+    pub hooks: Vec<String>,
 }
 
 /// Builds the `reagent` object for the plugin `name` at `version`, whose
@@ -226,13 +281,27 @@ pub(crate) fn reagent<'js>(
     reagent.set("on", on)?;
     let hook = Function::new(ctx.clone(), {
         let staging = Rc::clone(staging);
-        move |ctx: Ctx<'js>, hook: String, layer: Function<'js>| -> rquickjs::Result<()> {
-            let mut staged = staging.borrow_mut();
+        let hooks = Rc::new(host.hooks.clone());
+        let plugin = name.to_string();
+        move |ctx: Ctx<'js>,
+              hook: String,
+              layer: Function<'js>,
+              options: Opt<Object<'js>>|
+              -> rquickjs::Result<()> {
             let saved = Persistent::save(&ctx, layer);
             match hook.as_str() {
-                "tool.call" => staged.call.push(saved),
-                "tool.result" => staged.result.push(saved),
-                "turn.end" => staged.turn.push(saved),
+                "tool.call" => {
+                    if !hooks.iter().any(|allowed| allowed == "tool.call") {
+                        return Err(fail(
+                            &ctx,
+                            format!("plugin {plugin} has no hooks permission for tool.call"),
+                        ));
+                    }
+                    let staged = call_layer(&ctx, saved, options.0)?;
+                    staging.borrow_mut().call.push(staged);
+                }
+                "tool.result" => staging.borrow_mut().result.push(saved),
+                "turn.end" => staging.borrow_mut().turn.push(saved),
                 _ => {
                     return Err(fail(
                         &ctx,
@@ -356,7 +425,79 @@ pub(crate) fn reagent<'js>(
     plugin.set("name", name)?;
     plugin.set("version", version)?;
     reagent.set("plugin", plugin)?;
+    if let Some(answers) = &host.gateway {
+        reagent.set("gateway", gateway(ctx, name, answers)?)?;
+    }
     Ok(reagent.into_value())
+}
+
+/// The `reagent.gateway` object a gateway plugin gets, and no other plugin.
+///
+/// `answer(qid, token, answers, by)` hands the work to the gateway's async side
+/// and answers a Promise of `"ok"`, `"denied"`, `"stale"` or `"busy"`, which settles
+/// when the gateway is done with the journal, the parked folder and the worker
+/// it restarts. The plugin thread never waits on any of that itself.
+fn gateway<'js>(
+    ctx: &Ctx<'js>,
+    plugin: &str,
+    answers: &tokio::sync::mpsc::UnboundedSender<AnswerAsk>,
+) -> rquickjs::Result<Object<'js>> {
+    let answers = answers.clone();
+    let plugin = plugin.to_string();
+    // Its name is part of the `by` the journal records: `gateway:<plugin>:<by>`.
+    let answer = Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>,
+              qid: Value<'js>,
+              token: Value<'js>,
+              list: Value<'js>,
+              by: Value<'js>|
+              -> rquickjs::Result<Value<'js>> {
+            let (promise, resolve, _reject) = ctx.promise()?;
+            let refused = |verdict: &str| {
+                let _ = resolve.call::<_, ()>((verdict,));
+                promise.clone().into_value()
+            };
+            let (Some(qid), Some(token)) = (text_of(&qid), text_of(&token)) else {
+                return Ok(refused(DENIED));
+            };
+            let list = match json_of(&ctx, list) {
+                Some(list) if list.is_array() || list.is_null() => list.to_string(),
+                _ => return Ok(refused(DENIED)),
+            };
+            let by = text_of(&by).unwrap_or_default();
+            let (reply, done) = tokio::sync::oneshot::channel();
+            let ask = AnswerAsk {
+                plugin: plugin.clone(),
+                qid,
+                token,
+                answers: list,
+                by: cut(&by, BY_BYTES).to_owned(),
+                reply,
+            };
+            if answers.send(ask).is_err() {
+                return Ok(refused(STALE));
+            }
+            // The gateway answers on its own thread; this future settles the
+            // promise with what it decided, whatever the plugin awaits.
+            ctx.spawn(async move {
+                let verdict = match done.await {
+                    Ok(verdict) => verdict,
+                    Err(_) => STALE.to_string(),
+                };
+                let _ = resolve.call::<_, ()>((verdict,));
+            });
+            Ok(promise.into_value())
+        },
+    )?;
+    let object = Object::new(ctx.clone())?;
+    object.set("answer", answer)?;
+    Ok(object)
+}
+
+/// A JS value as a string, when it is one.
+fn text_of(value: &Value<'_>) -> Option<String> {
+    value.as_string().and_then(|text| text.to_string().ok())
 }
 
 /// Throws `message` and returns the error that carries it.
@@ -371,6 +512,64 @@ fn named(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+/// The `tool.call` layer `options` describes, with the limit and the outcome it
+/// names: `timeoutMs` 1 to 120000, and `onTimeout` `"block"` or `"keep"`.
+fn call_layer<'js>(
+    ctx: &Ctx<'js>,
+    func: Persistent<Function<'static>>,
+    options: Option<Object<'js>>,
+) -> rquickjs::Result<StagedCall> {
+    let mut layer = StagedCall {
+        func,
+        timeout: Duration::from_millis(TIMEOUT_MS),
+        on_timeout: OnTimeout::Keep,
+    };
+    let Some(options) = options else {
+        return Ok(layer);
+    };
+    // A misspelt key would leave a gate on the defaults without a word, so
+    // every key must be one this reads.
+    for key in options.keys::<String>() {
+        let key = key?;
+        if key != "timeoutMs" && key != "onTimeout" {
+            return Err(fail(
+                ctx,
+                format!("unknown hook option '{key}': use timeoutMs or onTimeout"),
+            ));
+        }
+    }
+    if let Some(value) = options.get::<_, Option<Value>>("timeoutMs")? {
+        let Some(ms) = value.as_int() else {
+            return Err(fail(
+                ctx,
+                "timeoutMs must be a whole number of milliseconds",
+            ));
+        };
+        let Some(ms) = u64::try_from(ms)
+            .ok()
+            .filter(|ms| (1..=TIMEOUT_MAX_MS).contains(ms))
+        else {
+            return Err(fail(
+                ctx,
+                format!("timeoutMs must be 1 to {TIMEOUT_MAX_MS}, not {ms}"),
+            ));
+        };
+        layer.timeout = Duration::from_millis(ms);
+    }
+    if let Some(value) = options.get::<_, Option<Value>>("onTimeout")? {
+        let mode = value
+            .as_string()
+            .and_then(|text| text.to_string().ok())
+            .unwrap_or_default();
+        layer.on_timeout = match mode.as_str() {
+            "block" => OnTimeout::Block,
+            "keep" => OnTimeout::Keep,
+            _ => return Err(fail(ctx, "onTimeout must be \"block\" or \"keep\"")),
+        };
+    }
+    Ok(layer)
 }
 
 /// The longest prefix of `text` that is at most `max` bytes and ends on a char
@@ -564,6 +763,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn call_gate_every_event_has_a_bit_of_its_own() {
+        let bits: Vec<u32> = EVENTS
+            .iter()
+            .map(|name| event_bit(name).expect("a bit"))
+            .collect();
+        let all = bits.iter().fold(0u32, |all, bit| all | bit);
+        assert_eq!(all.count_ones() as usize, EVENTS.len(), "{bits:?}");
+    }
+
+    #[test]
     fn a_name_is_letters_digits_underscore_and_dash() {
         assert!(named("shout"));
         assert!(named("read_file-2"));
@@ -577,6 +786,11 @@ mod tests {
         assert_eq!(event_bit("run_start"), Some(1));
         assert_eq!(event_bit("run_end"), Some(16));
         assert_eq!(event_bit("nothing"), None);
+    }
+
+    #[test]
+    fn usage_event_has_its_own_bit() {
+        assert_eq!(event_bit("usage"), Some(32));
     }
 
     #[test]

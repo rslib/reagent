@@ -829,7 +829,9 @@ impl StreamParser {
 
         for choice in chunk.choices.into_choices() {
             let delta = choice.delta;
-            if let Some(reasoning) = delta.reasoning_content.or(delta.reasoning) {
+            if let Some(reasoning) = delta.reasoning_content.or(delta.reasoning)
+                && !reasoning.as_str().is_empty()
+            {
                 out.push(StreamEvent::ThinkingDelta(reasoning.into_text()));
             }
             if let Some(details) = delta.reasoning_details {
@@ -2483,6 +2485,23 @@ mod tests {
                 StreamEvent::TextDelta("b".into())
             ],
             "the second line extends the same buffer"
+        );
+    }
+
+    /// Some hosts send an empty `reasoning_content` with every content chunk;
+    /// an empty thinking delta would split the reply text in a client.
+    #[test]
+    fn an_empty_reasoning_field_gives_no_thinking_delta() {
+        let mut parser = StreamParser::new();
+        let line = br#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"","content":"Do"},"finish_reason":null}]}"#;
+        assert_eq!(
+            parse_line(&mut parser, line),
+            vec![StreamEvent::TextDelta("Do".into())]
+        );
+        let line = br#"data: {"choices":[{"index":0,"delta":{"reasoning":"","content":"it"},"finish_reason":null}]}"#;
+        assert_eq!(
+            parse_line(&mut parser, line),
+            vec![StreamEvent::TextDelta("it".into())]
         );
     }
 

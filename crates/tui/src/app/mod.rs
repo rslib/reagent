@@ -2595,9 +2595,10 @@ const SKILL_CAP: usize = 64 * 1024;
 /// The line that ends a skill's file the cap cut.
 const SKILL_CUT: &str = "[skill file cut at 64 KB]";
 
-/// The prefix a row of the `/` list names a skill with when its plain name is
-/// taken: `/skill:<name>` runs every skill of the session, either way.
-const SKILL_PREFIX: &str = "/skill:";
+/// The prefix the `/` list names a skill with: `/skill:<name>` runs every skill
+/// of the session, and the list shows those rows only for a query that starts
+/// with it.
+pub(crate) const SKILL_PREFIX: &str = "/skill:";
 
 /// The read of a skill's file, and the message it makes when it answers.
 #[derive(Debug)]
@@ -3797,6 +3798,11 @@ impl App {
     /// A piece of the model's reasoning: one dim row of its time, and its newest
     /// line while the block is open.
     fn thinking(&mut self, delta: &str) {
+        // An empty delta, which some hosts send with every chunk, must not
+        // close the reply's text block.
+        if delta.is_empty() {
+            return;
+        }
         if !matches!(self.live.last(), Some(Item::Thought(_))) {
             // The reasoning before the first call of a run is its own block, and
             // the reasoning after it fills its place in the run.
@@ -5849,11 +5855,14 @@ impl App {
     }
 
     /// Builds the rows the `/` list and the palette open with: the built-ins,
-    /// then the commands the plugins of the session offer, then the skills of
-    /// the session, each under its scope's word.
+    /// then the commands the plugins of the session offer, then one plain row
+    /// per skill of the session, each under its scope's word, and last the
+    /// namespaced row of every skill.
     ///
-    /// A skill whose plain name a built-in or a plugin row holds loses it, and
-    /// keeps only its namespaced row: `/skill:<name>` runs every skill.
+    /// A skill whose plain name a built-in or a plugin row holds takes the
+    /// namespaced name alone: `/skill:<name>` runs every skill. The namespaced
+    /// rows come after every other row, so the list that hides them for a query
+    /// that does not name them cuts the tail alone.
     fn set_slash(&mut self) {
         let labels = self.keyfile.as_ref().map(keyfile::KeyFile::labels);
         let mut rows: Vec<list::Command> = commands::table(labels).to_vec();
@@ -5866,23 +5875,26 @@ impl App {
             });
         }
         let skills = self.skill_list();
+        let mut namespaced = Vec::with_capacity(skills.len());
         for (name, _, scope) in &skills {
             let plain = format!("/{name}");
+            let words = Cow::<str>::Owned(scope.clone());
             if !rows.iter().any(|row| *row.name == plain) {
                 rows.push(list::Command {
                     name: Cow::Owned(plain),
-                    words: Cow::Owned(scope.clone()),
+                    words: words.clone(),
                     key: Cow::Borrowed(""),
                     group: commands::SKILL_GROUP,
                 });
             }
-            rows.push(list::Command {
+            namespaced.push(list::Command {
                 name: Cow::Owned(format!("{SKILL_PREFIX}{name}")),
-                words: Cow::Owned(scope.clone()),
+                words,
                 key: Cow::Borrowed(""),
                 group: commands::SKILL_GROUP,
             });
         }
+        rows.append(&mut namespaced);
         self.slash = Arc::from(rows);
         self.dirty = true;
     }

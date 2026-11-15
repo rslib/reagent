@@ -46,6 +46,14 @@ pub const OWNER: u8 = RECORD_FIRST + 9;
 /// model is a [`MODEL`] record.
 pub const SETTINGS: u8 = RECORD_FIRST + 10;
 
+/// A question the model asked with the `ask` tool, or the answer it got: the
+/// question id, the call it belongs to, the questions and, once a person
+/// answered, who answered and what they said.
+///
+/// The question is on the disk before it goes out, so a process that ends
+/// before an answer leaves a question a later process answers.
+pub const QUESTION: u8 = RECORD_FIRST + 11;
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -53,7 +61,7 @@ mod tests {
     use reagent_store::Encoder;
 
     use crate::journal::record::{
-        self, Approval, ApprovalKind, CallStart, Model, Record, Settings, TurnEnd,
+        self, Approval, ApprovalKind, CallStart, Model, Question, Record, Settings, TurnEnd,
     };
     use crate::journal::state::{LedgerEntry, State};
     use crate::tool::EffectClass;
@@ -254,6 +262,54 @@ mod tests {
     }
 
     #[test]
+    fn question_record_asked_and_answered_round_trip() {
+        let asked = Question::Asked {
+            call: "call_1".into(),
+            qid: "0123456789abcdef0123456789abcdef".into(),
+            questions:
+                r#"[{"q":"Which database?","options":[{"label":"sqlite"},{"label":"postgres"}]}]"#
+                    .into(),
+        };
+        let answered = Question::Answered {
+            qid: "0123456789abcdef0123456789abcdef".into(),
+            by: "3".into(),
+            answers: r#"[["sqlite"]]"#.into(),
+        };
+        for question in [asked, answered] {
+            let mut out = Vec::new();
+            record::encode_question(&mut out, &question);
+            let payload = Bytes::from(out);
+            let decoded = record::decode_aside(QUESTION, &payload).expect("decode");
+            assert_eq!(
+                decoded,
+                Some(record::Aside::Question(question.clone())),
+                "{question:?}"
+            );
+        }
+    }
+
+    /// A question record of a build that wrote a field this one does not know
+    /// still decodes: only the fields this build reads come back.
+    #[test]
+    fn question_record_with_a_future_field_still_decodes() {
+        let qid = "0123456789abcdef0123456789abcdef";
+        let mut out = Vec::new();
+        let mut encoder = Encoder::new(&mut out);
+        encoder.u64(crate::journal::registry::question::KIND, 1);
+        encoder.str(crate::journal::registry::question::QID, qid);
+        encoder.str(200, "a field of a later build");
+        let decoded = record::decode_aside(QUESTION, &Bytes::from(out)).expect("decode");
+        assert_eq!(
+            decoded,
+            Some(record::Aside::Question(Question::Asked {
+                call: String::new(),
+                qid: qid.into(),
+                questions: String::new(),
+            }))
+        );
+    }
+
+    #[test]
     fn the_kinds_are_defined_once() {
         let kinds = [
             MESSAGE,
@@ -267,6 +323,7 @@ mod tests {
             APPROVAL,
             OWNER,
             SETTINGS,
+            QUESTION,
         ];
         for (at, kind) in kinds.iter().enumerate() {
             assert_eq!(*kind, RECORD_FIRST + at as u8);

@@ -43,6 +43,7 @@ use reagent_tools::read::Read;
 use reagent_tools::write::Write;
 
 use crate::args::{Args, SandboxMode, TOOL_NAMES};
+use crate::net_proxy::Proxy;
 use crate::prompt;
 use crate::skills;
 
@@ -537,6 +538,20 @@ pub async fn run(mut args: Args) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // The environment block starts here, before the provider is built, so its
+    // git runs overlap the provider setup. It is awaited below, just before the
+    // first message is built.
+    let probe = probe_for(&args.policy, &cwd);
+    // The provider is built before a worker names its session, so a worker
+    // that cannot reach its provider (a missing key) stops before its ready
+    // line, and the process that started it reads the reason.
+    let (provider, session, source) = match build_provider(&args).await {
+        Ok(built) => built,
+        Err(message) => {
+            eprintln!("reagent: {message}");
+            return ExitCode::from(2);
+        }
+    };
     // A worker takes its session before it names it: the lock, the socket and
     // the entry a client reads are all there before the ready line goes out.
     // The model it serves is the one this run uses, and the window is the one
@@ -558,17 +573,6 @@ pub async fn run(mut args: Args) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // The environment block starts here, before the provider is built, so its
-    // git runs overlap the provider setup. It is awaited below, just before the
-    // first message is built.
-    let probe = probe_for(&args.policy, &cwd);
-    let (provider, session, source) = match build_provider(&args).await {
-        Ok(built) => built,
-        Err(message) => {
-            eprintln!("reagent: {message}");
-            return ExitCode::from(2);
-        }
-    };
     // The one line before the first request, in both output modes: the
     // profile, the model and where the credential came from, never the key.
     eprintln!(
@@ -588,7 +592,16 @@ pub async fn run(mut args: Args) -> ExitCode {
         .iter()
         .any(|name| name == "mask" || name == "compact")
         .then(Archive::new);
-    let launcher = match launcher(&args, &cwd) {
+    // The proxy goes up before the first bash command: it is the one way out
+    // of a sandbox whose host list is longer than nothing.
+    let proxy = match proxy_for(&args).await {
+        Ok(proxy) => proxy,
+        Err(message) => {
+            eprintln!("reagent: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let launcher = match launcher(&args, &cwd, proxy.as_ref().map(Proxy::port)) {
         Ok(launcher) => launcher,
         Err(message) => {
             eprintln!("reagent: {message}");
@@ -612,7 +625,11 @@ pub async fn run(mut args: Args) -> ExitCode {
         );
     }
     let direct = direct_adapters(&args, servers.as_ref());
+    // The plugins load after the tools, so a script's calls find the run's
+    // call hook here once they have one.
+    let script_hook = reagent_script::codemode::HookSlot::default();
     let codemode = chosen(&args.tools, reagent_script::codemode::NAME).then(|| CodemodeSetup {
+        hook: Arc::clone(&script_hook),
         rules: args.rules.clone(),
         wall: codemode_wall(args.codemode.wall_time, args.deadline),
         servers: servers.clone(),
@@ -640,6 +657,11 @@ pub async fn run(mut args: Args) -> ExitCode {
         .then(reagent_agent::question::Questions::new);
     if let Some(questions) = &questions {
         registry.add(reagent_agent::question::Ask::new(Arc::clone(questions)));
+    }
+    // The worker parks the question its run waits for, so it holds the registry
+    // of the questions too.
+    if let (Some(worker), Some(questions)) = (worker.as_ref(), &questions) {
+        worker.questions(Arc::clone(questions));
     }
     // The plugins of the run, after every other tool so a name they take is
     // already owned. A run with no plugins folder loads nothing and adds no
@@ -670,8 +692,18 @@ pub async fn run(mut args: Args) -> ExitCode {
                 registry.add(tool);
             }
             // The run starts for the plugins here, before the first request.
-            loaded.event("run_start", serde_json::json!({}));
+            loaded.event(
+                "run_start",
+                // `hooks.codemodeInner`: a `codemode` script's calls meet the
+                // `tool.call` hook, so a gate may let codemode run.
+                serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "hooks": { "codemodeInner": true },
+                }),
+            );
             registry = registry.with_hook(loaded.clone());
+            // A script's calls meet the same gate as the model's own.
+            let _ = script_hook.set(loaded.clone());
             plugins = Some(loaded);
         }
     }
@@ -773,9 +805,7 @@ pub async fn run(mut args: Args) -> ExitCode {
         guard
     });
     if let Some(plugins) = &plugins {
-        agent = agent
-            .with_turn_hook(plugins.clone())
-            .with_event_hook(Arc::new(PluginEvents(Arc::clone(plugins))));
+        agent = agent.with_turn_hook(plugins.clone());
     }
     if let Some(questions) = &questions {
         agent = agent.with_questions(Arc::clone(questions));
@@ -809,6 +839,24 @@ pub async fn run(mut args: Args) -> ExitCode {
         provider: args.provider_name.as_deref().map(Text::from),
         shared: worker.as_ref().map(crate::worker::Worker::shared),
     };
+    // The plugins hear the loop's events, and a `usage` payload names what the
+    // `--json` lines name: the run's session, its folder, its price and the
+    // provider it started on. The hook goes in here, once those are known.
+    if let Some(plugins) = &plugins {
+        // The folder and the session every hook payload names: the plugins hear
+        // them before the first call runs.
+        plugins.serving(&cwd, report.session.as_deref());
+        agent = agent.with_event_hook(Arc::new(PluginEvents {
+            plugins: Arc::clone(plugins),
+            session: report.session.clone(),
+            cwd: cwd.clone(),
+            billing: report.billing,
+            provider: report.provider.clone(),
+            model: report.model.clone(),
+            preset: args.preset.map(|preset| preset.name),
+            shared: report.shared.clone(),
+        }));
+    }
     // The answer lines of the run's stdin client, when it has one, and the end
     // its session reports once it is over.
     let mut answers = None;
@@ -994,6 +1042,20 @@ pub async fn run(mut args: Args) -> ExitCode {
             .resume(&mut agent, &mut history, &mut Some(journal), &tx)
             .await;
     }
+    // A session a person answered from another process owes the model that
+    // answer: the results of the reply are in the history, nothing is pending,
+    // and the run goes on here, with no client of its own to read it.
+    if !steered
+        && no_task
+        && !matches!(pending_reason, TurnEndReason::Error)
+        && resumed.is_some_and(|resumed| resumed.answered)
+        && let Some(worker) = worker.as_mut()
+        && let Some((journal, _)) = journal.as_mut()
+    {
+        pending_reason = worker
+            .resume(&mut agent, &mut history, &mut Some(journal), &tx)
+            .await;
+    }
     if let Some(worker) = worker.as_mut() {
         // The worker's session runs from its inbox until its last client
         // leaves; the task it was given is already queued there.
@@ -1079,6 +1141,21 @@ pub async fn run(mut args: Args) -> ExitCode {
                 eprintln!("reagent: warning: could not close the session: {message}")
             }
             Err(_) => eprintln!("reagent: warning: the session writer stopped"),
+        }
+    }
+    // A run that parked leaves one file per open question where a process that
+    // did not run it finds them: `reagent answer` lists them, and an answer
+    // continues the session.
+    if matches!(reason, TurnEndReason::Parked)
+        && let Some(plan) = &plan
+    {
+        let dir = plan.dir.clone();
+        match tokio::task::spawn_blocking(move || parked_questions(&dir)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(message)) => {
+                eprintln!("reagent: warning: could not leave the parked questions: {message}")
+            }
+            Err(_) => eprintln!("reagent: warning: the parked questions did not go out"),
         }
     }
     // Deleting the sessions the limits no longer keep runs after the final
@@ -1277,26 +1354,156 @@ enum Step {
 
 /// Hands the loop's events to the plugins' listeners, in loop order, so a
 /// listener sees the end of a turn before a call of the next turn runs.
-struct PluginEvents(Arc<Plugins>);
+///
+/// It holds what a `usage` payload names, and the run hands it those once:
+/// the session the run writes, the folder it works in, the price of its model,
+/// the provider the `--json` lines name and the preset that provider is made
+/// from.
+struct PluginEvents {
+    plugins: Arc<Plugins>,
+    /// The session the run writes, or `None` for a run that keeps none.
+    session: Option<String>,
+    /// The folder the run's tools work in, which is absolute.
+    cwd: std::path::PathBuf,
+    /// The price of the model, which fills a cost the provider reported none.
+    billing: Option<Billing>,
+    /// The provider id and model the run started on.
+    provider: Option<Text>,
+    model: Option<Text>,
+    /// The built-in preset the starting provider is made from.
+    preset: Option<&'static str>,
+    /// The session's own names, which a `set` changes.
+    shared: Option<Arc<crate::worker::Shared>>,
+}
 
 impl EventHook for PluginEvents {
     fn seen(&self, event: Seen<'_>) {
         match event {
-            Seen::TurnStart => self.0.event("turn_start", serde_json::json!({})),
-            Seen::ToolEnd { tool, is_error } => self.0.event(
+            Seen::TurnStart => self.plugins.event("turn_start", serde_json::json!({})),
+            Seen::ToolEnd { tool, is_error } => self.plugins.event(
                 "tool_end",
                 serde_json::json!({ "tool": tool, "isError": is_error }),
             ),
-            Seen::TurnEnd(reason) => self.0.event(
+            Seen::TurnEnd(reason) => self.plugins.event(
                 "turn_end",
                 serde_json::json!({ "reason": reason_word(reason) }),
             ),
-            Seen::RunEnd(reason) => self.0.event(
+            Seen::RunEnd(reason) => self.plugins.event(
                 "run_end",
                 serde_json::json!({ "reason": reason_word(reason) }),
             ),
+            // A wait reaches the plugins as two payloads, one when it starts and
+            // one when it ends, and both only for a run whose plugins listen.
+            Seen::Waiting { kind, call, tool } => {
+                if self.plugins.wants("waiting") {
+                    self.plugins.event(
+                        "waiting",
+                        serde_json::json!({
+                            "kind": kind.word(),
+                            "call": call,
+                            "tool": tool,
+                            "session": self.session,
+                        }),
+                    );
+                }
+            }
+            Seen::Waited { kind, call, how } => {
+                if self.plugins.wants("waited") {
+                    self.plugins.event(
+                        "waited",
+                        serde_json::json!({
+                            "kind": kind.word(),
+                            "call": call,
+                            "how": how.word(),
+                            "session": self.session,
+                        }),
+                    );
+                }
+            }
+            // The payload is built only for a run whose plugins listen on it.
+            Seen::Usage(usage) => {
+                if self.plugins.wants("usage") {
+                    self.plugins.event("usage", self.payload(usage));
+                }
+            }
         }
     }
+}
+
+impl PluginEvents {
+    /// The payload of one `usage` event: the token use of one finished reply,
+    /// with the names the `--json` usage line writes for it.
+    fn payload(&self, usage: &Usage) -> serde_json::Value {
+        let (provider, model) = self.names();
+        let usage = priced_usage(*usage, self.billing);
+        serde_json::json!({
+            "id": fresh_id(),
+            "at": reagent_store::paths::now_ms(),
+            "session": self.session,
+            "parentSession": serde_json::Value::Null,
+            "preset": self.preset_of(provider.as_deref()),
+            "provider": provider,
+            "model": model,
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "cacheRead": usage.cache_read_tokens,
+            "cacheWrite": usage.cache_write_tokens,
+            "reasoning": usage.reasoning_tokens,
+            "cost": usage.cost,
+            "cwd": self.cwd,
+        })
+    }
+
+    /// The provider id and the model a usage is named by, as the `--json` usage
+    /// line names them: a `set` of a served session moves both.
+    fn names(&self) -> (Option<Text>, Option<Text>) {
+        match self.shared.as_ref() {
+            Some(shared) => {
+                let (provider, model) = shared.names();
+                (provider, Some(model))
+            }
+            None => (self.provider.clone(), self.model.clone()),
+        }
+    }
+
+    /// The preset `provider` is made from, when the run still uses the provider
+    /// it started on: a `set` that switches the provider names a table whose
+    /// preset this run never reads, so it reports none rather than another
+    /// provider's.
+    fn preset_of(&self, provider: Option<&str>) -> Option<&'static str> {
+        if provider == self.provider.as_deref() {
+            self.preset
+        } else {
+            None
+        }
+    }
+}
+
+/// One reply's usage with the cost the `--json` usage line shows: the price of
+/// the provider, or its model, at the peak rule of that price.
+fn priced_usage(usage: Usage, billing: Option<Billing>) -> Usage {
+    match priced(Event::Usage(usage, None), billing) {
+        Event::Usage(usage, _) => usage,
+        _ => usage,
+    }
+}
+
+/// A fresh usage id: 32 lowercase hex characters from two random words, the way
+/// a question id is made. A host that replays one reply reports the same id
+/// twice, so a reader of the events counts each reply once.
+fn fresh_id() -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut id = String::with_capacity(32);
+    for word in [
+        reagent_store::paths::random_u64(),
+        reagent_store::paths::random_u64(),
+    ] {
+        for byte in word.to_le_bytes() {
+            id.push(HEX[usize::from(byte >> 4)] as char);
+            id.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
+    }
+    id
 }
 
 /// The word `--json` writes for an end reason, which the plugin events carry
@@ -1305,6 +1512,7 @@ fn reason_word(reason: &TurnEndReason) -> &'static str {
     match reason {
         TurnEndReason::EndTurn => "end_turn",
         TurnEndReason::Cancelled => "cancelled",
+        TurnEndReason::Parked => "parked",
         TurnEndReason::Stopped(_) => "stopped",
         TurnEndReason::MaxTurns => "max_turns",
         TurnEndReason::Error => "error",
@@ -1620,7 +1828,7 @@ fn stop_string(reason: &TurnEndReason) -> Option<&'static str> {
 /// pressed Ctrl+C knows.
 fn stop_note(reason: &TurnEndReason, cause: Cause, session: Option<&str>) -> Option<String> {
     let note = match (reason, cause) {
-        (TurnEndReason::EndTurn | TurnEndReason::Error, _)
+        (TurnEndReason::EndTurn | TurnEndReason::Error | TurnEndReason::Parked, _)
         | (TurnEndReason::Cancelled, Cause::CtrlC) => return None,
         (TurnEndReason::MaxTurns, _) => {
             let mut note =
@@ -1657,6 +1865,7 @@ fn exit_code(reason: &TurnEndReason, cause: Cause) -> ExitCode {
         (TurnEndReason::Cancelled, Cause::CtrlC) => 130,
         (
             TurnEndReason::Cancelled
+            | TurnEndReason::Parked
             | TurnEndReason::MaxTurns
             | TurnEndReason::Error
             | TurnEndReason::Stopped(_),
@@ -2209,13 +2418,27 @@ fn check_rule_tools(rules: &Rules, registry: &Registry) -> Result<(), String> {
     Ok(())
 }
 
+/// What a command does when the sandbox cannot start: `auto` runs it bare,
+/// unless the config names network hosts.
+fn fallback_for(mode: SandboxMode, hosts: bool) -> Option<Fallback> {
+    match mode {
+        SandboxMode::Off => None,
+        SandboxMode::Auto if hosts => Some(Fallback::Required),
+        SandboxMode::Auto => Some(Fallback::Auto),
+        SandboxMode::On => Some(Fallback::Required),
+    }
+}
+
 /// The helper command that fences bash in, or none when the sandbox is off or
-/// this program cannot name itself.
-fn launcher(args: &Args, cwd: &std::path::Path) -> Result<Option<Launcher>, String> {
-    let fallback = match args.sandbox {
-        SandboxMode::Off => return Ok(None),
-        SandboxMode::Auto => Fallback::Auto,
-        SandboxMode::On => Fallback::Required,
+/// this program cannot name itself. `proxy` is the port of the run's network
+/// proxy, when it has one.
+fn launcher(
+    args: &Args,
+    cwd: &std::path::Path,
+    proxy: Option<u16>,
+) -> Result<Option<Launcher>, String> {
+    let Some(fallback) = fallback_for(args.sandbox, !args.network_hosts.is_empty()) else {
+        return Ok(None);
     };
     // The helper is this binary; without its path the sandbox cannot start.
     let program = match std::env::current_exe() {
@@ -2251,12 +2474,82 @@ fn launcher(args: &Args, cwd: &std::path::Path) -> Result<Option<Launcher>, Stri
     }
     if args.network {
         helper.push("--network".into());
+    } else if let Some(port) = proxy {
+        // A host list never gets `--network`: the program reaches the proxy
+        // and the listed local ports, and nothing else.
+        helper.push("--net-proxy".into());
+        helper.push(format!("127.0.0.1:{port}"));
+        // Linux puts the program in a network namespace with only loopback in
+        // it, so the proxy is reached through a bridge on a unix socket.
+        #[cfg(target_os = "linux")]
+        {
+            helper.push("--net-proxy-unix".into());
+            helper.push(
+                reagent_sandbox::proxy_socket_path(port)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        for host in &args.network_hosts {
+            if host.is_loopback() {
+                helper.push("--net-local".into());
+                helper.push(host.port().to_string());
+            }
+        }
     }
     Ok(Some(Launcher {
         program,
         args: helper,
         fallback,
     }))
+}
+
+/// Starts the network proxy of a run whose `[sandbox] network` names hosts,
+/// and answers none when the sandbox is off or the value is a bool.
+async fn proxy_for(args: &Args) -> Result<Option<Proxy>, String> {
+    if args.sandbox == SandboxMode::Off {
+        return Ok(None);
+    }
+    let hosts = proxy_hosts(&args.network_hosts);
+    if hosts.is_empty() {
+        return Ok(None);
+    }
+    Proxy::start(hosts).await.map(Some).map_err(|error| {
+        format!("the sandbox network proxy could not start on 127.0.0.1 ({error})")
+    })
+}
+
+/// The hosts the proxy serves. macOS holds them: its profile allows the proxy
+/// port and each local port, and nothing else. Linux holds them too, once a
+/// user and a network namespace can be made, which is what the bridge there
+/// runs in; where they cannot, a list is no network at all and the run says
+/// that once.
+#[cfg(target_os = "macos")]
+fn proxy_hosts(hosts: &[reagent_config::Host]) -> &[reagent_config::Host] {
+    hosts
+}
+
+#[cfg(target_os = "linux")]
+fn proxy_hosts(hosts: &[reagent_config::Host]) -> &[reagent_config::Host] {
+    fn available() -> bool {
+        static PROBED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *PROBED.get_or_init(reagent_sandbox::netns_available)
+    }
+    if hosts.is_empty() {
+        return &[];
+    }
+    if !available() {
+        eprintln!(
+            "reagent: sandbox.network host lists need user namespaces, which are off here; commands get no network"
+        );
+        return &[];
+    }
+    hosts
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn proxy_hosts(_hosts: &[reagent_config::Host]) -> &[reagent_config::Host] {
+    &[]
 }
 
 /// The `bash` on `PATH`, resolved once per run so the helper runs it without
@@ -2305,6 +2598,8 @@ const CODEMODE_WALL: Duration = Duration::from_secs(10 * 60);
 /// What the `codemode` tool needs: the rules its script's calls are checked
 /// against, and the longest one script may run.
 struct CodemodeSetup {
+    /// The run's call hook for a script's calls, set once the plugins load.
+    hook: reagent_script::codemode::HookSlot,
     rules: Rules,
     wall: Duration,
     /// The server set a script's late calls resolve through, when a run has one.
@@ -2366,6 +2661,33 @@ pub(crate) fn asks(selected: &[String], answering: bool) -> bool {
 /// Whether a resolved tool list holds `name`.
 fn chosen(selected: &[String], name: &str) -> bool {
     selected.iter().any(|chosen| chosen == name)
+}
+
+/// Writes the entry of every question the session at `dir` still waits for, so
+/// a process that did not run it answers one, and returns how many it left.
+///
+/// Reading the journal blocks, so a caller runs this on the blocking pool.
+fn parked_questions(dir: &std::path::Path) -> Result<usize, String> {
+    let state = crate::session::state_home()
+        .ok_or_else(|| "no state folder; set HOME or XDG_STATE_HOME".to_string())?;
+    let folder = reagent_protocol::discovery::folder(&state);
+    let session =
+        reagent_store::Session::open(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    let id = session.header().session_id.clone();
+    let open = reagent_agent::journal::resume::parked(&session)
+        .map_err(|error| format!("{}: {error}", dir.display()))?;
+    let at = reagent_store::paths::now_ms();
+    for question in &open {
+        let entry = reagent_protocol::discovery::Parked {
+            qid: question.qid.clone(),
+            session: id.clone(),
+            questions: serde_json::from_str(&question.questions).unwrap_or(serde_json::Value::Null),
+            at,
+        };
+        reagent_protocol::discovery::write_parked_blocking(&folder, &entry)
+            .map_err(|error| format!("{}: {error}", folder.display()))?;
+    }
+    Ok(open.len())
 }
 
 /// How long a run waits for its MCP servers before it starts without them.
@@ -2522,6 +2844,7 @@ fn tools(
             }
         }
         let mut script = Codemode::new(Arc::new(inner))
+            .with_hook_slot(setup.hook)
             .with_guard(Guard::new(setup.rules))
             .with_wall_time(setup.wall)
             .with_hidden(hidden);
@@ -2579,6 +2902,51 @@ mod tests {
     #[test]
     fn snapshot_policy_off_leaves_the_task_alone() {
         assert_eq!(crate::snapshot::first_message("task".into(), ""), "task");
+    }
+
+    /// Linux holds a host list once user namespaces work, since that is what
+    /// its network namespace and bridge need; where they are off, a list is no
+    /// network at all, so the run starts no proxy and the helper gets the
+    /// `network = false` sandbox.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_list_gets_the_proxy_when_namespaces_work() {
+        let hosts = [
+            reagent_config::Host::parse("127.0.0.1:5555").expect("an entry"),
+            reagent_config::Host::parse("devbox.example.net:22").expect("an entry"),
+        ];
+        assert!(proxy_hosts(&[]).is_empty());
+        if reagent_sandbox::netns_available() {
+            assert_eq!(proxy_hosts(&hosts).len(), 2);
+        } else {
+            assert!(proxy_hosts(&hosts).is_empty());
+        }
+    }
+
+    /// macOS holds a host list: the proxy serves every entry, and the profile
+    /// allows only its port.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_list_gets_the_proxy_on_macos() {
+        let hosts = [reagent_config::Host::parse("github.com:443").expect("an entry")];
+        assert_eq!(proxy_hosts(&hosts).len(), 1);
+        assert!(proxy_hosts(&[]).is_empty());
+    }
+
+    /// A host list is a fence the user asked for, so `auto` never drops it:
+    /// a sandbox that cannot start refuses the command instead.
+    #[test]
+    fn host_list_makes_an_auto_sandbox_required() {
+        assert_eq!(fallback_for(SandboxMode::Off, true), None);
+        assert_eq!(fallback_for(SandboxMode::Auto, false), Some(Fallback::Auto));
+        assert_eq!(
+            fallback_for(SandboxMode::Auto, true),
+            Some(Fallback::Required)
+        );
+        assert_eq!(
+            fallback_for(SandboxMode::On, false),
+            Some(Fallback::Required)
+        );
     }
 
     /// The deepseek preset, whose price peaks in the working day.
@@ -3785,6 +4153,7 @@ mod tests {
     /// The rules and wall time a run that lists `codemode` gives it.
     fn codemode_setup() -> CodemodeSetup {
         CodemodeSetup {
+            hook: reagent_script::codemode::HookSlot::default(),
             rules: Rules::none(),
             wall: CODEMODE_WALL,
             servers: None,
@@ -3960,6 +4329,7 @@ mod tests {
             true,
             &selected,
             Some(CodemodeSetup {
+                hook: reagent_script::codemode::HookSlot::default(),
                 servers: Some(servers),
                 ..codemode_setup()
             }),

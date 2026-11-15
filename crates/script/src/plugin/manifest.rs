@@ -3,6 +3,10 @@
 use std::path::{Component, Path, PathBuf};
 
 /// What one folder under the plugins root holds.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a manifest is read once, at load, and never copied"
+)]
 pub(crate) enum Found {
     /// A plugin, with the entry file it names.
     Plugin(Manifest),
@@ -31,6 +35,29 @@ pub(crate) struct Manifest {
         allow(dead_code, reason = "only the node modules read the permissions")
     )]
     pub permissions: Permissions,
+    /// The role it plays: a normal run loads the plugins that are not
+    /// [`Role::Gateway`], and `reagent gateway` loads only those.
+    pub role: Role,
+}
+
+/// The role a plugin's `reagent.role` names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Role {
+    /// A plugin a normal run loads, and the gateway skips.
+    Normal,
+    /// A plugin only `reagent gateway` loads.
+    Gateway,
+}
+
+impl Role {
+    /// The role `reagent.role` names, or the reason it names none.
+    fn read(reagent: &serde_json::Value) -> Result<Role, String> {
+        match reagent.get("role") {
+            None => Ok(Role::Normal),
+            Some(role) if role.as_str() == Some("gateway") => Ok(Role::Gateway),
+            Some(role) => Err(format!("unknown role {role}: `role` must be \"gateway\"")),
+        }
+    }
 }
 
 /// What a plugin's `reagent.permissions` lets it touch.
@@ -48,6 +75,8 @@ pub(crate) struct Permissions {
     pub net: Vec<Host>,
     /// The programs it may run.
     pub run: Vec<Program>,
+    /// The hooks it may install, by name.
+    pub hooks: Vec<String>,
 }
 
 impl Permissions {
@@ -58,6 +87,7 @@ impl Permissions {
             env: Env::None,
             net: Vec::new(),
             run: Vec::new(),
+            hooks: Vec::new(),
         }
     }
 }
@@ -169,6 +199,10 @@ pub(crate) fn read(dir: &Path) -> Found {
         Ok(permissions) => permissions,
         Err(reason) => return Found::Bad(reason),
     };
+    let role = match Role::read(reagent) {
+        Ok(role) => role,
+        Err(reason) => return Found::Bad(reason),
+    };
     let folder = dir
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -210,6 +244,7 @@ pub(crate) fn read(dir: &Path) -> Found {
         dir,
         entry: entry_at,
         permissions,
+        role,
     })
 }
 
@@ -222,7 +257,7 @@ fn permissions(reagent: &serde_json::Value) -> Result<Permissions, String> {
         return Err("the `permissions` block must be an object with `fs` and `env`".into());
     };
     for key in object.keys() {
-        if key != "fs" && key != "env" && key != "net" && key != "run" {
+        if key != "fs" && key != "env" && key != "net" && key != "run" && key != "hooks" {
             return Err(format!("unknown permission `{key}`"));
         }
     }
@@ -242,7 +277,41 @@ fn permissions(reagent: &serde_json::Value) -> Result<Permissions, String> {
         Some(run) => run_of(run)?,
         None => Vec::new(),
     };
-    Ok(Permissions { fs, env, net, run })
+    let hooks = match object.get("hooks") {
+        Some(hooks) => hooks_of(hooks)?,
+        None => Vec::new(),
+    };
+    Ok(Permissions {
+        fs,
+        env,
+        net,
+        run,
+        hooks,
+    })
+}
+
+/// The hooks `hooks` names, or the reason one of them is not a hook.
+fn hooks_of(value: &serde_json::Value) -> Result<Vec<String>, String> {
+    const EXPECTED: &str = "permission `hooks` must be a list of hook names";
+    let Some(items) = value.as_array() else {
+        return Err(EXPECTED.into());
+    };
+    let mut hooks = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(text) = item.as_str() else {
+            return Err(EXPECTED.into());
+        };
+        if !super::api::HOOKS.contains(&text) {
+            return Err(format!(
+                "permission `hooks` names {text:?}, which is not a hook: use one of {}",
+                super::api::HOOKS.join(", ")
+            ));
+        }
+        if !hooks.iter().any(|hook| hook == text) {
+            hooks.push(text.to_owned());
+        }
+    }
+    Ok(hooks)
 }
 
 /// The file system permission `fs` names, or the reason it is wrong.
@@ -475,6 +544,8 @@ fn inside(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 #[expect(clippy::disallowed_methods, reason = "test setup on a temp dir")]
 mod tests {
+    use crate::plugin::{AnswerAsk, Plugins};
+
     use super::*;
 
     /// The `package.json` of a plugin whose `reagent.permissions` is `permissions`.
@@ -536,6 +607,7 @@ mod tests {
                 env: Env::None,
                 net: Vec::new(),
                 run: Vec::new(),
+                hooks: Vec::new(),
             }
         );
     }
@@ -549,6 +621,7 @@ mod tests {
                 env: Env::None,
                 net: Vec::new(),
                 run: Vec::new(),
+                hooks: Vec::new(),
             }
         );
     }
@@ -562,6 +635,7 @@ mod tests {
                 env: Env::None,
                 net: Vec::new(),
                 run: Vec::new(),
+                hooks: Vec::new(),
             }
         );
     }
@@ -575,6 +649,7 @@ mod tests {
                 env: Env::None,
                 net: Vec::new(),
                 run: Vec::new(),
+                hooks: Vec::new(),
             }
         );
     }
@@ -624,6 +699,31 @@ mod tests {
             refused(&package(r#"{"gpu": true}"#)),
             "unknown permission `gpu`"
         );
+    }
+
+    #[test]
+    fn call_gate_hooks_permission_keeps_its_names() {
+        assert_eq!(
+            permissions_of(&package(r#"{"hooks": ["tool.call", "turn.end"]}"#)).hooks,
+            vec!["tool.call".to_owned(), "turn.end".to_owned()]
+        );
+        assert!(permissions_of(&package("{}")).hooks.is_empty());
+    }
+
+    #[test]
+    fn call_gate_an_unknown_hook_name_names_it() {
+        let reason = refused(&package(r#"{"hooks": ["tool.clal"]}"#));
+        assert!(reason.contains("tool.clal"), "{reason}");
+        assert!(reason.contains("`hooks`"), "{reason}");
+        assert!(reason.contains("tool.call"), "{reason}");
+    }
+
+    #[test]
+    fn call_gate_hooks_permission_must_be_a_list_of_names() {
+        let reason = refused(&package(r#"{"hooks": "tool.call"}"#));
+        assert!(reason.contains("`hooks`"), "{reason}");
+        let reason = refused(&package(r#"{"hooks": [7]}"#));
+        assert!(reason.contains("`hooks`"), "{reason}");
     }
 
     #[test]
@@ -836,6 +936,71 @@ mod tests {
             refused(&package(r#"{"run": [""]}"#)),
             "permission `run` entry \"\" must be a program name or an absolute path"
         );
+    }
+
+    #[test]
+    fn gateway_role_parses() {
+        let text = r#"{"name": "p", "reagent": {"entry": "index.js", "role": "gateway"}}"#;
+        match read_manifest(text) {
+            Found::Plugin(manifest) => assert_eq!(manifest.role, Role::Gateway),
+            Found::Bad(reason) => panic!("refused a gateway plugin: {reason}"),
+            Found::Skipped => panic!("skipped a gateway plugin"),
+        }
+    }
+
+    #[test]
+    fn gateway_role_is_normal_when_unset() {
+        assert_eq!(role_of(&package("{}")), Role::Normal);
+    }
+
+    #[test]
+    fn gateway_unknown_role_names_it() {
+        let text = r#"{"name": "p", "reagent": {"entry": "index.js", "role": "worker"}}"#;
+        let reason = refused(text);
+        assert!(reason.contains("worker"), "{reason}");
+        assert!(reason.contains("role"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn gateway_plugin_is_not_loaded_by_a_normal_run() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        let plugin = root.join("p");
+        std::fs::create_dir_all(&plugin).expect("makes the plugin folder");
+        std::fs::write(
+            plugin.join("package.json"),
+            r#"{"name": "p", "reagent": {"entry": "index.js", "role": "gateway"}}"#,
+        )
+        .expect("writes the manifest");
+        std::fs::write(
+            plugin.join("index.js"),
+            "export default function (reagent) { reagent.registerTool({ name: \"from_gateway\", run: () => \"\" }); }\n",
+        )
+        .expect("writes the entry");
+        let (normal, notes) = Plugins::load_in(root, root, root).await;
+        assert!(normal.is_none(), "a normal run loaded a gateway plugin");
+        assert!(notes.is_empty(), "{notes:?}");
+        let (gateway, notes) = Plugins::load_gateway(root, root, None, answers()).await;
+        assert!(notes.is_empty(), "{notes:?}");
+        let gateway = gateway.expect("the gateway plugin loads");
+        assert_eq!(gateway.tools().len(), 1);
+    }
+
+    /// The role a plugin names, which must load.
+    fn role_of(text: &str) -> Role {
+        match read_manifest(text) {
+            Found::Plugin(manifest) => manifest.role,
+            Found::Bad(reason) => panic!("refused a plugin it should load: {reason}"),
+            Found::Skipped => panic!("skipped a plugin it should load"),
+        }
+    }
+
+    /// The channel a gateway plugin's answers go to, with no gateway behind it.
+    fn answers() -> tokio::sync::mpsc::UnboundedSender<AnswerAsk> {
+        let (answers, mut asks) = tokio::sync::mpsc::unbounded_channel();
+        // The requests are dropped: a load asks for nothing.
+        tokio::spawn(async move { while asks.recv().await.is_some() {} });
+        answers
     }
 
     #[test]

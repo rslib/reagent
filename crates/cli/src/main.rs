@@ -1,12 +1,16 @@
 //! The reagent binary: a headless coding agent.
 
+mod answer;
 mod args;
 mod attach;
+#[cfg(feature = "tui")]
+mod gateway;
 mod gc;
 mod json;
 mod login;
 mod mcp;
 mod models;
+mod net_proxy;
 mod permissions;
 mod plugin;
 mod prompt;
@@ -27,6 +31,25 @@ mod worker;
 #[cfg(test)]
 const PROMPT_BUDGET: usize = 1040;
 
+/// Runs the gateway, which needs the terminal UI's worker and file watcher.
+#[cfg(feature = "tui")]
+fn gateway(
+    argv: Vec<std::ffi::OsString>,
+    runtime: &tokio::runtime::Runtime,
+) -> std::process::ExitCode {
+    runtime.block_on(gateway::run(argv))
+}
+
+/// The gateway is part of the default build; without it the command says so.
+#[cfg(not(feature = "tui"))]
+fn gateway(
+    _argv: Vec<std::ffi::OsString>,
+    _runtime: &tokio::runtime::Runtime,
+) -> std::process::ExitCode {
+    eprintln!("reagent: gateway needs the default build");
+    std::process::ExitCode::from(2)
+}
+
 fn main() -> std::process::ExitCode {
     let mut argv: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if argv.first().is_some_and(|arg| *arg == "--sandbox-exec") {
@@ -35,11 +58,21 @@ fn main() -> std::process::ExitCode {
     if let Some(command) = argv.first().and_then(|arg| arg.to_str())
         && matches!(
             command,
-            "login" | "logout" | "mcp" | "permissions" | "plugin" | "rpc" | "session"
+            "answer"
+                | "gateway"
+                | "login"
+                | "logout"
+                | "mcp"
+                | "permissions"
+                | "plugin"
+                | "rpc"
+                | "session"
         )
     {
         let runtime = runtime();
         let code = match command {
+            "answer" => runtime.block_on(answer::run(argv[1..].to_vec())),
+            "gateway" => gateway(argv[1..].to_vec(), &runtime),
             "mcp" => runtime.block_on(mcp::run(argv[1..].to_vec())),
             "permissions" => runtime.block_on(permissions::run(argv[1..].to_vec())),
             "plugin" => runtime.block_on(plugin::run(argv[1..].to_vec())),

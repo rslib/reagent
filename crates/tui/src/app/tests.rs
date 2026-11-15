@@ -10526,6 +10526,163 @@ async fn skill_command_rows_join_the_slash_list() {
     );
 }
 
+/// A skill whose plain name no other row holds draws one row, its scope at the
+/// right edge and two columns after its name.
+#[test]
+fn skill_rows_draw_the_scope_at_the_right() {
+    let dir = tempfile::tempdir().expect("a folder");
+    let design = written_skill(dir.path(), "codebase-design", "BODY\n", Scope::Global);
+    let mut app = skilled(vec![design]);
+    type_keys(&mut app, "/co");
+    app.paint();
+    let screen = screen_text(&app);
+    let rows: Vec<&str> = screen.lines().collect();
+    let at = rows
+        .iter()
+        .position(|row| row.contains("/codebase-design"))
+        .unwrap_or_else(|| panic!("the skill row draws:\n{screen}"));
+    let row = rows[at];
+    assert!(
+        !row.contains("/skill:"),
+        "one row for the skill, under its plain name: {row:?}"
+    );
+    let row = row.split('\u{2502}').next().unwrap_or(row).trim_end();
+    assert!(row.ends_with("global"), "the scope ends the row: {row:?}");
+    let after = &row[row.find("/codebase-design").expect("the name") + 16..];
+    assert!(
+        after.starts_with("  "),
+        "the name and its words keep two columns apart: {row:?}"
+    );
+    assert_eq!(after.trim(), "global", "the words are the scope: {row:?}");
+    let compact = rows
+        .iter()
+        .find(|row| row.contains("/compact"))
+        .unwrap_or_else(|| panic!("the `/compact` row draws:\n{screen}"))
+        .split('\u{2502}')
+        .next()
+        .unwrap_or_default()
+        .trim_end();
+    assert_eq!(
+        UnicodeWidthStr::width(row),
+        UnicodeWidthStr::width(compact),
+        "a row without a key ends at the last column one may use: {row:?} {compact:?}"
+    );
+}
+
+/// A skill name wider than the row is cut with `…`, and its scope still shows.
+#[test]
+fn skill_rows_cut_a_long_name_and_keep_the_scope() {
+    let dir = tempfile::tempdir().expect("a folder");
+    let long = "codebase-design-".repeat(12);
+    let design = written_skill(dir.path(), &long, "BODY\n", Scope::Project);
+    let mut app = skilled(vec![design]);
+    type_keys(&mut app, "/skill:");
+    app.paint();
+    let screen = screen_text(&app);
+    let row = screen
+        .lines()
+        .find(|row| row.contains("/skill:"))
+        .unwrap_or_else(|| panic!("the namespaced row draws:\n{screen}"));
+    let row = row.split('\u{2502}').next().unwrap_or(row).trim_end();
+    assert!(!row.contains(&long), "the whole name does not fit: {row:?}");
+    assert!(row.contains('\u{2026}'), "the name is cut: {row:?}");
+    assert!(row.ends_with("project"), "the scope still shows: {row:?}");
+}
+
+/// The namespaced rows of the skills wait for the query that names them: `/s`
+/// draws no `/skill:` row, and `/skill:` draws them all.
+#[test]
+fn skill_rows_wait_for_the_namespaced_query() {
+    let dir = tempfile::tempdir().expect("a folder");
+    let axi = written_skill(dir.path(), "axi", "AXI\n", Scope::Global);
+    let commits = written_skill(dir.path(), "commits", "COMMITS\n", Scope::Project);
+    let mut app = skilled(vec![axi, commits]);
+    type_keys(&mut app, "/s");
+    app.paint();
+    let screen = screen_text(&app);
+    assert!(
+        !screen.contains("/skill:"),
+        "no namespaced row shows under `/s`:\n{screen}"
+    );
+    assert!(
+        screen.contains("/sessions"),
+        "the built-in rows still show:\n{screen}"
+    );
+
+    type_keys(&mut app, "kill:");
+    app.paint();
+    let screen = screen_text(&app);
+    for wanted in ["/skill:axi", "/skill:commits"] {
+        assert!(
+            screen.contains(wanted),
+            "{wanted:?} shows under `/skill:`:\n{screen}"
+        );
+    }
+}
+
+/// A skill whose plain name a built-in holds takes the namespaced name, and the
+/// built-in keeps its own.
+#[test]
+fn skill_rows_take_the_namespaced_name_of_a_built_in() {
+    let dir = tempfile::tempdir().expect("a folder");
+    let model = written_skill(dir.path(), "model", "MODEL\n", Scope::Global);
+    let mut app = skilled(vec![model]);
+    let rows = slash_rows(&app);
+    assert!(
+        !rows.iter().any(|row| row.0 == "/model" && row.1 == "skill"),
+        "the built-in keeps `/model`: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.0 == "/skill:model"),
+        "the skill keeps its namespaced row: {rows:?}"
+    );
+    type_keys(&mut app, "/skill:m");
+    app.paint();
+    let screen = screen_text(&app);
+    assert!(
+        screen.contains("/skill:model"),
+        "the namespaced row draws:\n{screen}"
+    );
+
+    let dir = tempfile::tempdir().expect("a folder");
+    let model = written_skill(dir.path(), "model", "MODEL\n", Scope::Global);
+    let mut app = skilled(vec![model]);
+    app.models = Some(two_models());
+    type_keys(&mut app, "/model");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.sheet.is_some(),
+        "the built-in `/model` still opens the model sheet"
+    );
+}
+
+/// Tab completes `/skill:co` to the one skill of the session that matches it.
+#[test]
+fn skill_rows_tab_completes_the_namespaced_name() {
+    let dir = tempfile::tempdir().expect("a folder");
+    let style = written_skill(dir.path(), "code-style", "STYLE\n", Scope::Global);
+    let mut app = skilled(vec![style]);
+    type_keys(&mut app, "/skill:co");
+    app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(box_text(&app), "/skill:code-style |");
+}
+
+/// `/skill:<name>` typed in full and sent still runs the skill of that name.
+#[tokio::test]
+async fn skill_rows_send_the_namespaced_name() {
+    let dir = tempfile::tempdir().expect("a folder");
+    let axi = written_skill(dir.path(), "axi", "AXI-BODY\n", Scope::Global);
+    let path = axi.path.to_string();
+    let mut app = skilled(vec![axi]);
+    type_keys(&mut app, "/skill:axi go");
+    app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    skill_read(&mut app).await;
+    assert_eq!(
+        one_message(&mut app),
+        format!("{}AXI-BODY\n</skill>\n\ngo", block_head("axi", &path))
+    );
+}
+
 #[tokio::test]
 async fn skill_command_sends_the_file_and_the_typed_text() {
     let dir = tempfile::tempdir().expect("a folder");
@@ -10645,4 +10802,29 @@ fn skill_command_with_no_skills_says_so() {
     type_keys(&mut app, "/skills");
     app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(note_rows(&app), ["no skills in this session".to_owned()]);
+}
+
+/// An empty thinking delta between the text deltas of a reply leaves the text
+/// one block: some hosts send one with every chunk, and a split block draws
+/// each delta on its own line with its markdown cut.
+#[test]
+fn an_empty_thinking_delta_keeps_the_reply_text_one_block() {
+    let mut app = bare();
+    for delta in [
+        "Do",
+        " not keep ",
+        "CLAUDE.md",
+        " as a copy. It dr",
+        "ifts.",
+    ] {
+        app.thinking("");
+        app.text(delta);
+        app.paint();
+        app.commit();
+    }
+    let screen = painted(&mut app);
+    assert!(
+        screen.contains("Do not keep CLAUDE.md as a copy. It drifts."),
+        "{screen}"
+    );
 }

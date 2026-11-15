@@ -780,13 +780,22 @@ impl Tool for Bash {
     }
 }
 
-/// The launcher arguments with `--network` dropped: a contained call is the
-/// one that never reaches the network.
+/// The launcher arguments with `--network`, `--net-proxy`, `--net-proxy-unix`
+/// and `--net-local` dropped, values included: a contained call is the one that
+/// never reaches the network, not even the run's proxy.
 fn without_network(args: &[String]) -> Vec<String> {
-    args.iter()
-        .filter(|arg| arg.as_str() != "--network")
-        .cloned()
-        .collect()
+    let mut kept = Vec::with_capacity(args.len());
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--network" => {}
+            "--net-proxy" | "--net-proxy-unix" | "--net-local" => {
+                args.next();
+            }
+            _ => kept.push(arg.clone()),
+        }
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -1317,6 +1326,56 @@ mod tests {
             output.content.as_ref(),
             "args: --sandbox --read-only\nexit code: 0"
         );
+    }
+
+    /// A contained call never reaches the run's proxy either, so its
+    /// `--net-proxy` and `--net-local` flags go with their values.
+    #[tokio::test]
+    async fn contained_mode_drops_a_host_list_and_its_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut launcher = fake_launcher(
+            &tmp,
+            "args=\nwhile [ \"$1\" != -- ]; do args=\"$args $1\"; shift; done\necho \"args:$args\"",
+            Fallback::Required,
+        )
+        .await;
+        launcher.args = vec![
+            "--sandbox-exec".into(),
+            "--shell".into(),
+            "/bin/bash".into(),
+            "--net-proxy".into(),
+            "127.0.0.1:41234".into(),
+            "--net-local".into(),
+            "8080".into(),
+            "--read-only".into(),
+        ];
+        let bash = tool(&tmp).with_launcher(launcher);
+        assert!(bash.can_contain());
+        let output = bash
+            .run_contained(r#"{"command":"rm -rf target"}"#, &CancellationToken::new())
+            .await
+            .expect("the launcher starts");
+        assert_eq!(
+            output.content.as_ref(),
+            "args: --sandbox-exec --shell /bin/bash --read-only\nexit code: 0"
+        );
+    }
+
+    #[test]
+    fn host_list_without_network_keeps_every_other_flag() {
+        let args = [
+            "--sandbox-exec",
+            "--net-proxy",
+            "127.0.0.1:41234",
+            "--net-proxy-unix",
+            "/tmp/reagent-proxy-41234/proxy.sock",
+            "--net-local",
+            "8080",
+            "--network",
+            "--keep-group",
+        ];
+        let args = args.map(ToString::to_string);
+        assert_eq!(without_network(&args), ["--sandbox-exec", "--keep-group"]);
     }
 
     #[tokio::test]

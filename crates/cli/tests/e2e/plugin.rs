@@ -540,8 +540,9 @@ async fn no_plugins_offers_no_plugin_tool() {
 #[tokio::test]
 async fn a_hook_blocks_bash() {
     let home = Home::new();
-    home.plugin(
+    home.plugin_with(
         "guard",
+        r#"{"hooks": ["tool.call"]}"#,
         r#"
 export default function (reagent) {
   reagent.hook("tool.call", ({ tool }) =>
@@ -853,6 +854,137 @@ export default function (reagent) {
     let lines = lines(&output);
     let results = home.tool_results(&session(&lines)).await;
     assert_eq!(results.last().map(String::as_str), Some("1"), "{results:?}");
+}
+
+/// A plugin that keeps every `usage` event as a JSON line and offers them back
+/// through a tool, so a test can read what its listener saw.
+const USAGE_LOG: &str = r#"
+const seen = [];
+export default function (reagent) {
+  reagent.on("usage", (e) => { seen.push(JSON.stringify(e)); });
+  reagent.registerTool({
+    name: "usage_log",
+    description: "The usage events seen so far, one JSON object per line.",
+    parameters: { type: "object" },
+    run: () => seen.join("\n"),
+  });
+  reagent.registerTool({
+    name: "nothing",
+    description: "Does nothing.",
+    parameters: { type: "object" },
+    run: () => "",
+  });
+}
+"#;
+
+/// Each finished reply gives the plugins one `usage` event: two replies, two
+/// payloads, each with every key, the counts the provider reported and the
+/// names the `--json` usage line writes.
+#[tokio::test]
+async fn usage_event_carries_one_payload_per_reply() {
+    let home = Home::new();
+    // A table names the provider id, and its preset names the built-in kind.
+    home.config("[providers.mine]\npreset = \"anthropic\"\n")
+        .await;
+    home.plugin("usage", USAGE_LOG).await;
+    let fake = home
+        .script(
+            r#"{"replies": [
+              {"text": "one", "usage": {"input": 10, "output": 2, "cache_read": 3, "cache_write": 4, "reasoning": 1},
+               "calls": [{"name": "nothing", "arguments": {}}]},
+              {"text": "two", "usage": {"input": 20, "output": 5, "cache_read": 6, "cache_write": 7, "reasoning": 2},
+               "calls": [{"name": "usage_log", "arguments": {}}]},
+              {"text": "done"}
+            ]}"#,
+        )
+        .await;
+    let output = home
+        .run(&[
+            "--json",
+            "--no-serve",
+            "--provider",
+            &fake,
+            "--model",
+            "mine/m",
+            "-p",
+            "log the usage",
+        ])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let lines = lines(&output);
+    let session = session(&lines);
+    let results = home.tool_results(&session).await;
+    let log = results.last().expect("the usage log tool ran");
+    let payloads: Vec<Value> = text(log.as_bytes())
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("each payload is one JSON object"))
+        .collect();
+    assert_eq!(payloads.len(), 2, "one payload per reply: {payloads:?}");
+
+    let cwd = tokio::fs::canonicalize(home.work())
+        .await
+        .expect("the work folder")
+        .display()
+        .to_string();
+    let keys = [
+        "id",
+        "at",
+        "session",
+        "parentSession",
+        "provider",
+        "preset",
+        "model",
+        "input",
+        "output",
+        "cacheRead",
+        "cacheWrite",
+        "reasoning",
+        "cost",
+        "cwd",
+    ];
+    let counts = [(10, 2, 3, 4, 1), (20, 5, 6, 7, 2)];
+    for (payload, (input, output, cache_read, cache_write, reasoning)) in
+        payloads.iter().zip(counts)
+    {
+        for key in keys {
+            assert!(
+                payload.get(key).is_some(),
+                "the payload carries {key}: {payload}"
+            );
+        }
+        assert_eq!(payload["session"], Value::String(session.clone()));
+        assert_eq!(payload["parentSession"], Value::Null, "{payload}");
+        assert_eq!(payload["provider"], "mine", "{payload}");
+        assert_eq!(payload["preset"], "anthropic", "{payload}");
+        assert_eq!(payload["model"], "m", "{payload}");
+        assert_eq!(payload["input"], input, "{payload}");
+        assert_eq!(payload["output"], output, "{payload}");
+        assert_eq!(payload["cacheRead"], cache_read, "{payload}");
+        assert_eq!(payload["cacheWrite"], cache_write, "{payload}");
+        assert_eq!(payload["reasoning"], reasoning, "{payload}");
+        // The scripted provider reports no cost and names no price, so the
+        // payload has none, as the `--json` usage line has none.
+        assert_eq!(payload["cost"], Value::Null, "{payload}");
+        assert_eq!(payload["cwd"].as_str(), Some(cwd.as_str()), "{payload}");
+        let id = payload["id"].as_str().expect("an id");
+        assert_eq!(id.len(), 32, "{payload}");
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "the id is lowercase hex: {payload}"
+        );
+        assert!(
+            payload["at"]
+                .as_u64()
+                .is_some_and(|at| at > 1_600_000_000_000),
+            "the payload names the time in milliseconds: {payload}"
+        );
+    }
+    assert_ne!(
+        payloads[0]["id"], payloads[1]["id"],
+        "each reply has its own id: {payloads:?}"
+    );
 }
 
 #[tokio::test]
@@ -1368,8 +1500,9 @@ export default function (r) {
 #[tokio::test]
 async fn worker_sends_plugin_notes_to_clients() {
     let home = Home::new();
-    home.plugin(
+    home.plugin_with(
         "slowpoke",
+        r#"{"hooks": ["tool.call"]}"#,
         r#"
 export default function (r) {
   r.hook("tool.call", ({ tool }) => {
@@ -1428,8 +1561,9 @@ export default function (r) {
 #[tokio::test]
 async fn worker_prints_a_note_no_client_saw() {
     let home = Home::new();
-    home.plugin(
+    home.plugin_with(
         "slowpoke",
+        r#"{"hooks": ["tool.call"]}"#,
         r#"
 export default function (r) {
   r.hook("tool.call", ({ tool }) => {
@@ -1498,4 +1632,483 @@ async fn worker_unknown_command_is_an_error() {
     assert!(error.is_object(), "the command is refused: {answer}");
     let message = error["message"].as_str().unwrap_or_default();
     assert!(message.contains("nowhere"), "{answer}");
+}
+
+// The gate: what a `tool.call` layer is given, and the two events a run sends
+// when it starts and stops waiting for a person.
+
+/// A plugin whose `tool.call` layer blocks with a reason that names every key
+/// it was given.
+const INSPECT: &str = r#"
+export default function (reagent) {
+  reagent.hook("tool.call", (payload) => ({
+    block: [
+      `keys=${Object.keys(payload).sort().join(",")}`,
+      `tool=${payload.tool}`,
+      `args=${JSON.stringify(payload.args)}`,
+      `cwd=${payload.cwd}`,
+      `session=${payload.session}`,
+    ].join(" "),
+  }));
+}
+"#;
+
+#[tokio::test]
+async fn call_gate_sees_the_call_and_the_run() {
+    let home = Home::new();
+    home.plugin_with("inspect", r#"{"hooks": ["tool.call"]}"#, INSPECT)
+        .await;
+    let fake = home
+        .script(&call_script("bash", r#"{"command": "touch made.txt"}"#))
+        .await;
+    let output = home
+        .run(&[
+            "--json",
+            "--no-serve",
+            "--provider",
+            &fake,
+            "-p",
+            "make a file",
+        ])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let lines = lines(&output);
+    let id = session(&lines);
+    let result = tool_result(&lines);
+    let reason = result["error"].as_str().unwrap_or_default();
+    assert!(reason.contains("keys=args,cwd,session,tool"), "{reason}");
+    assert!(reason.contains("tool=bash"), "{reason}");
+    assert!(
+        reason.contains(r#"args={"command":"touch made.txt"}"#),
+        "{reason}"
+    );
+    let work = tokio::fs::canonicalize(home.work())
+        .await
+        .expect("the work folder");
+    assert!(
+        reason.contains(&format!("cwd={}", work.display())),
+        "{reason}"
+    );
+    assert!(reason.contains(&format!("session={id}")), "{reason}");
+}
+
+/// A script's own call of a tool meets the gate as a direct call does: the
+/// gate sees the inner tool's name and arguments, and the command never runs.
+#[tokio::test]
+async fn call_gate_blocks_a_bash_command_a_script_runs() {
+    let home = Home::new();
+    home.plugin_with(
+        "gate",
+        r#"{"hooks": ["tool.call"]}"#,
+        r#"
+export default function (reagent) {
+  reagent.hook("tool.call", ({ tool, args }) =>
+    tool === "bash" && String(args.command).startsWith("rm -rf")
+      ? { block: "the gate refuses to remove files" }
+      : undefined,
+    { timeoutMs: 200, onTimeout: "block" });
+}
+"#,
+    )
+    .await;
+    tokio::fs::create_dir_all(home.work())
+        .await
+        .expect("the work folder");
+    tokio::fs::write(home.work().join("keep.txt"), "kept\n")
+        .await
+        .expect("the file");
+    let code = r#"try { await tools.bash({command: "rm -rf keep.txt"}); print("ran"); } catch (e) { print("blocked: " + e.message); }"#;
+    let fake = home
+        .script(&call_script(
+            "codemode",
+            &serde_json::json!({ "code": code }).to_string(),
+        ))
+        .await;
+    let output = home
+        .run(&[
+            "--json",
+            "--no-serve",
+            "--tools",
+            "+codemode",
+            "--provider",
+            &fake,
+            "-p",
+            "remove the file",
+        ])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let lines = lines(&output);
+    let result = tool_result(&lines);
+    assert_eq!(result["is_error"], false, "the script itself ran: {result}");
+    assert!(
+        home.work().join("keep.txt").exists(),
+        "the script's command ran past the gate"
+    );
+}
+
+#[tokio::test]
+async fn call_gate_blocks_a_bash_command_before_it_runs() {
+    let home = Home::new();
+    home.plugin_with(
+        "gate",
+        r#"{"hooks": ["tool.call"]}"#,
+        r#"
+export default function (reagent) {
+  reagent.hook("tool.call", ({ tool, args }) =>
+    tool === "bash" && String(args.command).startsWith("rm -rf")
+      ? { block: "the gate refuses to remove files" }
+      : undefined,
+    { timeoutMs: 200, onTimeout: "block" });
+}
+"#,
+    )
+    .await;
+    tokio::fs::create_dir_all(home.work())
+        .await
+        .expect("the work folder");
+    tokio::fs::write(home.work().join("keep.txt"), "kept\n")
+        .await
+        .expect("the file");
+    let fake = home
+        .script(&call_script("bash", r#"{"command": "rm -rf keep.txt"}"#))
+        .await;
+    let output = home
+        .run(&[
+            "--json",
+            "--no-serve",
+            "--provider",
+            &fake,
+            "-p",
+            "remove the file",
+        ])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let lines = lines(&output);
+    let result = tool_result(&lines);
+    assert_eq!(result["is_error"], true, "{result}");
+    let error = result["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("the gate refuses to remove files"),
+        "{error}"
+    );
+    assert!(
+        home.work().join("keep.txt").exists(),
+        "the blocked command ran"
+    );
+}
+
+#[tokio::test]
+async fn call_gate_rewrites_the_command() {
+    let home = Home::new();
+    home.plugin_with(
+        "rewriter",
+        r#"{"hooks": ["tool.call"]}"#,
+        r#"
+export default function (reagent) {
+  reagent.hook("tool.call", ({ tool, args }) =>
+    tool === "bash" && String(args.command).startsWith("touch made")
+      ? { args: { command: "touch rewritten.txt" } }
+      : undefined);
+}
+"#,
+    )
+    .await;
+    let fake = home
+        .script(&call_script("bash", r#"{"command": "touch made.txt"}"#))
+        .await;
+    let output = home
+        .run(&[
+            "--json",
+            "--no-serve",
+            "--provider",
+            &fake,
+            "-p",
+            "make a file",
+        ])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let lines = lines(&output);
+    assert_eq!(tool_result(&lines)["is_error"], false, "{}", lines[1]);
+    assert!(
+        home.work().join("rewritten.txt").exists(),
+        "the rewritten command did not run"
+    );
+    assert!(
+        !home.work().join("made.txt").exists(),
+        "the first command ran"
+    );
+}
+
+#[tokio::test]
+async fn call_gate_run_start_names_the_version() {
+    let home = Home::new();
+    home.plugin(
+        "listener",
+        r#"
+const seen = [];
+export default function (reagent) {
+  reagent.on("run_start", (event) => { seen.push(JSON.stringify(event)); });
+  reagent.registerTool({
+    name: "started",
+    description: "Reports what the run started with.",
+    parameters: { type: "object", properties: {} },
+    run: () => seen.join("|"),
+  });
+}
+"#,
+    )
+    .await;
+    let fake = home.script(&call_script("started", "{}")).await;
+    let output = home
+        .run(&["--json", "--no-serve", "--provider", &fake, "-p", "hello"])
+        .await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let lines = lines(&output);
+    let results = home.tool_results(&session(&lines)).await;
+    let start = results.first().expect("the tool answered");
+    let event: Value = serde_json::from_str(start).unwrap_or_else(|_| panic!("no JSON: {start}"));
+    let named = event["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no version in {start}"));
+    let shown = home.run(&["--version"]).await;
+    assert!(shown.status.success(), "{}", text(&shown.stderr));
+    let printed = text(&shown.stdout);
+    assert_eq!(
+        Some(named),
+        printed.trim().strip_prefix("reagent "),
+        "the run names {named}, the binary {printed:?}"
+    );
+    // A gate reads this before it lets codemode run: an older build that has
+    // no such key lets a script's calls skip the hook.
+    assert_eq!(
+        event["hooks"]["codemodeInner"], true,
+        "the run says a script's calls meet the tool.call hook: {start}"
+    );
+}
+
+/// A plugin whose panel carries the `waiting` and `waited` payloads it saw, so
+/// a client of the worker reads them.
+const WAITS: &str = r#"
+const lines = [];
+let panel;
+export default function (reagent) {
+  panel = reagent.ui.panel({ id: "waits", title: "Waits" });
+  const keep = (event) => {
+    lines.push(JSON.stringify(event));
+    panel.set(lines);
+  };
+  reagent.on("waiting", keep);
+  reagent.on("waited", keep);
+}
+"#;
+
+/// The last panel frame of `id`, once it carries `count` lines: from `seen`,
+/// the frames an earlier wait already read, or else from the frames to come.
+async fn panel_lines(client: &mut Client, seen: &[Value], id: &str, count: usize) -> Vec<Value> {
+    let full = |frame: &Value| {
+        frame["method"] == "plugin_panel"
+            && frame["params"]["id"] == id
+            && frame["params"]["lines"]
+                .as_array()
+                .is_some_and(|lines| lines.len() >= count)
+    };
+    let frame = match seen.iter().rev().find(|frame| full(frame)) {
+        Some(frame) => frame.clone(),
+        None => {
+            let frames = client.until(full).await;
+            notices(&frames, "plugin_panel")
+                .pop()
+                .expect("a panel")
+                .clone()
+        }
+    };
+    frame["params"]["lines"]
+        .as_array()
+        .expect("the lines are a list")
+        .iter()
+        .map(|line| {
+            serde_json::from_str(line.as_str().expect("a line is text")).expect("a line is JSON")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn call_gate_waits_around_a_question() {
+    let home = Home::new();
+    home.plugin("gate", WAITS).await;
+    let state = state();
+    let fake = home
+        .script(
+            r#"{"replies":[{"calls":[{"name":"ask","arguments":{"questions":[{"q":"Which database?","options":[{"label":"sqlite"},{"label":"postgres"}]}]}}]},{"text":"done"}]}"#,
+        )
+        .await;
+    let worker = Worker::start(&home, state.path(), &fake).await;
+    let token = worker.entry().await.token;
+    let mut client = Client::initialize(&worker, &token, "a").await;
+    client.attach(client.committed).await;
+    let sent = client
+        .request("send", r#"{"text":"run it","mode":"queue"}"#)
+        .await;
+    client.answer(sent).await;
+    let asked = client
+        .until(|frame| frame["method"] == "question_request" || is_event(frame, "run_end"))
+        .await;
+    assert!(
+        asked
+            .iter()
+            .any(|frame| frame["method"] == "question_request"),
+        "no question came: {asked:?}"
+    );
+    let request = asked
+        .iter()
+        .find(|frame| frame["method"] == "question_request")
+        .expect("a question")
+        .clone();
+    let id = request["params"]["id"].as_u64().expect("a question id");
+    let answered = client
+        .request("answer", &format!(r#"{{"id":{id},"answers":null}}"#))
+        .await;
+    client.answer(answered).await;
+    let seen = client.until(|frame| is_event(frame, "run_end")).await;
+
+    let lines = panel_lines(&mut client, &seen, "gate/waits", 2).await;
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0]["kind"], "question", "{}", lines[0]);
+    assert_eq!(lines[0]["tool"], "ask", "{}", lines[0]);
+    assert_eq!(lines[0]["session"], worker.session(), "{}", lines[0]);
+    assert_eq!(lines[1]["how"], "answered", "{}", lines[1]);
+    assert_eq!(lines[1]["session"], worker.session(), "{}", lines[1]);
+    assert_eq!(
+        lines[0]["call"], lines[1]["call"],
+        "the wait and its end name one call: {lines:?}"
+    );
+    assert_eq!(lines[0]["call"], "call_0", "the ask tool call: {lines:?}");
+}
+
+/// A plugin that appends each `waiting` and `waited` payload to `waits.jsonl`
+/// in the run's folder, for a run whose clients are gone.
+const WAITS_FILE: &str = r#"
+import { writeFileSync } from "node:fs";
+const lines = [];
+export default function (reagent) {
+  const keep = (event) => {
+    lines.push(JSON.stringify(event));
+    writeFileSync("waits.jsonl", lines.join("\n") + "\n");
+  };
+  reagent.on("waiting", keep);
+  reagent.on("waited", keep);
+}
+"#;
+
+#[tokio::test]
+async fn call_gate_a_parked_question_ends_its_wait_as_parked() {
+    let home = Home::new();
+    home.plugin_with("gate", r#"{"fs": "write"}"#, WAITS_FILE)
+        .await;
+    let state = state();
+    let fake = home
+        .script(
+            r#"{"replies":[{"calls":[{"name":"ask","arguments":{"questions":[{"q":"Which database?","options":[{"label":"sqlite"},{"label":"postgres"}]}]}}]},{"text":"done"}]}"#,
+        )
+        .await;
+    let worker = Worker::start(&home, state.path(), &fake).await;
+    let token = worker.entry().await.token;
+    let mut client = Client::initialize(&worker, &token, "a").await;
+    client.attach(client.committed).await;
+    let sent = client
+        .request("send", r#"{"text":"run it","mode":"queue"}"#)
+        .await;
+    client.answer(sent).await;
+    client
+        .until(|frame| frame["method"] == "question_request")
+        .await;
+    // The last client leaves, so the question parks and the run ends.
+    drop(client);
+
+    let file = home.work().join("waits.jsonl");
+    let mut lines: Vec<Value> = Vec::new();
+    for _ in 0..1200 {
+        if let Ok(text) = tokio::fs::read_to_string(&file).await {
+            lines = text
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            if lines.len() >= 2 {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(lines.len(), 2, "one wait and one end: {lines:?}");
+    assert_eq!(lines[0]["kind"], "question", "{}", lines[0]);
+    assert_eq!(lines[1]["kind"], "question", "{}", lines[1]);
+    assert_eq!(lines[1]["how"], "parked", "{}", lines[1]);
+    assert_eq!(
+        lines[0]["call"], lines[1]["call"],
+        "the wait and its end name one call: {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn call_gate_waits_around_an_approval() {
+    let home = Home::new();
+    home.plugin("gate", WAITS).await;
+    tokio::fs::create_dir_all(home.work().join(".reagent"))
+        .await
+        .expect("the config folder");
+    tokio::fs::create_dir_all(home.work().join(".git"))
+        .await
+        .expect("the repo folder");
+    tokio::fs::write(
+        home.work().join(".reagent").join("config.toml"),
+        "[permissions]\nask = [\"Bash\"]\n",
+    )
+    .await
+    .expect("the rules");
+    let state = state();
+    let fake = home
+        .script(&call_script("bash", r#"{"command": "touch made.txt"}"#))
+        .await;
+    let worker = Worker::start(&home, state.path(), &fake).await;
+    let token = worker.entry().await.token;
+    let mut client = Client::initialize(&worker, &token, "a").await;
+    client.attach(client.committed).await;
+    let sent = client
+        .request("send", r#"{"text":"make a file","mode":"queue"}"#)
+        .await;
+    client.answer(sent).await;
+    let asked = client
+        .until(|frame| frame["method"] == "approval_request" || is_event(frame, "run_end"))
+        .await;
+    assert!(
+        asked
+            .iter()
+            .any(|frame| frame["method"] == "approval_request"),
+        "no approval came: {asked:?}"
+    );
+    let request = asked
+        .iter()
+        .find(|frame| frame["method"] == "approval_request")
+        .expect("an approval")
+        .clone();
+    let id = request["params"]["id"].as_u64().expect("an approval id");
+    let refused = client
+        .request("approve", &format!(r#"{{"id":{id},"answer":"refuse"}}"#))
+        .await;
+    client.answer(refused).await;
+    let seen = client.until(|frame| is_event(frame, "run_end")).await;
+
+    let lines = panel_lines(&mut client, &seen, "gate/waits", 2).await;
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(lines[0]["kind"], "approval", "{}", lines[0]);
+    assert_eq!(lines[0]["tool"], "bash", "{}", lines[0]);
+    assert_eq!(lines[1]["how"], "denied", "{}", lines[1]);
+    assert_eq!(
+        lines[0]["call"], lines[1]["call"],
+        "the wait and its end name one call: {lines:?}"
+    );
+    assert!(
+        !home.work().join("made.txt").exists(),
+        "the refused command ran"
+    );
 }

@@ -12,20 +12,21 @@
 //!
 //! Rows, top down: a blank one; in the palette a query row and a group row
 //! before each group; one row per item, a marker in column 0, the name with the
-//! matched chars marked and the key at the right edge; the leader's title and
-//! its grid of keys; and a footer that names the keys of the list. A count goes
-//! through a stack buffer, so drawing allocates nothing.
+//! matched chars marked at the left, the words at the right and the key after
+//! them at the right edge; the leader's title and its grid of keys; and a footer
+//! that names the keys of the list. A count goes through a stack buffer, so
+//! drawing allocates nothing.
 
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::keys::{self, Group};
 use crate::screen::{Cell, Screen};
 
 use super::super::list::{Command, List, PER_ROW, Source};
 
-/// The column the words of a command start at: the name and its padding take
-/// the columns before it.
-const NAME_COL: u16 = 14;
+/// The columns two parts of a row keep between them when the row can give
+/// them.
+const GAP: u16 = 2;
 
 /// The column a group row of the palette starts at.
 const GROUP_COL: u16 = 2;
@@ -48,6 +49,9 @@ const DIGITS: usize = 8;
 
 /// The glyph of the picked row.
 const MARK: &str = "\u{203a}";
+
+/// The glyph that marks a name or a words column the row had no room for.
+const ELLIPSIS: &str = "\u{2026}";
 
 /// The footer of the `/` list.
 const COMMANDS_FOOT: &str =
@@ -278,8 +282,13 @@ fn leader(
     }
 }
 
-/// Draws one command: the marker, the name and its padding, what it does and
-/// the key that runs it elsewhere at the right edge.
+/// Draws one command: the marker and the name at the left, what it does at the
+/// right, and the key that runs it elsewhere after it, at the right edge.
+///
+/// The words end [`GAP`] columns before the key, or at the last column the row
+/// may use when it has none. A row too narrow for both cuts the words with `…`
+/// first, down to nothing; when the whole name would leave the words no column
+/// at all, the name is cut instead, so a long name keeps its words.
 fn command_row(
     screen: &mut Screen,
     command: &Command,
@@ -313,21 +322,67 @@ fn command_row(
             marks,
         )
     };
-    x = marked(screen, x, row, &command.name, marks, name, width);
-    while x < NAME_COL && x < width {
-        screen.set(x, row, Cell::from_char(' ', inks.fill));
-        x += 1;
+    // The column after the widest key the row holds, and the column the words
+    // end at: the one free column at the edge stays free either way.
+    let key = if command.key.is_empty() || width < 2 {
+        None
+    } else {
+        Some(columns(&command.key).min(width - 1))
+    };
+    let end = match key {
+        Some(key) => width.saturating_sub(key.saturating_add(1 + GAP)),
+        None => width.saturating_sub(1),
+    };
+    // The columns the name and the words share, and what each of them takes.
+    let room = end.saturating_sub(x);
+    let whole_name = columns(&command.name);
+    let whole_words = columns(&command.words);
+    let (name_w, words_w) = if room > whole_name.saturating_add(GAP) {
+        (whole_name, (room - whole_name - GAP).min(whole_words))
+    } else if room > whole_words.saturating_add(GAP) {
+        ((room - whole_words - GAP).min(whole_name), whole_words)
+    } else {
+        (room.min(whole_name), 0)
+    };
+    let cut = name_w > 0 && name_w < whole_name;
+    let head = fit(&command.name, name_w.saturating_sub(u16::from(cut)));
+    x = marked(screen, x, row, head, marks, name, width);
+    if cut {
+        x = screen.put_str_until(x, row, ELLIPSIS, name.plain, width);
     }
-    x = screen.put_str_until(x, row, &command.words, inks.dim, width);
-    if command.key.is_empty() || width < 2 {
+    if words_w > 0 {
+        let cut = words_w < whole_words;
+        let head = fit(&command.words, words_w.saturating_sub(u16::from(cut)));
+        let x = screen.put_str_until(end - words_w, row, head, inks.dim, end);
+        if cut {
+            screen.put_str_until(x, row, ELLIPSIS, inks.dim, end);
+        }
+    }
+    let Some(key) = key else {
         return;
-    }
-    let keys = (UnicodeWidthStr::width(&*command.key) as u16).min(width - 1);
-    let key_x = width - 1 - keys;
+    };
+    let key_x = width - 1 - key;
     if key_x > x {
-        // The row keeps one column after the key, so it never reaches the edge.
         screen.put_str_until(key_x, row, &command.key, inks.dim, width - 1);
     }
+}
+
+/// The columns `text` takes, capped at the width of a row.
+fn columns(text: &str) -> u16 {
+    u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
+}
+
+/// The longest head of `text` that no more than `columns` columns hold.
+fn fit(text: &str, columns: u16) -> &str {
+    let mut used: u16 = 0;
+    for (at, c) in text.char_indices() {
+        let wide = u16::try_from(UnicodeWidthChar::width(c).unwrap_or(0)).unwrap_or(u16::MAX);
+        if used.saturating_add(wide) > columns {
+            return &text[..at];
+        }
+        used += wide;
+    }
+    text
 }
 
 /// Draws the footer of the list, in the words of its source: the keys a keys
@@ -586,10 +641,14 @@ mod tests {
         assert_eq!(draw_list(&mut screen, &list, 0, COLUMNS, &inks), 5);
 
         assert_eq!(text(&screen, 0), "", "a blank top row on the fill");
-        assert!(
-            text(&screen, 1).starts_with("\u{203a} /model      pick the model and the provider"),
-            "the picked row opens with the marker: {:?}",
-            text(&screen, 1)
+        assert_eq!(
+            text(&screen, 1),
+            format!(
+                "\u{203a} /model{}{}  ctrl+x m",
+                " ".repeat(30),
+                "pick the model and the provider"
+            ),
+            "the picked row opens with the marker and ends its words before the key"
         );
         assert!(text(&screen, 1).ends_with("ctrl+x m"));
         assert_eq!(
@@ -891,6 +950,135 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The three built-ins the row layout tests draw: one with a key, one
+    /// without, and one the pick sits on so the others draw unpicked.
+    fn keyed() -> Arc<[Command]> {
+        [
+            ("/help", "every key", "?"),
+            ("/quit", "leave the session", "ctrl+c ctrl+c"),
+            ("/mode", "permission mode", ""),
+        ]
+        .into_iter()
+        .map(|(name, words, key)| Command {
+            name: name.into(),
+            words: words.into(),
+            key: key.into(),
+            group: "app",
+        })
+        .collect::<Vec<_>>()
+        .into()
+    }
+
+    /// One skill row: its name, its scope and no key of its own.
+    fn skill(name: &'static str) -> Arc<[Command]> {
+        vec![Command {
+            name: name.into(),
+            words: "global".into(),
+            key: "".into(),
+            group: "skill",
+        }]
+        .into()
+    }
+
+    /// A row puts its words at the right: two columns before the key it has, and
+    /// at the last column a row without one may use.
+    #[test]
+    fn skill_rows_put_the_words_before_the_key() {
+        let mut screen = screen();
+        let inks = inks(&mut screen);
+        let list = List::commands(keyed(), false);
+        draw_list(&mut screen, &list, 0, COLUMNS, &inks);
+
+        // `/quit` keeps its key at the right edge and its words two columns before.
+        let quit = format!(
+            "  /quit{}{}  ctrl+c ctrl+c",
+            " ".repeat(40),
+            "leave the session"
+        );
+        assert_eq!(text(&screen, 2), quit);
+        assert_eq!(cell(&screen, 63, 2).char(), Some('n'), "the words end here");
+        assert_eq!(
+            cell(&screen, 64, 2).char(),
+            Some(' '),
+            "the gap is two columns"
+        );
+        assert_eq!(cell(&screen, 65, 2).char(), Some(' '));
+        assert_eq!(
+            cell(&screen, 66, 2).char(),
+            Some('c'),
+            "the key starts here"
+        );
+        assert_eq!(
+            cell(&screen, 79, 2).char(),
+            Some(' '),
+            "one column stays free"
+        );
+
+        // `/mode` has no key, so its words end at the last column it may use.
+        let mode = format!("  /mode{}{}", " ".repeat(57), "permission mode");
+        assert_eq!(text(&screen, 3), mode);
+        assert_eq!(cell(&screen, 78, 3).char(), Some('e'), "the words end here");
+        assert_eq!(
+            cell(&screen, 79, 3).char(),
+            Some(' '),
+            "one column stays free"
+        );
+    }
+
+    /// A narrow list cuts the words with `…` before it cuts the name.
+    #[test]
+    fn skill_rows_cut_the_words_before_the_name() {
+        const WIDTH: u16 = 24;
+        let mut screen = screen();
+        let inks = inks(&mut screen);
+        let list = List::commands(skill("/codebase-design"), false);
+        draw_list(&mut screen, &list, 0, WIDTH, &inks);
+
+        // The only row is the pick, so it opens with the marker.
+        assert_eq!(text(&screen, 1), "\u{203a} /codebase-design  gl\u{2026}");
+        assert_eq!(cell(&screen, 17, 1).char(), Some('n'), "the name is whole");
+        assert_eq!(
+            cell(&screen, 22, 1).char(),
+            Some('\u{2026}'),
+            "the cut marks"
+        );
+        assert_eq!(
+            cell(&screen, 23, 1).char(),
+            Some(' '),
+            "one column stays free"
+        );
+    }
+
+    /// A name that reaches past the right edge is cut with `…`, and its scope
+    /// still shows at the right of the row.
+    #[test]
+    fn skill_rows_cut_a_long_name_and_keep_the_scope() {
+        const WIDTH: u16 = 24;
+        let mut screen = screen();
+        let inks = inks(&mut screen);
+        let list = List::commands(skill("/codebase-design-and-more"), false);
+        draw_list(&mut screen, &list, 0, WIDTH, &inks);
+
+        assert_eq!(text(&screen, 1), "\u{203a} /codebase-de\u{2026}  global");
+        assert_eq!(
+            cell(&screen, 14, 1).char(),
+            Some('\u{2026}'),
+            "the cut marks"
+        );
+        assert_eq!(
+            cell(&screen, 15, 1).char(),
+            Some(' '),
+            "two columns stay free"
+        );
+        assert_eq!(cell(&screen, 16, 1).char(), Some(' '));
+        assert_eq!(cell(&screen, 17, 1).char(), Some('g'), "the scope is whole");
+        assert_eq!(
+            cell(&screen, 23, 1).char(),
+            Some(' '),
+            "one column stays free"
+        );
     }
 
     #[test]

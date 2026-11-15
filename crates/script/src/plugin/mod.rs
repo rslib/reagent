@@ -33,16 +33,80 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 
-use runtime::{CallReply, Job, RunReply, ToolInfo};
+use runtime::{CallReply, Job, RunReply, Served, ToolInfo};
 
 /// The most times in a row a plugin may add a follow-up.
 const FOLLOW_UPS: u32 = 3;
 
 /// The longest a hook chain may take before its answer is treated as keep.
+///
+/// No `tool.call` chain has this cap: each of its layers names its own limit,
+/// which is what bounds that chain.
 const CHAIN_TIME: Duration = Duration::from_secs(30);
 
 /// The most notes kept at once; the rest are counted, not stored.
 const NOTES: usize = 100;
+
+/// The longest `by` a gateway plugin may pass, in bytes.
+const BY_BYTES: usize = 64;
+
+/// One answer a gateway plugin asks the gateway to record, and where its
+/// result goes.
+///
+/// The plugin thread hands this to the gateway's async side, which owns the
+/// journal, the parked folder and the worker it restarts.
+pub struct AnswerAsk {
+    /// The plugin that asked, as its manifest names it.
+    pub plugin: String,
+    /// The question it answers.
+    pub qid: String,
+    /// The token the gateway handed it with `question_parked`.
+    pub token: String,
+    /// The answers, as JSON text, or `null` for none.
+    pub answers: String,
+    /// Who answered, in the plugin's own words, such as a chat user name.
+    pub by: String,
+    /// Carries `"ok"`, `"denied"`, `"stale"` or `"busy"` back to the plugin.
+    pub reply: tokio::sync::oneshot::Sender<String>,
+}
+
+impl fmt::Debug for AnswerAsk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnswerAsk")
+            .field("plugin", &self.plugin)
+            .field("qid", &self.qid)
+            .field("answers", &self.answers)
+            .field("by", &self.by)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The plugins one load takes from the root.
+pub(crate) enum Role {
+    /// A normal run: every plugin that is not a gateway plugin.
+    Run,
+    /// `reagent gateway`: the gateway plugins, with the channel their answers
+    /// go to.
+    Gateway(tokio::sync::mpsc::UnboundedSender<AnswerAsk>),
+}
+
+impl Role {
+    /// Whether a plugin of role `role` is one this load takes.
+    fn takes(&self, role: manifest::Role) -> bool {
+        matches!(
+            (self, role),
+            (Role::Run, manifest::Role::Normal) | (Role::Gateway(_), manifest::Role::Gateway)
+        )
+    }
+
+    /// The channel a gateway plugin's answers go to, if this is a gateway.
+    fn answers(&self) -> Option<tokio::sync::mpsc::UnboundedSender<AnswerAsk>> {
+        match self {
+            Role::Run => None,
+            Role::Gateway(answers) => Some(answers.clone()),
+        }
+    }
+}
 
 /// The most jobs that may wait for the plugin thread.
 const JOBS: usize = 1024;
@@ -296,11 +360,13 @@ pub struct Plugins {
     /// Whether any plugin installed a `turn.end` layer.
     turn: bool,
     /// A bit per event some listener waits on.
-    events: u8,
+    events: u32,
     /// How many follow-ups in a row the turn hook returned.
     follow_ups: AtomicU32,
     /// How many events the full queue dropped.
     lost_events: AtomicU64,
+    /// The folder and the session every hook payload names.
+    served: Arc<Mutex<Served>>,
 }
 
 impl Plugins {
@@ -319,25 +385,38 @@ impl Plugins {
         // The folder the run works in, which is the one a plugin's relative
         // path resolves against.
         let session = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self::load_with(root, &session, state, sandbox).await
+        Self::load_with(root, &session, state, sandbox, Role::Run).await
+    }
+
+    /// Loads only the gateway plugins under `root`, with `answers` the channel
+    /// their `reagent.gateway.answer` hands work to the caller.
+    ///
+    /// `state` is the state folder a plugin's cookies are saved under, and
+    /// `sandbox` the helper its child processes start through. The answer is
+    /// `None` when no gateway plugin loaded.
+    pub async fn load_gateway(
+        root: &Path,
+        state: &Path,
+        sandbox: Option<PathBuf>,
+        answers: tokio::sync::mpsc::UnboundedSender<AnswerAsk>,
+    ) -> (Option<Arc<Self>>, Vec<String>) {
+        let session = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::load_with(root, &session, state, sandbox, Role::Gateway(answers)).await
     }
 
     /// Loads every plugin under `root` with no sandbox helper, with `session`
     /// the folder a relative path of a plugin resolves against and `state` the
     /// folder its cookies are saved under.
     #[cfg_attr(
-        not(all(test, feature = "node")),
-        expect(
-            dead_code,
-            reason = "the node module tests load with no sandbox helper"
-        )
+        not(test),
+        expect(dead_code, reason = "the tests load with no sandbox helper")
     )]
     pub(crate) async fn load_in(
         root: &Path,
         session: &Path,
         state: &Path,
     ) -> (Option<Arc<Self>>, Vec<String>) {
-        Self::load_with(root, session, state, None).await
+        Self::load_with(root, session, state, None, Role::Run).await
     }
 
     /// Loads every plugin under `root`, with `session` the folder a relative
@@ -348,6 +427,7 @@ impl Plugins {
         session: &Path,
         state: &Path,
         sandbox: Option<PathBuf>,
+        role: Role,
     ) -> (Option<Arc<Self>>, Vec<String>) {
         let present = tokio::fs::metadata(root)
             .await
@@ -356,7 +436,8 @@ impl Plugins {
             return (None, Vec::new());
         }
         let notes = Arc::new(Mutex::new(Notes::default()));
-        let Some((jobs, live)) = runtime::start(Arc::clone(&notes)) else {
+        let served = Arc::new(Mutex::new(Served::default()));
+        let Some((jobs, live)) = runtime::start(Arc::clone(&notes), Arc::clone(&served)) else {
             return (
                 None,
                 vec!["plugins: the plugin thread did not start".into()],
@@ -368,6 +449,7 @@ impl Plugins {
             session: session.to_path_buf(),
             state: state.to_path_buf(),
             sandbox,
+            role,
             reply,
         };
         if jobs.send(job).await.is_err() {
@@ -411,6 +493,7 @@ impl Plugins {
             events: report.events,
             follow_ups: AtomicU32::new(0),
             lost_events: AtomicU64::new(0),
+            served,
         };
         let notes = drain(&notes);
         (Some(Arc::new(plugins)), notes)
@@ -419,6 +502,16 @@ impl Plugins {
     /// The tools the plugins registered, in load order.
     pub fn tools(&self) -> Vec<PluginTool> {
         self.tools.clone()
+    }
+
+    /// Names the run the plugins serve: its folder, which is absolute, and its
+    /// session, which a run that keeps none leaves out.
+    ///
+    /// Every payload a `tool.call` or `tool.result` hook gets names both.
+    pub fn serving(&self, folder: &Path, session: Option<&str>) {
+        if let Ok(mut served) = self.served.lock() {
+            served.name(folder, session);
+        }
     }
 
     /// The commands, in load order.
@@ -472,15 +565,21 @@ impl Plugins {
         self.live.wake.notified().await;
     }
 
+    /// Whether any plugin listens on the event `name`; false for a name no
+    /// plugin may listen on.
+    ///
+    /// A host asks this before it builds an event's payload: a run whose plugins
+    /// listen on nothing costs no allocation for it.
+    pub fn wants(&self, name: &str) -> bool {
+        api::event_bit(name).is_some_and(|bit| self.events & bit != 0)
+    }
+
     /// Hands one event to every listener waiting on it; it never blocks.
     ///
     /// An event the full queue cannot take is dropped and counted into one
     /// note, so a fire-hosing plugin costs the run no memory.
     pub fn event(&self, name: &str, payload: JsonValue) {
-        let Some(bit) = api::event_bit(name) else {
-            return;
-        };
-        if self.events & bit == 0 {
+        if !self.wants(name) {
             return;
         }
         let job = Job::Event {
@@ -593,15 +692,12 @@ impl CallHook for Plugins {
             if self.jobs.send(job).await.is_err() {
                 return CallVerdict::Keep;
             }
-            match tokio::time::timeout(CHAIN_TIME, answer).await {
-                Ok(Ok(CallReply::Args(args))) => CallVerdict::Args(args),
-                Ok(Ok(CallReply::Block(reason))) => CallVerdict::Block(reason),
-                Ok(Ok(CallReply::Keep)) => CallVerdict::Keep,
-                Ok(Err(_)) => CallVerdict::Keep,
-                Err(_) => {
-                    self.note("plugins: the tool.call chain timed out after 30 s".into());
-                    CallVerdict::Keep
-                }
+            // Each layer ends within its own limit, so the chain is bounded by
+            // the sum of them and no cap of its own cuts a layer short.
+            match answer.await {
+                Ok(CallReply::Args(args)) => CallVerdict::Args(args),
+                Ok(CallReply::Block(reason)) => CallVerdict::Block(reason),
+                _ => CallVerdict::Keep,
             }
         })
     }

@@ -14,6 +14,9 @@ pub enum TurnEndReason {
     EndTurn,
     /// The run was cancelled before it completed.
     Cancelled,
+    /// A question of the run was parked: the process may end, and a later one
+    /// answers it and resumes the session.
+    Parked,
     /// The provider stopped without asking for a tool, and the remaining
     /// content (if any) was kept as the reply.
     Stopped(StopReason),

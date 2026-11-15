@@ -1,6 +1,7 @@
 //! Runs a reply's tool calls, in parallel when every call is read-only.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
@@ -11,7 +12,8 @@ use reagent_util::text;
 
 use crate::coerce;
 use crate::guard::{Ask, Grant, Guard, Verdict};
-use crate::hook::CallVerdict;
+use crate::hook::{CallHook, CallVerdict, EventHook, WaitEnd, WaitKind};
+use crate::question::Questions;
 use crate::tool::{Registry, Repaired, Reroute, Seen, Tool, ToolOutput};
 use tokio_util::sync::CancellationToken;
 
@@ -45,14 +47,34 @@ pub enum Note {
         /// Fired once the answer is on the disk; the call runs only then.
         done: oneshot::Sender<()>,
     },
+    /// The call `call` asks a person: the question and the id its answer names.
+    ///
+    /// The question reaches the journal before it goes out, so a process that
+    /// ends while it waits leaves a question a later one answers.
+    Question {
+        /// The tool call the question belongs to.
+        call: String,
+        /// The id the answer names: 32 lowercase hex characters.
+        qid: String,
+        /// The JSON text of the `questions` argument, as the model sent it.
+        questions: String,
+        /// Fired once the record is on the disk; the question goes out only
+        /// then.
+        done: oneshot::Sender<()>,
+    },
 }
 
 /// Where the notes of one call go: its place among the batch's calls and the
-/// channel the loop reads them on.
+/// channel the loop reads them on, with the tool call's id and the run's event
+/// hook, so a wait of this call reaches the plugins.
 #[derive(Clone, Copy)]
 struct Report<'a> {
     at: usize,
     notes: &'a mpsc::UnboundedSender<Note>,
+    /// The id of the call this report belongs to.
+    call: &'a str,
+    /// The run's event hook, when it has one.
+    hook: Option<&'a Arc<dyn EventHook>>,
 }
 
 impl Report<'_> {
@@ -81,6 +103,28 @@ impl Report<'_> {
             .is_ok()
         {
             let _ = written.await;
+        }
+    }
+
+    /// Tells the plugins that this call starts to wait for a person.
+    fn waiting(self, tool: &str) {
+        if let Some(hook) = self.hook {
+            hook.seen(crate::hook::Seen::Waiting {
+                kind: WaitKind::Approval,
+                call: self.call,
+                tool,
+            });
+        }
+    }
+
+    /// Tells the plugins that the wait of this call ended.
+    fn waited(self, how: WaitEnd) {
+        if let Some(hook) = self.hook {
+            hook.seen(crate::hook::Seen::Waited {
+                kind: WaitKind::Approval,
+                call: self.call,
+                how,
+            });
         }
     }
 }
@@ -120,7 +164,7 @@ pub async fn run_all_guarded_seen<'a>(
     guard: Option<&'a Guard>,
     token: &'a CancellationToken,
 ) -> Vec<Outcome> {
-    run_batch(calls, registry, guard, token, None, false)
+    run_batch(calls, registry, guard, token, None, false, None, None)
         .await
         .into_iter()
         .map(|outcome| outcome.expect("a batch answers every call"))
@@ -134,6 +178,10 @@ pub async fn run_all_guarded_seen<'a>(
 /// `live` says that a client of a live session can answer a call; only then
 /// does a call that asks report its wait and its answer. A headless run keeps
 /// no such record: its guard refuses a call that asks at once.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every one is a part of the loop the calls run in"
+)]
 pub async fn run_all_noted<'a>(
     calls: &'a [ToolCall],
     registry: &'a Registry,
@@ -141,12 +189,36 @@ pub async fn run_all_noted<'a>(
     token: &'a CancellationToken,
     notes: &'a mpsc::UnboundedSender<Note>,
     live: bool,
+    questions: Option<&'a Arc<Questions>>,
+    hook: Option<&'a Arc<dyn EventHook>>,
 ) {
-    run_batch(calls, registry, guard, token, Some(notes), live).await;
+    // A call that asks places itself first, so its question knows the call it
+    // belongs to, and the wait reaches the journal through the notes.
+    if let Some(questions) = questions {
+        questions.begin(notes.clone(), hook.cloned());
+    }
+    run_batch(
+        calls,
+        registry,
+        guard,
+        token,
+        Some(notes),
+        live,
+        questions,
+        hook,
+    )
+    .await;
+    if let Some(questions) = questions {
+        questions.end();
+    }
 }
 
 /// Runs every call and either keeps each result in the returned slot or sends
 /// it on `notes`, which leaves its slot empty.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every one is a part of the loop the calls run in"
+)]
 async fn run_batch<'a>(
     calls: &'a [ToolCall],
     registry: &'a Registry,
@@ -154,6 +226,8 @@ async fn run_batch<'a>(
     token: &'a CancellationToken,
     notes: Option<&'a mpsc::UnboundedSender<Note>>,
     live: bool,
+    questions: Option<&'a Arc<Questions>>,
+    hook: Option<&'a Arc<dyn EventHook>>,
 ) -> Vec<Option<Outcome>> {
     if token.is_cancelled() {
         return calls
@@ -167,12 +241,17 @@ async fn run_batch<'a>(
         .iter()
         .all(|call| registry.resolve(&call.name).is_some_and(Tool::read_only));
     let reporter = move |at: usize| match notes {
-        Some(notes) if live => Some(Report { at, notes }),
+        Some(notes) if live => Some(Report {
+            at,
+            notes,
+            call: &calls[at].id,
+            hook,
+        }),
         _ => None,
     };
 
     if let [call] = calls {
-        let output = run_one_with(registry, guard, call, token, reporter(0)).await;
+        let output = run_one_with(registry, None, guard, call, token, reporter(0), questions).await;
         return vec![settle(0, call, output, notes)];
     }
     if parallel {
@@ -180,7 +259,7 @@ async fn run_batch<'a>(
             .iter()
             .enumerate()
             .map(|(at, call)| {
-                run_one_with(registry, guard, call, token, reporter(at))
+                run_one_with(registry, None, guard, call, token, reporter(at), questions)
                     .map(move |output| settle(at, call, output, notes))
             })
             .collect();
@@ -191,7 +270,7 @@ async fn run_batch<'a>(
         let output = if token.is_cancelled() {
             None
         } else {
-            run_one_with(registry, guard, call, token, reporter(at)).await
+            run_one_with(registry, None, guard, call, token, reporter(at), questions).await
         };
         slots.push(settle(at, call, output, notes));
     }
@@ -228,17 +307,31 @@ pub fn run_one<'a>(
     call: &'a ToolCall,
     token: &'a CancellationToken,
 ) -> BoxFuture<'a, Option<ToolOutput>> {
-    run_one_with(registry, guard, call, token, None)
+    run_one_with(registry, None, guard, call, token, None, None)
+}
+
+/// [`run_one`] with `hook` as the call hook in place of the registry's own,
+/// for a registry built before the hook existed, such as a script's.
+pub fn run_one_hooked<'a>(
+    registry: &'a Registry,
+    hook: Option<&'a dyn CallHook>,
+    guard: Option<&'a Guard>,
+    call: &'a ToolCall,
+    token: &'a CancellationToken,
+) -> BoxFuture<'a, Option<ToolOutput>> {
+    run_one_with(registry, hook, guard, call, token, None, None)
 }
 
 /// [`run_one`], sending the wait of a call for a client and the answer it gets
 /// on `report`.
 fn run_one_with<'a>(
     registry: &'a Registry,
+    hook: Option<&'a dyn CallHook>,
     guard: Option<&'a Guard>,
     call: &'a ToolCall,
     token: &'a CancellationToken,
     report: Option<Report<'a>>,
+    questions: Option<&'a Arc<Questions>>,
 ) -> BoxFuture<'a, Option<ToolOutput>> {
     match registry.resolve(&call.name) {
         Some(tool) => Box::pin(async move {
@@ -266,7 +359,7 @@ fn run_one_with<'a>(
             // A call hook may rewrite the call or block it. What it decides is
             // what the rules below see, so it cannot get a call past them.
             let mut rewritten: Option<String> = None;
-            if let Some(hook) = registry.hook() {
+            if let Some(hook) = hook.or_else(|| registry.hook()) {
                 let verdict = tokio::select! {
                     verdict = hook.before(name, args) => verdict,
                     () = token.cancelled() => return None,
@@ -305,6 +398,13 @@ fn run_one_with<'a>(
                     return after_call(registry, name, args, output, token).await;
                 }
             }
+            // The question of this call knows which call it belongs to, and
+            // which id its answer names, before the tool opens its wait.
+            if let Some(questions) = questions
+                && name == crate::question::NAME
+            {
+                questions.expect(&call.id, args);
+            }
             let output = run_call(guard, tool, args, contain.as_ref(), token, report).await?;
             // A call whose values are of another type than its arguments
             // declare is what a tool reports as `invalid arguments`: run it
@@ -320,6 +420,13 @@ fn run_one_with<'a>(
                     Some(Planned::Run) => None,
                     Some(Planned::Contain(ask)) => Some(ask),
                 };
+                // The call runs again with the converted arguments, so the
+                // question knows the call it belongs to by those arguments.
+                if let Some(questions) = questions
+                    && name == crate::question::NAME
+                {
+                    questions.expect(&call.id, &converted);
+                }
                 let retried =
                     run_call(guard, tool, &converted, contain.as_ref(), token, report).await?;
                 let note = converted_note(note.as_deref());
@@ -386,13 +493,21 @@ async fn approve(
     };
     if let Some(report) = report {
         report.wait().await;
+        report.waiting(&ask.tool);
     }
-    let planned = match guard.approve(ask, token).await? {
-        Grant::Run => Planned::Run,
-        Grant::Refuse(output) => Planned::Refuse(output),
+    let (planned, how) = match guard.approve(ask, token).await {
+        Some(Grant::Run) => (Planned::Run, WaitEnd::Answered),
+        Some(Grant::Refuse(output)) => (Planned::Refuse(output), WaitEnd::Denied),
+        None => {
+            if let Some(report) = report {
+                report.waited(WaitEnd::Cancelled);
+            }
+            return None;
+        }
     };
     if let Some(report) = report {
         report.answer(matches!(planned, Planned::Run)).await;
+        report.waited(how);
     }
     Some(planned)
 }

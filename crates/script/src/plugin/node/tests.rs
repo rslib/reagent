@@ -4256,3 +4256,42 @@ export default function () { throw new Error("no load"); }
     );
     assert_eq!(&*run(&plugins, "try").await.content, "kept");
 }
+
+#[tokio::test]
+async fn append_file_adds_to_the_end_behind_the_write_check() {
+    let root = temp_root();
+    awaited_tool(
+        root.path(),
+        "appender",
+        r#"{"fs": "write"}"#,
+        "appender",
+        r#"import { appendFile, readFile } from "fs/promises";
+import fs from "fs";"#,
+        r#"await appendFile("log.txt", "b\n");
+  await fs.promises.appendFile("log.txt", "c\n");
+  await appendFile("new.txt", "first\n");
+  return (await readFile("log.txt", "utf8")) + (await readFile("new.txt", "utf8"));"#,
+    )
+    .await;
+    awaited_tool(
+        root.path(),
+        "reader",
+        r#"{"fs": "read"}"#,
+        "reader",
+        r#"import { appendFile } from "fs/promises";"#,
+        r#"try { await appendFile("log.txt", "x"); return "appended"; } catch (error) { return error.message; }"#,
+    )
+    .await;
+    let session = temp_root();
+    file_in(session.path(), "log.txt", "a\n").await;
+    let plugins = loaded(root.path(), session.path()).await;
+    let out = run(&plugins, "appender").await;
+    assert!(!out.is_error, "{:?}", out.content);
+    assert_eq!(out.content.to_string(), "a\nb\nc\nfirst\n");
+    let out = run(&plugins, "reader").await;
+    let text = out.content.to_string();
+    assert!(
+        text.contains("plugin reader has no fs write permission for"),
+        "{text}"
+    );
+}

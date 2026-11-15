@@ -507,7 +507,7 @@ impl<'a> Agent<'a> {
             let mut steer_waits = false;
             if let Some(inbox) = inbox.as_deref_mut() {
                 if self.take_commands(inbox, events).await
-                    && !matches!(outcome, TurnOutcome::Error(_))
+                    && !matches!(outcome, TurnOutcome::Error(_) | TurnOutcome::Parked)
                 {
                     outcome = TurnOutcome::Cancelled;
                 }
@@ -1251,7 +1251,16 @@ impl<'a> Agent<'a> {
             return TurnEndReason::Error;
         }
         // Each result reaches the journal as it comes back, and a call that
-        // asks records its wait and its answer, exactly as in a turn.
+        // asks records its wait and its answer, exactly as in a turn. A call
+        // whose question is already on the disk asks under its old id, so it
+        // writes no second record.
+        if let Some(questions) = self.questions.as_ref() {
+            for call in pending {
+                if let Some(qid) = call.qid.as_deref() {
+                    questions.reuse(&call.id, qid);
+                }
+            }
+        }
         let mut ledger = std::mem::take(&mut self.ledger);
         let (notes, mut progress) = mpsc::unbounded_channel();
         let batch = run_all_noted(
@@ -1261,6 +1270,8 @@ impl<'a> Agent<'a> {
             &self.token,
             &notes,
             self.live,
+            self.questions.as_ref(),
+            self.event_hook.as_ref(),
         );
         let mut results = Results {
             calls: &calls,
@@ -1275,6 +1286,8 @@ impl<'a> Agent<'a> {
             written: None,
             slots: calls.iter().map(|_| None).collect(),
             facts: calls.iter().map(|_| None).collect(),
+            questions: self.questions.as_ref(),
+            parked: false,
             failure: None,
         };
         self.watched_noted(batch, inbox, events, &mut progress, &mut results)
@@ -1285,19 +1298,25 @@ impl<'a> Agent<'a> {
         let Results {
             slots,
             facts,
+            parked,
             failure,
             ..
         } = results;
         self.ledger = ledger;
         // Every result reaches history before any event is sent, so a cancel
-        // or a closed receiver cannot leave a call unanswered.
-        for result in slots {
-            history.push(result.expect("the batch answers every call"));
+        // or a closed receiver cannot leave a call unanswered. A call a park
+        // ended has neither a result nor an event.
+        for (call, result) in calls.iter().zip(slots) {
+            match result {
+                Some(result) => history.push(result),
+                None => assert!(
+                    self.questions
+                        .as_ref()
+                        .is_some_and(|questions| questions.parked_call(&call.id)),
+                    "the batch answers every call it did not park"
+                ),
+            }
         }
-        let facts: Vec<Fact> = facts
-            .into_iter()
-            .map(|fact| fact.expect("the batch answers every call"))
-            .collect();
         mark_recorded(journal, history.len());
         if let Some(error) = failure {
             emit(events, &self.token, Event::Error(error)).await;
@@ -1307,7 +1326,10 @@ impl<'a> Agent<'a> {
             emit(events, &self.token, Event::RunEnd(TurnEndReason::Error)).await;
             return TurnEndReason::Error;
         }
-        for (call, (bytes, output, is_error, images)) in calls.iter().zip(facts) {
+        for (call, fact) in calls.iter().zip(facts) {
+            let Some((bytes, output, is_error, images)) = fact else {
+                continue;
+            };
             self.saw(Seen::ToolEnd {
                 tool: &call.name,
                 is_error,
@@ -1322,6 +1344,10 @@ impl<'a> Agent<'a> {
             if emit(events, &self.token, event).await {
                 return TurnEndReason::Cancelled;
             }
+        }
+        // The parked question ends the run: a later process answers it.
+        if parked {
+            return TurnEndReason::Parked;
         }
         if self.token.is_cancelled() {
             return TurnEndReason::Cancelled;
@@ -1363,6 +1389,7 @@ impl<'a> Agent<'a> {
             ),
             TurnOutcome::Recovered => (TurnEndReason::Stopped(StopReason::MaxTokens), None),
             TurnOutcome::Cancelled => (TurnEndReason::Cancelled, Some(TurnEndReason::Cancelled)),
+            TurnOutcome::Parked => (TurnEndReason::Parked, Some(TurnEndReason::Parked)),
             TurnOutcome::Error(message) | TurnOutcome::NoHandoff(message) => {
                 emit(events, &self.token, Event::Error(message)).await;
                 (TurnEndReason::Error, Some(TurnEndReason::Error))
@@ -1663,6 +1690,15 @@ impl<'a> Agent<'a> {
             break (message, broken, repaired);
         };
 
+        // One usage report per finished reply, with the counts the assembler
+        // keeps: the stream may report the same reply several times, each time
+        // cumulative. A reply the loop retried never reaches here, so a failed
+        // attempt reports nothing. A reply a cancel cut still reports the use
+        // it had reached.
+        if message.usage != Usage::default() {
+            self.saw(Seen::Usage(&message.usage));
+        }
+
         // An empty reply is never pushed. A refusal with no content is still
         // a refusal, not an "empty reply" error, and pushes nothing.
         if message.content.is_empty() {
@@ -1738,6 +1774,8 @@ impl<'a> Agent<'a> {
                     &self.token,
                     &notes,
                     self.live,
+                    self.questions.as_ref(),
+                    self.event_hook.as_ref(),
                 );
                 let mut results = Results {
                     calls: &calls,
@@ -1752,6 +1790,8 @@ impl<'a> Agent<'a> {
                     written: None,
                     slots: calls.iter().map(|_| None).collect(),
                     facts: calls.iter().map(|_| None).collect(),
+                    questions: self.questions.as_ref(),
+                    parked: false,
                     failure: None,
                 };
                 self.watched_noted(batch, inbox, events, &mut progress, &mut results)
@@ -1764,6 +1804,7 @@ impl<'a> Agent<'a> {
                 let Results {
                     slots,
                     facts,
+                    parked,
                     failure,
                     ..
                 } = results;
@@ -1771,16 +1812,26 @@ impl<'a> Agent<'a> {
                 // Every result reaches history before any event is sent, so a
                 // cancel or a closed receiver cannot leave a call unanswered.
                 // The results move into history, so only their event fields
-                // are kept here; nothing is cloned.
-                for result in slots {
-                    history.push(result.expect("the batch answers every call"));
+                // are kept here; nothing is cloned. A call a park ended has
+                // neither a result nor an event.
+                for (call, result) in calls.iter().zip(slots) {
+                    match result {
+                        Some(result) => history.push(result),
+                        None => assert!(
+                            self.questions
+                                .as_ref()
+                                .is_some_and(|questions| questions.parked_call(&call.id)),
+                            "the batch answers every call it did not park"
+                        ),
+                    }
                 }
                 if let Some(error) = failure {
                     return TurnOutcome::Error(error);
                 }
                 for (call, fact) in calls.iter().zip(facts) {
-                    let (bytes, output, is_error, images) =
-                        fact.expect("the batch answers every call");
+                    let Some((bytes, output, is_error, images)) = fact else {
+                        continue;
+                    };
                     self.saw(Seen::ToolEnd {
                         tool: &call.name,
                         is_error,
@@ -1795,6 +1846,11 @@ impl<'a> Agent<'a> {
                     if emit(events, &self.token, event).await {
                         return TurnOutcome::Cancelled;
                     }
+                }
+                // The reply's other calls finished and are in; the parked one
+                // ends the run, and a later process answers its question.
+                if parked {
+                    return TurnOutcome::Parked;
                 }
                 if self.token.is_cancelled() {
                     return TurnOutcome::Cancelled;
@@ -2033,6 +2089,10 @@ struct Results<'a, 'b, 'c> {
     slots: Vec<Option<Message>>,
     /// The event fields of each result, by its place among the calls.
     facts: Vec<Option<Fact>>,
+    /// The registry of the questions, to know which call a park ended.
+    questions: Option<&'a Arc<Questions>>,
+    /// Whether a park ended the question of a call, so the run ends.
+    parked: bool,
     /// The first journal error, which ends the turn.
     failure: Option<Text>,
 }
@@ -2055,6 +2115,15 @@ impl Results<'_, '_, '_> {
                 self.approval(at, kind).await;
                 let _ = done.send(());
             }
+            Note::Question {
+                call,
+                qid,
+                questions,
+                done,
+            } => {
+                self.question(&call, &qid, &questions).await;
+                let _ = done.send(());
+            }
         }
     }
 
@@ -2062,6 +2131,16 @@ impl Results<'_, '_, '_> {
     /// note, then the journal and its commit, so a crash in the middle of the
     /// batch keeps what already ran.
     async fn done(&mut self, at: usize, (result, seen): Outcome) {
+        // A call whose question the run parked has no result: the process ends
+        // and a later one answers the question, so nothing of the call reaches
+        // the journal or the history.
+        if self.calls.get(at).is_some_and(|call| {
+            self.questions
+                .is_some_and(|questions| questions.parked_call(&call.id))
+        }) {
+            self.parked = true;
+            return;
+        }
         // A note says how the agent itself read the call, so a weak model
         // stops sending the same shape. Only a result with such a note is
         // touched.
@@ -2111,6 +2190,29 @@ impl Results<'_, '_, '_> {
             }
         }
         self.slots[at] = Some(result);
+        if wrote {
+            committed(self.journal, self.live, self.events, self.token).await;
+        }
+    }
+
+    /// Records the wait of a question, so a process that ends while it waits
+    /// leaves a question a later process answers.
+    async fn question(&mut self, call: &str, qid: &str, questions: &str) {
+        let mut wrote = false;
+        if let Some(journal) = self.journal.as_mut() {
+            // A question waits for a person, so it is synced: the question goes
+            // out only once the record is on the disk.
+            let written = match journal.question_asked(call, qid, questions) {
+                Ok(()) => journal.sync().await,
+                Err(error) => Err(error),
+            };
+            match written {
+                Ok(()) => wrote = true,
+                Err(error) => {
+                    self.failure.get_or_insert(journal_error(&error));
+                }
+            }
+        }
         if wrote {
             committed(self.journal, self.live, self.events, self.token).await;
         }
@@ -2458,6 +2560,9 @@ enum TurnOutcome {
     Recovered,
     /// The run was cancelled mid-turn.
     Cancelled,
+    /// A park ended the question of one of the reply's calls: the process may
+    /// end, and a later one answers it. The call has no result.
+    Parked,
     /// The provider, a tool or the session reported an error.
     Error(Text),
     /// The provider failed the request that forbids tools. Only the handoff is
@@ -3133,7 +3238,10 @@ mod tests {
     use serde_json::json;
 
     use crate::journal::Journal;
-    use crate::journal::record::{self, Record};
+    use crate::journal::kinds;
+    use crate::journal::record::{self, Aside, Question, Record};
+    use crate::journal::resume::{load, parked};
+    use crate::question::{Ask, Questions};
     use crate::tool::{Effects, Identity, Seen, Tool, ToolOutput, parse_args};
 
     /// Opens a journal over `dir`, as a run does.
@@ -3146,6 +3254,25 @@ mod tests {
         );
         Journal::create(dir, header).expect("create the journal")
     }
+
+    /// Every question of the newest part, in the order the journal wrote it,
+    /// read without closing the journal.
+    fn read_questions(dir: &Path) -> Vec<Question> {
+        let session = Session::open(dir).expect("open the session");
+        session
+            .records()
+            .filter_map(|record| {
+                let record = record.expect("read a record");
+                match record::decode_aside(record.kind, &record.payload).expect("decode") {
+                    Some(Aside::Question(question)) => Some(question),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// The questions of one `ask` call, as the model sent them.
+    const QUESTIONS: &str = r#"{"questions":[{"q":"Which database?","options":[{"label":"sqlite"},{"label":"postgres"}]}]}"#;
 
     /// Every record of the newest part, decoded, read without closing the journal.
     fn read_records(dir: &Path) -> Vec<Record> {
@@ -4488,6 +4615,314 @@ mod tests {
         assert_eq!(turn_ends, 2, "one per turn");
     }
 
+    /// Opens a resumed part after the log `dir` holds, for the run `resumed`
+    /// reads back.
+    fn resumed_journal(dir: &Path, resumed: &crate::journal::resume::Resumed) -> Journal {
+        let session = Session::open(dir).expect("open the session");
+        let last = session
+            .records()
+            .filter_map(Result::ok)
+            .map(|record| record.seq)
+            .max()
+            .expect("a record");
+        let header = Header::new(
+            session.header().session_id.clone(),
+            session.header().created_ms + 1,
+            Some(session.fork_point(last)),
+            Bytes::new(),
+        );
+        drop(session);
+        Journal::resumed(dir, header, resumed.recorded).expect("resume the journal")
+    }
+
+    /// Runs `run` and parks its first question, returning the events it sent,
+    /// the id the question carried and the reason the run ended with.
+    ///
+    /// `at` is a session folder the test reads the moment the question goes
+    /// out, so a question a client hears is already a record on the disk.
+    async fn park_on_the_question(
+        at: Option<&Path>,
+        run: impl std::future::Future<Output = TurnEndReason>,
+        questions: &Questions,
+        rx: &mut mpsc::Receiver<Event>,
+    ) -> (Vec<Event>, Option<String>, Option<TurnEndReason>) {
+        let mut run = std::pin::pin!(run);
+        let mut seen = Vec::new();
+        let mut qid = None;
+        let mut reason = None;
+        loop {
+            tokio::select! {
+                done = &mut run => {
+                    reason = Some(done);
+                    break;
+                }
+                event = rx.recv() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    if matches!(event, Event::QuestionRequest(_)) {
+                        qid = questions.qid("call_1");
+                        if let Some(dir) = at {
+                            let read = read_questions(dir);
+                            assert!(
+                                matches!(read.last(), Some(Question::Asked { call, .. }) if call == "call_1"),
+                                "the question is on the disk before it goes out: {read:?}"
+                            );
+                        }
+                        questions.park();
+                    }
+                    seen.push(event);
+                }
+            }
+        }
+        seen.extend(std::iter::from_fn(|| rx.try_recv().ok()));
+        (seen, qid, reason)
+    }
+
+    /// A run whose question is parked ends with `TurnEndReason::Parked`: the
+    /// question is on the disk before the reply's other result, and the ask
+    /// call has no result in the journal or the history.
+    #[tokio::test]
+    async fn park_ends_the_run_and_leaves_the_question_asked() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let provider = FakeProvider::new(vec![tool_replies(&[
+            ("call_1", "ask", QUESTIONS),
+            ("call_2", "echo", r#"{"message":"hi"}"#),
+        ])]);
+        let questions = Questions::new();
+        let mut registry = registry();
+        registry.add(Ask::new(Arc::clone(&questions)));
+        let (tx, mut rx) = mpsc::channel(64);
+        questions.listen(tx.clone());
+        let mut history = vec![Message::user("hello")];
+        let mut journal = journal(dir.path());
+        let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_questions(Arc::clone(&questions));
+
+        let (seen, ..) = park_on_the_question(
+            Some(dir.path()),
+            async {
+                agent.run(&mut history, Some(&mut journal), &tx).await;
+                TurnEndReason::EndTurn
+            },
+            &questions,
+            &mut rx,
+        )
+        .await;
+        journal.close().expect("close the journal");
+
+        assert_eq!(
+            seen.last(),
+            Some(&Event::RunEnd(TurnEndReason::Parked)),
+            "the run ends parked: {seen:?}"
+        );
+        assert!(
+            seen.contains(&Event::TurnEnd(TurnEndReason::Parked)),
+            "the turn ends parked: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|event| matches!(
+                event,
+                Event::ToolResult { id, .. } if id.as_ref() == "call_1"
+            )),
+            "a parked call sends no result: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                Event::ToolResult { id, .. } if id.as_ref() == "call_2"
+            )),
+            "the other call still answers: {seen:?}"
+        );
+
+        let questions_read = read_questions(dir.path());
+        let [
+            Question::Asked {
+                call,
+                qid,
+                questions,
+            },
+        ] = &questions_read[..]
+        else {
+            panic!("one question is on the disk: {questions_read:?}");
+        };
+        assert_eq!(call, "call_1");
+        assert_eq!(qid.len(), 32, "{qid}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(questions).expect("the questions text"),
+            serde_json::json!([{"q": "Which database?",
+                "options": [{"label": "sqlite"}, {"label": "postgres"}]}]),
+        );
+
+        let records = read_records(dir.path());
+        let asked = records
+            .iter()
+            .position(|record| matches!(record, Record::Unknown(kinds::QUESTION)))
+            .expect("the question is on the disk");
+        let other = records
+            .iter()
+            .position(|record| {
+                matches!(record, Record::Message(Message::ToolResult(result)) if result.call_id.as_ref() == "call_2")
+            })
+            .expect("the other call has its result");
+        assert!(
+            asked < other,
+            "the question is on the disk before it goes out"
+        );
+        assert!(
+            !records.iter().any(|record| matches!(
+                record,
+                Record::Message(Message::ToolResult(result)) if result.call_id.as_ref() == "call_1"
+            )),
+            "a parked call is not in the journal"
+        );
+        assert!(
+            !history.iter().any(|message| matches!(
+                message,
+                Message::ToolResult(result) if result.call_id.as_ref() == "call_1"
+            )),
+            "a parked call is not in the history"
+        );
+        assert!(
+            history.iter().any(|message| matches!(
+                message,
+                Message::ToolResult(result) if result.call_id.as_ref() == "call_2"
+            )),
+            "the other call is in the history"
+        );
+    }
+
+    /// A later process runs the pending ask call again: it asks under the id
+    /// the log already holds, so no second question record reaches the journal.
+    #[tokio::test]
+    async fn park_a_rerun_writes_no_second_asked_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let provider = FakeProvider::new(vec![tool_replies(&[
+            ("call_1", "ask", QUESTIONS),
+            ("call_2", "echo", r#"{"message":"hi"}"#),
+        ])]);
+        let questions = Questions::new();
+        let mut tools = registry();
+        tools.add(Ask::new(Arc::clone(&questions)));
+        let (tx, mut rx) = mpsc::channel(64);
+        questions.listen(tx.clone());
+        let mut history = vec![Message::user("hello")];
+        let mut journal = journal(dir.path());
+        let mut agent = Agent::new(&provider, &tools, config(), CancellationToken::new())
+            .with_questions(Arc::clone(&questions));
+        park_on_the_question(
+            None,
+            async {
+                agent.run(&mut history, Some(&mut journal), &tx).await;
+                TurnEndReason::EndTurn
+            },
+            &questions,
+            &mut rx,
+        )
+        .await;
+        journal.close().expect("close the journal");
+        let [Question::Asked { qid: asked, .. }] = &read_questions(dir.path())[..] else {
+            panic!("one question is on the disk");
+        };
+        let asked = asked.clone();
+
+        // The second process: the log says the question of call_1 waits.
+        let session = Session::open(dir.path()).expect("open the session");
+        let resumed = load(&session).expect("load the run");
+        let index = parked(&session).expect("the open questions");
+        assert_eq!(index.len(), 1, "{index:?}");
+        assert_eq!(index[0].qid, asked);
+        assert_eq!(resumed.parked, [("call_1".to_owned(), asked.clone())]);
+        drop(session);
+        let mut journal = resumed_journal(dir.path(), &resumed);
+
+        let provider = FakeProvider::new(Vec::new());
+        let questions = Questions::new();
+        let mut tools = registry();
+        tools.add(Ask::new(Arc::clone(&questions)));
+        let (tx, mut rx) = mpsc::channel(64);
+        questions.listen(tx.clone());
+        let mut agent = Agent::new(&provider, &tools, config(), CancellationToken::new())
+            .with_questions(Arc::clone(&questions));
+        let mut history = resumed.history.clone();
+        let (seen, reused, reason) = park_on_the_question(
+            None,
+            agent.run_pending(&mut history, &mut Some(&mut journal), &tx, &resumed.pending),
+            &questions,
+            &mut rx,
+        )
+        .await;
+        journal.close().expect("close the journal");
+
+        assert_eq!(reused.as_deref(), Some(asked.as_str()), "the same id again");
+        assert_eq!(reason, Some(TurnEndReason::Parked), "{seen:?}");
+        let records = read_questions(dir.path());
+        let [Question::Asked { call, qid, .. }] = &records[..] else {
+            panic!("one question record, not two: {records:?}");
+        };
+        assert_eq!(
+            (call.as_str(), qid.as_str()),
+            ("call_1", asked.as_str()),
+            "the one record is the one the first run wrote"
+        );
+    }
+
+    /// A question whose arguments the type coercion repairs still reaches the
+    /// journal, so a park leaves it for a later process to answer.
+    #[tokio::test]
+    async fn park_a_coerced_ask_call_is_placed_and_asked() {
+        // `multi` is a boolean in the spec, and the model sent a string.
+        const COERCED: &str = r#"{"questions":[{"q":"Which database?","options":[{"label":"sqlite"},{"label":"postgres"}],"multi":"true"}]}"#;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let provider = FakeProvider::new(vec![
+            tool_replies(&[("call_1", "ask", COERCED)]),
+            text_reply("done"),
+        ]);
+        let questions = Questions::new();
+        let mut registry = registry();
+        registry.add(Ask::new(Arc::clone(&questions)));
+        let (tx, mut rx) = mpsc::channel(64);
+        questions.listen(tx.clone());
+        let mut history = vec![Message::user("hello")];
+        let mut journal = journal(dir.path());
+        let mut agent = Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_questions(Arc::clone(&questions));
+
+        let (seen, qid, _) = park_on_the_question(
+            Some(dir.path()),
+            async {
+                agent.run(&mut history, Some(&mut journal), &tx).await;
+                TurnEndReason::EndTurn
+            },
+            &questions,
+            &mut rx,
+        )
+        .await;
+        journal.close().expect("close the journal");
+
+        assert!(
+            qid.is_some(),
+            "the retried call is placed under its own question: {seen:?}"
+        );
+        assert_eq!(
+            seen.last(),
+            Some(&Event::RunEnd(TurnEndReason::Parked)),
+            "the run ends parked: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|event| matches!(
+                event,
+                Event::ToolResult { id, .. } if id.as_ref() == "call_1"
+            )),
+            "a parked call sends no result: {seen:?}"
+        );
+        let records = read_questions(dir.path());
+        let [Question::Asked { call, .. }] = &records[..] else {
+            panic!("one question is on the disk: {records:?}");
+        };
+        assert_eq!(call, "call_1");
+    }
+
     #[tokio::test]
     async fn config_provider_of_a_set_reaches_the_model_record() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -4621,6 +5056,7 @@ mod tests {
             id: "call_1".into(),
             name: "huge".into(),
             class: Some(EffectClass::Read),
+            qid: None,
         }];
         let (tx, mut rx) = mpsc::channel(64);
         let mut journal = journal(dir.path());
@@ -6489,7 +6925,14 @@ mod tests {
                 Seen::TurnStart => "turn_start".to_string(),
                 Seen::ToolEnd { tool, is_error } => format!("tool_end {tool} {is_error}"),
                 Seen::TurnEnd(reason) => format!("turn_end {reason:?}"),
+                Seen::Usage(usage) => format!("usage {usage:?}"),
                 Seen::RunEnd(reason) => format!("run_end {reason:?}"),
+                Seen::Waiting { kind, call, tool } => {
+                    format!("waiting {} {call} {tool}", kind.word())
+                }
+                Seen::Waited { kind, call, how } => {
+                    format!("waited {} {call} {}", kind.word(), how.word())
+                }
             };
             self.seen.lock().expect("recorder lock").push(line);
         }
@@ -6543,6 +6986,164 @@ mod tests {
             seen.last().map(String::as_str),
             Some("run_end EndTurn"),
             "{seen:?}"
+        );
+    }
+
+    /// An event hook that writes down the token use of each reply it saw.
+    #[derive(Default)]
+    struct UsageRecorder {
+        seen: Mutex<Vec<Usage>>,
+    }
+
+    impl crate::hook::EventHook for UsageRecorder {
+        fn seen(&self, event: crate::hook::Seen<'_>) {
+            if let crate::hook::Seen::Usage(usage) = event {
+                self.seen.lock().expect("recorder lock").push(*usage);
+            }
+        }
+    }
+
+    /// Runs `replies` through a fresh agent and gives back the usage of each
+    /// reply the event hook saw.
+    async fn usage_seen(replies: Vec<Vec<StreamEvent>>) -> Vec<Usage> {
+        let provider = FakeProvider::new(replies);
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+        let hook = Arc::new(UsageRecorder::default());
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_event_hook(Arc::clone(&hook) as Arc<dyn crate::hook::EventHook>)
+            .run(&mut history, None, &tx)
+            .await;
+
+        let _ = drain(tx, &mut rx);
+        hook.seen.lock().expect("recorder lock").clone()
+    }
+
+    /// A reply whose stream reports `usages` in order, each one cumulative.
+    fn usage_reply(text: &str, usages: &[Usage]) -> Vec<StreamEvent> {
+        let mut events = Vec::with_capacity(usages.len() + 2);
+        events.push(StreamEvent::TextDelta(Text::from(text)));
+        events.extend(usages.iter().copied().map(StreamEvent::Usage));
+        events.push(StreamEvent::Stop(StopReason::EndTurn));
+        events
+    }
+
+    /// A stream that reports two cumulative usages of one reply gives the hook
+    /// one event, with the counts the reply keeps at its end.
+    #[tokio::test]
+    async fn usage_event_is_one_per_reply_with_the_last_counts() {
+        let reply = usage_reply(
+            "done",
+            &[
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    ..Usage::default()
+                },
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 9,
+                    cache_read_tokens: 4,
+                    cost: Some(0.25),
+                    ..Usage::default()
+                },
+            ],
+        );
+
+        let seen = usage_seen(vec![reply]).await;
+
+        assert_eq!(
+            seen,
+            [Usage {
+                input_tokens: 10,
+                output_tokens: 9,
+                cache_read_tokens: 4,
+                cost: Some(0.25),
+                ..Usage::default()
+            }],
+            "one event per reply, with the counts it ended on"
+        );
+    }
+
+    /// A tool call and the text after it are two replies, so the hook sees one
+    /// usage event for each.
+    #[tokio::test]
+    async fn usage_event_is_one_per_reply_of_a_tool_turn() {
+        let mut call = tool_reply("call-1", "echo", r#"{"message":"hi"}"#);
+        call.insert(
+            call.len() - 1,
+            StreamEvent::Usage(Usage {
+                input_tokens: 7,
+                output_tokens: 3,
+                ..Usage::default()
+            }),
+        );
+        let text = usage_reply(
+            "done",
+            &[Usage {
+                input_tokens: 12,
+                output_tokens: 1,
+                ..Usage::default()
+            }],
+        );
+
+        let seen = usage_seen(vec![call, text]).await;
+
+        let counts: Vec<(u64, u64)> = seen
+            .iter()
+            .map(|usage| (usage.input_tokens, usage.output_tokens))
+            .collect();
+        assert_eq!(counts, [(7, 3), (12, 1)], "one event for each reply");
+    }
+
+    /// An attempt a retry replaced sends none: the reply that finishes is the
+    /// only one the hook hears about.
+    #[tokio::test(start_paused = true)]
+    async fn usage_event_is_none_for_a_retried_attempt() {
+        let provider = FakeProvider::new(vec![]);
+        // The cut attempt reported its partial use before the connection broke.
+        provider.push_failing_reply(
+            vec![
+                StreamEvent::TextDelta(Text::from("half")),
+                StreamEvent::Usage(Usage {
+                    input_tokens: 40,
+                    output_tokens: 4,
+                    ..Usage::default()
+                }),
+            ],
+            Error::Http("refused".into()),
+        );
+        provider.push_reply(usage_reply(
+            "done",
+            &[Usage {
+                input_tokens: 5,
+                output_tokens: 1,
+                ..Usage::default()
+            }],
+        ));
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+        let hook = Arc::new(UsageRecorder::default());
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_event_hook(Arc::clone(&hook) as Arc<dyn crate::hook::EventHook>)
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(provider.seen().len(), 2, "one retry after the failure");
+        let _ = drain(tx, &mut rx);
+        let seen = hook.seen.lock().expect("recorder lock").clone();
+        assert_eq!(
+            seen,
+            [Usage {
+                input_tokens: 5,
+                output_tokens: 1,
+                ..Usage::default()
+            }],
+            "the cut attempt reports nothing"
         );
     }
 

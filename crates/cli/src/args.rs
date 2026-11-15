@@ -253,6 +253,9 @@ pub struct Args {
     pub sandbox: SandboxMode,
     /// Whether sandboxed commands may use the network.
     pub network: bool,
+    /// The `host:port` entries sandboxed commands may reach, when the config
+    /// names hosts instead of the bool. Empty with a bool.
+    pub network_hosts: Vec<reagent_config::Host>,
     /// Folders sandboxed commands may write, besides the working and temp
     /// folders.
     pub write: Vec<PathBuf>,
@@ -313,11 +316,12 @@ pub enum SandboxMode {
 }
 
 /// Reads the sandbox settings, expanding a leading `~/` in the write folders
-/// with `home`.
+/// with `home`. The network is a bool or a list of hosts; a list means no
+/// network at all except the hosts it names.
 fn resolve_sandbox(
     sandbox: &reagent_config::Sandbox,
     home: Option<&Path>,
-) -> Result<(SandboxMode, bool, Vec<PathBuf>), String> {
+) -> Result<(SandboxMode, bool, Vec<reagent_config::Host>, Vec<PathBuf>), String> {
     let mode = match sandbox.mode.as_deref() {
         None | Some("off") => SandboxMode::Off,
         Some("auto") => SandboxMode::Auto,
@@ -336,7 +340,12 @@ fn resolve_sandbox(
             _ => PathBuf::from(dir),
         })
         .collect();
-    Ok((mode, sandbox.network.unwrap_or(false), write))
+    let (network, hosts) = match &sandbox.network {
+        None => (false, Vec::new()),
+        Some(reagent_config::Network::Open(open)) => (*open, Vec::new()),
+        Some(reagent_config::Network::Hosts(hosts)) => (false, hosts.clone()),
+    };
+    Ok((mode, network, hosts, write))
 }
 
 /// Where the task text comes from.
@@ -407,6 +416,9 @@ fn usage() -> &'static str {
         "  login <provider> [--as <name>] [--no-browser]  save a login for a provider;\n",
         "                       openrouter, chatgpt\n",
         "  logout <provider>  drop a saved login\n",
+        "  answer [<qid>] [--json] [--no-resume]  list the questions the parked runs left,\n",
+        "                       or answer one: the answers JSON on stdin, one list per\n",
+        "                       question, then the session goes on headless\n",
         "  mcp add|remove|list|login|logout  manage MCP servers (see reagent mcp --help)\n",
         "  plugin add|list|remove|update  install a plugin from npm (see reagent plugin --help)\n",
         "  rpc <session>  print the requests a live session waits for, then send the request\n",
@@ -1283,7 +1295,8 @@ fn parse_from(
     };
     check_provider_names(&settings)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let (sandbox, network, write) = resolve_sandbox(&settings.sandbox, home.as_deref())?;
+    let (sandbox, network, network_hosts, write) =
+        resolve_sandbox(&settings.sandbox, home.as_deref())?;
     let model_text = model
         .or_else(|| settings.model.clone())
         .unwrap_or_else(|| DEFAULT_MODEL.into());
@@ -1475,6 +1488,7 @@ fn parse_from(
         price: model_table.price,
         sandbox,
         network,
+        network_hosts,
         write,
         plugins_dir,
     })))
@@ -1510,7 +1524,7 @@ mod tests {
     fn sandbox_table(mode: Option<&str>, write: &[&str]) -> reagent_config::Sandbox {
         reagent_config::Sandbox {
             mode: mode.map(str::to_string),
-            network: Some(true),
+            network: Some(reagent_config::Network::Open(true)),
             write: write.iter().map(ToString::to_string).collect(),
         }
     }
@@ -1524,7 +1538,7 @@ mod tests {
             (Some("auto"), SandboxMode::Auto),
             (Some("on"), SandboxMode::On),
         ] {
-            let (got, network, _) =
+            let (got, network, _, _) =
                 resolve_sandbox(&sandbox_table(text, &[]), home).expect("resolves");
             assert_eq!((got, network), (mode, true));
         }
@@ -1538,7 +1552,8 @@ mod tests {
     #[test]
     fn sandbox_write_folders_expand_a_leading_home() {
         let table = sandbox_table(Some("on"), &["~/.cache", "/data", "rel"]);
-        let (_, _, write) = resolve_sandbox(&table, Some(Path::new("/home/u"))).expect("resolves");
+        let (_, _, _, write) =
+            resolve_sandbox(&table, Some(Path::new("/home/u"))).expect("resolves");
         assert_eq!(
             write,
             [
@@ -1558,7 +1573,43 @@ mod tests {
         let args = run_with(&["-p", "x"], settings);
         assert_eq!(args.sandbox, SandboxMode::Auto);
         assert!(args.network);
+        assert!(args.network_hosts.is_empty());
         assert_eq!(args.write, [PathBuf::from("/data")]);
+    }
+
+    #[test]
+    fn host_list_reaches_the_args_and_turns_the_bool_off() {
+        let settings = Settings {
+            sandbox: reagent_config::Sandbox {
+                mode: Some("on".into()),
+                network: Some(reagent_config::Network::Hosts(vec![
+                    reagent_config::Host::parse("devbox.example.net:22").expect("an entry"),
+                    reagent_config::Host::parse("127.0.0.1:8080").expect("an entry"),
+                ])),
+                write: Vec::new(),
+            },
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "x"], settings);
+        assert!(!args.network, "a host list is not the whole network");
+        assert_eq!(
+            args.network_hosts
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["devbox.example.net:22", "127.0.0.1:8080"]
+        );
+        assert!(args.network_hosts[1].is_loopback() && !args.network_hosts[0].is_loopback());
+        // An empty list is no network, and no hosts.
+        let empty = Settings {
+            sandbox: reagent_config::Sandbox {
+                network: Some(reagent_config::Network::Hosts(Vec::new())),
+                ..sandbox_table(Some("on"), &[])
+            },
+            ..Settings::default()
+        };
+        let args = run_with(&["-p", "x"], empty);
+        assert!(!args.network && args.network_hosts.is_empty());
     }
 
     #[test]

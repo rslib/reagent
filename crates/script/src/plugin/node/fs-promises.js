@@ -81,6 +81,18 @@ export const open = async (path, flags, ...rest) => {
   return opened(handle, checked, opensWrite(flags));
 };
 
+// There is no raw `appendFile`: the checked `open` in append mode takes the
+// write check, and the kernel puts every write at the end of the file, so two
+// processes that append to one file never lose a line.
+export const appendFile = async (path, data) => {
+  const handle = await open(path, "a");
+  try {
+    await handle.write(data);
+  } finally {
+    await handle.close();
+  }
+};
+
 export const access = (path, ...rest) => raw.access(reading(path), ...rest);
 export const chmod = (path, mode, ...rest) =>
   raw.chmod(writing(path), mode, ...rest);
@@ -106,6 +118,7 @@ export const constants = raw.constants;
 
 export default {
   access,
+  appendFile,
   chmod,
   lstat,
   mkdir,

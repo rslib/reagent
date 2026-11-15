@@ -101,6 +101,27 @@ pub mod settings {
     pub const MODE: u32 = 2;
 }
 
+/// Fields of a [`kinds::QUESTION`] record.
+///
+/// The wait and the answer share the question id, so one number names it for
+/// both; every field only one of them writes has its own.
+pub mod question {
+    /// The kind: 1 waits for an answer, 2 is the answer.
+    pub const KIND: u32 = 1;
+    /// The tool call the question belongs to; the wait only.
+    pub const CALL_ID: u32 = 2;
+    /// The id the answer names: 32 lowercase hex characters.
+    pub const QID: u32 = 3;
+    /// The JSON text of the `questions` argument, as the model sent it; the
+    /// wait only.
+    pub const QUESTIONS: u32 = 4;
+    /// The client that answered, as [`crate::live::ClientId`] writes it; the
+    /// answer only.
+    pub const BY: u32 = 5;
+    /// The JSON text of the answers, one list per question; the answer only.
+    pub const ANSWERS: u32 = 6;
+}
+
 /// Every pair the journal writes, in the order the golden test lists them.
 pub const FIELDS: &[(u8, u32, &str)] = &[
     (kinds::MESSAGE, message::ROLE, "message.role"),
@@ -267,6 +288,12 @@ pub const FIELDS: &[(u8, u32, &str)] = &[
     (kinds::APPROVAL, approval::KIND, "approval.kind"),
     (kinds::SETTINGS, settings::LEVEL, "settings.level"),
     (kinds::SETTINGS, settings::MODE, "settings.mode"),
+    (kinds::QUESTION, question::KIND, "question.kind"),
+    (kinds::QUESTION, question::CALL_ID, "question.call_id"),
+    (kinds::QUESTION, question::QID, "question.qid"),
+    (kinds::QUESTION, question::QUESTIONS, "question.questions"),
+    (kinds::QUESTION, question::BY, "question.by"),
+    (kinds::QUESTION, question::ANSWERS, "question.answers"),
 ];
 
 #[cfg(test)]
@@ -367,6 +394,12 @@ mod tests {
 24 2 approval.kind
 26 1 settings.level
 26 2 settings.mode
+27 1 question.kind
+27 2 question.call_id
+27 3 question.qid
+27 4 question.questions
+27 5 question.by
+27 6 question.answers
 ";
         let mut listed = String::new();
         for (kind, field, name) in FIELDS {

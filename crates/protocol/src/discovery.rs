@@ -195,6 +195,219 @@ pub async fn list(folder: &Path) -> Vec<Entry> {
     out
 }
 
+/// `<folder>/parked`, where a worker leaves the questions its run parked.
+pub fn parked_folder(folder: &Path) -> PathBuf {
+    folder.join("parked")
+}
+
+/// Makes `<folder>/parked` exist, for a reader that must hold it open before
+/// any question parks, and answers its path.
+///
+/// The folder is the one [`write_parked`] would make: 0700, this user's own.
+pub async fn create_parked(folder: &Path) -> io::Result<PathBuf> {
+    let folder = folder.to_path_buf();
+    tokio::task::spawn_blocking(move || create_parked_blocking(&folder))
+        .await
+        .map_err(io::Error::other)?
+}
+
+/// [`create_parked`] for a caller already on the blocking pool.
+#[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]
+pub fn create_parked_blocking(folder: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let at = parked_folder(folder);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(DIR_MODE)
+        .create(&at)?;
+    let found = std::fs::symlink_metadata(&at)?;
+    if !found.is_dir() || found.uid() != getuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a folder of this user", at.display()),
+        ));
+    }
+    std::fs::set_permissions(&at, Permissions::from_mode(DIR_MODE))?;
+    Ok(at)
+}
+
+/// One question a run parked, as a process that did not run it finds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Parked {
+    /// The id the question carries in the journal of its session.
+    pub qid: String,
+    /// The session that waits for the answer.
+    pub session: String,
+    /// The questions of the call, as the model asked them.
+    pub questions: serde_json::Value,
+    /// When the run parked it, in milliseconds since the epoch.
+    pub at: u64,
+}
+
+impl Parked {
+    /// The text of the first question, as a listing names it.
+    pub fn first(&self) -> &str {
+        self.questions
+            .as_array()
+            .and_then(|list| list.first())
+            .and_then(|question| question.get("q"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    }
+}
+
+/// Writes the entry of one parked question.
+///
+/// The folder is 0700 and the entry 0600, as the entry files of the workers
+/// are, and the file is written to a temp file and renamed. The file calls run
+/// as one job on the blocking pool.
+pub async fn write_parked(folder: &Path, parked: Parked) -> io::Result<()> {
+    let folder = folder.to_path_buf();
+    tokio::task::spawn_blocking(move || write_parked_blocking(&folder, &parked))
+        .await
+        .map_err(io::Error::other)?
+}
+
+/// [`write_parked`] for a caller already on the blocking pool.
+#[expect(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "runs inside spawn_blocking"
+)]
+pub fn write_parked_blocking(folder: &Path, parked: &Parked) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let at = parked_folder(folder);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(DIR_MODE)
+        .create(&at)?;
+    let found = std::fs::symlink_metadata(&at)?;
+    if !found.is_dir() || found.uid() != getuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not a folder of this user", at.display()),
+        ));
+    }
+    std::fs::set_permissions(&at, Permissions::from_mode(DIR_MODE))?;
+    let name = parked_name(&parked.qid)?;
+    let temp = at.join(format!("{name}.tmp-{}", std::process::id()));
+    let bytes = serde_json::to_vec(parked).map_err(io::Error::other)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(FILE_MODE)
+        .open(&temp)?;
+    file.write_all(&bytes)?;
+    file.set_permissions(Permissions::from_mode(FILE_MODE))?;
+    drop(file);
+    std::fs::rename(&temp, at.join(name))
+}
+
+/// Removes the entry of question `qid`; a missing one is not an error.
+pub async fn remove_parked(folder: &Path, qid: &str) -> io::Result<()> {
+    let Ok(name) = parked_name(qid) else {
+        return Ok(());
+    };
+    match fs::remove_file(parked_folder(folder).join(name)).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// [`remove_parked`] for a caller already on the blocking pool.
+#[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]
+pub fn remove_parked_blocking(folder: &Path, qid: &str) -> io::Result<()> {
+    let Ok(name) = parked_name(qid) else {
+        return Ok(());
+    };
+    match std::fs::remove_file(parked_folder(folder).join(name)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Every parked question whose session still waits for it, and removes the
+/// entry of one whose journal no longer holds the question open.
+///
+/// `open` says whether the journal of a session still waits for a question, so
+/// the journal is the source of truth and an entry of a question a person has
+/// answered, or a run has closed, is not listed. The folder and the files are
+/// read on the blocking pool, and `open` runs there.
+pub async fn list_parked<F>(folder: &Path, mut open: F) -> Vec<Parked>
+where
+    F: FnMut(&str, &str) -> bool + Send + 'static,
+{
+    let folder = folder.to_path_buf();
+    tokio::task::spawn_blocking(move || list_parked_blocking(&folder, &mut open))
+        .await
+        .unwrap_or_default()
+}
+
+/// [`list_parked`] for a caller already on the blocking pool.
+#[expect(clippy::disallowed_methods, reason = "runs inside spawn_blocking")]
+pub fn list_parked_blocking(
+    folder: &Path,
+    open: &mut dyn FnMut(&str, &str) -> bool,
+) -> Vec<Parked> {
+    let mut out = Vec::new();
+    let at = parked_folder(folder);
+    // A link is not a folder this program wrote, so it is refused.
+    let Ok(found) = std::fs::symlink_metadata(&at) else {
+        return out;
+    };
+    if !found.is_dir() {
+        return out;
+    }
+    let Ok(dir) = std::fs::read_dir(&at) else {
+        return out;
+    };
+    for item in dir.flatten() {
+        let path = item.path();
+        if path.extension() != Some(OsStr::new("json")) {
+            continue;
+        }
+        // An entry this program writes is a plain file: a link to another file
+        // is refused, and it names no question of this machine.
+        if !std::fs::symlink_metadata(&path).is_ok_and(|found| found.is_file()) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(entry) = serde_json::from_slice::<Parked>(&bytes) else {
+            continue;
+        };
+        if !open(&entry.session, &entry.qid) {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        out.push(entry);
+    }
+    out.sort_by(|one, two| one.at.cmp(&two.at).then_with(|| one.qid.cmp(&two.qid)));
+    out
+}
+
+/// The file name of one parked question, refused unless `qid` is one this
+/// program writes: 32 lowercase hex characters, so no path leaves the folder.
+fn parked_name(qid: &str) -> io::Result<String> {
+    let named = qid.len() == 32
+        && qid
+            .chars()
+            .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase());
+    if !named {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{qid} is not a question id"),
+        ));
+    }
+    Ok(format!("{qid}.json"))
+}
+
 /// `<folder>/<session>.sock`, refused when the platform cannot bind it.
 pub fn socket_path(folder: &Path, session: &str) -> Result<PathBuf, PathTooLong> {
     let path = folder.join(format!("{session}.sock"));
@@ -344,6 +557,115 @@ mod tests {
             .await
             .expect_err("refuses a link");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// One parked question of session `s1`.
+    fn parked(qid: &str) -> Parked {
+        Parked {
+            qid: qid.to_string(),
+            session: "s1".to_string(),
+            questions: serde_json::json!([
+                {"q": "Which database?", "options": [{"label": "sqlite"}, {"label": "postgres"}]}
+            ]),
+            at: 7,
+        }
+    }
+
+    const QID: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The entry of a parked question is 0700 in its folder, 0600 in its file,
+    /// and reads back as the one that was written.
+    #[tokio::test]
+    async fn park_writes_lists_and_removes_a_parked_entry() {
+        let tmp = TempDir::new().expect("temp");
+        let folder = folder(tmp.path());
+        write_parked(&folder, parked(QID)).await.expect("writes");
+        let at = parked_folder(&folder);
+        assert_eq!(mode(&at).await, 0o700);
+        assert_eq!(mode(&at.join(format!("{QID}.json"))).await, 0o600);
+        assert_eq!(names(&at).await, vec![format!("{QID}.json")]);
+
+        let listed = list_parked(&folder, |session, qid| {
+            assert_eq!(session, "s1");
+            qid == QID
+        })
+        .await;
+        assert_eq!(listed, [parked(QID)]);
+        assert_eq!(listed[0].first(), "Which database?");
+
+        remove_parked(&folder, QID).await.expect("removes");
+        assert!(names(&at).await.is_empty());
+        // A second remove finds nothing and is not an error.
+        remove_parked(&folder, QID).await.expect("removes once");
+    }
+
+    /// An entry whose question a journal no longer waits for is not listed, and
+    /// its file goes.
+    #[tokio::test]
+    async fn park_a_closed_question_is_not_listed() {
+        let tmp = TempDir::new().expect("temp");
+        let folder = folder(tmp.path());
+        write_parked(&folder, parked(QID)).await.expect("writes");
+
+        let listed = list_parked(&folder, |_, _| false).await;
+        assert!(listed.is_empty(), "{listed:?}");
+        assert!(
+            names(&parked_folder(&folder)).await.is_empty(),
+            "the entry of a closed question goes"
+        );
+    }
+
+    /// A link where an entry should be is refused, so a file another program
+    /// owns names no question of this machine.
+    #[tokio::test]
+    async fn park_a_symlinked_entry_is_refused() {
+        let tmp = TempDir::new().expect("temp");
+        let folder = folder(tmp.path());
+        write_parked(&folder, parked(QID)).await.expect("writes");
+        let at = parked_folder(&folder);
+        let other = tmp.path().join("other.json");
+        let bytes = serde_json::to_vec(&parked(QID)).expect("JSON");
+        fs::write(&other, &bytes).await.expect("writes the other");
+        let file = at.join(format!("{QID}.json"));
+        fs::remove_file(&file).await.expect("removes");
+        fs::symlink(&other, &file).await.expect("links");
+
+        let listed = list_parked(&folder, |_, _| true).await;
+        assert!(listed.is_empty(), "a link is no entry: {listed:?}");
+    }
+
+    /// A folder that is a link names no entry this program wrote.
+    #[tokio::test]
+    async fn park_a_symlinked_folder_is_refused() {
+        let tmp = TempDir::new().expect("temp");
+        let folder = folder(tmp.path());
+        fs::create_dir_all(&folder).await.expect("creates");
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).await.expect("creates");
+        let at = parked_folder(&folder);
+        fs::symlink(&real, &at).await.expect("links");
+        let listed = list_parked(&folder, |_, _| true).await;
+        assert!(listed.is_empty(), "{listed:?}");
+        let error = write_parked(&folder, parked(QID))
+            .await
+            .expect_err("refuses a link");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    /// A question id that could name another file is refused.
+    #[tokio::test]
+    async fn park_a_qid_that_leaves_the_folder_is_refused() {
+        let tmp = TempDir::new().expect("temp");
+        let folder = folder(tmp.path());
+        let mut entry = parked(QID);
+        entry.qid = "../other".to_string();
+        let error = write_parked(&folder, entry)
+            .await
+            .expect_err("refuses the name");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        remove_parked(&folder, "../other")
+            .await
+            .expect("removes nothing");
     }
 
     #[test]

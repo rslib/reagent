@@ -12,7 +12,7 @@ use bytes::Bytes;
 use reagent_ai::{Message, Usage};
 use reagent_store::{Header, Writer};
 
-use crate::journal::record::{Approval, ApprovalKind, Settings, TurnEnd};
+use crate::journal::record::{Approval, ApprovalKind, Question, Settings, TurnEnd};
 use crate::journal::state::State;
 use crate::tool::EffectClass;
 
@@ -138,6 +138,38 @@ impl Journal {
             },
         );
         self.append(kinds::APPROVAL, false)
+    }
+
+    /// Appends the wait of an `ask` call for a person's answer.
+    ///
+    /// The question is on the disk before it goes out, so a process that ends
+    /// while it waits leaves a question a later process answers.
+    pub fn question_asked(&mut self, call: &str, qid: &str, questions: &str) -> io::Result<()> {
+        self.scratch.clear();
+        record::encode_question(
+            &mut self.scratch,
+            &Question::Asked {
+                call: call.to_owned(),
+                qid: qid.to_owned(),
+                questions: questions.to_owned(),
+            },
+        );
+        self.append(kinds::QUESTION, false)
+    }
+
+    /// Appends the answer a person gave to question `qid`, as the JSON text of
+    /// one list per question.
+    pub fn question_answered(&mut self, qid: &str, by: &str, answers: &str) -> io::Result<()> {
+        self.scratch.clear();
+        record::encode_question(
+            &mut self.scratch,
+            &Question::Answered {
+                qid: qid.to_owned(),
+                by: by.to_owned(),
+                answers: answers.to_owned(),
+            },
+        );
+        self.append(kinds::QUESTION, false)
     }
 
     /// Appends a change of the reasoning level, the permission mode, or both.

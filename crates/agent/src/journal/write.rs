@@ -1031,6 +1031,7 @@ async fn a_resume_of_a_waiting_approval_asks_the_same_question() {
             id: "call_1".into(),
             name: "poke".into(),
             class: Some(EffectClass::LocalReversible),
+            qid: None,
         }]
     );
     assert!(
@@ -1186,6 +1187,7 @@ async fn a_resumed_read_runs_again_and_its_result_reaches_the_next_request() {
             id: "call_1".into(),
             name: "peek".into(),
             class: None,
+            qid: None,
         }]
     );
 

@@ -44,8 +44,20 @@ pub struct Resumed {
     pub recorded: usize,
     /// The calls to run again, in the order the model asked for them.
     pub pending: Vec<PendingCall>,
+    /// The calls whose question a person has not answered, with the id of the
+    /// question, in the order the model asked them.
+    ///
+    /// A call here is also in [`Resumed::pending`]: the run asks its question
+    /// again under the same id, so a client answers the question it already
+    /// holds and no second wait reaches the journal.
+    pub parked: Vec<(String, String)>,
     /// Whether the last turn has no `TURN_END`.
     pub open_turn: bool,
+    /// Whether this read wrote the result of a question a person answered.
+    ///
+    /// The model has not read that answer, so the turn goes on: a run that
+    /// resumes these messages and has nothing pending asks for the next reply.
+    pub answered: bool,
     /// The reasoning level the run last moved to, when a settings record says.
     pub level: Option<Text>,
     /// The permission mode the run last moved to, when a settings record says.
@@ -61,6 +73,9 @@ pub struct PendingCall {
     pub name: String,
     /// The class the journal recorded, when the call started.
     pub class: Option<EffectClass>,
+    /// The question the call asks under again, when it asked before and nobody
+    /// answered: 32 lowercase hex characters.
+    pub qid: Option<String>,
 }
 
 /// A turn the journal does not have.
@@ -112,7 +127,9 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
         turns: 0,
         recorded: 0,
         pending: Vec::new(),
+        parked: Vec::new(),
         open_turn: false,
+        answered: false,
         level: None,
         mode: None,
     };
@@ -121,6 +138,10 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
     let mut answered: HashSet<Text> = HashSet::new();
     // The kind of the last approval record of each call.
     let mut approvals: HashMap<String, ApprovalKind> = HashMap::new();
+    // The question of each call that asked one: its id and the questions.
+    let mut asked: HashMap<String, (String, String)> = HashMap::new();
+    // The answers a person gave, by the id of the question.
+    let mut answers: HashMap<String, String> = HashMap::new();
     // The tool calls of the last assistant message, in the order sent.
     let mut last_calls: Vec<(Text, Text)> = Vec::new();
     // The results that follow the last assistant message. A batch commits each
@@ -139,6 +160,22 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
                 Aside::Approval(approval) => {
                     approvals.insert(approval.id, approval.kind);
                 }
+                Aside::Question(question) => match question {
+                    record::Question::Asked {
+                        call,
+                        qid,
+                        questions,
+                    } => {
+                        asked.insert(call, (qid, questions));
+                    }
+                    record::Question::Answered {
+                        qid,
+                        answers: given,
+                        ..
+                    } => {
+                        answers.insert(qid, given);
+                    }
+                },
                 Aside::Settings(change) => {
                     if let Some(level) = change.level {
                         resumed.level = Some(Text::from(level));
@@ -226,7 +263,15 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
     }
     // Everything read so far is on the disk; what `settle` adds is not.
     resumed.recorded = resumed.history.len();
-    settle(&mut resumed, &started, &answered, &approvals, &last_calls);
+    settle(
+        &mut resumed,
+        &started,
+        &answered,
+        &approvals,
+        &last_calls,
+        &asked,
+        &answers,
+    );
     if resumed.state.provider.is_empty()
         && let Some(provider) = last_provider
     {
@@ -272,6 +317,8 @@ fn settle(
     answered: &HashSet<Text>,
     approvals: &HashMap<String, ApprovalKind>,
     last_calls: &[(Text, Text)],
+    asked: &HashMap<String, (String, String)>,
+    answers: &HashMap<String, String>,
 ) {
     let classes: HashMap<&str, EffectClass> = started
         .iter()
@@ -290,6 +337,8 @@ fn settle(
             name,
             classes.get(&**id).copied(),
             approvals.get(&**id).copied(),
+            asked.get(&**id),
+            answers,
         );
     }
 }
@@ -314,7 +363,33 @@ fn settle_one(
     name: &str,
     class: Option<EffectClass>,
     approval: Option<ApprovalKind>,
+    asked: Option<&(String, String)>,
+    answers: &HashMap<String, String>,
 ) {
+    // A question the journal holds decides the call on its own: an answered
+    // question is the call's result, so nothing runs again, and one nobody
+    // answered is the call pending under its own id.
+    if let Some((qid, questions)) = asked {
+        match answers.get(qid) {
+            Some(answers) => {
+                let output = crate::question::from_record(questions, answers);
+                resumed.answered = true;
+                resumed
+                    .history
+                    .push(Message::tool_result(id, output.content, output.is_error));
+            }
+            None => {
+                resumed.parked.push((id.to_owned(), qid.clone()));
+                resumed.pending.push(PendingCall {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    class,
+                    qid: Some(qid.clone()),
+                });
+            }
+        }
+        return;
+    }
     // A call whose last approval record is a wait or a refusal never ran: the
     // call is pending, so the guard asks again after the resume.
     let rerun = match (class, approval) {
@@ -329,6 +404,7 @@ fn settle_one(
             id: id.to_owned(),
             name: name.to_owned(),
             class,
+            qid: None,
         });
     } else {
         resumed
@@ -346,6 +422,70 @@ fn tool_calls(content: &[Content]) -> Vec<(Text, Text)> {
             _ => None,
         })
         .collect()
+}
+
+/// One question a person has not answered, as a log left it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParkedQuestion {
+    /// The id the answer names: 32 lowercase hex characters.
+    pub qid: String,
+    /// The tool call the question belongs to.
+    pub call: String,
+    /// The JSON text of the `questions` argument, as the model sent it.
+    pub questions: String,
+}
+
+/// The questions the log `session` holds that nobody answered and no result
+/// closes, in the order the model asked them.
+///
+/// This is the list a client shows and answers: answering one writes the
+/// [`crate::journal::Journal::question_answered`] record it is closed by.
+///
+/// Reading blocks, so a caller runs this in `spawn_blocking`.
+pub fn parked(session: &Session) -> io::Result<Vec<ParkedQuestion>> {
+    let from = session
+        .last_base()
+        .unwrap_or(reagent_store::part::FIRST_SEQ);
+    let mut asked: Vec<ParkedQuestion> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut answered: HashSet<String> = HashSet::new();
+    let mut closed: HashSet<String> = HashSet::new();
+    for record in session.records_from(from) {
+        let record = record?;
+        match record::decode_aside(record.kind, &record.payload)? {
+            Some(Aside::Question(record::Question::Asked {
+                call,
+                qid,
+                questions,
+            })) => {
+                if seen.insert(qid.clone()) {
+                    asked.push(ParkedQuestion {
+                        qid,
+                        call,
+                        questions,
+                    });
+                }
+            }
+            Some(Aside::Question(record::Question::Answered { qid, .. })) => {
+                answered.insert(qid);
+            }
+            Some(Aside::Approval(_) | Aside::Settings(_)) => {}
+            None => {
+                if let Record::Message(Message::ToolResult(result)) =
+                    record::decode(record.kind, &record.payload)?
+                {
+                    closed.insert(result.call_id.to_string());
+                }
+            }
+        }
+    }
+    let parked = asked
+        .into_iter()
+        .filter(|question| {
+            !answered.contains(&question.qid) && !closed.contains(question.call.as_str())
+        })
+        .collect();
+    Ok(parked)
 }
 
 #[cfg(test)]
@@ -517,6 +657,7 @@ mod tests {
                 id: "c1".into(),
                 name: "read".into(),
                 class: Some(EffectClass::Read),
+                qid: None,
             }]
         );
     }
@@ -540,11 +681,13 @@ mod tests {
                     id: "c1".into(),
                     name: "bash".into(),
                     class: None,
+                    qid: None,
                 },
                 PendingCall {
                     id: "c2".into(),
                     name: "read".into(),
                     class: None,
+                    qid: None,
                 },
             ]
         );
@@ -604,6 +747,7 @@ mod tests {
                 id: "c1".into(),
                 name: "bash".into(),
                 class: Some(EffectClass::LocalReversible),
+                qid: None,
             }],
             "the rerun asks the same question again"
         );
@@ -859,5 +1003,153 @@ mod tests {
             "the history from the base on, once"
         );
         assert_eq!(resumed.state.compaction, 1);
+    }
+
+    /// The questions of one reply that calls `ask` for call `id`.
+    fn ask_reply(id: &str) -> Message {
+        call_reply(&[(id, crate::question::NAME)])
+    }
+
+    /// A log that ends with the question of one `ask` call, and the answer a
+    /// person gave when `answers` names one. Returns the id of the question.
+    fn a_parked_question(dir: &Path, answers: Option<&str>) -> String {
+        let qid = "0123456789abcdef0123456789abcdef";
+        let mut journal = journal(dir);
+        let base = State::new("p", "m", 0);
+        journal.base(&base).expect("base");
+        journal.message(&Message::user("hello")).expect("append");
+        journal.message(&ask_reply("call_1")).expect("append");
+        journal
+            .question_asked(
+                "call_1",
+                qid,
+                r#"[{"q":"Which database?","options":[{"label":"sqlite"},{"label":"postgres"}]}]"#,
+            )
+            .expect("question");
+        if let Some(answers) = answers {
+            journal
+                .question_answered(qid, "3", answers)
+                .expect("answer");
+        }
+        journal.commit().expect("commit");
+        journal.close().expect("close");
+        qid.to_owned()
+    }
+
+    /// A log whose open question a person answered before the process ended
+    /// resumes with the text the live answer gives, and nothing is pending.
+    #[tokio::test]
+    async fn a_park_the_log_answered_resumes_with_its_answer() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        a_parked_question(dir.path(), Some(r#"[["postgres"]]"#));
+
+        let resumed = load_now(dir.path());
+        let last = resumed.history.last().expect("the ask result");
+        let Message::ToolResult(result) = last else {
+            panic!("the answer is the call's result");
+        };
+        assert_eq!(result.call_id.as_ref(), "call_1");
+        assert_eq!(result.content.as_ref(), "Q: Which database?\nA: postgres");
+        assert!(!result.is_error);
+        assert!(resumed.pending.is_empty(), "{:?}", resumed.pending);
+        assert!(resumed.parked.is_empty(), "{:?}", resumed.parked);
+    }
+
+    /// A log whose open question a person answered before the process ended
+    /// resumes with the result of that answer, and the turn goes on: the model
+    /// has not read it.
+    #[tokio::test]
+    async fn a_park_the_log_answered_goes_on_to_the_model() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        a_parked_question(dir.path(), Some(r#"[["postgres"]]"#));
+
+        let resumed = load_now(dir.path());
+        assert!(resumed.answered, "the turn owes the model the answer");
+        assert!(resumed.pending.is_empty(), "{:?}", resumed.pending);
+    }
+
+    /// A log with no answer to fill in leaves the turn as it was.
+    #[tokio::test]
+    async fn a_park_the_log_has_no_answer_to_go_on() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        a_parked_question(dir.path(), None);
+
+        let resumed = load_now(dir.path());
+        assert!(!resumed.answered, "nothing was answered");
+        assert_eq!(resumed.pending.len(), 1, "the call runs again");
+    }
+
+    /// A log whose open question nobody answered resumes with the call pending
+    /// and the id the question carries, so a rerun asks under the same id.
+    #[tokio::test]
+    async fn a_park_nobody_answered_resumes_with_the_call_pending() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let qid = a_parked_question(dir.path(), None);
+
+        let resumed = load_now(dir.path());
+        assert_eq!(
+            resumed.parked,
+            [("call_1".to_owned(), qid.clone())],
+            "the question the run parked"
+        );
+        assert_eq!(resumed.pending.len(), 1);
+        assert_eq!(resumed.pending[0].id, "call_1");
+        assert_eq!(resumed.pending[0].qid.as_deref(), Some(qid.as_str()));
+        assert!(
+            !resumed
+                .history
+                .iter()
+                .any(|message| matches!(message, Message::ToolResult(_))),
+            "no result reaches the history"
+        );
+    }
+
+    /// The list a client shows holds the question nobody answered, and not one
+    /// a person answered or one a result closed.
+    #[tokio::test]
+    async fn a_park_the_index_lists_only_the_open_question() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = journal(dir.path());
+        let base = State::new("p", "m", 0);
+        journal.base(&base).expect("base");
+        journal.message(&Message::user("hello")).expect("append");
+        journal
+            .message(&call_reply(&[
+                ("call_1", crate::question::NAME),
+                ("call_2", crate::question::NAME),
+                ("call_3", "read"),
+            ]))
+            .expect("append");
+        let questions =
+            r#"[{"q":"Which database?","options":[{"label":"sqlite"},{"label":"postgres"}]}]"#;
+        for (call, qid) in [
+            ("call_1", "11111111111111111111111111111111"),
+            ("call_2", "22222222222222222222222222222222"),
+            ("call_3", "33333333333333333333333333333333"),
+        ] {
+            journal
+                .question_asked(call, qid, questions)
+                .expect("question");
+        }
+        journal
+            .question_answered("11111111111111111111111111111111", "3", r#"[["sqlite"]]"#)
+            .expect("answer");
+        journal
+            .message(&Message::tool_result("call_3", "text", false))
+            .expect("append");
+        journal.commit().expect("commit");
+        journal.close().expect("close");
+
+        let session = Session::open(dir.path()).expect("open the session");
+        let open = parked(&session).expect("read the questions");
+        assert_eq!(
+            open,
+            [ParkedQuestion {
+                qid: "22222222222222222222222222222222".into(),
+                call: "call_2".into(),
+                questions: questions.into(),
+            }],
+            "only the question no answer and no result closes"
+        );
     }
 }

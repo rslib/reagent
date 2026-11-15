@@ -60,7 +60,7 @@ const MARK: Duration = Duration::from_millis(20);
 const MARK_WAIT: Duration = Duration::from_millis(2000);
 
 /// A state folder short enough for a socket path, which the platform caps.
-fn state() -> tempfile::TempDir {
+pub(crate) fn state() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("rw")
         .tempdir_in("/tmp")
@@ -68,7 +68,7 @@ fn state() -> tempfile::TempDir {
 }
 
 /// A scripted provider reply, and the `--provider` value that reads it.
-async fn script(dir: &Path, body: &str) -> String {
+pub(crate) async fn script(dir: &Path, body: &str) -> String {
     wire(dir, "script.json", body).await
 }
 
@@ -83,7 +83,7 @@ async fn wire(dir: &Path, name: &str, body: &str) -> String {
 }
 
 /// A config folder whose `[providers]` tables are `body`, and that folder.
-async fn config_of(dir: &Path, body: &str) -> PathBuf {
+pub(crate) async fn config_of(dir: &Path, body: &str) -> PathBuf {
     let config = dir.join("config");
     tokio::fs::create_dir_all(config.join("reagent"))
         .await
@@ -262,7 +262,7 @@ async fn anthropic_config(dir: &Path, base: &str) -> PathBuf {
 }
 
 /// A folder whose project config asks a person before every `bash` call.
-async fn ask_folder(cwd: &Path) {
+pub(crate) async fn ask_folder(cwd: &Path) {
     tokio::fs::create_dir_all(cwd.join(".reagent"))
         .await
         .expect("the config folder");
@@ -278,14 +278,14 @@ async fn ask_folder(cwd: &Path) {
 }
 
 /// A worker the test started, with the ready line it printed.
-struct Worker {
+pub(crate) struct Worker {
     child: tokio::process::Child,
     ready: Value,
 }
 
 impl Worker {
     /// Starts a worker and reads its ready line.
-    async fn start(state: &Path, cwd: &Path, args: &[&str]) -> Worker {
+    pub(crate) async fn start(state: &Path, cwd: &Path, args: &[&str]) -> Worker {
         Worker::start_with(
             state,
             cwd,
@@ -297,7 +297,12 @@ impl Worker {
 
     /// Starts a worker that reads the config folder `config`, so a model table
     /// of it names the context window of a model.
-    async fn start_with(state: &Path, cwd: &Path, config: &Path, args: &[&str]) -> Worker {
+    pub(crate) async fn start_with(
+        state: &Path,
+        cwd: &Path,
+        config: &Path,
+        args: &[&str],
+    ) -> Worker {
         Worker::start_with_cache(
             state,
             cwd,
@@ -369,11 +374,11 @@ impl Worker {
             .with_file_name(format!("{}.json", self.session()))
     }
 
-    fn session(&self) -> &str {
+    pub(crate) fn session(&self) -> &str {
         self.ready["session"].as_str().expect("a session id")
     }
 
-    async fn entry(&self) -> reagent_protocol::discovery::Entry {
+    pub(crate) async fn entry(&self) -> reagent_protocol::discovery::Entry {
         let bytes = tokio::fs::read(self.entry_path())
             .await
             .expect("the entry file is there");
@@ -425,7 +430,7 @@ impl Worker {
     }
 
     /// Stops the worker without waiting for its own exit.
-    async fn kill(&mut self) {
+    pub(crate) async fn kill(&mut self) {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
     }
@@ -445,7 +450,7 @@ impl Worker {
 
 /// One client of a worker: its connection, the frames it reads and the ids the
 /// worker gave it.
-struct Client {
+pub(crate) struct Client {
     stream: UnixStream,
     /// The bytes read, of which the first `at` are used.
     buf: Vec<u8>,
@@ -454,9 +459,9 @@ struct Client {
     /// The frames read but not used yet, oldest first.
     frames: VecDeque<Value>,
     /// The id `initialize` gave this connection.
-    id: u64,
+    pub(crate) id: u64,
     /// The newest record the worker had committed at `initialize`.
-    committed: u64,
+    pub(crate) committed: u64,
     /// Whether the answer to the last `attach` said a run is open.
     running: bool,
     /// The model the answer to `initialize` named.
@@ -472,7 +477,7 @@ struct Client {
 
 impl Client {
     /// Connects and initializes with `name`.
-    async fn initialize(worker: &Worker, token: &str, name: &str) -> Client {
+    pub(crate) async fn initialize(worker: &Worker, token: &str, name: &str) -> Client {
         let mut client = Client {
             stream: worker.connect().await,
             buf: Vec::new(),
@@ -508,7 +513,7 @@ impl Client {
     }
 
     /// Sends one request and returns the id it carries.
-    async fn request(&mut self, method: &str, params: &str) -> u64 {
+    pub(crate) async fn request(&mut self, method: &str, params: &str) -> u64 {
         self.next += 1;
         let line = format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"{method}\",\"params\":{params}}}\n",
@@ -560,7 +565,7 @@ impl Client {
     }
 
     /// The frames up to the first one `stop` holds for, that one last.
-    async fn until(&mut self, stop: impl Fn(&Value) -> bool) -> Vec<Value> {
+    pub(crate) async fn until(&mut self, stop: impl Fn(&Value) -> bool) -> Vec<Value> {
         let mut taken = Vec::new();
         loop {
             if let Some(at) = self.frames.iter().position(&stop) {
@@ -575,7 +580,7 @@ impl Client {
     }
 
     /// The answer of `request`, which keeps the frames read before it.
-    async fn answer(&mut self, request: u64) -> Value {
+    pub(crate) async fn answer(&mut self, request: u64) -> Value {
         let mut frames = VecDeque::from(
             self.until(|frame| frame["id"].as_u64() == Some(request))
                 .await,
@@ -588,7 +593,7 @@ impl Client {
     }
 
     /// Attaches from `from`, and returns the frames the answer came after.
-    async fn attach(&mut self, from: u64) -> Vec<Value> {
+    pub(crate) async fn attach(&mut self, from: u64) -> Vec<Value> {
         let request = self
             .request("attach", &format!("{{\"from\":{from}}}"))
             .await;
@@ -736,12 +741,12 @@ fn client_id(line: &[u8]) -> Option<u64> {
 }
 
 /// Whether `frame` is the event of `kind`.
-fn is_event(frame: &Value, kind: &str) -> bool {
+pub(crate) fn is_event(frame: &Value, kind: &str) -> bool {
     frame["method"] == "event" && frame["params"]["type"] == kind
 }
 
 /// The event params of `frames`, in order, without the notices of clients.
-fn events(frames: Vec<Value>) -> Vec<Value> {
+pub(crate) fn events(frames: Vec<Value>) -> Vec<Value> {
     frames
         .into_iter()
         .filter(|frame| frame["method"] == "event")
@@ -2962,7 +2967,7 @@ async fn a_worker_image_word_on_a_text_file_sends_no_image() {
 
 /// The script of a run whose first reply asks a question and whose next one
 /// ends the run.
-fn ask_script() -> String {
+pub(crate) fn ask_script() -> String {
     r#"{"replies":[{"calls":[{"name":"ask","arguments":{"questions":[{"q":"Which database?","options":[{"label":"sqlite"},{"label":"postgres"}]}]}}]},{"text":"done"}]}"#.to_string()
 }
 

@@ -10,6 +10,7 @@ pub mod shell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -68,6 +69,9 @@ pub struct Settings {
     /// The `[session]` table. Only the global file and a profile may hold it.
     #[serde(default)]
     pub session: SessionSettings,
+    /// The `[gateway]` table. Only the global file and a profile may hold it.
+    #[serde(default)]
+    pub gateway: Gateway,
 }
 
 /// The `[sandbox]` table: how bash commands are fenced in.
@@ -77,10 +81,148 @@ pub struct Sandbox {
     /// `off` (the default), `auto` or `on`.
     pub mode: Option<String>,
     /// Whether commands may open network connections; default false.
-    pub network: Option<bool>,
+    pub network: Option<Network>,
     /// Folders commands may write besides the working and temp folders.
     #[serde(default)]
     pub write: Vec<String>,
+}
+
+/// The `[sandbox] network` setting: `true` or `false`, or the `host:port`
+/// entries a command may reach through the run's proxy. Only allow entries
+/// exist; there is no deny form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Network {
+    /// Whether a command may open any connection.
+    Open(bool),
+    /// The hosts a command may reach, and nothing else.
+    Hosts(Vec<Host>),
+}
+
+impl Network {
+    /// The `host:port` entries, empty when the value is a bool.
+    pub fn hosts(&self) -> &[Host] {
+        match self {
+            Network::Open(_) => &[],
+            Network::Hosts(hosts) => hosts,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Network {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Network, D::Error> {
+        use serde::de::{Error, SeqAccess, Visitor};
+
+        struct Value;
+
+        impl<'de> Visitor<'de> for Value {
+            type Value = Network;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("true, false or a list of \"host:port\" entries")
+            }
+
+            fn visit_bool<E: Error>(self, open: bool) -> Result<Network, E> {
+                Ok(Network::Open(open))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Network, A::Error> {
+                let mut hosts = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(text) = seq.next_element::<String>()? {
+                    hosts.push(Host::parse(&text).map_err(A::Error::custom)?);
+                }
+                Ok(Network::Hosts(hosts))
+            }
+        }
+
+        deserializer.deserialize_any(Value)
+    }
+}
+
+/// One `host:port` entry of `[sandbox] network`, whose host is compared
+/// without case and whose IP literals are compared as addresses. An IPv6 host
+/// is written in brackets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Host {
+    host: String,
+    port: u16,
+}
+
+impl Host {
+    /// Parses `host:port`, or names the entry in the reason it refuses it.
+    pub fn parse(text: &str) -> Result<Host, String> {
+        let bad = |why: &str| format!("sandbox.network entry \"{text}\" {why}");
+        let (host, port) = match text.strip_prefix('[') {
+            Some(bracketed) => {
+                let end = bracketed.find(']').ok_or_else(|| bad("has no closing ]"))?;
+                let port = bracketed[end + 1..]
+                    .strip_prefix(':')
+                    .ok_or_else(|| bad("needs a port after the ]"))?;
+                (&bracketed[..end], port)
+            }
+            None => text
+                .rsplit_once(':')
+                .ok_or_else(|| bad("is not host:port"))?,
+        };
+        if host.is_empty() {
+            return Err(bad("has no host"));
+        }
+        // An IPv6 address goes in brackets and nothing else does, so a `:`
+        // never splits a host in two ways.
+        let bracketed = text.starts_with('[');
+        if bracketed && host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(bad(
+                "has brackets around something that is not an IPv6 address",
+            ));
+        }
+        if !bracketed && (host.contains(':') || host.contains('@')) {
+            return Err(bad(
+                "has a : or @ in its host; write an IPv6 address in brackets",
+            ));
+        }
+        if host
+            .chars()
+            .any(|ch| ch == ' ' || ch == '/' || ch == '*' || ch.is_control())
+        {
+            return Err(bad("has a space, / or * in its host"));
+        }
+        let port: u16 = port
+            .parse()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| bad("needs a port 1-65535"))?;
+        Ok(Host {
+            host: host.to_string(),
+            port,
+        })
+    }
+
+    /// The host, without the brackets of an IPv6 address.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The port.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Whether the entry names this machine, which the sandbox allows without
+    /// the proxy.
+    pub fn is_loopback(&self) -> bool {
+        self.host.eq_ignore_ascii_case("localhost")
+            || self.host == "127.0.0.1"
+            || self.host == "::1"
+    }
+}
+
+impl std::fmt::Display for Host {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
 }
 
 /// Days a session is kept after its last write when `keep_days` is unset.
@@ -97,6 +239,52 @@ pub struct SessionSettings {
     pub keep_days: Option<u64>,
     /// MiB the sessions of all folders may take; 0 means no cap.
     pub max_mb: Option<u64>,
+}
+
+/// Hours a parked question waits for its answer when `gateway.deadline` is unset.
+pub const DEFAULT_DEADLINE_HOURS: u64 = 72;
+
+/// The `[gateway]` table: the questions `reagent gateway` takes, and how long
+/// one may wait. Only the global file and a profile may hold it.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Gateway {
+    /// How long a question waits: a number with `s`, `m`, `h` or `d`, or
+    /// `off` for a question that never expires.
+    pub deadline: Option<String>,
+}
+
+impl Gateway {
+    /// How long a question waits, or `None` when it never expires.
+    ///
+    /// The unit is one of `s`, `m`, `h` and `d`, so `30s`, `2h` and `3d` all
+    /// read, and a whole number of at least one is required.
+    pub fn deadline(&self) -> Result<Option<Duration>, String> {
+        let Some(text) = &self.deadline else {
+            return Ok(Some(Duration::from_secs(DEFAULT_DEADLINE_HOURS * 3_600)));
+        };
+        if text == "off" {
+            return Ok(None);
+        }
+        let wrong = || {
+            format!(
+                "gateway.deadline must be a whole number with s, m, h or d, or off, not {text:?}"
+            )
+        };
+        let mut chars = text.chars();
+        let seconds = match chars.next_back() {
+            Some('s') => 1,
+            Some('m') => 60,
+            Some('h') => 3_600,
+            Some('d') => 86_400,
+            _ => return Err(wrong()),
+        };
+        let count: u64 = chars.as_str().parse().map_err(|_| wrong())?;
+        if count == 0 {
+            return Err(wrong());
+        }
+        Ok(Some(Duration::from_secs(count.saturating_mul(seconds))))
+    }
 }
 
 /// How the terminal UI draws.
@@ -429,6 +617,15 @@ fn load_file(path: Option<&Path>, repo: bool) -> Result<Option<Layer>, String> {
             path.display()
         ));
     }
+    if repo && settings.gateway != Gateway::default() {
+        return Err(format!(
+            "{}: gateway may be set only in the global config",
+            path.display()
+        ));
+    }
+    if let Err(reason) = settings.gateway.deadline() {
+        return Err(format!("{}: {reason}", path.display()));
+    }
     if repo && (!settings.permissions.allow.is_empty() || settings.permissions.default.is_some()) {
         return Err(format!(
             "{}: permissions.allow and permissions.default may be set only in the global config",
@@ -651,6 +848,11 @@ fn apply(merged: &mut Settings, settings: &Settings, profile: bool) {
         merged.providers = settings.providers.clone();
     }
     if profile {
+        over(&mut merged.gateway.deadline, &settings.gateway.deadline);
+    } else if merged.gateway == Gateway::default() {
+        merged.gateway = settings.gateway.clone();
+    }
+    if profile {
         over(&mut merged.sandbox.mode, &settings.sandbox.mode);
         over(&mut merged.sandbox.network, &settings.sandbox.network);
         if !settings.sandbox.write.is_empty() {
@@ -788,6 +990,31 @@ mod tests {
         });
         assert_eq!(merged.sandbox.mode.as_deref(), Some("on"));
         assert_eq!(merged.sandbox.write, vec!["~/.cache"]);
+    }
+
+    #[test]
+    fn gateway_deadline_of_the_global_file_stays_under_a_profile_without_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let global = write(dir.path(), "g.toml", "[gateway]\ndeadline = \"off\"\n");
+        let profile = write(dir.path(), "p.toml", "[sandbox]\nmode = \"on\"\n");
+        let merged = merge_all(&Layers {
+            global: load_file(Some(&global), false).expect("loads"),
+            profile: load_file(Some(&profile), false).expect("loads"),
+            repo: None,
+            saved: None,
+        });
+        assert_eq!(merged.gateway.deadline(), Ok(None));
+        let over = write(dir.path(), "o.toml", "[gateway]\ndeadline = \"2h\"\n");
+        let merged = merge_all(&Layers {
+            global: load_file(Some(&global), false).expect("loads"),
+            profile: load_file(Some(&over), false).expect("loads"),
+            repo: None,
+            saved: None,
+        });
+        assert_eq!(
+            merged.gateway.deadline(),
+            Ok(Some(Duration::from_secs(7_200)))
+        );
     }
 
     #[cfg(unix)]
@@ -1106,7 +1333,7 @@ mod tests {
         );
         let merged = settings(Some(&global), None);
         assert_eq!(merged.sandbox.mode.as_deref(), Some("auto"));
-        assert_eq!(merged.sandbox.network, Some(true));
+        assert_eq!(merged.sandbox.network, Some(Network::Open(true)));
         assert_eq!(merged.sandbox.write, vec!["~/.cache"]);
         let repo = write(dir.path(), "repo.toml", "[sandbox]\nmode = \"off\"\n");
         let error = load(Some(&global), Some(&repo)).unwrap_err();
@@ -1116,6 +1343,183 @@ mod tests {
         );
         let typo = write(dir.path(), "t.toml", "[sandbox]\nmod = \"on\"\n");
         assert!(load(Some(&typo), None).unwrap_err().contains("mod"));
+    }
+
+    #[test]
+    fn gateway_deadline_parses_its_spans() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (text, seconds) in [("30s", 30), ("72h", 72 * 3_600), ("2d", 2 * 86_400)] {
+            let file = write(
+                dir.path(),
+                "config.toml",
+                &format!("[gateway]\ndeadline = \"{text}\"\n"),
+            );
+            assert_eq!(
+                settings(Some(&file), None).gateway.deadline(),
+                Ok(Some(Duration::from_secs(seconds))),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_deadline_off_never_expires() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = write(dir.path(), "config.toml", "[gateway]\ndeadline = \"off\"\n");
+        assert_eq!(settings(Some(&file), None).gateway.deadline(), Ok(None));
+    }
+
+    #[test]
+    fn gateway_deadline_is_72_hours_when_unset() {
+        assert_eq!(
+            settings(None, None).gateway.deadline(),
+            Ok(Some(Duration::from_secs(72 * 3_600)))
+        );
+    }
+
+    #[test]
+    fn gateway_deadline_a_wrong_value_names_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for text in ["3w", "72", "", "2x"] {
+            let file = write(
+                dir.path(),
+                "config.toml",
+                &format!("[gateway]\ndeadline = \"{text}\"\n"),
+            );
+            let error = load(Some(&file), None).unwrap_err();
+            assert!(
+                error.contains(&format!("{text:?}")) && error.contains("gateway.deadline"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_table_is_refused_in_a_repo_file_and_checks_its_keys() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = write(dir.path(), "repo.toml", "[gateway]\ndeadline = \"2h\"\n");
+        let error = load(None, Some(&repo)).unwrap_err();
+        assert!(
+            error.contains("repo.toml") && error.contains("gateway"),
+            "{error}"
+        );
+        let typo = write(dir.path(), "t.toml", "[gateway]\ndeadlin = \"2h\"\n");
+        assert!(load(Some(&typo), None).unwrap_err().contains("deadlin"));
+    }
+
+    #[test]
+    fn host_list_parses_into_the_network_setting() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let global = write(
+            dir.path(),
+            "g.toml",
+            concat!(
+                "[sandbox]\n",
+                "network = [\"devbox.example.net:22\", \"GitHub.com:443\",",
+                " \"127.0.0.1:8080\", \"[::1]:9000\"]\n",
+            ),
+        );
+        let merged = settings(Some(&global), None);
+        let Some(Network::Hosts(hosts)) = merged.sandbox.network else {
+            panic!("not a host list: {:?}", merged.sandbox.network);
+        };
+        assert_eq!(
+            hosts.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            [
+                "devbox.example.net:22",
+                "GitHub.com:443",
+                "127.0.0.1:8080",
+                "[::1]:9000",
+            ]
+        );
+        assert_eq!(hosts[0].host(), "devbox.example.net");
+        assert_eq!(hosts[0].port(), 22);
+        assert_eq!(hosts[3].host(), "::1");
+        assert!(hosts[2].is_loopback() && hosts[3].is_loopback());
+        assert!(!hosts[0].is_loopback());
+        // An empty list is no network, and no error.
+        assert_eq!(Host::parse("h:1").map(|host| host.port()), Ok(1));
+        assert_eq!(Network::Hosts(Vec::new()).hosts().len(), 0);
+    }
+
+    #[test]
+    fn host_list_entry_forms_are_refused_with_their_text() {
+        for text in [
+            "",
+            "nohost",
+            ":443",
+            "github.com:",
+            "github.com:0",
+            "github.com:70000",
+            "github.com:port",
+            "git hub.com:443",
+            "github.com/x:443",
+            "*.github.com:443",
+            "[::1]",
+            "[::1:8080",
+            "[]:8080",
+        ] {
+            let refused = Host::parse(text).unwrap_err();
+            assert!(refused.contains(&format!("\"{text}\"")), "{refused}");
+            assert!(refused.contains("sandbox.network entry"), "{refused}");
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = write(
+                dir.path(),
+                "g.toml",
+                &format!("[sandbox]\nnetwork = [\"{text}\"]\n"),
+            );
+            let error = load(Some(&path), None).unwrap_err();
+            assert!(error.contains(&format!("\"{text}\"")), "{text}: {error}");
+        }
+    }
+
+    #[test]
+    fn host_list_a_host_with_a_colon_or_an_at_is_refused() {
+        for entry in [
+            "::1:80",
+            "a:b:80",
+            "user@host:22",
+            "[example.com]:80",
+            "[]:80",
+        ] {
+            assert!(Host::parse(entry).is_err(), "{entry} parses");
+        }
+        assert_eq!(Host::parse("[::1]:80").expect("an entry").host(), "::1");
+    }
+
+    #[test]
+    fn host_list_a_bool_still_parses() {
+        for (text, wanted) in [("true", true), ("false", false)] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = write(
+                dir.path(),
+                "g.toml",
+                &format!("[sandbox]\nnetwork = {text}\n"),
+            );
+            let merged = settings(Some(&path), None);
+            assert_eq!(merged.sandbox.network, Some(Network::Open(wanted)));
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write(dir.path(), "g.toml", "[sandbox]\nnetwork = [\"h:1\", 3]\n");
+        assert!(load(Some(&path), None).is_err());
+    }
+
+    #[test]
+    fn host_list_a_profile_replaces_the_network_value() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let global = write(
+            dir.path(),
+            "g.toml",
+            "[sandbox]\nnetwork = [\"a.example:1\"]\n",
+        );
+        let profile = write(dir.path(), "p.toml", "[sandbox]\nnetwork = true\n");
+        let merged = merge_all(&Layers {
+            global: load_file(Some(&global), false).expect("loads"),
+            profile: load_file(Some(&profile), false).expect("loads"),
+            repo: None,
+            saved: None,
+        });
+        assert_eq!(merged.sandbox.network, Some(Network::Open(true)));
     }
 
     #[test]

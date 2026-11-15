@@ -21,8 +21,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
-use reagent_agent::batch::run_one;
+use reagent_agent::batch::run_one_hooked;
 use reagent_agent::guard::Guard;
+use reagent_agent::hook::CallHook;
 use reagent_agent::tool::{
     EffectClass, Effects, Object, Registry, Repaired, Reroute, Tool, ToolOutput, parse_args,
 };
@@ -254,8 +255,14 @@ pub struct Codemode {
     /// so a later one says their specs may be old.
     start_generation: u64,
     guard: Option<Guard>,
+    /// The run's call hook, which the run sets once its plugins load, after
+    /// this tool was built: every call of a script goes through it.
+    hook: HookSlot,
     wall_time: Duration,
 }
+
+/// Where the run puts its call hook for a script's calls, once it has one.
+pub type HookSlot = Arc<std::sync::OnceLock<Arc<dyn CallHook>>>;
 
 /// One generation of the tools `describeTool` and `listTools` answer for.
 #[derive(Clone)]
@@ -302,6 +309,7 @@ impl Codemode {
             listed: Mutex::new(None),
             start_generation: UNTRACKED,
             guard: None,
+            hook: HookSlot::default(),
             wall_time: WALL_TIME,
         }
     }
@@ -328,6 +336,14 @@ impl Codemode {
     /// tools, so a hidden tool's spec and adapter come from the source.
     fn moved(&self, generation: u64) -> bool {
         generation != UNTRACKED && generation != self.start_generation
+    }
+
+    /// Sends each nested call through the call hook `slot` holds once the run
+    /// sets it, before the guard sees the call, as a direct call goes.
+    #[must_use]
+    pub fn with_hook_slot(mut self, slot: HookSlot) -> Self {
+        self.hook = slot;
+        self
     }
 
     /// Checks each nested call against `guard`, which refuses a call that runs.
@@ -731,7 +747,14 @@ impl Tool for Codemode {
                                     Some(Ok(tool)) => {
                                         let mut registry = Registry::new();
                                         registry.add(Boxed(tool));
-                                        run_one(&registry, self.guard.as_ref(), &call, cancel).await
+                                        run_one_hooked(
+                                            &registry,
+                                            self.hook.get().map(|hook| &**hook),
+                                            self.guard.as_ref(),
+                                            &call,
+                                            cancel,
+                                        )
+                                        .await
                                     }
                                     Some(Err(reason)) => Some(ToolOutput::error(reason)),
                                     None => {
@@ -741,7 +764,14 @@ impl Tool for Codemode {
                                 None => Some(ToolOutput::error(unknown(&call.name, &self.tools))),
                             }
                         } else {
-                            run_one(&self.registry, self.guard.as_ref(), &call, cancel).await
+                            run_one_hooked(
+                                &self.registry,
+                                self.hook.get().map(|hook| &**hook),
+                                self.guard.as_ref(),
+                                &call,
+                                cancel,
+                            )
+                            .await
                         };
                         (id, at, output)
                     });
@@ -2201,6 +2231,62 @@ mod tests {
         assert!(output.content.contains("denied"), "{}", output.content);
         assert!(
             output.content.contains("- bash error"),
+            "{}",
+            output.content
+        );
+    }
+
+    /// A call hook that blocks every call of `bash` and names what it saw.
+    struct BlockBash;
+
+    impl reagent_agent::hook::CallHook for BlockBash {
+        fn before<'a>(
+            &'a self,
+            tool: &'a str,
+            args: &'a str,
+        ) -> BoxFuture<'a, reagent_agent::hook::CallVerdict> {
+            let verdict = if tool == "bash" {
+                reagent_agent::hook::CallVerdict::Block(format!("gate saw {tool} {args}"))
+            } else {
+                reagent_agent::hook::CallVerdict::Keep
+            };
+            Box::pin(std::future::ready(verdict))
+        }
+
+        fn after<'a>(
+            &'a self,
+            _tool: &'a str,
+            _args: &'a str,
+            output: ToolOutput,
+        ) -> BoxFuture<'a, ToolOutput> {
+            Box::pin(std::future::ready(output))
+        }
+    }
+
+    /// A script's call goes through the run's call hook, which the run sets
+    /// after the tool was built: the gate sees the inner tool's own name and
+    /// arguments, and a block keeps the tool from running.
+    #[tokio::test]
+    async fn call_gate_sees_a_script_call_and_blocks_it() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&runs);
+        let mut registry = Registry::new();
+        registry.add(fake_replying("bash", with_path(), move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            ToolOutput::ok("ran")
+        }));
+        let slot = HookSlot::default();
+        let codemode = Codemode::new(Arc::new(registry)).with_hook_slot(Arc::clone(&slot));
+        let hook: Arc<dyn reagent_agent::hook::CallHook> = Arc::new(BlockBash);
+        assert!(slot.set(hook).is_ok(), "the slot was empty");
+        let output = run_code(
+            &codemode,
+            "try { await tools.bash({path: \"x\"}) } catch (e) { print(e.message) }",
+        )
+        .await;
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "the tool ran");
+        assert!(
+            output.content.contains("gate saw bash") && output.content.contains("\"path\""),
             "{}",
             output.content
         );

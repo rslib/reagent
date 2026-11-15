@@ -9,6 +9,7 @@
 use futures_util::future::BoxFuture;
 
 use reagent_ai::Text;
+use reagent_ai::Usage;
 
 use crate::event::TurnEndReason;
 use crate::policy::TurnView;
@@ -78,8 +79,83 @@ pub enum Seen<'a> {
     },
     /// A turn ended.
     TurnEnd(&'a TurnEndReason),
+    /// A model reply finished, with the token use the reply keeps.
+    ///
+    /// Sent once per reply, not once per streamed usage: some providers report
+    /// the counts of one reply several times, each time cumulative. A reply a
+    /// retry replaced sends none, and a reply the run cut by a cancel sends one
+    /// when the stream had already reported its use.
+    Usage(&'a Usage),
     /// The run ended.
     RunEnd(&'a TurnEndReason),
+    /// A tool call started to wait for a person.
+    ///
+    /// Every `Waiting` is answered by exactly one [`Seen::Waited`] with the same
+    /// `kind` and `call`.
+    Waiting {
+        /// What the wait is for.
+        kind: WaitKind,
+        /// The id of the tool call that waits.
+        call: &'a str,
+        /// The tool's name; `ask` for a question.
+        tool: &'a str,
+    },
+    /// The wait of a call ended.
+    Waited {
+        /// What the wait was for.
+        kind: WaitKind,
+        /// The id of the tool call that waited.
+        call: &'a str,
+        /// What ended the wait.
+        how: WaitEnd,
+    },
+}
+
+/// What a call waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitKind {
+    /// An `ask` question, shown to the clients of the session.
+    Question,
+    /// A permission prompt.
+    Approval,
+}
+
+impl WaitKind {
+    /// The word a plugin payload names this kind by.
+    pub fn word(self) -> &'static str {
+        match self {
+            WaitKind::Question => "question",
+            WaitKind::Approval => "approval",
+        }
+    }
+}
+
+/// What ended a wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitEnd {
+    /// A client answered.
+    Answered,
+    /// A client refused, or no client was left to ask.
+    Denied,
+    /// The run was cancelled.
+    Cancelled,
+    /// The wait ran out of time; no wait has a timer yet.
+    Timeout,
+    /// An `ask` parked, because its last client left.
+    Parked,
+}
+
+impl WaitEnd {
+    /// The word a plugin payload names this end by.
+    pub fn word(self) -> &'static str {
+        match self {
+            WaitEnd::Answered => "answered",
+            WaitEnd::Denied => "denied",
+            WaitEnd::Cancelled => "cancelled",
+            WaitEnd::Timeout => "timeout",
+            WaitEnd::Parked => "parked",
+        }
+    }
 }
 
 /// Sees the run's events in loop order, before they reach the event channel.

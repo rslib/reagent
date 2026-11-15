@@ -9,6 +9,10 @@
 //! The list holds no drawing: [`crate::app::paint::list`] reads it, and the app
 //! that owns it keeps its query and its matcher between keys, so typing in a
 //! list allocates nothing once the buffers are warm.
+//!
+//! The namespaced rows of the skills, `/skill:<name>`, show only while the
+//! query names them: the app keeps them after every other row, so a key that
+//! hides them cuts the tail of the list and leaves the rest as it was.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -17,6 +21,8 @@ use std::sync::Arc;
 use crate::keyfile::{Foot, Labels};
 use crate::keys::{self, Group};
 use crate::pick::Matcher;
+
+use super::SKILL_PREFIX;
 
 /// The most item rows the list draws at once.
 pub(crate) const WINDOW: usize = 10;
@@ -237,10 +243,11 @@ impl List {
         }
     }
 
-    /// How many names the source holds, whatever the query hits.
+    /// How many names the source offers the query, whatever it hits: a
+    /// namespaced row that the query does not name is not one of them.
     pub(crate) fn total(&self) -> usize {
         match &self.source {
-            Source::Commands(commands) => commands.len(),
+            Source::Commands(commands) => shown(commands, &self.query),
             Source::Files(paths) => paths.len(),
             Source::Leader => keys::hints(Group::Leader).count(),
         }
@@ -304,8 +311,11 @@ impl List {
         let query = std::mem::take(&mut self.query);
         match &self.source {
             Source::Commands(commands) => {
-                self.matcher
-                    .run(&query, commands.iter().map(|command| &*command.name));
+                let shown = shown(commands, &query);
+                self.matcher.run(
+                    &query,
+                    commands[..shown].iter().map(|command| &*command.name),
+                );
             }
             Source::Files(paths) => {
                 self.matcher.run(&query, paths.iter().map(|path| &**path));
@@ -314,6 +324,19 @@ impl List {
         }
         self.query = query;
     }
+}
+
+/// How many rows of `commands` show for `query`: a namespaced row of a skill
+/// waits for a query that names it, and the rows it waits behind are the ones
+/// before it, so a hit keeps the index of its command.
+fn shown(commands: &[Command], query: &str) -> usize {
+    if query.starts_with(SKILL_PREFIX) {
+        return commands.len();
+    }
+    commands
+        .iter()
+        .position(|command| command.name.starts_with(SKILL_PREFIX))
+        .unwrap_or(commands.len())
 }
 
 #[cfg(test)]

@@ -44,6 +44,11 @@ fn manifest() -> &'static str {
     r#"{"name": "__NAME__", "version": "1.0.0", "type": "module", "reagent": {"entry": "index.js"}}"#
 }
 
+/// The `package.json` of a plugin that may install a `tool.call` layer.
+fn call_manifest() -> &'static str {
+    r#"{"name": "__NAME__", "version": "1.0.0", "type": "module", "reagent": {"entry": "index.js", "permissions": {"hooks": ["tool.call"]}}}"#
+}
+
 /// A temporary plugins root.
 fn temp_root() -> TempDir {
     tempfile::tempdir().unwrap()
@@ -793,7 +798,7 @@ async fn a_call_hook_blocks_and_rewrites() {
     plugin(
         root.path(),
         "guard",
-        manifest(),
+        call_manifest(),
         &[(
             "index.js",
             r#"
@@ -831,7 +836,7 @@ async fn a_block_of_false_keeps_the_call() {
     plugin(
         root.path(),
         "guard",
-        manifest(),
+        call_manifest(),
         &[(
             "index.js",
             r#"
@@ -1031,7 +1036,7 @@ async fn a_hook_that_hangs_is_stopped() {
     plugin(
         root.path(),
         "hang",
-        manifest(),
+        call_manifest(),
         &[(
             "index.js",
             r#"
@@ -1175,7 +1180,7 @@ async fn a_slow_layer_is_noted_and_kept() {
     plugin(
         root.path(),
         "slow",
-        manifest(),
+        call_manifest(),
         &[(
             "index.js",
             r#"
@@ -1326,7 +1331,7 @@ async fn a_plugin_that_throws_registers_nothing() {
     plugin(
         root.path(),
         "a_good",
-        manifest(),
+        call_manifest(),
         &[(
             "index.js",
             r#"export default function (r) { r.registerTool({ name: "kept", description: "kept", parameters: { type: "object" }, run: () => "kept" }); }"#,
@@ -2147,7 +2152,7 @@ async fn changed_wakes_after_a_note() {
     plugin(
         root.path(),
         "grumpy",
-        manifest(),
+        call_manifest(),
         &[(
             "index.js",
             r#"
@@ -2541,7 +2546,7 @@ async fn async_hook_never_settles() {
     plugin(
         root.path(),
         "hangs",
-        manifest(),
+        call_manifest(),
         &[(
             "index.js",
             r#"
@@ -3011,7 +3016,7 @@ async fn async_deadline_counts_from_the_call() {
     plugin(
         root.path(),
         "latecomer",
-        manifest(),
+        call_manifest(),
         &[(
             "index.js",
             r#"
@@ -3367,7 +3372,7 @@ async fn async_long_tool_waits() {
     plugin(
         root.path(),
         "slow_tool",
-        manifest(),
+        call_manifest(),
         &[(
             "index.js",
             &waits(
@@ -3395,7 +3400,7 @@ async fn async_long_command_waits() {
     plugin(
         root.path(),
         "slow_command",
-        manifest(),
+        call_manifest(),
         &[(
             "index.js",
             &waits(
@@ -3422,7 +3427,7 @@ async fn async_long_spin_still_stops() {
     plugin(
         root.path(),
         "slow_spin",
-        manifest(),
+        call_manifest(),
         &[(
             "index.js",
             &waits(
@@ -3458,7 +3463,7 @@ async fn async_long_hook_keeps_5s() {
     plugin(
         root.path(),
         "slow_hook",
-        manifest(),
+        call_manifest(),
         &[(
             "index.js",
             &waits(
@@ -3665,5 +3670,187 @@ export default function () {}
             "the plugin thread still holds its runtimes"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+// The gate a `tool.call` layer is: the permission its manifest needs, the
+// limit it may name, and what it does when the layer does not answer.
+
+#[tokio::test]
+async fn call_gate_a_hook_without_the_hooks_permission_throws() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "guard",
+        manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.hook("tool.call", () => ({ block: "no" }));
+}
+"#,
+        )],
+    )
+    .await;
+    let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
+    assert!(plugins.is_none(), "the layer was accepted");
+    assert!(
+        notes
+            .iter()
+            .any(|note| note == "plugin guard: plugin guard has no hooks permission for tool.call"),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn call_gate_block_on_timeout_blocks_a_silent_handler() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "silent",
+        call_manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.hook("tool.call", () => new Promise(() => {}), { timeoutMs: 200, onTimeout: "block" });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    let started = Instant::now();
+    let verdict = plugins.before("shout", "{}").await;
+    let took = started.elapsed();
+    assert_eq!(
+        verdict,
+        CallVerdict::Block("plugin silent: tool.call hook timed out after 200 ms".into())
+    );
+    assert!(took < Duration::from_secs(1), "it took {took:?}");
+}
+
+/// A gate may wait on its coordinator longer than one slice of JS may run: its
+/// own `timeoutMs` is the wait, as a tool's promise wait is.
+#[tokio::test]
+async fn call_gate_a_slow_answer_inside_its_limit_counts() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "slow",
+        call_manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.hook(
+    "tool.call",
+    () => new Promise((resolve) => setTimeout(() => resolve({ block: "late" }), 6000)),
+    { timeoutMs: 10000, onTimeout: "keep" },
+  );
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    assert_eq!(
+        plugins.before("shout", "{}").await,
+        CallVerdict::Block("late".into())
+    );
+}
+
+#[tokio::test]
+async fn call_gate_keep_on_timeout_keeps_a_silent_handler() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "silent",
+        call_manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.hook("tool.call", () => new Promise(() => {}), { timeoutMs: 200, onTimeout: "keep" });
+  r.registerTool({ name: "shout", description: "shouts", run: () => "shouted" });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    let started = Instant::now();
+    let verdict = plugins.before("shout", "{}").await;
+    let took = started.elapsed();
+    assert_eq!(verdict, CallVerdict::Keep, "the call goes on unchanged");
+    assert!(took < Duration::from_secs(1), "it took {took:?}");
+    assert_eq!(&*run(&plugins, "shout", "{}").await.content, "shouted");
+}
+
+#[tokio::test]
+async fn call_gate_a_throw_blocks_with_its_message() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "thrower",
+        call_manifest(),
+        &[(
+            "index.js",
+            r#"
+export default function (r) {
+  r.hook("tool.call", () => { throw new Error("boom"); }, { onTimeout: "block" });
+}
+"#,
+        )],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    assert_eq!(
+        plugins.before("shout", "{}").await,
+        CallVerdict::Block("plugin thrower: tool.call hook failed: boom".into())
+    );
+}
+
+#[tokio::test]
+async fn call_gate_bad_options_throw() {
+    for options in [
+        "{ timeoutMs: 0 }",
+        "{ timeoutMs: 121000 }",
+        "{ timeoutMs: 1.5 }",
+        "{ timeoutMs: 'soon' }",
+        "{ onTimeout: 'wait' }",
+        "{ onTimeout: 7 }",
+        "{ timeout: 200 }",
+        "{ onTimeOut: 'block' }",
+        "{ timeoutMs: -5 }",
+    ] {
+        let root = temp_root();
+        plugin(
+            root.path(),
+            "picky",
+            call_manifest(),
+            &[(
+                "index.js",
+                &format!(
+                    "export default function (r) {{ r.hook(\"tool.call\", () => undefined, {options}); }}\n"
+                ),
+            )],
+        )
+        .await;
+        let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
+        assert!(plugins.is_none(), "{options} was accepted: {notes:?}");
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("timeoutMs") || note.contains("onTimeout")),
+            "{options}: {notes:?}"
+        );
+        if options.contains("-5") {
+            assert!(
+                notes.iter().any(|note| note.contains("not -5")),
+                "the range error names the value: {notes:?}"
+            );
+        }
     }
 }
