@@ -150,7 +150,7 @@ impl OpenAiChat {
         }
         let images = request.images;
         bodies.align(request.messages, |message| {
-            MessageBody::with_images(message, PROVIDER, images)
+            MessageBody::build(message, PROVIDER, images, self.compat.replay_reasoning)
         })?;
         let mut parts = builder.body_parts(bodies.bodies());
         if request.tool_choice == crate::ToolChoice::Off && !request.tools.is_empty() {
@@ -261,6 +261,17 @@ impl MessageBody {
     /// images only when `images` and writing the note of
     /// [`crate::request_images::NO_IMAGES`] in their place when not.
     pub fn with_images(message: &Message, provider: &str, images: bool) -> Result<Self, Error> {
+        Self::build(message, provider, images, true)
+    }
+
+    /// As [`MessageBody::with_images`], and an assistant message sends its own
+    /// thinking back only when `reasoning`.
+    fn build(
+        message: &Message,
+        provider: &str,
+        images: bool,
+        reasoning: bool,
+    ) -> Result<Self, Error> {
         let (bytes, parts) = match message {
             Message::User { content } => (
                 Some(to_bytes(&UserOut {
@@ -269,7 +280,10 @@ impl MessageBody {
                 })),
                 Vec::new(),
             ),
-            Message::Assistant(assistant) => (assistant_message(assistant, provider), Vec::new()),
+            Message::Assistant(assistant) => (
+                assistant_message(assistant, provider, reasoning),
+                Vec::new(),
+            ),
             Message::ToolResult(result) => (
                 Some(to_bytes(&ToolOut {
                     role: "tool",
@@ -440,7 +454,13 @@ impl RequestBuilder {
         if compat.max_tokens_field != MaxTokensField::Omit {
             out.put_slice(max_tokens.to_string().as_bytes());
         }
-        out.put_slice(b",\"stream\":true,\"stream_options\":{\"include_usage\":true}");
+        // An endpoint that does not take `stream_options` gets the plain
+        // stream, and its usage comes from the last chunk when it sends one.
+        if compat.stream_usage {
+            out.put_slice(b",\"stream\":true,\"stream_options\":{\"include_usage\":true}");
+        } else {
+            out.put_slice(b",\"stream\":true");
+        }
         if tools.is_empty() {
             out.put_slice(b",\"messages\":[");
         } else {
@@ -694,8 +714,12 @@ struct FunctionCallOut<'a> {
     arguments: &'a str,
 }
 
-fn assistant_message(assistant: &AssistantMessage, provider: &str) -> Option<Bytes> {
-    let keep_thinking = assistant.provider.as_ref() == provider;
+fn assistant_message(
+    assistant: &AssistantMessage,
+    provider: &str,
+    reasoning_wanted: bool,
+) -> Option<Bytes> {
+    let keep_thinking = reasoning_wanted && assistant.provider.as_ref() == provider;
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut details: Option<&RawValue> = None;
@@ -839,10 +863,17 @@ impl StreamParser {
                     self.accept_detail(detail);
                 }
             }
-            if let Some(content) = delta.content
-                && !content.as_str().is_empty()
-            {
-                out.push(StreamEvent::TextDelta(content.into_text()));
+            match delta.content {
+                ContentDelta::Nothing => {}
+                ContentDelta::Text(content) if !content.as_str().is_empty() => {
+                    out.push(StreamEvent::TextDelta(content.into_text()));
+                }
+                ContentDelta::Text(_) => {}
+                ContentDelta::Chunks(chunks) => {
+                    for chunk in chunks {
+                        chunk.push(out);
+                    }
+                }
             }
             for call in delta.tool_calls {
                 self.accept_tool_call(call, out);
@@ -898,7 +929,11 @@ impl StreamParser {
         let Some(function) = call.function else {
             return;
         };
-        if let Some(name) = function.name {
+        // An empty name is no new call: one Kimi backend repeats `"name": ""` on
+        // every argument piece, and a start would drop the pieces before it.
+        if let Some(name) = function.name
+            && !name.as_str().is_empty()
+        {
             out.push(StreamEvent::ToolCallStart {
                 id: id.clone(),
                 name: name.into_text(),
@@ -1356,10 +1391,103 @@ struct Choice<'a> {
     finish_reason: Option<&'a str>,
 }
 
+/// One streamed `delta.content`: the plain string the wire usually sends, or
+/// the list of chunks an endpoint sends while it thinks.
+#[derive(Default)]
+enum ContentDelta<'a> {
+    /// The field is absent or null.
+    #[default]
+    Nothing,
+    /// A plain content string, which stays on the borrowed path.
+    Text(JsonStr<'a>),
+    /// A list of typed chunks.
+    Chunks(Vec<ContentChunk<'a>>),
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for ContentDelta<'a> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ContentDelta<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a string or a list of content chunks")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(ContentDelta::Nothing)
+            }
+
+            fn visit_borrowed_str<E>(self, text: &'de str) -> Result<Self::Value, E> {
+                Ok(ContentDelta::Text(JsonStr::Borrowed(text)))
+            }
+
+            fn visit_str<E>(self, text: &str) -> Result<Self::Value, E> {
+                Ok(ContentDelta::Text(JsonStr::Owned(Text::from(text))))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut chunks = Vec::new();
+                while let Some(chunk) = seq.next_element()? {
+                    chunks.push(chunk);
+                }
+                Ok(ContentDelta::Chunks(chunks))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// One chunk of a list-shaped `delta.content`: a `thinking` chunk whose nested
+/// parts hold the reasoning text, a `text` chunk of the answer, or a kind this
+/// wire does not use.
+#[derive(Deserialize)]
+struct ContentChunk<'a> {
+    #[serde(rename = "type", default, borrow)]
+    kind: Option<&'a str>,
+    #[serde(default, borrow)]
+    text: Option<JsonStr<'a>>,
+    #[serde(default, borrow, deserialize_with = "null_as_default")]
+    thinking: Vec<ContentChunk<'a>>,
+}
+
+impl ContentChunk<'_> {
+    /// Appends the events of one chunk to `out`: the text parts of a thinking
+    /// chunk as reasoning deltas, and a text chunk as a text delta. Empty text
+    /// carries no event, and an unknown kind is dropped.
+    fn push(self, out: &mut Vec<StreamEvent>) {
+        match self.kind {
+            Some("thinking") => {
+                for part in self.thinking.into_iter().filter_map(|part| part.text) {
+                    if !part.as_str().is_empty() {
+                        out.push(StreamEvent::ThinkingDelta(part.into_text()));
+                    }
+                }
+            }
+            Some("text") => {
+                if let Some(text) = self.text
+                    && !text.as_str().is_empty()
+                {
+                    out.push(StreamEvent::TextDelta(text.into_text()));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[derive(Default, Deserialize)]
 struct Delta<'a> {
     #[serde(default, borrow)]
-    content: Option<JsonStr<'a>>,
+    content: ContentDelta<'a>,
     #[serde(default, borrow)]
     reasoning_content: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
@@ -2140,6 +2268,202 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, 120);
         assert_eq!(usage.output_tokens, 20);
         assert_eq!(events.last(), Some(&StreamEvent::Stop(StopReason::ToolUse)));
+    }
+
+    /// The body of a preset's request: Mistral refuses `stream_options`, so a
+    /// compat without usage writes `"stream":true` only.
+    #[test]
+    fn mistral_request_body_has_no_stream_options() {
+        let history = vec![Message::user("hi")];
+        let request = Request {
+            model: "mistral-large-latest",
+            max_tokens: 64,
+            system: None,
+            tools: &[],
+            tool_choice: crate::ToolChoice::Auto,
+            messages: &history,
+            images: true,
+            reasoning: None,
+            cache_key: None,
+        };
+        let mistral = crate::providers::get("mistral").expect("the preset");
+        let chat = OpenAiChat::new("key", mistral.default_route().base_url)
+            .with_compat(mistral.default_route().compat);
+        let bytes = chat.request_body(&request).unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(body.contains(r#""stream":true"#), "{body}");
+        assert!(!body.contains("stream_options"), "{body}");
+        assert!(!body.contains("include_usage"), "{body}");
+
+        // Every other preset keeps the bytes it sent before.
+        let opencode = crate::providers::get("opencode-go").expect("the preset");
+        let chat = OpenAiChat::new("key", opencode.default_route().base_url)
+            .with_compat(opencode.default_route().compat);
+        let bytes = chat.request_body(&request).unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            body.contains(r#""stream":true,"stream_options":{"include_usage":true}"#),
+            "{body}"
+        );
+    }
+
+    /// Mistral refuses fields it does not know, and `reasoning_content` is not
+    /// one of its fields, so its requests leave the replayed thinking out.
+    #[test]
+    fn mistral_replay_leaves_out_reasoning_content() {
+        let history = vec![
+            Message::user("hi"),
+            Message::assistant(AssistantMessage::new(
+                PROVIDER,
+                "magistral-medium-latest",
+                vec![
+                    Content::Thinking {
+                        thinking: "pondered".into(),
+                        signature: None,
+                    },
+                    Content::text("visible"),
+                ],
+            )),
+            Message::user("more"),
+        ];
+        let request = Request {
+            model: "magistral-medium-latest",
+            max_tokens: 64,
+            system: None,
+            tools: &[],
+            tool_choice: crate::ToolChoice::Auto,
+            messages: &history,
+            images: true,
+            reasoning: None,
+            cache_key: None,
+        };
+        let mistral = crate::providers::get("mistral").expect("the preset");
+        let chat = OpenAiChat::new("key", mistral.default_route().base_url)
+            .with_compat(mistral.default_route().compat);
+        let bytes = chat.request_body(&request).unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(!body.contains("reasoning_content"), "{body}");
+        assert!(!body.contains("pondered"), "{body}");
+        assert!(body.contains(r#""content":"visible""#), "{body}");
+
+        let opencode = crate::providers::get("opencode-go").expect("the preset");
+        let chat = OpenAiChat::new("key", opencode.default_route().base_url)
+            .with_compat(opencode.default_route().compat);
+        let bytes = chat.request_body(&request).unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(body.contains(r#""reasoning_content":"pondered""#), "{body}");
+    }
+
+    /// Mistral streams its thinking as a list of chunks in `delta.content`, and
+    /// its answer as a plain string, which stays on the old path.
+    #[test]
+    fn mistral_thinking_chunks_become_reasoning_deltas() {
+        let events = parse(concat!(
+            r#"data: {"choices":[{"index":0,"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"Let me "}]}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"think."}]}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":""}]},{"type":"text","text":"Two"}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"content":" plus two"}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"finish_reason":"stop","delta":{}}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        ));
+        let seen: Vec<StreamEvent> = events
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    StreamEvent::ThinkingDelta(_) | StreamEvent::TextDelta(_)
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                StreamEvent::ThinkingDelta("Let me ".into()),
+                StreamEvent::ThinkingDelta("think.".into()),
+                StreamEvent::TextDelta("Two".into()),
+                StreamEvent::TextDelta(" plus two".into()),
+            ]
+        );
+    }
+
+    /// A chunk type the wire does not use is dropped, and the tool call of the
+    /// same stream still parses.
+    #[test]
+    fn mistral_content_chunks_ignore_unknown_types_and_keep_the_tool_call() {
+        let events = parse(concat!(
+            r#"data: {"choices":[{"index":0,"delta":{"content":[]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"content":[{"type":"image_url","text":"nope"},{"type":"text","text":"I will read it."}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_02","type":"function","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"finish_reason":"tool_calls","delta":{}}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        ));
+        let unknown = |event: &StreamEvent| match event {
+            StreamEvent::ThinkingDelta(text) | StreamEvent::TextDelta(text) => {
+                text.as_ref() == "nope"
+            }
+            _ => false,
+        };
+        assert!(!events.iter().any(unknown));
+        assert_eq!(events[0], StreamEvent::TextDelta("I will read it.".into()));
+        let arguments: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallDelta { partial_json, .. } => Some(partial_json.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(arguments, "{\"path\":\"a.rs\"}");
+        assert_eq!(events.last(), Some(&StreamEvent::Stop(StopReason::ToolUse)));
+    }
+
+    /// One Kimi backend behind opencode-go repeats `"name": ""` and `"id": null`
+    /// on every argument piece: an empty name is not a new call, so the pieces
+    /// stay one call's arguments.
+    #[test]
+    fn an_empty_name_on_an_argument_piece_keeps_the_call() {
+        let events = parse(concat!(
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"bash_0_ce364101","type":"function","function":{"name":"bash","arguments":""}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":null,"type":null,"function":{"name":"","arguments":"{"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":null,"type":null,"function":{"name":"","arguments":"\"command\":\""}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":null,"type":null,"function":{"name":"","arguments":"echo hi\"}"}}]}}]}"#,
+            "\n\n",
+            r#"data: {"choices":[{"index":0,"finish_reason":"tool_calls","delta":{}}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n",
+        ));
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallStart { id, name } => Some((id.to_string(), name.to_string())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![("bash_0_ce364101".to_string(), "bash".to_string())]
+        );
+        let arguments: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallDelta { partial_json, .. } => Some(partial_json.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(arguments, r#"{"command":"echo hi"}"#);
     }
 
     #[test]

@@ -475,6 +475,7 @@ mod tests {
                 mandatory: false,
                 default: Some(Level::High),
                 unknown: vec!["ultra".to_string()],
+                never: false,
             }),
             images: None,
         };

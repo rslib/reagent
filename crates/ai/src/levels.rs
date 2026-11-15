@@ -174,9 +174,21 @@ pub struct Reasoning {
     /// word, each once, as first written. reagent cannot order them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unknown: Vec<String>,
+    /// Whether the model does not think at all, so a request names no
+    /// reasoning: an endpoint may refuse the field, even with its off word.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub never: bool,
 }
 
 impl Reasoning {
+    /// The plan of a model that does not think.
+    pub fn never() -> Reasoning {
+        Reasoning {
+            never: true,
+            ..Reasoning::default()
+        }
+    }
+
     /// The plan the words of one source describe: the levels it names, with
     /// `off` or `none` turning thinking off. A word reagent does not know is
     /// kept in `unknown`.
@@ -215,6 +227,7 @@ impl Reasoning {
             && !self.mandatory
             && self.default.is_none()
             && self.unknown.is_empty()
+            && !self.never
     }
 }
 

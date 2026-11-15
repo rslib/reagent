@@ -1,7 +1,8 @@
-//! The OAuth logins of the providers: the ChatGPT and OpenRouter flows and the
-//! saved session, over the shared pieces of `reagent-oauth`.
+//! The OAuth logins of the providers: the ChatGPT, OpenRouter and Mistral Vibe
+//! flows and the saved session, over the shared pieces of `reagent-oauth`.
 
 pub mod chatgpt;
+pub mod mistral_vibe;
 pub mod openrouter;
 pub mod session;
 

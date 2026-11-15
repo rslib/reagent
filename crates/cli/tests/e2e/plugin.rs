@@ -2112,3 +2112,84 @@ async fn call_gate_waits_around_an_approval() {
         "the refused command ran"
     );
 }
+
+/// A run that names a plugin it must have.
+async fn required_run(home: &Home, extra: &[&str]) -> Output {
+    let fake = home
+        .script(r#"{"replies":[{"text":"the model answered"}]}"#)
+        .await;
+    let mut args = vec!["--json", "--no-serve", "--provider", &fake];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["-p", "hello"]);
+    home.run(&args).await
+}
+
+#[tokio::test]
+async fn require_plugin_runs_when_the_plugin_loads() {
+    let home = Home::new();
+    home.plugin("gate", "export default function (reagent) {}\n")
+        .await;
+    let output = required_run(&home, &["--require-plugin", "gate"]).await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    assert!(text(&output.stdout).contains("the model answered"));
+}
+
+/// A guard that fails to load must not leave the run going without it: the run
+/// stops before its first request.
+#[tokio::test]
+async fn require_plugin_stops_the_run_when_the_plugin_fails_to_load() {
+    let home = Home::new();
+    home.plugin(
+        "gate",
+        "import { nothing } from \"node:fs/promises\";\nexport default function () {}\n",
+    )
+    .await;
+    let output = required_run(&home, &["--require-plugin", "gate"]).await;
+    assert!(!output.status.success(), "the run went on without its gate");
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("required plugin gate did not load"),
+        "{stderr}"
+    );
+    assert!(
+        !text(&output.stdout).contains("the model answered"),
+        "the model was asked before the check"
+    );
+}
+
+#[tokio::test]
+async fn require_plugin_stops_the_run_when_no_plugin_has_the_name() {
+    let home = Home::new();
+    home.plugin("other", "export default function (reagent) {}\n")
+        .await;
+    let output = required_run(&home, &["--require-plugin", "gate"]).await;
+    assert!(!output.status.success());
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("required plugin gate did not load"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn require_plugin_refuses_no_plugins() {
+    let home = Home::new();
+    let output = required_run(&home, &["--no-plugins", "--require-plugin", "gate"]).await;
+    assert!(!output.status.success());
+    let stderr = text(&output.stderr);
+    assert!(stderr.contains("--require-plugin"), "{stderr}");
+    assert!(stderr.contains("--no-plugins"), "{stderr}");
+}
+
+/// No plugins folder at all is no required plugin either.
+#[tokio::test]
+async fn require_plugin_stops_the_run_with_no_plugins_folder() {
+    let home = Home::new();
+    let output = required_run(&home, &["--require-plugin", "gate"]).await;
+    assert!(!output.status.success());
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("required plugin gate did not load"),
+        "{stderr}"
+    );
+}

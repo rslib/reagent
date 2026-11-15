@@ -5,6 +5,8 @@ pub mod chatgpt;
 pub mod commandcode;
 pub mod deepseek;
 pub mod freeinference;
+pub mod mistral;
+pub mod mistral_vibe;
 pub mod openai;
 pub mod opencode_go;
 pub mod openrouter;
@@ -95,6 +97,13 @@ pub struct Compat {
     /// The header that carries one id per conversation, for an endpoint that
     /// rejects a request without it.
     pub session_header: Option<&'static str>,
+    /// Whether the request asks for a usage chunk with `stream_options`, which
+    /// an endpoint that does not take the field must leave out.
+    pub stream_usage: bool,
+    /// Whether an assistant message sends its thinking back as
+    /// `reasoning_content`, which an endpoint that refuses unknown fields
+    /// must not get.
+    pub replay_reasoning: bool,
 }
 
 impl Compat {
@@ -104,6 +113,8 @@ impl Compat {
         reasoning_field: ReasoningField::Effort,
         reasoning_off: None,
         session_header: None,
+        stream_usage: true,
+        replay_reasoning: true,
     };
 }
 
@@ -140,6 +151,8 @@ impl CompatOverride {
                 None => base.reasoning_off,
             },
             session_header: base.session_header,
+            stream_usage: base.stream_usage,
+            replay_reasoning: base.replay_reasoning,
         }
     }
 }
@@ -351,6 +364,8 @@ pub const ALL: &[&Preset] = &[
     &chatgpt::PRESET,
     &openrouter::PRESET,
     &opencode_go::PRESET,
+    &mistral::PRESET,
+    &mistral_vibe::PRESET,
     &commandcode::PRESET,
     &deepseek::PRESET,
     &freeinference::PRESET,
@@ -521,6 +536,45 @@ mod tests {
             .unwrap();
         assert_eq!(messages.name, "messages");
         assert_eq!(messages.base_url, "https://api.synthetic.new/anthropic");
+    }
+
+    #[test]
+    fn mistral_presets_use_the_chat_wire_and_send_no_stream_options() {
+        for name in ["mistral", "mistral-vibe"] {
+            let preset = get(name).expect("a mistral preset");
+            let route = preset.default_route();
+            assert_eq!(route.wire, Wire::OpenAiChat, "{name}");
+            assert_eq!(route.base_url, "https://api.mistral.ai/v1", "{name}");
+            assert_eq!(
+                route.compat.reasoning_field,
+                ReasoningField::Effort,
+                "{name}"
+            );
+            assert_eq!(route.compat.reasoning_off, Some("none"), "{name}");
+            assert!(!route.compat.stream_usage, "{name}");
+            assert!(!route.compat.replay_reasoning, "{name}");
+        }
+        assert_eq!(
+            get("mistral").expect("the preset").api_key_env,
+            "MISTRAL_API_KEY"
+        );
+        // The Vibe key is the one `reagent login mistral-vibe` saves.
+        assert_eq!(get("mistral-vibe").expect("the preset").api_key_env, "");
+        for preset in ALL
+            .iter()
+            .filter(|preset| !preset.name.starts_with("mistral"))
+        {
+            assert!(
+                preset.default_route().compat.stream_usage,
+                "{} lost its usage chunk",
+                preset.name
+            );
+            assert!(
+                preset.default_route().compat.replay_reasoning,
+                "{} lost its replayed thinking",
+                preset.name
+            );
+        }
     }
 
     #[test]

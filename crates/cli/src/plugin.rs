@@ -189,10 +189,11 @@ async fn list() -> Result<ExitCode, Fail> {
         if name.starts_with('.') {
             continue;
         }
-        if !entry
-            .file_type()
+        // A linked folder counts, as it does for the loader: the metadata
+        // follows the link.
+        if !tokio::fs::metadata(entry.path())
             .await
-            .map(|kind| kind.is_dir())
+            .map(|found| found.is_dir())
             .unwrap_or(false)
         {
             continue;

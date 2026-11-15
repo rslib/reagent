@@ -30,12 +30,13 @@ const ALL_POLICIES: [&str; 3] = ["completion", "budget", "snapshot"];
 /// The policies with no `--policy` flag. The budget note does nothing without
 /// a deadline or a turn cap, and with one it cut timeouts on a slow model. The
 /// snapshot hands the model its environment in the first message, so it does
-/// not spend a turn finding out.
-const DEFAULT_POLICIES: [&str; 2] = ["budget", "snapshot"];
+/// not spend a turn finding out. Compaction keeps a long session under its
+/// budget: without it a long run grows until the model loses the thread.
+const DEFAULT_POLICIES: [&str; 3] = ["budget", "compact", "snapshot"];
 
 /// The policies with no `--policy` flag on the chat wire. Masking cut prompt
 /// tokens by 42% on a glm-5.3-flash dev run with no drop in pass rate.
-const DEFAULT_CHAT_POLICIES: [&str; 3] = ["budget", "mask", "snapshot"];
+const DEFAULT_CHAT_POLICIES: [&str; 4] = ["budget", "compact", "mask", "snapshot"];
 
 /// The reply token cap when `--max-tokens` is absent. A `write` call carries
 /// the whole file, and thinking counts toward the cap, so a low cap cuts the
@@ -262,6 +263,9 @@ pub struct Args {
     /// The folder the run loads its plugins from, `None` when `--no-plugins`
     /// is given or the folder does not exist.
     pub plugins_dir: Option<PathBuf>,
+    /// The plugins, by manifest name, the run must load before it asks the
+    /// model anything (`--require-plugin`).
+    pub required_plugins: Vec<String>,
 }
 
 /// One provider the `models` command lists.
@@ -388,8 +392,8 @@ fn usage() -> &'static str {
         "      --provider <wire>  anthropic, openai-chat, openai-responses or pi-messages\n",
         "                       (default: anthropic)\n",
         "                       --model <name>/<id> picks a preset: anthropic, openai, chatgpt,\n",
-        "                       openrouter, opencode-go, commandcode, deepseek, freeinference,\n",
-        "                       radius or synthetic\n",
+        "                       openrouter, opencode-go, mistral, mistral-vibe, commandcode,\n",
+        "                       deepseek, freeinference, radius or synthetic\n",
         "      --base-url <url>   the endpoint; default from the provider env, else built in\n",
         "      --api-key-env <name>  the env var holding the API key; never the key itself\n",
         "      --header <name:value>  an extra request header; repeatable; reserved names\n",
@@ -405,16 +409,18 @@ fn usage() -> &'static str {
         "      --mcp <list>     MCP servers to start: +name adds, -name removes, plain names replace\n",
         "      --no-mcp         start no MCP server\n",
         "      --no-plugins     load no plugins from the config folder\n",
+        "      --require-plugin <name>  stop before the first request unless the plugin\n",
+        "                       named <name> (its package.json name) loaded; repeatable\n",
         "      --policy <list>  loop policies: completion, stuck, budget, snapshot, mask, compact;\n",
         "                       all = completion, budget, snapshot; none = off;\n",
         "                       +name adds, -name removes, plain names replace\n",
-        "                       (default: budget and snapshot, plus mask on openai-chat)\n",
+        "                       (default: budget, compact and snapshot, plus mask on openai-chat)\n",
         "      --version        print the version and exit\n",
         "\n",
         "Commands:\n",
         "  models [name] [--refresh]  list the models of a provider, or of all with a key\n",
         "  login <provider> [--as <name>] [--no-browser]  save a login for a provider;\n",
-        "                       openrouter, chatgpt\n",
+        "                       openrouter, chatgpt, mistral-vibe\n",
         "  logout <provider>  drop a saved login\n",
         "  answer [<qid>] [--json] [--no-resume]  list the questions the parked runs left,\n",
         "                       or answer one: the answers JSON on stdin, one list per\n",
@@ -836,12 +842,16 @@ fn resolve_compat(
             } else {
                 MaxTokensField::MaxTokens
             };
-            CompatOverride {
+            let mut host = CompatOverride {
                 max_tokens_field: Some(field),
                 reasoning_field: None,
                 reasoning_off: None,
             }
-            .apply(Compat::DEFAULT)
+            .apply(Compat::DEFAULT);
+            // A header costs another server nothing, and a proxy in front of
+            // the preset's gateway needs it, so the session header stays.
+            host.session_header = route.and_then(|route| route.compat.session_header);
+            host
         }
     };
     Ok(Some(over.apply(base)))
@@ -999,6 +1009,7 @@ fn parse_from(
     let mut mcp: Vec<Vec<String>> = Vec::new();
     let mut no_mcp = false;
     let mut no_plugins = false;
+    let mut required_plugins: Vec<String> = Vec::new();
     let mut models: Option<Option<String>> = None;
     let mut refresh = false;
     let mut profile = None;
@@ -1139,6 +1150,12 @@ fn parse_from(
             }
             lexopt::Arg::Long("no-mcp") => no_mcp = true,
             lexopt::Arg::Long("no-plugins") => no_plugins = true,
+            lexopt::Arg::Long("require-plugin") => {
+                let value = parser
+                    .value()
+                    .map_err(|_| "missing value for --require-plugin".to_string())?;
+                required_plugins.push(value.into_string().map_err(|_| bad("--require-plugin"))?);
+            }
             lexopt::Arg::Long("cwd") => {
                 let value = parser
                     .value()
@@ -1243,6 +1260,7 @@ fn parse_from(
             || !mcp.is_empty()
             || no_mcp
             || no_plugins
+            || !required_plugins.is_empty()
         {
             return Err("the models command takes no run flags".into());
         }
@@ -1288,6 +1306,9 @@ fn parse_from(
     // The plugins folder is read here, where the config files are, and not on
     // the blocking pool: a run with no plugins folder costs one stat before the
     // runtime starts, no job and no thread.
+    if no_plugins && !required_plugins.is_empty() {
+        return Err("--require-plugin needs plugins, and --no-plugins loads none".into());
+    }
     let plugins_dir = if no_plugins {
         None
     } else {
@@ -1491,6 +1512,7 @@ fn parse_from(
         network_hosts,
         write,
         plugins_dir,
+        required_plugins,
     })))
 }
 
@@ -1736,8 +1758,8 @@ mod tests {
     }
 
     #[test]
-    fn policy_default_is_budget_and_snapshot() {
-        assert_eq!(run(&["-p", "task"]).policy, vec!["budget", "snapshot"]);
+    fn policy_default_is_budget_compact_and_snapshot() {
+        assert_eq!(run(&["-p", "task"]).policy, vec!["budget", "compact", "snapshot"]);
     }
 
     #[test]
@@ -1749,9 +1771,9 @@ mod tests {
     }
 
     #[test]
-    fn policy_default_on_the_chat_wire_is_budget_mask_and_snapshot() {
+    fn policy_default_on_the_chat_wire_is_budget_compact_mask_and_snapshot() {
         let args = run(&["-p", "task", "--provider", "openai-chat"]);
-        assert_eq!(args.policy, vec!["budget", "mask", "snapshot"]);
+        assert_eq!(args.policy, vec!["budget", "compact", "mask", "snapshot"]);
     }
 
     #[test]
@@ -2451,7 +2473,7 @@ mod tests {
         );
         assert_eq!(
             run_with(&["-p", "task"], settings).policy,
-            ["budget", "stuck"]
+            ["budget", "compact", "stuck"]
         );
     }
 
@@ -2462,7 +2484,7 @@ mod tests {
             ..Settings::default()
         };
         let args = run_with(&["-p", "task", "--policy", "-stuck"], settings);
-        assert_eq!(args.policy, ["budget", "snapshot"]);
+        assert_eq!(args.policy, ["budget", "compact", "snapshot"]);
     }
 
     #[test]
@@ -2485,7 +2507,7 @@ mod tests {
             "--policy",
             "-mask",
         ]);
-        assert_eq!(args.policy, ["budget", "snapshot"]);
+        assert_eq!(args.policy, ["budget", "compact", "snapshot"]);
     }
 
     #[test]
@@ -2941,6 +2963,8 @@ mod tests {
                 "chatgpt",
                 "openrouter",
                 "opencode-go",
+                "mistral",
+                "mistral-vibe",
                 "commandcode",
                 "deepseek",
                 "freeinference",
@@ -3013,7 +3037,7 @@ mod tests {
                 ("x-team".to_string(), "b".to_string())
             ]
         );
-        assert_eq!(args.policy, vec!["budget", "mask", "snapshot"]);
+        assert_eq!(args.policy, vec!["budget", "compact", "mask", "snapshot"]);
     }
 
     #[test]
@@ -3193,7 +3217,7 @@ mod tests {
             Some("https://opencode.ai/zen/go/v1")
         );
         assert_eq!(args.api_key_env.as_deref(), Some("OPENCODE_API_KEY"));
-        assert_eq!(args.policy, vec!["budget", "mask", "snapshot"]);
+        assert_eq!(args.policy, vec!["budget", "compact", "mask", "snapshot"]);
     }
 
     fn table(name: &str, provider: Provider) -> Settings {
@@ -3215,7 +3239,7 @@ mod tests {
         assert_eq!(args.auth, Auth::Wire);
         assert_eq!(args.api_key_env.as_deref(), Some("COMMANDCODE_API_KEY"));
         // The chat wire's default mask does not apply on Messages.
-        assert_eq!(args.policy, vec!["budget", "snapshot"]);
+        assert_eq!(args.policy, vec!["budget", "compact", "snapshot"]);
 
         let other = run(&[
             "-p",
@@ -3431,6 +3455,29 @@ mod tests {
             field(Some("http://localhost:11434/v1")),
             MaxTokensField::MaxTokens
         );
+    }
+
+    /// A proxy in front of opencode still needs its session header: a header
+    /// costs another server nothing, so a preset keeps it at any URL, while the
+    /// flags that shape the body stay with the preset's own endpoint.
+    #[test]
+    fn preset_session_header_stays_at_another_url() {
+        let compat = |args: &[&str]| {
+            run_with(args, Settings::default())
+                .compat
+                .expect("a compat")
+        };
+        let own = compat(&["-p", "task", "--model", "opencode-go/kimi"]);
+        assert_eq!(own.session_header, Some("x-opencode-session"));
+        let proxied = compat(&[
+            "-p",
+            "task",
+            "--model",
+            "opencode-go/kimi",
+            "--base-url",
+            "http://127.0.0.1:18777",
+        ]);
+        assert_eq!(proxied.session_header, Some("x-opencode-session"));
     }
 
     #[test]

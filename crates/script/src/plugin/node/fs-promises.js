@@ -93,6 +93,10 @@ export const appendFile = async (path, data) => {
   }
 };
 
+// The guard answers a read with the absolute path it resolved, every link
+// followed, which is what `realpath` is: no raw call, the same read check.
+export const realpath = async (path) => reading(path);
+
 export const access = (path, ...rest) => raw.access(reading(path), ...rest);
 export const chmod = (path, mode, ...rest) =>
   raw.chmod(writing(path), mode, ...rest);
@@ -119,6 +123,7 @@ export const constants = raw.constants;
 export default {
   access,
   appendFile,
+  realpath,
   chmod,
   lstat,
   mkdir,

@@ -5810,6 +5810,7 @@ fn level_models() -> Models {
         mandatory: false,
         default: Some(reagent_ai::levels::Level::High),
         unknown: Vec::new(),
+        never: false,
     });
     models
 }
@@ -10827,4 +10828,107 @@ fn an_empty_thinking_delta_keeps_the_reply_text_one_block() {
         screen.contains("Do not keep CLAUDE.md as a copy. It drifts."),
         "{screen}"
     );
+}
+
+/// The cells one terminal shows that differ from a clean draw of the same
+/// frame: text or background.
+fn stale_cells(kept: &vt100::Screen, clean: &vt100::Screen, rows: u16, columns: u16) -> Vec<String> {
+    let mut stale = Vec::new();
+    for row in 0..rows {
+        for column in 0..columns {
+            let (Some(a), Some(b)) = (kept.cell(row, column), clean.cell(row, column)) else {
+                continue;
+            };
+            if a.contents() != b.contents() || a.bgcolor() != b.bgcolor() {
+                stale.push(format!(
+                    "({row},{column}) {:?}/{:?} vs {:?}/{:?}",
+                    a.contents(),
+                    a.bgcolor(),
+                    b.contents(),
+                    b.bgcolor()
+                ));
+            }
+        }
+    }
+    stale
+}
+
+/// A run with a tool card on screen, for the resize tests.
+async fn carded(options: Options) -> Harness {
+    let harness = Harness::start(options, Fake::start("sess", 0));
+    wait_text(&harness.bytes, "idle").await;
+    harness.fake.event(json!({ "type": "turn_start" }));
+    harness
+        .fake
+        .event(json!({ "type": "tool_start", "id": "call-1", "name": "edit" }));
+    harness.fake.event(json!({
+        "type": "tool_call_ready",
+        "id": "call-1",
+        "name": "edit",
+        "arguments": json!({
+            "path": "src/paint.rs",
+            "old_string": numbered(6),
+            "new_string": numbered(8),
+        })
+        .to_string(),
+    }));
+    harness.fake.event(json!({
+        "type": "tool_result",
+        "id": "call-1",
+        "is_error": false,
+        "bytes": 8,
+    }));
+    harness
+        .fake
+        .event(json!({ "type": "turn_end", "reason": "end_turn" }));
+    wait_text(&harness.bytes, "src/paint.rs").await;
+    harness
+}
+
+/// One terminal that keeps what it showed across each resize, as a real one
+/// does, ends every resize with the same cells as a clean draw at the new size:
+/// no background of a block drawn at the old width stays behind.
+async fn resizes_end_clean(options: Options) {
+    let harness = carded(options).await;
+    let mut kept = vt100::Parser::new(nonzero(ROWS), nonzero(COLUMNS), SCROLLBACK);
+    let mut fed = 0;
+    for columns in [50, 120, 40, 100, 70] {
+        let from = written(&harness.bytes);
+        {
+            let held = harness
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            kept.process(&held[fed..from]);
+        }
+        kept.set_size(nonzero(ROWS), nonzero(columns));
+        harness
+            .keys
+            .send(Event::Resize(columns, ROWS))
+            .expect("the keys");
+        wait_at(&harness.bytes, from, ROWS, columns, "src/paint.rs").await;
+        // Let the frames after the resize land.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let to = written(&harness.bytes);
+        let held = harness
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        kept.process(&held[from..to]);
+        fed = to;
+        let mut clean = vt100::Parser::new(nonzero(ROWS), nonzero(columns), SCROLLBACK);
+        clean.process(&held[from..to]);
+        let stale = stale_cells(kept.screen(), clean.screen(), ROWS, columns);
+        assert!(
+            stale.is_empty(),
+            "after a resize to {columns} columns, {} cells keep the old frame: {:?}",
+            stale.len(),
+            &stale[..stale.len().min(12)]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_resize_leaves_no_cell_of_the_old_width_full_screen() {
+    resizes_end_clean(full()).await;
 }

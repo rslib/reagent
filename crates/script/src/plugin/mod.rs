@@ -367,6 +367,8 @@ pub struct Plugins {
     lost_events: AtomicU64,
     /// The folder and the session every hook payload names.
     served: Arc<Mutex<Served>>,
+    /// The manifest names of the plugins that loaded, in load order.
+    names: Vec<String>,
 }
 
 impl Plugins {
@@ -494,6 +496,7 @@ impl Plugins {
             follow_ups: AtomicU32::new(0),
             lost_events: AtomicU64::new(0),
             served,
+            names: report.names,
         };
         let notes = drain(&notes);
         (Some(Arc::new(plugins)), notes)
@@ -512,6 +515,11 @@ impl Plugins {
         if let Ok(mut served) = self.served.lock() {
             served.name(folder, session);
         }
+    }
+
+    /// The manifest names of the plugins that loaded, in load order.
+    pub fn names(&self) -> &[String] {
+        &self.names
     }
 
     /// The commands, in load order.

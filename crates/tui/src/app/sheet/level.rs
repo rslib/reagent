@@ -120,6 +120,7 @@ mod tests {
             mandatory,
             default,
             unknown: unknown.iter().map(|word| (*word).to_string()).collect(),
+            never: false,
         }
     }
 

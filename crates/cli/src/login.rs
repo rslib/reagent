@@ -29,8 +29,11 @@ const CHATGPT: &str = "chatgpt";
 /// The provider the Radius device login is saved under.
 const RADIUS: &str = "radius";
 
+/// The provider the Mistral Vibe login is saved under.
+const MISTRAL_VIBE: &str = "mistral-vibe";
+
 /// Every provider `login` names.
-const PROVIDERS: &str = "openrouter, chatgpt, radius";
+const PROVIDERS: &str = "openrouter, chatgpt, radius, mistral-vibe";
 
 /// The providers a login can open, in the order the model sheet lists them.
 #[cfg(feature = "tui")]
@@ -146,7 +149,40 @@ async fn login(args: &[OsString]) -> Result<(), String> {
         &Announce::printing(),
         tokio::io::BufReader::new(tokio::io::stdin()),
     )
-    .await
+    .await?;
+    if let Ok(program) = std::env::current_exe() {
+        list_models(&program, &account, false).await;
+    }
+    Ok(())
+}
+
+/// How long the model list a login fetches may take before it is left.
+const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Fills the models cache of `account` right after its login, so the model
+/// sheet lists its models without a `reagent models` run first.
+///
+/// It runs `program models <account> --refresh`, which reads the config and the
+/// saved login as that command always does. The list it prints is dropped; its
+/// lines on stderr show unless `quiet`, which the TUI needs, since the terminal
+/// belongs to the UI. A failed list never fails the login.
+async fn list_models(program: &Path, account: &str, quiet: bool) {
+    let stderr = if quiet {
+        std::process::Stdio::null()
+    } else {
+        std::process::Stdio::inherit()
+    };
+    let child = tokio::process::Command::new(program)
+        .args(["models", account, "--refresh"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr)
+        .kill_on_drop(true)
+        .spawn();
+    let Ok(mut child) = child else {
+        return;
+    };
+    let _ = tokio::time::timeout(LIST_TIMEOUT, child.wait()).await;
 }
 
 /// Runs one login for the TUI: the page and the code go to `announce`, and no
@@ -154,7 +190,11 @@ async fn login(args: &[OsString]) -> Result<(), String> {
 #[cfg(feature = "tui")]
 pub(crate) async fn tui(provider: &str, announce: &Announce<'_>) -> Result<(), String> {
     let dir = reagent_config::auth::dir()?;
-    flow(provider, provider, &dir, true, announce, &b""[..]).await
+    flow(provider, provider, &dir, true, announce, &b""[..]).await?;
+    if let Ok(program) = std::env::current_exe() {
+        list_models(&program, provider, true).await;
+    }
+    Ok(())
 }
 
 /// Runs the login `name` asks for, saved under `account` in `dir`.
@@ -219,6 +259,17 @@ pub(crate) async fn flow(
                 account,
                 dir,
                 &oauth::device::Endpoints::radius(),
+                browser,
+                &crate::run::sleeper(),
+                announce,
+            )
+            .await
+        }
+        MISTRAL_VIBE => {
+            mistral_vibe(
+                account,
+                dir,
+                oauth::mistral_vibe::CONSOLE,
                 browser,
                 &crate::run::sleeper(),
                 announce,
@@ -460,6 +511,44 @@ async fn openrouter(
     Ok(())
 }
 
+/// The line of a Vibe login that names the account to sign in with.
+const VIBE_PLAN: &str = "sign in with the Mistral account that has the Vibe plan";
+
+/// One Mistral Vibe login, saved under `name` in `dir`.
+///
+/// `console` is a parameter so a test drives the flow against its own server;
+/// the command passes the real console. The key the exchange gives does not
+/// expire, so it is saved as a plain key.
+async fn mistral_vibe(
+    name: &str,
+    dir: &Path,
+    console: &str,
+    browser: bool,
+    sleep: &reagent_ai::oauth::session::Sleeper,
+    announce: &Announce<'_>,
+) -> Result<(), String> {
+    let verifier = oauth::mistral_vibe::verifier()?;
+    let challenge = oauth::challenge(&verifier);
+    // The auth file is read before the page is printed: a refused or broken
+    // file fails the login while no page has been opened yet.
+    let logins = {
+        let dir = dir.to_path_buf();
+        auth_task(move || auth::read(&dir)).await?
+    };
+    let sign_in = oauth::mistral_vibe::sign_in(console, &challenge).await?;
+    (announce.line)(VIBE_PLAN);
+    (announce.open)(&sign_in.sign_in_url);
+    if browser {
+        opener(&sign_in.sign_in_url);
+    }
+    let token = oauth::mistral_vibe::wait(&sign_in, sleep).await?;
+    let key =
+        oauth::mistral_vibe::exchange(console, &sign_in.process_id, &token, &verifier).await?;
+    save(dir, logins, &key, name).await?;
+    (announce.line)(&format!("logged in to {name}"));
+    Ok(())
+}
+
 /// What one ChatGPT login reads and where it answers.
 struct Flow {
     /// The name the login is saved under: the provider, or `--as`.
@@ -638,8 +727,36 @@ async fn chatgpt_login(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use tokio::sync::oneshot;
+
+    /// A login fills the models cache of the account it saved, so the model
+    /// sheet lists its models at once: it runs `models <account> --refresh`.
+    #[tokio::test]
+    async fn login_lists_the_models_of_the_saved_account() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let seen = dir.path().join("seen");
+        let program = dir.path().join("fake-reagent");
+        tokio::fs::write(
+            &program,
+            format!("#!/bin/sh\necho \"$@\" > '{}'\n", seen.display()),
+        )
+        .await
+        .expect("write the program");
+        tokio::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .await
+            .expect("make it run");
+
+        list_models(&program, "mistral-work", true).await;
+
+        let args = tokio::fs::read_to_string(&seen)
+            .await
+            .expect("the program ran");
+        assert_eq!(args.trim(), "models mistral-work --refresh");
+    }
 
     /// Serves one request with `status` and `reply`; returns the URL and the
     /// recorded body.
@@ -720,6 +837,266 @@ mod tests {
 
     /// The callback of a code a test never checks.
     fn nothing_code(_: &str, _: &str) {}
+
+    #[test]
+    fn mistral_vibe_logout_removes_the_key_without_a_call() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut logins = auth::Logins::default();
+        logins.set(
+            MISTRAL_VIBE,
+            Login::Key {
+                key: Secret::from("sk-vibe-test"),
+            },
+        );
+        auth::write(dir.path(), &logins).expect("writes");
+        // Mistral documents no revoke call: the logout only drops the copy.
+        assert!(logout_in(dir.path(), MISTRAL_VIBE).expect("logs out"));
+        assert!(saved(dir.path(), MISTRAL_VIBE).is_none());
+        assert!(!logout_in(dir.path(), MISTRAL_VIBE).expect("a second logout"));
+    }
+
+    /// A fake Mistral console: the base URL of a server that answers one
+    /// `(status, reply)` pair per request, in order, and the requests it read.
+    ///
+    /// The listener is bound before `answers` runs, so a reply can name the
+    /// base URL the login must stay on.
+    async fn vibe_console(
+        answers: impl FnOnce(&str) -> Vec<(u16, String)>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind a port");
+        let base = format!(
+            "http://{}",
+            listener.local_addr().expect("the bound address")
+        );
+        let replies = answers(&base);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        tokio::spawn(async move {
+            for (status, reply) in replies {
+                let (mut socket, _) = listener.accept().await.expect("accept a connection");
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                recorder
+                    .lock()
+                    .expect("the recorder")
+                    .push(String::from_utf8_lossy(&buffer).into_owned());
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (base, seen)
+    }
+
+    /// The sign-in reply of a console at `base`, waiting at `expires_at`.
+    fn vibe_sign_in(base: &str, expires_at: &str) -> String {
+        let sign_in = format!(
+            r#"{{"process_id":"p-1","sign_in_url":"{base}/sign-in/p-1","poll_url":"{base}/api/vibe/sign-in/p-1/poll","expires_at":"{expires_at}"}}"#
+        );
+        sign_in
+    }
+
+    /// A sleeper that finishes at once, so a poll costs no wait.
+    fn instant_sleeper() -> reagent_ai::oauth::session::Sleeper {
+        use reagent_ai::oauth::session::Wait;
+        Arc::new(|_: Duration| -> Wait { Box::pin(std::future::ready(())) })
+    }
+
+    /// The pages a login announced, and the lines it printed.
+    type Announced = (Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>);
+
+    /// The announce of a test that records the pages and the lines.
+    fn recording(
+        opened: &Arc<Mutex<Vec<String>>>,
+        printed: &Arc<Mutex<Vec<String>>>,
+    ) -> Announce<'static> {
+        let open = {
+            let opened = Arc::clone(opened);
+            move |url: &str| opened.lock().expect("opened").push(url.to_string())
+        };
+        let line = {
+            let printed = Arc::clone(printed);
+            move |line: &str| printed.lock().expect("printed").push(line.to_string())
+        };
+        // The callbacks of one login outlive it: the test leaks them so the
+        // announce can name them.
+        let open: &'static (dyn Fn(&str) + Send + Sync) = Box::leak(Box::new(open));
+        let line: &'static (dyn Fn(&str) + Send + Sync) = Box::leak(Box::new(line));
+        Announce {
+            code: quiet().code,
+            open,
+            line,
+        }
+    }
+
+    /// Runs one Vibe login at `console` over `dir`, recording what it shows.
+    async fn run_vibe(dir: &Path, console: &str, browser: bool) -> (Result<(), String>, Announced) {
+        let opened: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let printed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let announce = recording(&opened, &printed);
+        let outcome = mistral_vibe(
+            MISTRAL_VIBE,
+            dir,
+            console,
+            browser,
+            &instant_sleeper(),
+            &announce,
+        )
+        .await;
+        (outcome, (opened, printed))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mistral_vibe_login_polls_and_saves_the_key() {
+        let (console, seen) = vibe_console(|base| {
+            vec![
+                (200, vibe_sign_in(base, "2099-01-01T00:00:00Z")),
+                (200, r#"{"status":"pending"}"#.to_string()),
+                (
+                    200,
+                    r#"{"status":"completed","exchange_token":"the-exchange"}"#.to_string(),
+                ),
+                (200, r#"{"api_key":"sk-vibe-test"}"#.to_string()),
+            ]
+        })
+        .await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (outcome, (opened, printed)) = run_vibe(dir.path(), &console, false).await;
+        outcome.expect("the login works");
+        assert_eq!(
+            saved(dir.path(), MISTRAL_VIBE).as_deref(),
+            Some("sk-vibe-test")
+        );
+        assert_eq!(mode(&auth::path(dir.path())), 0o600);
+        assert_eq!(
+            *opened.lock().expect("opened"),
+            vec![format!("{console}/sign-in/p-1")]
+        );
+        let printed = printed.lock().expect("printed");
+        assert_eq!(printed.first().map(String::as_str), Some(VIBE_PLAN));
+        assert_eq!(
+            printed.last().map(String::as_str),
+            Some("logged in to mistral-vibe")
+        );
+        let seen = seen.lock().expect("the recorder");
+        assert_eq!(seen.len(), 4, "{seen:?}");
+        assert!(
+            seen[0].starts_with("POST /api/vibe/sign-in "),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains(r#""code_challenge_method":"S256""#),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[1].starts_with("GET /api/vibe/sign-in/p-1/poll "),
+            "{}",
+            seen[1]
+        );
+        assert!(
+            seen[3].starts_with("POST /api/vibe/sign-in/p-1/exchange "),
+            "{}",
+            seen[3]
+        );
+        assert!(
+            seen[3].contains(r#""exchange_token":"the-exchange""#),
+            "{}",
+            seen[3]
+        );
+        assert!(seen[3].contains(r#""code_verifier":""#), "{}", seen[3]);
+        assert!(!seen[3].contains("sk-vibe-test"), "the key is not sent");
+    }
+
+    #[tokio::test]
+    async fn mistral_vibe_login_refuses_a_page_off_the_console() {
+        let (console, seen) = vibe_console(|base| {
+            vec![(
+                200,
+                format!(
+                    r#"{{"process_id":"p-1","sign_in_url":"https://evil.example/sign-in","poll_url":"{base}/api/vibe/sign-in/p-1/poll","expires_at":"2099-01-01T00:00:00Z"}}"#
+                ),
+            )]
+        })
+        .await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        // The browser is allowed: a refused page must not open one.
+        let (outcome, (opened, _printed)) = run_vibe(dir.path(), &console, true).await;
+        let error = outcome.unwrap_err();
+        assert!(error.contains("refused a sign-in page"), "{error}");
+        assert!(opened.lock().expect("opened").is_empty(), "nothing opens");
+        assert!(saved(dir.path(), MISTRAL_VIBE).is_none());
+        assert_eq!(seen.lock().expect("the recorder").len(), 1, "no poll");
+    }
+
+    #[tokio::test]
+    async fn mistral_vibe_login_ends_on_denied() {
+        let (console, seen) = vibe_console(|base| {
+            vec![
+                (200, vibe_sign_in(base, "2099-01-01T00:00:00Z")),
+                (200, r#"{"status":"denied"}"#.to_string()),
+            ]
+        })
+        .await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (outcome, _announced) = run_vibe(dir.path(), &console, false).await;
+        assert_eq!(outcome.unwrap_err(), oauth::mistral_vibe::DENIED);
+        assert!(saved(dir.path(), MISTRAL_VIBE).is_none());
+        assert_eq!(seen.lock().expect("the recorder").len(), 2, "no exchange");
+    }
+
+    #[tokio::test]
+    async fn mistral_vibe_login_ends_on_expired() {
+        let (console, seen) = vibe_console(|base| {
+            vec![
+                (200, vibe_sign_in(base, "2099-01-01T00:00:00Z")),
+                (200, r#"{"status":"expired"}"#.to_string()),
+            ]
+        })
+        .await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (outcome, _announced) = run_vibe(dir.path(), &console, false).await;
+        assert_eq!(outcome.unwrap_err(), oauth::mistral_vibe::EXPIRED);
+        assert!(saved(dir.path(), MISTRAL_VIBE).is_none());
+        assert_eq!(seen.lock().expect("the recorder").len(), 2, "no exchange");
+    }
+
+    #[tokio::test]
+    async fn mistral_vibe_login_reports_a_workspace_without_vibe() {
+        let (console, seen) = vibe_console(|base| {
+            vec![
+                (200, vibe_sign_in(base, "2099-01-01T00:00:00Z")),
+                (
+                    200,
+                    r#"{"status":"completed","exchange_token":"the-exchange"}"#.to_string(),
+                ),
+                (
+                    403,
+                    r#"{"error_code":9004,"message":"this workspace has no vibe"}"#.to_string(),
+                ),
+            ]
+        })
+        .await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (outcome, _announced) = run_vibe(dir.path(), &console, false).await;
+        assert_eq!(outcome.unwrap_err(), oauth::mistral_vibe::NO_PLAN);
+        assert!(saved(dir.path(), MISTRAL_VIBE).is_none());
+        assert_eq!(seen.lock().expect("the recorder").len(), 3);
+    }
 
     /// Connects once the flow has bound its port.
     async fn connect(port: u16) -> TcpStream {
@@ -978,13 +1355,18 @@ mod tests {
         );
         assert_eq!(two(&["chatgpt"]).ok(), Some(("chatgpt".into(), true, None)));
         assert_eq!(
+            two(&["mistral-vibe"]).ok(),
+            Some(("mistral-vibe".into(), true, None)),
+            "a provider the login names"
+        );
+        assert_eq!(
             two(&["openrouter", "--no-browser"]).ok(),
             Some(("openrouter".into(), false, None))
         );
         let error = two(&[]).unwrap_err();
         assert_eq!(
             error,
-            "login needs a provider; login supports: openrouter, chatgpt, radius"
+            "login needs a provider; login supports: openrouter, chatgpt, radius, mistral-vibe"
         );
         assert!(two(&["openrouter", "--nope"]).is_err());
         assert!(two(&["a", "b"]).is_err());

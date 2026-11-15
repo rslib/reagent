@@ -90,6 +90,8 @@ mod tests {
                 reasoning_field: ReasoningField::Effort,
                 reasoning_off: Some("none"),
                 session_header: None,
+                stream_usage: true,
+                replay_reasoning: true,
             }
         );
     }

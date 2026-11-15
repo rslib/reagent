@@ -5,12 +5,18 @@ The function runs once for each event the run sends.
 The payload of each event is one object, and it is passed to the function as its only argument.
 
 ```js
+import { appendFile } from "node:fs/promises";
+
 export default function (reagent) {
-  reagent.on("usage", (e) => {
-    if (e.cost !== null) console.log(`${e.model}: ${e.cost} USD`);
+  reagent.on("usage", async (e) => {
+    if (e.cost !== null) await appendFile("cost.log", `${e.model}: ${e.cost} USD\n`);
   });
 }
 ```
+
+`console` and `process` are not globals in a plugin: a plugin that names them gets `console is not defined` or `process is not defined`.
+Import what you need from the node modules, such as `import process from "node:process"`, and write output to a file or a panel (`reagent.ui.panel`).
+A listener that throws leaves one note, `plugin <name>: event <event> threw: <message>`, which the run prints on stderr or shows its clients; a listener that catches its own error leaves none.
 
 A listener runs on the plugin thread, so it costs the run nothing but the payload.
 A run whose plugins listen on no event builds no payload at all.
@@ -95,7 +101,7 @@ A reader that counts each reply once keeps the ids it has seen, since the event 
 
 `provider` is the id the user wrote in their config, and the user names it freely.
 `preset` is the built-in kind that id is made from, so a reader can map a reply to a model maker without reading the user's config.
-The preset ids are `anthropic`, `chatgpt`, `commandcode`, `deepseek`, `freeinference`, `openai`, `opencode-go`, `openrouter`, `radius` and `synthetic`.
+The preset ids are `anthropic`, `chatgpt`, `commandcode`, `deepseek`, `freeinference`, `mistral`, `mistral-vibe`, `openai`, `opencode-go`, `openrouter`, `radius` and `synthetic`.
 A provider the run switched to mid-run reports `preset` as null, because the run reads the preset of the provider it started on.
 
 `parentSession` is null until reagent has subagents.
@@ -134,6 +140,13 @@ open.
 
 The answers go back through `reagent.gateway.answer`, which only a gateway
 plugin has. See `docs/gateway.md`.
+
+## Requiring a plugin
+
+A plugin that guards a run, such as a `tool.call` gate, must not be skipped in silence when it fails to load.
+`reagent --require-plugin <name>` names a plugin the run must load, by the `name` in its `package.json`; the flag may be given more than once.
+When a named plugin did not load (it is missing, its manifest is wrong or its code throws at load), the run prints `reagent: required plugin <name> did not load; the run stops` and exits with code 1 before its first model request.
+`--require-plugin` with `--no-plugins` is an error.
 
 ## The `tool.call` hook
 

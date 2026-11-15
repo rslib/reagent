@@ -492,6 +492,29 @@ async fn install_list_names_installed_and_handmade_plugins() {
     );
 }
 
+/// A plugin folder linked into the plugins folder loads in a run, so the list
+/// names it too.
+#[tokio::test]
+async fn install_list_names_a_linked_plugin_folder() {
+    let home = Home::new().await;
+    home.handmade("real").await;
+    let outside = home.root.path().join("elsewhere");
+    tokio::fs::rename(home.plugins().join("real"), &outside)
+        .await
+        .expect("moves the plugin out");
+    tokio::fs::symlink(&outside, home.plugins().join("linked"))
+        .await
+        .expect("links the plugin in");
+    let output = home.run(&["plugin", "list"]).await;
+    assert!(output.status.success(), "{}", text(&output.stderr));
+    let stdout = text(&output.stdout);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec!["linked  0.2.0  local"],
+        "{stdout}"
+    );
+}
+
 #[tokio::test]
 async fn install_remove_takes_the_installed_plugin_and_refuses_a_handmade_one() {
     let home = Home::new().await;

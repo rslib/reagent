@@ -59,6 +59,8 @@ export const statSync = (path, ...rest) =>
   raw.statSync(reading(path), ...rest);
 export const symlinkSync = (target, path, ...rest) =>
   raw.symlinkSync(writing(target), writingEntry(path), ...rest);
+// The guard's answer to a read is the resolved absolute path: `realpath`.
+export const realpathSync = (path) => reading(path);
 export const writeFileSync = (path, data, ...rest) =>
   raw.writeFileSync(writing(path), data, ...rest);
 export const constants = raw.constants;
@@ -79,5 +81,6 @@ export default {
   statSync,
   symlinkSync,
   writeFileSync,
+  realpathSync,
   constants,
 };

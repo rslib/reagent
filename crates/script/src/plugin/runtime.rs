@@ -148,6 +148,8 @@ pub(crate) struct LoadReport {
     pub commands: Vec<CommandInfo>,
     /// How many plugins loaded.
     pub loaded: usize,
+    /// The manifest names of the plugins that loaded, in load order.
+    pub names: Vec<String>,
     /// Whether any plugin installed a `tool.call` layer.
     pub call: bool,
     /// Whether any plugin installed a `tool.result` layer.
@@ -586,6 +588,7 @@ impl Fleet {
             }
             match loaded {
                 Ok(Ok(loaded)) => {
+                    report.names.push(name.clone());
                     names.push((name, dir));
                     self.instances[at].shares = loaded.shares;
                     for tool in &loaded.owned.tools {

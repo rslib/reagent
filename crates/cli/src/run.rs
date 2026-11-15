@@ -305,6 +305,13 @@ fn map_level(asked: &str, reasoning: Option<&Reasoning>) -> Mapped {
     let Some(reasoning) = reasoning.filter(|reasoning| !reasoning.is_empty()) else {
         return unchanged();
     };
+    if reasoning.never {
+        return Mapped {
+            sent: None,
+            note: (!asked.is_off())
+                .then(|| format!("reasoning {text} -> none (the model does not think)")),
+        };
+    }
     if reasoning.takes_unknown(text) {
         return unchanged();
     }
@@ -667,6 +674,13 @@ pub async fn run(mut args: Args) -> ExitCode {
     // already owned. A run with no plugins folder loads nothing and adds no
     // hook: its loop stays the one it was.
     let mut plugins: Option<Arc<Plugins>> = None;
+    if args.plugins_dir.is_none()
+        && let Some(missing) = args.required_plugins.first()
+    {
+        eprintln!("reagent: required plugin {missing} did not load; the run stops");
+        stop_servers(servers).await;
+        return ExitCode::from(1);
+    }
     if let Some(dir) = args.plugins_dir.as_deref() {
         // The state folder the sessions use, whose `plugins` folder holds each
         // plugin's cookies, beside their `sessions` folder.
@@ -681,6 +695,18 @@ pub async fn run(mut args: Args) -> ExitCode {
         let (loaded, notes) = Plugins::load(dir, &state, sandbox).await;
         for note in notes {
             eprintln!("reagent: {note}");
+        }
+        // A required plugin, such as a guard, that did not load stops the run
+        // here, before the first request: a guard must fail closed.
+        let names = loaded.as_ref().map_or(&[][..], |loaded| loaded.names());
+        if let Some(missing) = args
+            .required_plugins
+            .iter()
+            .find(|required| !names.contains(required))
+        {
+            eprintln!("reagent: required plugin {missing} did not load; the run stops");
+            stop_servers(servers).await;
+            return ExitCode::from(1);
         }
         if let Some(loaded) = loaded {
             for tool in loaded.tools() {
@@ -3901,6 +3927,22 @@ mod tests {
             default,
             ..reasoning
         }
+    }
+
+    /// A model whose list says it does not think gets no reasoning field: Mistral
+    /// answers 400 to `reasoning_effort` on such a model, even with `none`.
+    #[test]
+    fn reasoning_map_a_model_that_never_thinks_gets_nothing() {
+        let never = Reasoning::never();
+        for asked in ["high", "off", "4096"] {
+            let mapped = map_reasoning(asked, Some(&never));
+            assert_eq!(mapped.sent, None, "{asked}");
+        }
+        assert_eq!(
+            map_reasoning("high", Some(&never)).note.as_deref(),
+            Some("reasoning high -> none (the model does not think)")
+        );
+        assert_eq!(map_reasoning("off", Some(&never)).note, None);
     }
 
     #[test]

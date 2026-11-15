@@ -4295,3 +4295,42 @@ import fs from "fs";"#,
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn realpath_resolves_a_link_behind_the_read_check() {
+    let root = temp_root();
+    awaited_tool(
+        root.path(),
+        "resolver",
+        r#"{"fs": "read"}"#,
+        "resolver",
+        r#"import { realpath } from "fs/promises";
+import { realpathSync } from "fs";"#,
+        r#"const a = await realpath("link.txt");
+  const b = realpathSync("link.txt");
+  return a === b && a.endsWith("/real.txt") && !a.includes("link") ? "same" : `${a} ${b}`;"#,
+    )
+    .await;
+    awaited_tool(
+        root.path(),
+        "blind",
+        "{}",
+        "blind",
+        r#"import { realpath } from "fs/promises";"#,
+        r#"try { await realpath("real.txt"); return "resolved"; } catch (error) { return error.message; }"#,
+    )
+    .await;
+    let session = temp_root();
+    file_in(session.path(), "real.txt", "x").await;
+    std::os::unix::fs::symlink(session.path().join("real.txt"), session.path().join("link.txt"))
+        .expect("the link");
+    let plugins = loaded(root.path(), session.path()).await;
+    let out = run(&plugins, "resolver").await;
+    assert!(!out.is_error, "{:?}", out.content);
+    assert_eq!(out.content.to_string(), "same");
+    let text = run(&plugins, "blind").await.content.to_string();
+    assert!(
+        text.contains("plugin blind has no fs read permission for"),
+        "{text}"
+    );
+}
