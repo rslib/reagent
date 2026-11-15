@@ -81,10 +81,112 @@ impl fmt::Debug for AnswerAsk {
     }
 }
 
+/// One request a plugin's `reagent.sessions` hands to the run it belongs to.
+///
+/// The plugin thread hands this to the run's async side, which starts the
+/// worker of a session and joins it as a client, so the plugin thread never
+/// waits on a worker.
+pub struct SessionAsk {
+    /// The plugin that asked, as its manifest names it.
+    pub plugin: String,
+    /// What it asks for.
+    pub op: SessionOp,
+    /// Carries the outcome back to the plugin.
+    pub reply: tokio::sync::oneshot::Sender<SessionReply>,
+}
+
+impl fmt::Debug for SessionAsk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionAsk")
+            .field("plugin", &self.plugin)
+            .field("op", &self.op)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a plugin's `reagent.sessions` may ask of its run.
+#[derive(Debug)]
+pub enum SessionOp {
+    /// Start a session on a task.
+    Start {
+        /// The task, which is the first message of the session.
+        task: String,
+        /// The folder it works in, or `None` for the folder of the run.
+        cwd: Option<PathBuf>,
+        /// The model it starts on, as `--model` names it.
+        model: Option<String>,
+        /// The config profile it reads, as `--profile` names it.
+        profile: Option<String>,
+        /// The provider it starts on, as `--provider` names it, which is the
+        /// provider of the run when it is `None`.
+        provider: Option<String>,
+    },
+    /// Queue `text` as the next message of the session.
+    Send {
+        /// The session.
+        id: String,
+        /// The text to queue.
+        text: String,
+    },
+    /// Steer the run of the session with `text`.
+    Steer {
+        /// The session.
+        id: String,
+        /// The text the running turn reads.
+        text: String,
+    },
+    /// Stop the turn the session runs.
+    Cancel {
+        /// The session.
+        id: String,
+    },
+    /// Answer when the run of the session ends.
+    Result {
+        /// The session.
+        id: String,
+    },
+    /// Forward the frames of the session to the plugin's listeners, or stop.
+    Watch {
+        /// The session.
+        id: String,
+        /// Whether to forward them.
+        forward: bool,
+    },
+    /// The sessions of the plugin that are still open.
+    List,
+}
+
+/// What the run answers one `reagent.sessions` call with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionReply {
+    /// The id of the session `start` made.
+    Started(String),
+    /// Nothing to hand back.
+    Done,
+    /// The sessions of the plugin that are still open, in start order.
+    List(Vec<String>),
+    /// A run of the session ended: why, and the assistant text of its last
+    /// turn.
+    Ended {
+        /// The reason the worker named, such as `end_turn`.
+        reason: String,
+        /// The text the assistant wrote in that run.
+        text: String,
+    },
+    /// The call did not happen, with the reason.
+    Failed(String),
+}
+
 /// The plugins one load takes from the root.
 pub(crate) enum Role {
-    /// A normal run: every plugin that is not a gateway plugin.
-    Run,
+    /// A normal run: every plugin that is not a gateway plugin, with the
+    /// channel a plugin's `reagent.sessions` hands work to, when the run has a
+    /// host for the sessions it starts.
+    Run(Option<tokio::sync::mpsc::UnboundedSender<SessionAsk>>),
+    /// A normal run a session started: every plugin that is not a gateway
+    /// plugin, and no session of its own, because a session that starts
+    /// sessions has no depth limit.
+    Sealed,
     /// `reagent gateway`: the gateway plugins, with the channel their answers
     /// go to.
     Gateway(tokio::sync::mpsc::UnboundedSender<AnswerAsk>),
@@ -95,16 +197,31 @@ impl Role {
     fn takes(&self, role: manifest::Role) -> bool {
         matches!(
             (self, role),
-            (Role::Run, manifest::Role::Normal) | (Role::Gateway(_), manifest::Role::Gateway)
+            (Role::Run(_) | Role::Sealed, manifest::Role::Normal)
+                | (Role::Gateway(_), manifest::Role::Gateway)
         )
     }
 
     /// The channel a gateway plugin's answers go to, if this is a gateway.
     fn answers(&self) -> Option<tokio::sync::mpsc::UnboundedSender<AnswerAsk>> {
         match self {
-            Role::Run => None,
+            Role::Run(_) | Role::Sealed => None,
             Role::Gateway(answers) => Some(answers.clone()),
         }
+    }
+
+    /// The channel a plugin's sessions ask on, if this run has a host for them.
+    fn sessions(&self) -> Option<tokio::sync::mpsc::UnboundedSender<SessionAsk>> {
+        match self {
+            Role::Run(sessions) => sessions.clone(),
+            Role::Sealed | Role::Gateway(_) => None,
+        }
+    }
+
+    /// Whether this run may start no session at all, which is a run a session
+    /// started: its plugins load, and every `reagent.sessions` call rejects.
+    fn sealed(&self) -> bool {
+        matches!(self, Role::Sealed)
     }
 }
 
@@ -359,6 +476,11 @@ pub struct Plugins {
     result: bool,
     /// Whether any plugin installed a `turn.end` layer.
     turn: bool,
+    /// Whether any plugin asked for the session permission, which is what a run
+    /// serves sessions for.
+    sessions: bool,
+    /// The names of the plugins that may start sessions, in load order.
+    speakers: Vec<String>,
     /// A bit per event some listener waits on.
     events: u32,
     /// How many follow-ups in a row the turn hook returned.
@@ -387,7 +509,38 @@ impl Plugins {
         // The folder the run works in, which is the one a plugin's relative
         // path resolves against.
         let session = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self::load_with(root, &session, state, sandbox, Role::Run).await
+        Self::load_with(root, &session, state, sandbox, Role::Run(None)).await
+    }
+
+    /// Loads every plugin under `root`, with `sessions` the channel a plugin
+    /// whose manifest grants `sessions` starts and drives sessions on.
+    ///
+    /// `state` and `sandbox` are as [`Plugins::load`] names them. The answer is
+    /// `None` when no plugin loaded.
+    pub async fn load_with_sessions(
+        root: &Path,
+        state: &Path,
+        sandbox: Option<PathBuf>,
+        sessions: tokio::sync::mpsc::UnboundedSender<SessionAsk>,
+    ) -> (Option<Arc<Self>>, Vec<String>) {
+        let session = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::load_with(root, &session, state, sandbox, Role::Run(Some(sessions))).await
+    }
+
+    /// Loads every plugin under `root` for a run that may start no session,
+    /// which is the run of a worker a session started: the plugins load as they
+    /// do in the run that started it, guard hooks and all, and every
+    /// `reagent.sessions` call rejects.
+    ///
+    /// `state` and `sandbox` are as [`Plugins::load`] names them. The answer is
+    /// `None` when no plugin loaded.
+    pub async fn load_sealed(
+        root: &Path,
+        state: &Path,
+        sandbox: Option<PathBuf>,
+    ) -> (Option<Arc<Self>>, Vec<String>) {
+        let session = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::load_with(root, &session, state, sandbox, Role::Sealed).await
     }
 
     /// Loads only the gateway plugins under `root`, with `answers` the channel
@@ -418,7 +571,7 @@ impl Plugins {
         session: &Path,
         state: &Path,
     ) -> (Option<Arc<Self>>, Vec<String>) {
-        Self::load_with(root, session, state, None, Role::Run).await
+        Self::load_with(root, session, state, None, Role::Run(None)).await
     }
 
     /// Loads every plugin under `root`, with `session` the folder a relative
@@ -492,6 +645,8 @@ impl Plugins {
             call: report.call,
             result: report.result,
             turn: report.turn,
+            sessions: report.sessions,
+            speakers: report.speakers,
             events: report.events,
             follow_ups: AtomicU32::new(0),
             lost_events: AtomicU64::new(0),
@@ -593,6 +748,34 @@ impl Plugins {
         let job = Job::Event {
             name: name.to_string(),
             payload,
+        };
+        if self.jobs.try_send(job).is_err() {
+            self.lost_events.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether any plugin may start sessions, which is what makes a run serve
+    /// the sessions its plugins start.
+    pub fn sessions(&self) -> bool {
+        self.sessions
+    }
+
+    /// The names of the plugins that may start sessions, in load order, which
+    /// are the only ones a run starts a session for.
+    pub fn speakers(&self) -> Vec<String> {
+        self.speakers.clone()
+    }
+
+    /// Hands one frame of the session `id` to the plugin `plugin` that started
+    /// it: only its own listeners see it, through its own `on`.
+    ///
+    /// A frame the full queue cannot take is dropped and counted into one note,
+    /// like an event.
+    pub fn session_event(&self, plugin: &str, id: &str, event: JsonValue) {
+        let job = Job::Session {
+            plugin: plugin.to_owned(),
+            id: id.to_owned(),
+            event,
         };
         if self.jobs.try_send(job).is_err() {
             self.lost_events.fetch_add(1, Ordering::Relaxed);

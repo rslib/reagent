@@ -1,5 +1,6 @@
 //! The reagent binary: a headless coding agent.
 
+mod acp;
 mod answer;
 mod args;
 mod attach;
@@ -18,6 +19,8 @@ mod rpc;
 mod run;
 mod sandbox;
 mod session;
+#[cfg(feature = "tui")]
+mod sessions;
 mod skills;
 mod snapshot;
 #[cfg(feature = "tui")]
@@ -59,6 +62,7 @@ fn main() -> std::process::ExitCode {
         && matches!(
             command,
             "answer"
+                | "acp"
                 | "gateway"
                 | "login"
                 | "logout"
@@ -72,6 +76,7 @@ fn main() -> std::process::ExitCode {
         let runtime = runtime();
         let code = match command {
             "answer" => runtime.block_on(answer::run(argv[1..].to_vec())),
+            "acp" => acp::run(argv[1..].to_vec(), &runtime),
             "gateway" => gateway(argv[1..].to_vec(), &runtime),
             "mcp" => runtime.block_on(mcp::run(argv[1..].to_vec())),
             "permissions" => runtime.block_on(permissions::run(argv[1..].to_vec())),

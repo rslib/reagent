@@ -681,17 +681,46 @@ pub async fn run(mut args: Args) -> ExitCode {
         stop_servers(servers).await;
         return ExitCode::from(1);
     }
+    // The sessions the plugins ask this run to start, when it starts any.
+    #[cfg(feature = "tui")]
+    let mut sessions = crate::sessions::Sessions::none();
     if let Some(dir) = args.plugins_dir.as_deref() {
-        // The state folder the sessions use, whose `plugins` folder holds each
-        // plugin's cookies, beside their `sessions` folder.
-        let state = crate::session::state_home()
-            .map_or_else(std::env::temp_dir, |home| home.join("reagent"));
+        // The state folder of this run, which holds the discovery entries of
+        // its workers, and the one the plugins read, whose `plugins` folder
+        // holds each plugin's cookies beside their `sessions` folder.
+        let home = crate::session::state_home();
+        let state = plugin_state(home.clone());
+        // The folder the workers of this run's sessions write their discovery
+        // entries into, which is the one this run's own worker writes.
+        #[cfg(feature = "tui")]
+        let served = home.unwrap_or_else(std::env::temp_dir);
         // The helper every child process of a plugin starts through, and none
         // when this run has no sandbox or this program cannot name itself.
         let sandbox = match args.sandbox {
             SandboxMode::Off => None,
             SandboxMode::Auto | SandboxMode::On => std::env::current_exe().ok(),
         };
+        // A start is settled by a task of this run's runtime, so the run serves
+        // the sessions its plugins start from here: the plugin thread asks and
+        // gets a Promise, and waits for nothing. The channel costs nothing, and
+        // a plugin that asks for no session gets no host task.
+        //
+        // A worker a session started loads these plugins again, guard hooks and
+        // all, and starts no session of its own: it is one session deep, and a
+        // session of a session would end only with the machine.
+        #[cfg(feature = "tui")]
+        let mut asks = None;
+        #[cfg(feature = "tui")]
+        let sealed = crate::sessions::sealed();
+        #[cfg(feature = "tui")]
+        let (loaded, notes) = if sealed {
+            Plugins::load_sealed(dir, &state, sandbox).await
+        } else {
+            let (talk, listening) = crate::sessions::channel();
+            asks = Some(listening);
+            Plugins::load_with_sessions(dir, &state, sandbox, talk).await
+        };
+        #[cfg(not(feature = "tui"))]
         let (loaded, notes) = Plugins::load(dir, &state, sandbox).await;
         for note in notes {
             eprintln!("reagent: {note}");
@@ -730,6 +759,23 @@ pub async fn run(mut args: Args) -> ExitCode {
             registry = registry.with_hook(loaded.clone());
             // A script's calls meet the same gate as the model's own.
             let _ = script_hook.set(loaded.clone());
+            // A session's worker starts under this run's flags without its own
+            // task: its provider, its profile and its sandbox. A run whose
+            // plugins ask for no session starts no host and no worker.
+            #[cfg(feature = "tui")]
+            if let (false, Ok(program), Some(asks)) = (sealed, std::env::current_exe(), asks.take())
+            {
+                let worker = crate::sessions::Worker {
+                    program,
+                    cwd: cwd.clone(),
+                    flags: crate::sessions::inherited(),
+                };
+                sessions =
+                    crate::sessions::Sessions::serve(&served, worker, asks, loaded.speakers());
+                if sessions.serving() {
+                    sessions.attach(Arc::clone(&loaded));
+                }
+            }
             plugins = Some(loaded);
         }
     }
@@ -1197,6 +1243,11 @@ pub async fn run(mut args: Args) -> ExitCode {
             Err(_) => eprintln!("reagent: warning: the session sweep failed"),
         }
     }
+    // The sessions the plugins started: every client leaves its session, so a
+    // worker that still runs a turn keeps running it and then stops, the way a
+    // worker with no client and no run open stops.
+    #[cfg(feature = "tui")]
+    sessions.close().await;
     // The notes the plugins raised that no client of the session saw, one line
     // each, after its own output.
     if let Some(plugins) = &plugins {
@@ -2677,6 +2728,16 @@ fn direct_tools(
     }
 }
 
+/// The state folder of the run's plugins, whose `plugins` folder holds each
+/// plugin's cookies beside their sessions.
+///
+/// A run with no state home keeps it in the temp folder, where a run kept it
+/// before it started any session: the folder of the discovery entries of this
+/// run's workers is a different one.
+fn plugin_state(home: Option<std::path::PathBuf>) -> std::path::PathBuf {
+    home.map_or_else(std::env::temp_dir, |home| home.join("reagent"))
+}
+
 /// Whether a run offers the question tool: its list names `ask` and a person
 /// can answer it, which only a worker or a run that takes its requests on
 /// stdin or a socket can.
@@ -2917,6 +2978,18 @@ mod tests {
         let cwd = std::path::Path::new("/");
         assert!(probe_for(&["budget".into()], cwd).is_none());
         assert!(probe_for(&[], cwd).is_none());
+    }
+
+    /// A run with no state home keeps the state of its plugins in the temp folder
+    /// itself, and not in a folder named after this one, which is the folder of the
+    /// discovery entries of its workers.
+    #[test]
+    fn plugin_session_plugin_state_keeps_the_temp_folder_without_a_state_home() {
+        assert_eq!(plugin_state(None), std::env::temp_dir());
+        assert_eq!(
+            plugin_state(Some(std::path::PathBuf::from("/home/u/.local/state"))),
+            std::path::PathBuf::from("/home/u/.local/state/reagent")
+        );
     }
 
     #[tokio::test]

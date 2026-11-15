@@ -187,6 +187,7 @@ A plugin may install a layer only when its `package.json` lists the hook:
 ```
 
 The list is a list of hook names, and a name that is not a hook is an error at load time that names it.
+A plugin that starts sessions of its own wants the `sessions` permission, which [plugin-sessions.md](plugin-sessions.md) describes.
 Without it, `reagent.hook("tool.call", fn)` throws `plugin <name> has no hooks permission for tool.call`.
 `tool.result` and `turn.end` need no permission.
 

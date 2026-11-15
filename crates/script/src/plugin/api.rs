@@ -3,6 +3,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,7 +13,7 @@ use rquickjs::{Array, Ctx, Exception, Function, Object, Persistent, Value};
 use serde_json::{Map, Value as JsonValue};
 
 use super::runtime;
-use super::{AnswerAsk, BY_BYTES, Live, Notes};
+use super::{AnswerAsk, BY_BYTES, Live, Notes, SessionAsk, SessionOp, SessionReply};
 
 /// The events a plugin may listen on.
 ///
@@ -167,6 +168,20 @@ pub(crate) struct Host {
     pub gateway: Option<tokio::sync::mpsc::UnboundedSender<AnswerAsk>>,
     /// The hooks the plugin's manifest lets it install.
     pub hooks: Vec<String>,
+    /// Whether the plugin's manifest grants `sessions`, which is what puts
+    /// `reagent.sessions` on its object.
+    pub sessions: bool,
+    /// The run's channel a `reagent.sessions` call goes to, and `None` for a
+    /// run with no host for the sessions it starts.
+    pub talk: Option<tokio::sync::mpsc::UnboundedSender<SessionAsk>>,
+    /// Whether this run may start no session of its own, which is a run a
+    /// session started: every call rejects, and says why.
+    pub sealed: bool,
+    /// The index of this plugin, which a note about one of its listeners names.
+    pub index: usize,
+    /// The listeners of the sessions this plugin started, over the list the
+    /// instance fires them from.
+    pub watched: Rc<RefCell<Watched>>,
 }
 
 /// Builds the `reagent` object for the plugin `name` at `version`, whose
@@ -428,6 +443,9 @@ pub(crate) fn reagent<'js>(
     if let Some(answers) = &host.gateway {
         reagent.set("gateway", gateway(ctx, name, answers)?)?;
     }
+    if host.sessions {
+        reagent.set("sessions", sessions(ctx, name, host)?)?;
+    }
     Ok(reagent.into_value())
 }
 
@@ -493,6 +511,377 @@ fn gateway<'js>(
     let object = Object::new(ctx.clone())?;
     object.set("answer", answer)?;
     Ok(object)
+}
+
+/// What a `reagent.sessions` call answers when the run has no host for the
+/// sessions a plugin starts.
+///
+/// A build without the terminal UI starts no worker, so such a run has no host
+/// and every call reads this.
+const NO_HOST: &str = "this build has no sessions";
+
+/// What a `reagent.sessions` call answers in a run a session started.
+///
+/// Such a run loads the same plugins as the run that started it, guard hooks
+/// included, and starts none of its own: a session that started sessions would
+/// have no depth limit.
+const SEALED: &str = "a session cannot start sessions";
+
+/// What a `reagent.sessions` call of this plugin's run answers when the run
+/// starts no session.
+fn refusal(host: &Host) -> &'static str {
+    if host.sealed { SEALED } else { NO_HOST }
+}
+
+/// One listener of one of the sessions a plugin started.
+pub(crate) struct SessionListener {
+    /// The session it waits on.
+    pub id: String,
+    /// The number `on` answered, which removes it.
+    pub at: u64,
+    /// The plugin that added it, which a note names.
+    pub plugin: String,
+    /// The index of that plugin, which is what a stop of its children matches.
+    pub index: usize,
+    /// The function it runs.
+    pub func: Persistent<Function<'static>>,
+}
+
+/// The listeners of the sessions one plugin started, in the order `on` added
+/// them.
+#[derive(Default)]
+pub(crate) struct Watched {
+    /// The listeners, oldest first.
+    pub listeners: Vec<SessionListener>,
+    /// The number the next listener takes.
+    pub next: u64,
+}
+
+/// The `reagent.sessions` object a plugin whose manifest grants `sessions`
+/// gets, and no other plugin.
+///
+/// Every call hands a [`SessionAsk`] to the run's async side and answers a
+/// Promise of its outcome, which settles when that side has started, joined or
+/// read the worker of the session. The plugin thread never waits on a worker.
+fn sessions<'js>(ctx: &Ctx<'js>, plugin: &str, host: &Host) -> rquickjs::Result<Object<'js>> {
+    let plugin = Rc::new(plugin.to_string());
+    let talk = host.talk.clone();
+    let sealed = refusal(host);
+    let object = Object::new(ctx.clone())?;
+    let start = Function::new(ctx.clone(), {
+        let plugin = Rc::clone(&plugin);
+        let talk = talk.clone();
+        move |ctx: Ctx<'js>, spec: Opt<Object<'js>>| -> rquickjs::Result<Value<'js>> {
+            let call = Call::new(&ctx)?;
+            let Some(spec) = spec.0 else {
+                return Ok(call.refuse(&ctx, "start needs { task }"));
+            };
+            let Some(task) = spec.get::<_, Option<String>>("task").ok().flatten() else {
+                return Ok(call.refuse(&ctx, "start needs a string task"));
+            };
+            if task.trim().is_empty() {
+                return Ok(call.refuse(&ctx, "start needs a task that is not empty"));
+            }
+            // A task of `-` is the word that reads a message from stdin, and a
+            // worker's stdin is closed: it would wait for ever.
+            if task.trim() == "-" {
+                return Ok(call.refuse(
+                    &ctx,
+                    "start needs a task, and `-` would read a message from a stdin that is closed",
+                ));
+            }
+            let cwd = spec
+                .get::<_, Option<String>>("cwd")
+                .ok()
+                .flatten()
+                .map(PathBuf::from);
+            let model = spec.get::<_, Option<String>>("model").ok().flatten();
+            let profile = spec.get::<_, Option<String>>("profile").ok().flatten();
+            let provider = spec.get::<_, Option<String>>("provider").ok().flatten();
+            Ok(ask(
+                &ctx,
+                talk.as_ref(),
+                sealed,
+                &plugin,
+                SessionOp::Start {
+                    task,
+                    cwd,
+                    model,
+                    profile,
+                    provider,
+                },
+                call,
+            ))
+        }
+    })?;
+    object.set("start", start)?;
+    let send = Function::new(ctx.clone(), {
+        let plugin = Rc::clone(&plugin);
+        let talk = talk.clone();
+        move |ctx: Ctx<'js>, id: Value<'js>, text: Value<'js>| -> rquickjs::Result<Value<'js>> {
+            let call = Call::new(&ctx)?;
+            let (Some(id), Some(text)) = (text_of(&id), text_of(&text)) else {
+                return Ok(call.refuse(&ctx, "send needs a session id and a text"));
+            };
+            Ok(ask(
+                &ctx,
+                talk.as_ref(),
+                sealed,
+                &plugin,
+                SessionOp::Send { id, text },
+                call,
+            ))
+        }
+    })?;
+    object.set("send", send)?;
+    let steer = Function::new(ctx.clone(), {
+        let plugin = Rc::clone(&plugin);
+        let talk = talk.clone();
+        move |ctx: Ctx<'js>, id: Value<'js>, text: Value<'js>| -> rquickjs::Result<Value<'js>> {
+            let call = Call::new(&ctx)?;
+            let (Some(id), Some(text)) = (text_of(&id), text_of(&text)) else {
+                return Ok(call.refuse(&ctx, "steer needs a session id and a text"));
+            };
+            Ok(ask(
+                &ctx,
+                talk.as_ref(),
+                sealed,
+                &plugin,
+                SessionOp::Steer { id, text },
+                call,
+            ))
+        }
+    })?;
+    object.set("steer", steer)?;
+    let cancel = Function::new(ctx.clone(), {
+        let plugin = Rc::clone(&plugin);
+        let talk = talk.clone();
+        move |ctx: Ctx<'js>, id: Value<'js>| -> rquickjs::Result<Value<'js>> {
+            let call = Call::new(&ctx)?;
+            let Some(id) = text_of(&id) else {
+                return Ok(call.refuse(&ctx, "cancel needs a session id"));
+            };
+            Ok(ask(
+                &ctx,
+                talk.as_ref(),
+                sealed,
+                &plugin,
+                SessionOp::Cancel { id },
+                call,
+            ))
+        }
+    })?;
+    object.set("cancel", cancel)?;
+    let result = Function::new(ctx.clone(), {
+        let plugin = Rc::clone(&plugin);
+        let talk = talk.clone();
+        move |ctx: Ctx<'js>, id: Value<'js>| -> rquickjs::Result<Value<'js>> {
+            let call = Call::new(&ctx)?;
+            let Some(id) = text_of(&id) else {
+                return Ok(call.refuse(&ctx, "result needs a session id"));
+            };
+            Ok(ask(
+                &ctx,
+                talk.as_ref(),
+                sealed,
+                &plugin,
+                SessionOp::Result { id },
+                call,
+            ))
+        }
+    })?;
+    object.set("result", result)?;
+    let list = Function::new(ctx.clone(), {
+        let plugin = Rc::clone(&plugin);
+        let talk = talk.clone();
+        move |ctx: Ctx<'js>| -> rquickjs::Result<Value<'js>> {
+            let call = Call::new(&ctx)?;
+            Ok(ask(
+                &ctx,
+                talk.as_ref(),
+                sealed,
+                &plugin,
+                SessionOp::List,
+                call,
+            ))
+        }
+    })?;
+    object.set("list", list)?;
+    let on = Function::new(ctx.clone(), {
+        let plugin = Rc::clone(&plugin);
+        let watched = Rc::clone(&host.watched);
+        let index = host.index;
+        move |ctx: Ctx<'js>, id: Value<'js>, func: Function<'js>| -> rquickjs::Result<Value<'js>> {
+            let Some(id) = text_of(&id) else {
+                return Err(fail(&ctx, "on needs a session id and a function"));
+            };
+            let at = {
+                let mut list = watched.borrow_mut();
+                let first = !list.listeners.iter().any(|entry| entry.id == id);
+                let at = list.next;
+                list.next += 1;
+                list.listeners.push(SessionListener {
+                    id: id.clone(),
+                    at,
+                    plugin: plugin.to_string(),
+                    index,
+                    func: Persistent::save(&ctx, func),
+                });
+                // The run forwards a session's frames only while the plugin has
+                // a listener on it, so a session nobody watches costs nothing.
+                if first {
+                    forward(talk.as_ref(), &plugin, &id, true);
+                }
+                at
+            };
+            let remove = Function::new(ctx.clone(), {
+                let talk = talk.clone();
+                let plugin = Rc::clone(&plugin);
+                let watched = Rc::clone(&watched);
+                move || {
+                    let mut list = watched.borrow_mut();
+                    let Some(where_at) = list.listeners.iter().position(|entry| entry.at == at)
+                    else {
+                        return;
+                    };
+                    list.listeners.remove(where_at);
+                    // The last listener is gone: the run stops forwarding.
+                    if !list.listeners.iter().any(|entry| entry.id == id) {
+                        forward(talk.as_ref(), &plugin, &id, false);
+                    }
+                }
+            })?;
+            Ok(remove.into_value())
+        }
+    })?;
+    object.set("on", on)?;
+    Ok(object)
+}
+
+/// Tells the run that the plugin wants the frames of session `id`, or no longer
+/// wants them.
+fn forward(
+    talk: Option<&tokio::sync::mpsc::UnboundedSender<SessionAsk>>,
+    plugin: &str,
+    id: &str,
+    want: bool,
+) {
+    let Some(talk) = talk else {
+        return;
+    };
+    let (reply, _) = tokio::sync::oneshot::channel();
+    let _ = talk.send(SessionAsk {
+        plugin: plugin.to_string(),
+        op: SessionOp::Watch {
+            id: id.to_string(),
+            forward: want,
+        },
+        reply,
+    });
+}
+
+/// One `reagent.sessions` call in flight: the Promise the plugin awaits, and
+/// the two ways it settles.
+struct Call<'js> {
+    /// What the plugin awaits.
+    promise: rquickjs::Promise<'js>,
+    /// Settles it with the answer.
+    resolve: Function<'js>,
+    /// Settles it with the reason the call did not happen.
+    reject: Function<'js>,
+}
+
+impl<'js> Call<'js> {
+    /// The unresolved Promise of one call.
+    fn new(ctx: &Ctx<'js>) -> rquickjs::Result<Call<'js>> {
+        let (promise, resolve, reject) = ctx.promise()?;
+        Ok(Call {
+            promise,
+            resolve,
+            reject,
+        })
+    }
+
+    /// The Promise the plugin gets back.
+    fn value(&self) -> Value<'js> {
+        self.promise.clone().into_value()
+    }
+
+    /// Rejects the call with `reason`, and answers its Promise.
+    fn refuse(&self, ctx: &Ctx<'js>, reason: &str) -> Value<'js> {
+        if let Ok(error) = Exception::from_message(ctx.clone(), reason) {
+            let _ = self.reject.call::<_, ()>((error,));
+        }
+        self.value()
+    }
+
+    /// Settles the call with what the run answered.
+    fn settle(&self, ctx: &Ctx<'js>, answer: SessionReply) {
+        let value = match answer {
+            SessionReply::Started(id) => {
+                let _ = self.resolve.call::<_, ()>((id,));
+                return;
+            }
+            SessionReply::Done => {
+                let _ = self.resolve.call::<_, ()>(());
+                return;
+            }
+            SessionReply::List(ids) => from_json(ctx, &JsonValue::from(ids)),
+            SessionReply::Ended { reason, text } => from_json(
+                ctx,
+                &JsonValue::Object(Map::from_iter([
+                    ("reason".to_string(), JsonValue::from(reason)),
+                    ("text".to_string(), JsonValue::from(text)),
+                ])),
+            ),
+            SessionReply::Failed(reason) => {
+                self.refuse(ctx, reason.as_str());
+                return;
+            }
+        };
+        if let Ok(value) = value {
+            let _ = self.resolve.call::<_, ()>((value,));
+        }
+    }
+}
+
+/// Hands `op` to the run's session host and answers the Promise it settles.
+///
+/// The plugin thread never waits: the future that settles the Promise runs on
+/// this plugin's own runtime, like a timer.
+fn ask<'js>(
+    ctx: &Ctx<'js>,
+    talk: Option<&tokio::sync::mpsc::UnboundedSender<SessionAsk>>,
+    refusal: &'static str,
+    plugin: &str,
+    op: SessionOp,
+    call: Call<'js>,
+) -> Value<'js> {
+    let Some(talk) = talk else {
+        return call.refuse(ctx, refusal);
+    };
+    let (reply, done) = tokio::sync::oneshot::channel();
+    let sent = talk.send(SessionAsk {
+        plugin: plugin.to_string(),
+        op,
+        reply,
+    });
+    if sent.is_err() {
+        return call.refuse(ctx, refusal);
+    }
+    let value = call.value();
+    // The plugin thread never waits: the Promise settles on this plugin's own
+    // runtime, the way a timer's callback does.
+    let inside = ctx.clone();
+    ctx.spawn(async move {
+        match done.await {
+            Ok(answer) => call.settle(&inside, answer),
+            Err(_) => {
+                call.refuse(&inside, refusal);
+            }
+        }
+    });
+    value
 }
 
 /// A JS value as a string, when it is one.

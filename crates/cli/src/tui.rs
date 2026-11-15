@@ -11,6 +11,7 @@ use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use reagent_protocol::discovery;
@@ -31,6 +32,10 @@ const MILLION: f64 = 1_000_000.0;
 
 /// The log file of the worker's stderr, beside the session store.
 const LOG: &str = "worker.log";
+
+/// How many workers this process started, which names each one's log: a run
+/// with no session starts one.
+static WORKERS: AtomicU64 = AtomicU64::new(0);
 
 /// The ready line a worker prints once it serves a session.
 #[derive(Debug, serde::Deserialize)]
@@ -189,10 +194,28 @@ pub(crate) async fn start_worker(
     state: &Path,
     flags: Vec<OsString>,
 ) -> Result<discovery::Entry, String> {
-    let log = log_path().await;
     let exe =
         std::env::current_exe().map_err(|error| format!("could not find this binary: {error}"))?;
-    let stderr = match &log {
+    let log = log_path().await;
+    spawn_worker(&exe, state, flags, log.as_deref(), &[]).await
+}
+
+/// Starts `program` as a worker with `flags` and answers the discovery entry
+/// that joins it, which is what a session a plugin starts needs.
+///
+/// `program` is this binary in every caller; the argument lets a test name it.
+/// The worker's stderr goes to `log`, the file [`reason`] reads, so a start that
+/// never gets a ready line answers with the reason that worker printed. `env`
+/// holds the variables this worker adds to its own, which is how a session says
+/// how deep it is.
+pub(crate) async fn spawn_worker(
+    program: &Path,
+    state: &Path,
+    flags: Vec<OsString>,
+    log: Option<&Path>,
+    env: &[(String, String)],
+) -> Result<discovery::Entry, String> {
+    let stderr = match log {
         Some(path) => match tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -205,9 +228,10 @@ pub(crate) async fn start_worker(
         },
         None => Stdio::null(),
     };
-    let mut command = tokio::process::Command::new(exe);
+    let mut command = tokio::process::Command::new(program);
     command
         .args(flags)
+        .envs(env.iter().map(|(name, value)| (name, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(stderr)
@@ -216,7 +240,7 @@ pub(crate) async fn start_worker(
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start the worker: {error}"))?;
-    let session = ready_line(&mut child, log.as_deref()).await?.session;
+    let session = ready_line(&mut child, log).await?.session;
     let folder = discovery::folder(state);
     discovery::list(&folder)
         .await
@@ -311,6 +335,10 @@ fn words(given: impl IntoIterator<Item = OsString>, choice: Choice<'_>) -> Vec<O
         if !std::mem::take(&mut value) {
             match word.to_str() {
                 Some("--inline") => continue,
+                // A worker speaks the client protocol and takes its clients
+                // already, so the flags a run serves people with are no
+                // worker's: a session a plugin starts is a worker.
+                Some("--json" | "--no-serve" | "--listen" | "--commands") => continue,
                 Some(flag) if dropped && session_flag(flag) => {
                     drop_next = drop_value(flag);
                     continue;
@@ -371,6 +399,7 @@ fn takes_value(flag: &str) -> bool {
             | "--tools"
             | "--policy"
             | "--mcp"
+            | "--mcp-spec"
             | "--cwd"
             | "--profile"
     )
@@ -407,14 +436,15 @@ fn prices(
     Some((price.input * MILLION, price.output * MILLION))
 }
 
-/// The file the worker's stderr goes to, or `None` when there is no state
-/// folder to write it in.
-async fn log_path() -> Option<PathBuf> {
+/// The file the stderr of the worker this process starts next goes to, or
+/// `None` when there is no state folder to write it in.
+pub(crate) async fn log_path() -> Option<PathBuf> {
     let dir = reagent_config::auth::dir().ok()?;
     tokio::fs::create_dir_all(&dir).await.ok()?;
-    // One log per TUI start, so a second start cannot cut the log of a worker
-    // that still writes to it, or show another session's reason.
-    Some(dir.join(format!("{LOG}.{}", std::process::id())))
+    // One log per worker, so a second worker cannot cut the log of one that
+    // still writes to it, and a session's reason is its own worker's.
+    let worker = WORKERS.fetch_add(1, Ordering::Relaxed);
+    Some(dir.join(format!("{LOG}.{}.{worker}", std::process::id())))
 }
 
 /// Reads the worker's ready line, or the reason it printed none.
@@ -472,6 +502,18 @@ mod tests {
             reagent_tui::history::BASE,
             reagent_agent::journal::kinds::BASE
         );
+    }
+
+    /// Every worker this process starts writes to a log of its own, so a start
+    /// that reads a reason reads its own worker's, and no second worker cuts
+    /// the log of the first.
+    #[tokio::test]
+    async fn plugin_session_each_worker_has_its_own_log() {
+        let (Some(first), Some(second)) = (log_path().await, log_path().await) else {
+            // A machine with no state folder keeps no log at all.
+            return;
+        };
+        assert_ne!(first, second, "two workers share one log");
     }
 
     /// A run flag that the old rebuilt list left out, such as `--reasoning`,
@@ -628,6 +670,28 @@ mod tests {
         let flags = new_flags(given.iter().map(OsString::from));
         let want: Vec<OsString> = ["worker", "--model", "m"]
             .iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(flags, want);
+    }
+
+    /// `--mcp-spec` takes its JSON as the next word, so the worker of another
+    /// session keeps the flag and the value, even when the value reads like a
+    /// flag of its own.
+    #[test]
+    fn mcp_spec_takes_its_value() {
+        assert!(takes_value("--mcp-spec"));
+        let given = ["--mcp-spec", "--inline"];
+        let flags = new_flags(given.iter().map(OsString::from));
+        let want: Vec<OsString> = ["worker", "--mcp-spec", "--inline"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert_eq!(flags, want);
+        let given = ["--mcp-spec", r#"{"name":"fs","command":"/bin/cat"}"#];
+        let flags = worker_flags(given.iter().map(OsString::from));
+        let want: Vec<OsString> = std::iter::once("worker")
+            .chain(given)
             .map(OsString::from)
             .collect();
         assert_eq!(flags, want);

@@ -476,6 +476,100 @@ pub fn valid_server_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
+/// One MCP server as an editor sends it in an ACP `session/new` request, before
+/// the checks.
+#[derive(Deserialize)]
+struct RawSpec {
+    /// `stdio` when absent or named, `http` or `sse`.
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    name: Option<String>,
+    command: Option<String>,
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    #[serde(default)]
+    env: Option<Vec<SpecPair>>,
+    url: Option<String>,
+    #[serde(default)]
+    headers: Option<Vec<SpecPair>>,
+}
+
+/// One `{name, value}` pair of a spec.
+#[derive(Deserialize)]
+struct SpecPair {
+    name: String,
+    value: String,
+}
+
+impl RawSpec {
+    /// The `(name, value)` pairs of `pairs`, in the order given.
+    fn pairs(pairs: Option<Vec<SpecPair>>) -> Vec<(String, String)> {
+        pairs
+            .unwrap_or_default()
+            .into_iter()
+            .map(|pair| (pair.name, pair.value))
+            .collect()
+    }
+}
+
+/// Reads one `--mcp-spec` value as a server and the name it takes, with the
+/// defaults an `mcp.toml` entry gets.
+///
+/// The JSON is the stdio shape an editor sends in an ACP `session/new` request,
+/// `{"name", "command", "args", "env": [{"name", "value"}]}`, or the http shape
+/// `{"type": "http", "name", "url", "headers": [{"name", "value"}]}`. `sse` has
+/// no transport here, so it is refused. Nothing here is stored, so no error and
+/// no `Debug` output holds an env or a header value.
+pub fn server_from_spec(text: &str) -> Result<(String, McpServer), String> {
+    let spec: RawSpec =
+        serde_json::from_str(text).map_err(|error| format!("invalid JSON: {error}"))?;
+    let name = spec.name.ok_or_else(|| "missing name".to_string())?;
+    if !valid_server_name(&name) {
+        return Err(format!(
+            "invalid name {name}: use lowercase letters, digits, - and _ only"
+        ));
+    }
+    let transport = match spec.kind.as_deref() {
+        None | Some("stdio") => {
+            if spec.command.is_some() && spec.url.is_some() {
+                return Err("set either command or url, not both".to_string());
+            }
+            let command = spec.command.ok_or_else(|| "missing command".to_string())?;
+            if !Path::new(&command).is_absolute() {
+                return Err(format!("command is not an absolute path: {command}"));
+            }
+            McpTransport::Stdio {
+                command,
+                args: spec.args.unwrap_or_default(),
+                env: RawSpec::pairs(spec.env),
+                cwd: None,
+            }
+        }
+        Some("http") => McpTransport::Http {
+            url: spec.url.ok_or_else(|| "missing url".to_string())?,
+            headers: RawSpec::pairs(spec.headers),
+        },
+        Some("sse") => {
+            return Err("type sse is not supported: pass a stdio or an http server".to_string());
+        }
+        Some(other) => {
+            return Err(format!(
+                "unknown type {other}: use a stdio or an http server"
+            ));
+        }
+    };
+    Ok((
+        name,
+        McpServer {
+            transport,
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT),
+            enabled: true,
+            direct: McpDirect::None,
+            oauth: None,
+        },
+    ))
+}
+
 /// The servers of a config folder and the settings they share.
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpConfig {
@@ -1205,5 +1299,108 @@ mod tests {
             back.servers["some"].direct,
             super::McpDirect::Only(vec!["search".to_string()])
         );
+    }
+
+    /// The two shapes an editor sends, as JSON.
+    const STDIO_SPEC: &str = concat!(
+        r#"{"name":"fs","command":"/usr/bin/npx","args":["-y","server"],"#,
+        r#""env":[{"name":"TOKEN","value":"hunter2"}]}"#
+    );
+
+    const HTTP_SPEC: &str = concat!(
+        r#"{"type":"http","name":"docs","url":"https://example.com/mcp","#,
+        r#""headers":[{"name":"Authorization","value":"Bearer hunter2"}]}"#
+    );
+
+    /// A stdio spec is the ACP entry: a name, an absolute command, its args and
+    /// its `{name, value}` pairs, with the defaults an `mcp.toml` entry gets.
+    #[test]
+    fn mcp_spec_stdio_reads_args_and_env() {
+        let (name, server) = super::server_from_spec(STDIO_SPEC).expect("reads");
+        assert_eq!(name, "fs");
+        assert_eq!(
+            server.transport,
+            super::McpTransport::Stdio {
+                command: "/usr/bin/npx".into(),
+                args: ["-y", "server"].map(str::to_string).to_vec(),
+                env: [("TOKEN".to_string(), "hunter2".to_string())].to_vec(),
+                cwd: None,
+            }
+        );
+        assert_eq!(
+            server.timeout,
+            std::time::Duration::from_secs(super::DEFAULT_TIMEOUT)
+        );
+        assert!(server.enabled);
+        assert_eq!(server.direct, super::McpDirect::None);
+        assert_eq!(server.oauth, None);
+    }
+
+    /// An http spec is a URL and its headers, and needs no command.
+    #[test]
+    fn mcp_spec_http_reads_url_and_headers() {
+        let (name, server) = super::server_from_spec(HTTP_SPEC).expect("reads");
+        assert_eq!(name, "docs");
+        assert_eq!(
+            server.transport,
+            super::McpTransport::Http {
+                url: "https://example.com/mcp".into(),
+                headers: [("Authorization".to_string(), "Bearer hunter2".to_string())].to_vec(),
+            }
+        );
+        assert_eq!(
+            server.timeout,
+            std::time::Duration::from_secs(super::DEFAULT_TIMEOUT)
+        );
+        assert!(server.enabled);
+        assert_eq!(server.oauth, None);
+    }
+
+    /// Each wrong spec is refused with the word that says which part is wrong.
+    #[test]
+    fn mcp_spec_errors_name_what_is_wrong() {
+        for (json, wanted) in [
+            ("{", "JSON"),
+            (r#"{"command":"/bin/cat"}"#, "name"),
+            (r#"{"name":"fs"}"#, "command"),
+            (r#"{"type":"http","name":"docs"}"#, "url"),
+            (r#"{"name":"fs","command":"npx"}"#, "absolute"),
+            (r#"{"name":"fs","command":""}"#, "absolute"),
+            (
+                r#"{"type":"sse","name":"fs","url":"https://example.com/sse"}"#,
+                "sse",
+            ),
+            (
+                r#"{"type":"bogus","name":"fs","command":"/bin/cat"}"#,
+                "bogus",
+            ),
+        ] {
+            let error = super::server_from_spec(json).unwrap_err();
+            assert!(error.contains(wanted), "{json}: {error}");
+        }
+        // A name that `mcp.toml` could not hold names the name and the rule.
+        let error = super::server_from_spec(r#"{"name":"a b","command":"/bin/cat"}"#).unwrap_err();
+        assert!(error.contains("a b"), "{error}");
+        assert!(error.contains("lowercase"), "{error}");
+    }
+
+    /// Neither the `Debug` of a spec's server nor an error message holds an env
+    /// or a header value.
+    #[test]
+    fn mcp_spec_hides_the_values() {
+        let (_, server) = super::server_from_spec(STDIO_SPEC).expect("reads");
+        let text = format!("{server:?}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("TOKEN"), "{text}");
+        let (_, server) = super::server_from_spec(HTTP_SPEC).expect("reads");
+        let text = format!("{server:?}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("Authorization"), "{text}");
+        // An error that names another part still holds no value.
+        let error = super::server_from_spec(
+            r#"{"name":"FS","command":"/bin/cat","env":[{"name":"TOKEN","value":"hunter2"}]}"#,
+        )
+        .unwrap_err();
+        assert!(!error.contains("hunter2"), "{error}");
     }
 }

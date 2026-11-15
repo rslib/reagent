@@ -77,6 +77,8 @@ pub(crate) struct Permissions {
     pub run: Vec<Program>,
     /// The hooks it may install, by name.
     pub hooks: Vec<String>,
+    /// Whether it may start sessions of its own, from `sessions: true`.
+    pub sessions: bool,
 }
 
 impl Permissions {
@@ -88,6 +90,7 @@ impl Permissions {
             net: Vec::new(),
             run: Vec::new(),
             hooks: Vec::new(),
+            sessions: false,
         }
     }
 }
@@ -257,7 +260,13 @@ fn permissions(reagent: &serde_json::Value) -> Result<Permissions, String> {
         return Err("the `permissions` block must be an object with `fs` and `env`".into());
     };
     for key in object.keys() {
-        if key != "fs" && key != "env" && key != "net" && key != "run" && key != "hooks" {
+        if key != "fs"
+            && key != "env"
+            && key != "net"
+            && key != "run"
+            && key != "hooks"
+            && key != "sessions"
+        {
             return Err(format!("unknown permission `{key}`"));
         }
     }
@@ -281,13 +290,27 @@ fn permissions(reagent: &serde_json::Value) -> Result<Permissions, String> {
         Some(hooks) => hooks_of(hooks)?,
         None => Vec::new(),
     };
+    let sessions = match object.get("sessions") {
+        Some(sessions) => sessions_of(sessions)?,
+        None => false,
+    };
     Ok(Permissions {
         fs,
         env,
         net,
         run,
         hooks,
+        sessions,
     })
+}
+
+/// The session permission `sessions` names, or the reason it is wrong.
+fn sessions_of(value: &serde_json::Value) -> Result<bool, String> {
+    const EXPECTED: &str = "permission `sessions` must be true or false";
+    match value.as_bool() {
+        Some(flag) => Ok(flag),
+        None => Err(format!("{EXPECTED}, not {value}")),
+    }
 }
 
 /// The hooks `hooks` names, or the reason one of them is not a hook.
@@ -608,6 +631,7 @@ mod tests {
                 net: Vec::new(),
                 run: Vec::new(),
                 hooks: Vec::new(),
+                sessions: false,
             }
         );
     }
@@ -622,6 +646,7 @@ mod tests {
                 net: Vec::new(),
                 run: Vec::new(),
                 hooks: Vec::new(),
+                sessions: false,
             }
         );
     }
@@ -636,6 +661,7 @@ mod tests {
                 net: Vec::new(),
                 run: Vec::new(),
                 hooks: Vec::new(),
+                sessions: false,
             }
         );
     }
@@ -650,6 +676,7 @@ mod tests {
                 net: Vec::new(),
                 run: Vec::new(),
                 hooks: Vec::new(),
+                sessions: false,
             }
         );
     }

@@ -407,6 +407,7 @@ fn usage() -> &'static str {
         "  -t, --tools <list>   tools: bash, edit, find, grep, read, write, codemode, ask;\n",
         "                       +name adds, -name removes, plain names replace (default: all but codemode)\n",
         "      --mcp <list>     MCP servers to start: +name adds, -name removes, plain names replace\n",
+        "      --mcp-spec <json>  start an MCP server given as ACP session/new JSON; repeatable\n",
         "      --no-mcp         start no MCP server\n",
         "      --no-plugins     load no plugins from the config folder\n",
         "      --require-plugin <name>  stop before the first request unless the plugin\n",
@@ -1007,6 +1008,7 @@ fn parse_from(
     let mut tools: Vec<Vec<String>> = Vec::new();
     let mut policy: Vec<Vec<String>> = Vec::new();
     let mut mcp: Vec<Vec<String>> = Vec::new();
+    let mut mcp_spec: Vec<(String, McpServer)> = Vec::new();
     let mut no_mcp = false;
     let mut no_plugins = false;
     let mut required_plugins: Vec<String> = Vec::new();
@@ -1148,6 +1150,16 @@ fn parse_from(
                 let text = value.into_string().map_err(|_| bad("--mcp"))?;
                 mcp.push(mcp_list(&text).map_err(|error| format!("--mcp: {error}"))?);
             }
+            lexopt::Arg::Long("mcp-spec") => {
+                let value = parser
+                    .value()
+                    .map_err(|_| "missing value for --mcp-spec".to_string())?;
+                let text = value.into_string().map_err(|_| bad("--mcp-spec"))?;
+                mcp_spec.push(
+                    reagent_config::mcp::server_from_spec(&text)
+                        .map_err(|error| format!("--mcp-spec: {error}"))?,
+                );
+            }
             lexopt::Arg::Long("no-mcp") => no_mcp = true,
             lexopt::Arg::Long("no-plugins") => no_plugins = true,
             lexopt::Arg::Long("require-plugin") => {
@@ -1258,6 +1270,7 @@ fn parse_from(
             || !tools.is_empty()
             || !policy.is_empty()
             || !mcp.is_empty()
+            || !mcp_spec.is_empty()
             || no_mcp
             || no_plugins
             || !required_plugins.is_empty()
@@ -1416,6 +1429,23 @@ fn parse_from(
             &servers.servers,
         )?
     };
+    // An editor's servers start beside the ones the files name, never in place
+    // of one: a name `mcp.toml` already defines is an error, so a spec cannot
+    // replace a configured server without a word about it.
+    if !no_mcp {
+        for (name, server) in mcp_spec {
+            if servers.servers.contains_key(&name) {
+                return Err(format!(
+                    "--mcp-spec: {name} is a server of mcp.toml; pass --mcp {name} to start that one"
+                ));
+            }
+            if mcp_servers.iter().any(|(given, _)| *given == name) {
+                return Err(format!("--mcp-spec: {name} is given twice"));
+            }
+            mcp_servers.push((name, server));
+        }
+        mcp_servers.sort_by(|(left, _), (right, _)| left.cmp(right));
+    }
     // A script reaches the tools that are not direct, so a picked server with
     // one needs `codemode`. A server whose every tool is direct needs nothing.
     if mcp_servers
@@ -2408,6 +2438,83 @@ mod tests {
             &["-p", "task", "--mcp", "+a", "--no-mcp"],
             Settings::default(),
             servers,
+        );
+        assert!(args.mcp_servers.is_empty(), "{:?}", picked(&args));
+    }
+
+    const STDIO_SPEC: &str = concat!(
+        r#"{"name":"fs","command":"/usr/bin/npx","args":["-y","server"],"#,
+        r#""env":[{"name":"TOKEN","value":"hunter2"}]}"#
+    );
+
+    const HTTP_SPEC: &str = concat!(
+        r#"{"type":"http","name":"docs","url":"https://example.com/mcp","#,
+        r#""headers":[{"name":"Authorization","value":"Bearer hunter2"}]}"#
+    );
+
+    /// A `-p` run with one `--mcp-spec` flag for each value of `specs`, over
+    /// the servers of a fake `mcp.toml`.
+    fn run_specs(specs: &[&str], servers: BTreeMap<String, McpServer>) -> Result<Args, String> {
+        let mut argv = vec!["-p", "task"];
+        for spec in specs {
+            argv.extend(["--mcp-spec", *spec]);
+        }
+        match parse_with_servers(&argv, Settings::default(), servers) {
+            Ok(Outcome::Run(args)) => Ok(*args),
+            Ok(other) => panic!("expected a run outcome, got {other:?}"),
+            Err(message) => Err(message),
+        }
+    }
+
+    #[test]
+    fn mcp_spec_two_flags_reach_the_args() {
+        let args = run_specs(&[STDIO_SPEC, HTTP_SPEC], BTreeMap::new()).expect("parses");
+        assert_eq!(picked(&args), ["docs", "fs"]);
+        assert_eq!(
+            args.mcp_servers[1].1.transport,
+            McpTransport::Stdio {
+                command: "/usr/bin/npx".into(),
+                args: ["-y", "server"].map(str::to_string).to_vec(),
+                env: [("TOKEN".to_string(), "hunter2".to_string())].to_vec(),
+                cwd: None,
+            }
+        );
+        // A spec server is like any other, so its tools reach the request
+        // through codemode, which turns on with the first server.
+        assert!(
+            args.tools.iter().any(|name| name == "codemode"),
+            "{:?}",
+            args.tools
+        );
+    }
+
+    #[test]
+    fn mcp_spec_a_name_in_mcp_toml_is_an_error() {
+        let error = run_specs(&[STDIO_SPEC], defined(&[("fs", true)])).unwrap_err();
+        assert!(error.contains("fs"), "{error}");
+        assert!(error.contains("mcp.toml"), "{error}");
+        assert!(!error.contains("hunter2"), "{error}");
+    }
+
+    #[test]
+    fn mcp_spec_bad_json_is_refused() {
+        let error = parse(&["-p", "task", "--mcp-spec", "{"]).unwrap_err();
+        assert!(error.contains("--mcp-spec"), "{error}");
+        assert!(error.contains("JSON"), "{error}");
+    }
+
+    #[test]
+    fn mcp_spec_the_same_name_twice_is_an_error() {
+        let error = run_specs(&[STDIO_SPEC, STDIO_SPEC], BTreeMap::new()).unwrap_err();
+        assert!(error.contains("fs"), "{error}");
+    }
+
+    #[test]
+    fn mcp_spec_no_mcp_starts_none() {
+        let args = run_servers(
+            &["-p", "task", "--mcp-spec", STDIO_SPEC, "--no-mcp"],
+            Settings::default(),
+            BTreeMap::new(),
         );
         assert!(args.mcp_servers.is_empty(), "{:?}", picked(&args));
     }

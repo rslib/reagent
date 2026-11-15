@@ -136,6 +136,15 @@ pub(crate) enum Job {
         /// What the listener sees.
         payload: JsonValue,
     },
+    /// Hands one frame of a session to the plugin that started it.
+    Session {
+        /// The plugin that started the session, as its manifest names it.
+        plugin: String,
+        /// The session the frame came from.
+        id: String,
+        /// What the plugin's listeners see.
+        event: JsonValue,
+    },
 }
 
 /// What loading reported: the tools to offer, the commands to list and which
@@ -156,6 +165,10 @@ pub(crate) struct LoadReport {
     pub result: bool,
     /// Whether any plugin installed a `turn.end` layer.
     pub turn: bool,
+    /// Whether any plugin may start sessions.
+    pub sessions: bool,
+    /// The names of the plugins that may start sessions, in load order.
+    pub speakers: Vec<String>,
     /// A bit per event some listener waits on.
     pub events: u32,
 }
@@ -319,6 +332,7 @@ async fn serve(
                 let _ = reply.send(out);
             }
             Job::Event { name, payload } => fleet.event(&name, &payload).await,
+            Job::Session { plugin, id, event } => fleet.session(&plugin, &id, &event),
         }
     }
     fleet.stop().await;
@@ -387,6 +401,13 @@ enum InJob {
         /// Answers once every listener of this plugin ran.
         reply: oneshot::Sender<()>,
     },
+    /// Hands one frame of one of this plugin's sessions to its listeners.
+    Session {
+        /// The session the frame came from.
+        id: String,
+        /// What the listener sees.
+        event: JsonValue,
+    },
 }
 
 /// What one instance loaded: what the report offers, and which chains it takes
@@ -407,6 +428,8 @@ struct Shares {
     result: bool,
     /// Whether it installed a `turn.end` layer.
     turn: bool,
+    /// Whether its manifest grants the session permission.
+    sessions: bool,
     /// A bit per event some listener of its waits on.
     events: u32,
 }
@@ -427,6 +450,12 @@ struct Shared {
     /// load that is not the gateway's: the object is absent from a normal
     /// plugin's `reagent`.
     gateway: Option<tokio::sync::mpsc::UnboundedSender<super::AnswerAsk>>,
+    /// The run's channel for `reagent.sessions`, and `None` for a load whose
+    /// run has no host for the sessions a plugin starts.
+    sessions: Option<tokio::sync::mpsc::UnboundedSender<super::SessionAsk>>,
+    /// Whether this load may start no session at all, which is the load of a
+    /// worker a session started.
+    sealed: bool,
     /// The folder and the session every hook payload names.
     served: Arc<Mutex<Served>>,
 }
@@ -471,6 +500,8 @@ struct Fleet {
 
 /// One plugin's task: its queue and the runtime behind it.
 struct Instance {
+    /// The plugin's name, which is what a frame of a session it started names.
+    name: String,
     /// The queue of its task.
     jobs: Sender<InJob>,
     /// Its task, awaited when the fleet ends.
@@ -488,6 +519,8 @@ impl Fleet {
                 names: Rc::new(RefCell::new(HashSet::new())),
                 command_names: Rc::new(RefCell::new(HashSet::new())),
                 gateway: None,
+                sessions: None,
+                sealed: false,
                 served,
             },
             instances: Vec::new(),
@@ -504,6 +537,8 @@ impl Fleet {
     /// gateway loads only them.
     async fn load(&mut self, root: &Path, role: Role) -> LoadReport {
         self.shared.gateway = role.answers();
+        self.shared.sessions = role.sessions();
+        self.shared.sealed = role.sealed();
         let mut report = LoadReport::default();
         #[expect(
             clippy::disallowed_methods,
@@ -589,7 +624,7 @@ impl Fleet {
             match loaded {
                 Ok(Ok(loaded)) => {
                     report.names.push(name.clone());
-                    names.push((name, dir));
+                    names.push((name.clone(), dir));
                     self.instances[at].shares = loaded.shares;
                     for tool in &loaded.owned.tools {
                         self.tools.insert(tool.name.clone(), at);
@@ -603,6 +638,10 @@ impl Fleet {
                     report.call |= loaded.shares.call;
                     report.result |= loaded.shares.result;
                     report.turn |= loaded.shares.turn;
+                    report.sessions |= loaded.shares.sessions;
+                    if loaded.shares.sessions {
+                        report.speakers.push(name.clone());
+                    }
                     report.events |= loaded.shares.events;
                 }
                 Ok(Err(Failed::Threw(reason))) => {
@@ -624,6 +663,7 @@ impl Fleet {
     ) -> (usize, oneshot::Receiver<Result<InstanceLoad, Failed>>) {
         let (jobs, queue) = tokio::sync::mpsc::channel(super::JOBS);
         let (reply, loaded) = oneshot::channel();
+        let name = manifest.name.clone();
         let task = tokio::task::spawn_local(instance(
             index,
             manifest,
@@ -633,11 +673,34 @@ impl Fleet {
             reply,
         ));
         self.instances.push(Instance {
+            name,
             jobs,
             task,
             shares: Shares::default(),
         });
         (self.instances.len() - 1, loaded)
+    }
+
+    /// Hands one frame of the session `id` to the plugin `plugin` that started
+    /// it, and to no other: a plugin that did not start the session has no
+    /// listener that matches.
+    fn session(&self, plugin: &str, id: &str, event: &JsonValue) {
+        for at in self
+            .instances
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.name == plugin)
+            .map(|(at, _)| at)
+        {
+            let job = InJob::Session {
+                id: id.to_owned(),
+                event: event.clone(),
+            };
+            // A frame the full queue cannot take is dropped: the plugin thread
+            // has a job of its own running, and waiting here would stop this
+            // one for as long as that takes.
+            let _ = self.instances[at].jobs.try_send(job);
+        }
     }
 
     /// Runs one plugin tool on the instance that owns its name.
@@ -883,6 +946,7 @@ async fn instance(
                 call: !engine.call.is_empty(),
                 result: !engine.result.is_empty(),
                 turn: !engine.turn.is_empty(),
+                sessions: manifest.permissions.sessions,
                 events: engine
                     .listeners
                     .iter()
@@ -954,6 +1018,9 @@ async fn answer(ctx: &Ctx<'_>, engine: &Engine, watch: &Rc<Watch>, shared: &Shar
         } => {
             fire(ctx, engine, watch, notes, &name, &payload).await;
             let _ = reply.send(());
+        }
+        InJob::Session { id, event } => {
+            fire_session(ctx, engine, watch, notes, &id, &event).await;
         }
     }
 }
@@ -1561,6 +1628,9 @@ struct Engine {
     turn: Vec<Layer>,
     /// The listeners, in load order.
     listeners: Vec<Listener>,
+    /// The listeners of the sessions this plugin started, and the number that
+    /// removes each.
+    sessions: Rc<RefCell<api::Watched>>,
 }
 
 /// One tool a plugin registered, with the plugin that owns it.
@@ -1629,6 +1699,7 @@ impl Engine {
             result: Vec::new(),
             turn: Vec::new(),
             listeners: Vec::new(),
+            sessions: Rc::new(RefCell::new(api::Watched::default())),
         }
     }
 }
@@ -1679,6 +1750,11 @@ async fn load_one(
         committed: Rc::clone(&committed),
         gateway: shared.gateway.clone(),
         hooks: manifest.permissions.hooks.clone(),
+        sessions: manifest.permissions.sessions,
+        talk: shared.sessions.clone(),
+        sealed: shared.sealed,
+        index,
+        watched: Rc::clone(&engine.sessions),
     };
     watched(
         ctx,
@@ -2251,6 +2327,62 @@ async fn fire(
                 notes,
                 format!("plugin {}: {what} threw: {message}", listener.plugin),
             );
+        }
+    }
+}
+
+/// Hands one frame of session `id` to the listeners the plugin put on it.
+///
+/// Only the plugin that started the session has such a listener, so no other
+/// plugin sees the frame.
+async fn fire_session(
+    ctx: &Ctx<'_>,
+    engine: &Engine,
+    watch: &Rc<Watch>,
+    notes: &Mutex<Notes>,
+    id: &str,
+    event: &JsonValue,
+) {
+    let what = format!("session {id}");
+    // The functions are copied out first: a listener may remove itself while it
+    // runs, and from then on the list is borrowed by JS.
+    let listeners: Vec<(Persistent<Function<'static>>, String, usize)> = {
+        let list = engine.sessions.borrow();
+        list.listeners
+            .iter()
+            .filter(|listener| listener.id == id)
+            .map(|listener| {
+                (
+                    listener.func.clone(),
+                    listener.plugin.clone(),
+                    listener.index,
+                )
+            })
+            .collect()
+    };
+    for (func, plugin, index) in listeners {
+        let Some(func) = restore(ctx, &func) else {
+            continue;
+        };
+        let out = watched(
+            ctx,
+            watch,
+            notes,
+            Who {
+                index,
+                name: &plugin,
+            },
+            &what,
+            STOP,
+            async |window| {
+                let value = api::from_json(ctx, event).map_err(|error| failure(ctx, error))?;
+                call1(ctx, watch, window, &func, value).await?;
+                Ok(())
+            },
+        )
+        .await;
+        if let Err(Failed::Threw(message)) = out {
+            note(notes, format!("plugin {plugin}: {what} threw: {message}"));
         }
     }
 }

@@ -11,10 +11,12 @@ name = "reagent"
 path = "src/main.rs"
 
 [features]
-default = ["tui", "node"]
+default = ["tui", "node", "acp"]
 # The terminal UI. `--no-default-features` builds the headless run and the
 # worker only, which is what the eval and `min` builds use.
 tui = ["dep:reagent-tui"]
+# `reagent acp`: the ACP v1 agent an editor runs, one worker per session.
+acp = ["tui"]
 # Node modules for plugins, from LLRT, behind the plugin permission checks.
 node = ["reagent-script/node"]
 testing = ["reagent-ai/testing", "dep:tempfile"]

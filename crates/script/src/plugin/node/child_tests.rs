@@ -169,16 +169,28 @@ async fn loaded(
     session: &Path,
     sandbox: Option<PathBuf>,
 ) -> (Arc<Plugins>, Vec<String>) {
-    let (plugins, notes) =
-        Plugins::load_with(root, session, &state(), sandbox, crate::plugin::Role::Run).await;
+    let (plugins, notes) = Plugins::load_with(
+        root,
+        session,
+        &state(),
+        sandbox,
+        crate::plugin::Role::Run(None),
+    )
+    .await;
     let plugins = plugins.unwrap_or_else(|| panic!("no plugin loaded: {notes:?}"));
     (plugins, notes)
 }
 
 /// Loads the plugins under `root`, which must not have loaded.
 async fn refused(root: &Path, session: &Path, sandbox: Option<PathBuf>) -> Vec<String> {
-    let (plugins, notes) =
-        Plugins::load_with(root, session, &state(), sandbox, crate::plugin::Role::Run).await;
+    let (plugins, notes) = Plugins::load_with(
+        root,
+        session,
+        &state(),
+        sandbox,
+        crate::plugin::Role::Run(None),
+    )
+    .await;
     assert!(plugins.is_none(), "{notes:?}");
     notes
 }

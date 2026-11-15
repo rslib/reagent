@@ -19,6 +19,7 @@ mod sandbox;
 mod serve;
 mod session;
 mod session_crash;
+mod sessions;
 mod session_gc;
 mod signal;
 mod spill;

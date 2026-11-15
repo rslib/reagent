@@ -3854,3 +3854,76 @@ async fn call_gate_bad_options_throw() {
         }
     }
 }
+
+// The sessions a plugin may start: the permission its manifest names, the
+// object that appears with it, and the asks it hands the run.
+
+/// The `package.json` of a plugin that may start sessions.
+fn session_manifest() -> &'static str {
+    r#"{"name": "__NAME__", "version": "1.0.0", "type": "module", "reagent": {"entry": "index.js", "permissions": {"sessions": true}}}"#
+}
+
+/// The plugin program that answers what `typeof reagent.sessions` is.
+fn session_typeof() -> &'static str {
+    r#"
+export default function (r) {
+  r.registerTool({
+    name: "probe",
+    description: "says what reagent.sessions is",
+    run: () => typeof r.sessions,
+  });
+}
+"#
+}
+
+#[tokio::test]
+async fn plugin_session_permission_true_shows_the_object() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "talker",
+        session_manifest(),
+        &[("index.js", session_typeof())],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    assert_eq!(&*run(&plugins, "probe", "{}").await.content, "object");
+}
+
+#[tokio::test]
+async fn plugin_session_permission_absent_hides_the_object() {
+    let root = temp_root();
+    plugin(
+        root.path(),
+        "quiet",
+        manifest(),
+        &[("index.js", session_typeof())],
+    )
+    .await;
+    let plugins = loaded(root.path()).await;
+    assert_eq!(&*run(&plugins, "probe", "{}").await.content, "undefined");
+}
+
+#[tokio::test]
+async fn plugin_session_permission_of_a_wrong_value_names_it() {
+    for wrong in ["\"yes\"", "\"true\"", "1", "null", "{}"] {
+        let root = temp_root();
+        let package = manifest().replace(
+            r#""entry": "index.js""#,
+            &format!(r#""entry": "index.js", "permissions": {{ "sessions": {wrong} }}"#),
+        );
+        plugin(
+            root.path(),
+            "odd",
+            &package,
+            &[("index.js", session_typeof())],
+        )
+        .await;
+        let (plugins, notes) = Plugins::load(root.path(), &state(), None).await;
+        assert!(plugins.is_none(), "{wrong} was accepted");
+        assert!(
+            notes.iter().any(|note| note.contains("`sessions`")),
+            "{wrong}: {notes:?}"
+        );
+    }
+}
