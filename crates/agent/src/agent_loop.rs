@@ -1616,7 +1616,9 @@ impl<'a> Agent<'a> {
                 match outcome {
                     ConsumeOutcome::Cancelled | ConsumeOutcome::Finished => break,
                     ConsumeOutcome::StreamError(error) => {
-                        if retries >= crate::retry::MAX_RETRIES || error.retry_hint().is_none() {
+                        if retries >= crate::retry::MAX_RETRIES
+                            || error.retry_hint().is_none_or(crate::retry::too_far)
+                        {
                             stop_error = Some(error);
                             break;
                         }
@@ -3691,6 +3693,39 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(event, Event::Error(_))),
             "the turn reports the error"
+        );
+        assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::Error)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_limit_that_resets_later_than_the_wait_cap_is_not_retried() {
+        // A weekly usage limit names a reset hours away: waiting the capped
+        // minute ten times only hides the error for ten minutes.
+        let provider = FakeProvider::new(vec![]);
+        provider.push_error(Error::Status {
+            code: 429,
+            body: "usage limit reached (weekly, resets in 8h 57m)".into(),
+            retry: reagent_ai::Retry {
+                should: None,
+                wait_ms: Some(8 * 3600 * 1000),
+            },
+        });
+        provider.push_reply(text_reply("done"));
+        let registry = registry();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut history = vec![Message::user("hello")];
+
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .run(&mut history, None, &tx)
+            .await;
+
+        assert_eq!(provider.seen().len(), 1, "no retry of a far reset");
+        let events = drain(tx, &mut rx);
+        assert!(
+            events.iter().any(
+                |event| matches!(event, Event::Error(text) if text.contains("resets in 8h 57m"))
+            ),
+            "the error names the reset: {events:?}"
         );
         assert_eq!(events.last(), Some(&Event::RunEnd(TurnEndReason::Error)));
     }

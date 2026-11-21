@@ -1648,9 +1648,14 @@ async fn join(
     shared.listen(client, Text::from(name), queue, closing);
     let (mut read, write) = stream.into_split();
     let mut writer = tokio::spawn(hub::write(write, frames, cut));
-    let (model, context_window, level) = {
+    let (model, context_window, level, mode) = {
         let model = shared.model();
-        (Arc::clone(&model.text), model.window, model.level.clone())
+        (
+            Arc::clone(&model.text),
+            model.window,
+            model.level.clone(),
+            model.mode,
+        )
     };
     let skills: Vec<SkillInfo<'_>> = shared
         .skills()
@@ -1672,6 +1677,7 @@ async fn join(
         context_window,
         level: level.as_deref(),
         skills: &skills,
+        mode: Some(mode.as_str()),
     };
     message::result(&mut out, id, &body);
     shared.reply(client, &out);
@@ -1848,6 +1854,19 @@ async fn end_pump(pump: &mut Option<Pump>) {
     let _ = pump.task.await;
 }
 
+/// The command that queues the message `text` a plugin sent as the worker's
+/// own, and notes that the session has work waiting.
+fn plugin_send(shared: &Shared, text: String) -> live::Command {
+    shared.queued();
+    live::Command::Send {
+        message: shared.message(),
+        client: WORKER,
+        text: Text::from(text),
+        blocks: Vec::new(),
+        mode: SendMode::Queue,
+    }
+}
+
 /// Sends what the plugins publish to the clients of the session, and queues the
 /// messages they send as the worker's own, until `stop` ends the session.
 async fn pump(shared: Arc<Shared>, plugins: Arc<Plugins>, sender: Sender, stop: CancellationToken) {
@@ -1872,15 +1891,7 @@ async fn pump(shared: Arc<Shared>, plugins: Arc<Plugins>, sender: Sender, stop: 
         // The messages go before the panels wait: a plugin that sets a panel and
         // then sends starts its turn at once.
         for text in plugins.take_sent() {
-            shared.queued();
-            let message = shared.message();
-            let command = live::Command::Send {
-                message,
-                client: WORKER,
-                text: Text::from(text),
-                blocks: Vec::new(),
-                mode: SendMode::Queue,
-            };
+            let command = plugin_send(&shared, text);
             tokio::select! {
                 taken = sender.send(command) => {
                     if taken.is_err() {
@@ -2135,10 +2146,12 @@ async fn handle(
             }
             let plugins = Arc::clone(plugins);
             let shared = Arc::clone(shared);
+            let sender = sender.cloned();
             // The request line is gone once this call returns, so the command
             // runs on its own copy of its name and arguments.
             let (name, args) = (name.into_owned(), args.into_owned());
             tokio::spawn(async move {
+                let before = shared.state().next_message;
                 if let Some(text) = plugins.command(&name, &args).await {
                     let mut out = Vec::with_capacity(LINE);
                     message::note(&mut out, &text);
@@ -2149,6 +2162,17 @@ async fn handle(
                         eprintln!("reagent: {text}");
                     }
                 }
+                // The messages the command sent are queued before it is said to
+                // be done, so the client that asked knows a run follows.
+                if let Some(sender) = &sender {
+                    for text in plugins.take_sent() {
+                        let _ = sender.send(plugin_send(&shared, text)).await;
+                    }
+                }
+                let sent = shared.state().next_message > before;
+                let mut out = Vec::with_capacity(LINE);
+                message::command_end(&mut out, &name, sent);
+                shared.reply(client, &out);
             });
         }
         Request::Attach { .. } | Request::Detach | Request::Initialize { .. } => {

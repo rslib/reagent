@@ -521,8 +521,21 @@ impl RawSpec {
 /// no transport here, so it is refused. Nothing here is stored, so no error and
 /// no `Debug` output holds an env or a header value.
 pub fn server_from_spec(text: &str) -> Result<(String, McpServer), String> {
-    let spec: RawSpec =
-        serde_json::from_str(text).map_err(|error| format!("invalid JSON: {error}"))?;
+    // serde's own message quotes the value it could not read, which can be a
+    // secret, so the error names only the kind of fault and where it is.
+    let spec: RawSpec = serde_json::from_str(text).map_err(|error| {
+        let fault = match error.classify() {
+            serde_json::error::Category::Data => "a value has the wrong type",
+            serde_json::error::Category::Syntax => "the text is not JSON",
+            serde_json::error::Category::Eof => "the text ends too early",
+            serde_json::error::Category::Io => "the text does not read",
+        };
+        format!(
+            "invalid JSON: {fault} at line {} column {}",
+            error.line(),
+            error.column()
+        )
+    })?;
     let name = spec.name.ok_or_else(|| "missing name".to_string())?;
     if !valid_server_name(&name) {
         return Err(format!(
@@ -1402,5 +1415,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(!error.contains("hunter2"), "{error}");
+    }
+
+    /// A value of the wrong type is not quoted back: serde's own error names
+    /// the value it could not read.
+    #[test]
+    fn mcp_spec_type_error_hides_the_value() {
+        for json in [
+            r#"{"name":"fs","command":"/bin/cat","env":[{"name":"TOKEN","value":424242}]}"#,
+            r#"{"type":"http","name":"docs","url":"https://example.com","headers":[{"name":"Authorization","value":424242}]}"#,
+        ] {
+            let error = super::server_from_spec(json).unwrap_err();
+            assert!(!error.contains("424242"), "{error}");
+            assert!(error.contains("wrong type"), "{error}");
+        }
+        // A syntax fault right after a secret names the place, not the text.
+        let error = super::server_from_spec(
+            r#"{"name":"fs","command":"/bin/cat","env":[{"name":"TOKEN","value":"hunter2"x}]}"#,
+        )
+        .unwrap_err();
+        assert!(!error.contains("hunter2"), "{error}");
+        assert!(error.contains("not JSON"), "{error}");
     }
 }

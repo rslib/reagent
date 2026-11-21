@@ -100,6 +100,8 @@ pub(super) const LEAVE: &[u8] =
 /// output.
 #[derive(Debug)]
 pub struct Real {
+    /// The largest size the app draws in, whatever the terminal's own size.
+    limit: Limit,
     /// The tty and the bytes read from it, opened when the app first waits for
     /// input: opening it is async, and [`Real::new`] runs before the app's
     /// loop.
@@ -118,10 +120,19 @@ impl Real {
         install_hook();
         let out = output()?;
         Ok(Real {
+            limit: Limit::default(),
             input: None,
             out,
             background: Background::default(),
         })
+    }
+
+    /// Draws within `limit`, so a viewer narrower than the terminal shows
+    /// every row whole.
+    #[must_use]
+    pub fn with_limit(mut self, limit: Limit) -> Self {
+        self.limit = limit;
+        self
     }
 
     /// The handle the terminal's answers to the first frame's two queries arrive
@@ -133,6 +144,21 @@ impl Real {
     pub fn background(&self) -> Background {
         self.background.clone()
     }
+}
+
+/// The largest size the app draws in. An unset side takes the terminal's own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Limit {
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
+}
+
+/// The size the app draws in: the terminal's own, cut to `limit`.
+fn capped((cols, rows): (u16, u16), limit: Limit) -> (u16, u16) {
+    (
+        limit.cols.map_or(cols, |max| cols.min(max)),
+        limit.rows.map_or(rows, |max| rows.min(max)),
+    )
 }
 
 /// A duplicate of fd 1 for the app's own writes.
@@ -154,7 +180,7 @@ impl Drop for Real {
 
 impl Terminal for Real {
     fn size(&self) -> (u16, u16) {
-        terminal::size().unwrap_or((80, 24))
+        capped(terminal::size().unwrap_or((80, 24)), self.limit)
     }
 
     fn cell(&self) -> Option<crate::picture::CellShape> {
@@ -215,7 +241,26 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-    use super::write_frame;
+    use super::{Limit, capped, write_frame};
+
+    #[test]
+    fn a_limit_cuts_the_size_to_it() {
+        let limit = Limit {
+            cols: Some(95),
+            rows: Some(40),
+        };
+        assert_eq!(capped((200, 120), limit), (95, 40));
+    }
+
+    #[test]
+    fn a_limit_never_grows_the_size() {
+        let limit = Limit {
+            cols: Some(95),
+            rows: None,
+        };
+        assert_eq!(capped((80, 24), limit), (80, 24));
+        assert_eq!(capped((200, 120), limit), (95, 120));
+    }
 
     /// A writer that counts the writes it takes.
     #[derive(Debug, Default)]

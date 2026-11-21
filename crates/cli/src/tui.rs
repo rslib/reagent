@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use reagent_protocol::discovery;
 use reagent_store::paths;
-use reagent_tui::app::{self, Exit, Options, Real};
+use reagent_tui::app::{self, Exit, Limit, Options, Real};
 use tokio::io::AsyncBufReadExt;
 
 use crate::args::{Args, Sessions};
@@ -156,7 +156,13 @@ async fn attach(args: &Args, cwd: &Path) -> Result<Exit, String> {
     // The terminal is made before the options name its answer handle: the app
     // asks for the background with its first frame setup, and the handle knows
     // the answer before the tty is even open.
-    let terminal = Real::new().map_err(|error| format!("the terminal: {error}"))?;
+    let limit = limit_of(
+        std::env::var_os(MAX_COLS).as_deref(),
+        std::env::var_os(MAX_ROWS).as_deref(),
+    )?;
+    let terminal = Real::new()
+        .map_err(|error| format!("the terminal: {error}"))?
+        .with_limit(limit);
     // The host answers what only this binary can: the model list, the files,
     // the logins and the worker of another session, which starts under the flags
     // of this run.
@@ -261,6 +267,33 @@ pub(crate) async fn spawn_worker(
 ///
 /// `--inline` is the one word left out: it picks how this terminal draws, and
 /// the worker has no terminal.
+/// The variables that cut the size the TUI draws in, for a viewer that shows
+/// the terminal in a narrower box than its own size.
+const MAX_COLS: &str = "REAGENT_MAX_COLS";
+const MAX_ROWS: &str = "REAGENT_MAX_ROWS";
+
+/// The draw limit the two variables set; an unset or empty one sets none.
+fn limit_of(
+    cols: Option<&std::ffi::OsStr>,
+    rows: Option<&std::ffi::OsStr>,
+) -> Result<Limit, String> {
+    fn side(name: &str, value: Option<&std::ffi::OsStr>) -> Result<Option<u16>, String> {
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        value
+            .to_str()
+            .and_then(|text| text.parse::<u16>().ok())
+            .filter(|&max| max > 0)
+            .map(Some)
+            .ok_or_else(|| format!("{name} must be a whole number from 1 to 65535"))
+    }
+    Ok(Limit {
+        cols: side(MAX_COLS, cols)?,
+        rows: side(MAX_ROWS, rows)?,
+    })
+}
+
 fn worker_flags(given: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     words(given, Choice::Keep)
 }
@@ -493,6 +526,36 @@ async fn reason(log: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_max_variables_set_the_draw_limit() {
+        let limit = limit_of(Some("95".as_ref()), None).expect("valid");
+        assert_eq!(
+            limit,
+            Limit {
+                cols: Some(95),
+                rows: None
+            }
+        );
+        let limit = limit_of(Some("".as_ref()), Some("40".as_ref())).expect("valid");
+        assert_eq!(
+            limit,
+            Limit {
+                cols: None,
+                rows: Some(40)
+            }
+        );
+    }
+
+    #[test]
+    fn a_bad_max_variable_names_itself() {
+        for bad in ["0", "wide", "-3", "70000"] {
+            let error = limit_of(Some(bad.as_ref()), None).expect_err(bad);
+            assert!(error.contains("REAGENT_MAX_COLS"), "{error}");
+        }
+        let error = limit_of(None, Some("0".as_ref())).expect_err("zero rows");
+        assert!(error.contains("REAGENT_MAX_ROWS"), "{error}");
+    }
 
     /// The TUI reads the journal without the agent crate, so its copy of the
     /// base record kind must match the kind the agent writes.

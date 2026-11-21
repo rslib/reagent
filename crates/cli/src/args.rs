@@ -1789,7 +1789,10 @@ mod tests {
 
     #[test]
     fn policy_default_is_budget_compact_and_snapshot() {
-        assert_eq!(run(&["-p", "task"]).policy, vec!["budget", "compact", "snapshot"]);
+        assert_eq!(
+            run(&["-p", "task"]).policy,
+            vec!["budget", "compact", "snapshot"]
+        );
     }
 
     #[test]

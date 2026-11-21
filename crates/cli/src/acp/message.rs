@@ -37,6 +37,36 @@ pub(super) struct Initialize {
     /// The client that runs this agent, as it names itself.
     #[serde(default)]
     pub(super) client_info: Option<ClientInfo>,
+    /// What the client says it can show.
+    #[serde(default)]
+    pub(super) client_capabilities: Option<ClientCapabilities>,
+}
+
+/// The `clientCapabilities` of `initialize`.
+#[derive(Debug, Deserialize)]
+pub(super) struct ClientCapabilities {
+    /// What the client shows of a session.
+    #[serde(default)]
+    pub(super) session: Option<ClientSession>,
+    /// What the client shows of a question this agent asks.
+    #[serde(default)]
+    pub(super) elicitation: Option<ClientElicitation>,
+}
+
+/// The `elicitation` of `clientCapabilities`.
+#[derive(Debug, Deserialize)]
+pub(super) struct ClientElicitation {
+    /// The form mode the client takes: `{}` advertises it, and `null` does not.
+    #[serde(default)]
+    pub(super) form: Option<Value>,
+}
+
+/// The `session` of `clientCapabilities`.
+#[derive(Debug, Deserialize)]
+pub(super) struct ClientSession {
+    /// The notices the client takes: `{}` advertises them, and `null` does not.
+    #[serde(default)]
+    pub(super) notices: Option<Value>,
 }
 
 /// The `clientInfo` of `initialize`.
@@ -58,7 +88,7 @@ pub(super) struct NewSession {
     pub(super) mcp_servers: Vec<Value>,
 }
 
-/// The params of `session/load`.
+/// The params of `session/load`, which are the ones of `session/resume` too.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct LoadSession {
@@ -71,40 +101,83 @@ pub(super) struct LoadSession {
     pub(super) mcp_servers: Vec<Value>,
 }
 
+/// The params of `session/list`, each of them optional.
+#[derive(Debug, Deserialize)]
+pub(super) struct ListSessions {
+    /// The folder to list, absolute, and nothing for every folder.
+    #[serde(default)]
+    pub(super) cwd: Option<String>,
+    /// The token that ends the page before the one asked for.
+    #[serde(default)]
+    pub(super) cursor: Option<String>,
+}
+
+/// The head of one line the editor wrote: its id and its method, read without
+/// the params, so a large prompt is not copied just to see what it is.
+#[derive(Debug, Deserialize)]
+pub(super) struct Head {
+    /// The id of a request.
+    #[serde(default)]
+    pub(super) id: Option<Value>,
+    /// The method of a request or a notification.
+    #[serde(default)]
+    pub(super) method: Option<String>,
+}
+
+/// A `session/prompt` line, whose params borrow from the bytes of the line.
+#[derive(Debug, Deserialize)]
+pub(super) struct PromptCall<'a> {
+    /// The params of the request.
+    #[serde(default, borrow)]
+    pub(super) params: Option<Prompt<'a>>,
+}
+
 /// The params of `session/prompt`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct Prompt {
+pub(super) struct Prompt<'a> {
     /// The session the prompt belongs to.
     pub(super) session_id: String,
     /// The blocks of the prompt, in the order the editor made them.
-    #[serde(default)]
-    pub(super) prompt: Vec<Block>,
+    #[serde(default, borrow)]
+    pub(super) prompt: Vec<Block<'a>>,
 }
 
 /// One block of a prompt.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(super) enum Block {
+pub(super) enum Block<'a> {
     /// Visible text.
     Text {
         /// The text itself.
-        text: String,
+        #[serde(borrow)]
+        text: Cow<'a, str>,
     },
     /// A link to a file the session can read.
     ResourceLink {
         /// What the link points at.
-        uri: String,
+        #[serde(borrow)]
+        uri: Cow<'a, str>,
         /// The name the editor shows.
-        name: String,
+        #[serde(borrow)]
+        name: Cow<'a, str>,
     },
     /// A file the editor embedded.
     Resource {
         /// The file, as the editor sent it.
-        resource: ResourceBody,
+        #[serde(borrow)]
+        resource: ResourceBody<'a>,
     },
-    /// A picture. This agent advertises none, so it is refused.
-    Image {},
+    /// A picture, which this agent writes to the session's own folder for the
+    /// worker to attach.
+    Image {
+        /// The bytes of the picture, as base64 text.
+        #[serde(borrow)]
+        data: Cow<'a, str>,
+        /// The media type of the picture.
+        #[serde(borrow, rename = "mimeType")]
+        mime_type: Cow<'a, str>,
+    },
     /// A recording. This agent advertises none, so it is refused.
     Audio {},
     /// A block this build does not know, which is refused too.
@@ -114,13 +187,19 @@ pub(super) enum Block {
 
 /// The `resource` of a [`Block::Resource`].
 #[derive(Debug, Deserialize)]
-pub(super) struct ResourceBody {
+pub(super) struct ResourceBody<'a> {
     /// Where the file is.
-    #[serde(default)]
-    pub(super) uri: String,
+    #[serde(default, borrow)]
+    pub(super) uri: Cow<'a, str>,
     /// The text of the file, and nothing for a blob.
-    #[serde(default)]
-    pub(super) text: Option<String>,
+    #[serde(default, borrow)]
+    pub(super) text: Option<Cow<'a, str>>,
+    /// The bytes of the file, as base64 text, and nothing for a text file.
+    #[serde(default, borrow)]
+    pub(super) blob: Option<Cow<'a, str>>,
+    /// The media type of the file, which says whether the blob is a picture.
+    #[serde(default, borrow, rename = "mimeType")]
+    pub(super) mime_type: Option<Cow<'a, str>>,
 }
 
 /// The params of `session/update`, which this agent sends.
@@ -138,11 +217,26 @@ pub(super) struct SessionUpdate<'a, U> {
 #[serde(tag = "sessionUpdate", rename_all = "snake_case")]
 pub(super) enum Change<'a> {
     /// A piece of the agent's visible text.
-    AgentMessageChunk { content: Chunk<'a> },
+    AgentMessageChunk {
+        content: Chunk<'a>,
+        /// The message the piece belongs to.
+        #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
+        message_id: Option<&'a str>,
+    },
     /// A piece of the model's own reasoning.
-    AgentThoughtChunk { content: Chunk<'a> },
+    AgentThoughtChunk {
+        content: Chunk<'a>,
+        /// The message the piece belongs to.
+        #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
+        message_id: Option<&'a str>,
+    },
     /// A message the user sent.
-    UserMessageChunk { content: Chunk<'a> },
+    UserMessageChunk {
+        content: Chunk<'a>,
+        /// The message the piece belongs to.
+        #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
+        message_id: Option<&'a str>,
+    },
     /// A tool call that started.
     ToolCall {
         /// The call's id.
@@ -150,6 +244,8 @@ pub(super) enum Change<'a> {
         tool_call_id: &'a str,
         /// The line the editor shows.
         title: String,
+        /// The programmatic name of the tool.
+        name: &'a str,
         /// What kind of work the call does.
         kind: Kind,
         /// Where the call stands.
@@ -172,6 +268,9 @@ pub(super) enum Change<'a> {
         /// The call's arguments.
         #[serde(rename = "rawInput", skip_serializing_if = "Option::is_none")]
         raw_input: Option<Value>,
+        /// What the call produced.
+        #[serde(rename = "rawOutput", skip_serializing_if = "Option::is_none")]
+        raw_output: Option<&'a str>,
         /// The files the call works in.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         locations: Vec<Location>,
@@ -179,6 +278,91 @@ pub(super) enum Change<'a> {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         content: Vec<ToolContent<'a>>,
     },
+    /// The commands the session offers, which replaces the list the editor has.
+    AvailableCommandsUpdate {
+        /// The commands, in name order.
+        #[serde(rename = "availableCommands")]
+        available_commands: Vec<AvailableCommand<'a>>,
+    },
+    /// The title of the session, once it has one.
+    SessionInfoUpdate {
+        /// The title the editor shows.
+        title: &'a str,
+        /// When the session last changed, as ISO 8601.
+        #[serde(rename = "updatedAt")]
+        updated_at: String,
+    },
+    /// The tokens the session used, and the window they used.
+    UsageUpdate {
+        /// The tokens of the context the session holds.
+        used: u64,
+        /// The tokens the context window of the model holds.
+        size: u64,
+        /// What the provider charged, when it says.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cost: Option<Cost>,
+    },
+    /// One live event of the session, which a client that advertises notices
+    /// takes instead of an agent message.
+    Notice {
+        /// How serious it is.
+        severity: Severity,
+        /// The one line the editor shows.
+        title: String,
+        /// What happened, when one line is not enough.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// Every config option of the session, after a change.
+    ConfigOptionUpdate {
+        /// The options as they stand now.
+        #[serde(rename = "configOptions")]
+        config_options: Value,
+    },
+    /// The mode the session decides with now.
+    CurrentModeUpdate {
+        /// The mode's id.
+        #[serde(rename = "currentModeId")]
+        current_mode_id: &'a str,
+    },
+}
+
+/// One command the session offers: a slash command of the editor.
+#[derive(Serialize)]
+pub(super) struct AvailableCommand<'a> {
+    /// The name the user types after the slash.
+    pub(super) name: &'a str,
+    /// The line the editor shows beside it.
+    pub(super) description: &'a str,
+    /// What the command takes, when it takes arguments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) input: Option<CommandInput<'a>>,
+}
+
+/// The `input` of an [`AvailableCommand`]: unstructured text, and a hint.
+#[derive(Serialize)]
+pub(super) struct CommandInput<'a> {
+    /// What the text is for, as the editor shows it.
+    pub(super) hint: &'a str,
+}
+
+/// What a provider charged for a request.
+#[derive(Serialize)]
+pub(super) struct Cost {
+    /// The amount.
+    pub(super) amount: f64,
+    /// Its unit, an ISO 4217 code such as `USD`.
+    pub(super) currency: &'static str,
+}
+
+/// How serious a notice is.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Severity {
+    /// Something the editor should know, which costs nothing.
+    Warning,
+    /// Something that failed.
+    Error,
 }
 
 /// One text content block.
@@ -250,6 +434,29 @@ pub(super) struct Permission {
     pub(super) tool_call: CallRef,
     /// What the editor may answer.
     pub(super) options: Vec<PermissionOption>,
+}
+
+/// The params of `elicitation/create`, which this agent sends for a question
+/// set when the editor advertises that it shows a form.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Elicit {
+    /// The session that asks.
+    pub(super) session_id: String,
+    /// The mode asked for.
+    pub(super) mode: ElicitMode,
+    /// The line the editor shows above the form.
+    pub(super) message: String,
+    /// What the form asks for, as a JSON schema of the answers.
+    pub(super) requested_schema: Value,
+}
+
+/// The mode of `elicitation/create`.
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ElicitMode {
+    /// A form the editor shows, one field per answer.
+    Form,
 }
 
 /// The call a permission request names.
@@ -337,4 +544,23 @@ pub(super) struct ErrorObject {
     /// What the error names, such as the session it could not find.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) data: Option<Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use super::Block;
+    use super::PromptCall;
+
+    #[test]
+    fn the_base64_text_of_an_image_borrows_from_the_line() {
+        let line = br#"{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s","prompt":[{"type":"image","data":"aGk=","mimeType":"image/png"}]}}"#;
+        let call: PromptCall<'_> = serde_json::from_slice(line).expect("a prompt");
+        let prompt = call.params.expect("params");
+        match &prompt.prompt[0] {
+            Block::Image { data, .. } => assert!(matches!(data, Cow::Borrowed(_))),
+            other => panic!("expected an image, got {other:?}"),
+        }
+    }
 }

@@ -9768,6 +9768,8 @@ async fn picture_waits_for_the_record_that_holds_it() {
     app.frame(Frame::UserMessage {
         text: "[Image #1] can u read this".into(),
         images: 1,
+        client: None,
+        message: None,
     });
     // The first record of the run holds no image, and the read that follows it
     // finds none.
@@ -9819,6 +9821,8 @@ async fn picture_order_of_eight_images_holds() {
     app.frame(Frame::UserMessage {
         text: "look at the eight @pictures".into(),
         images: 8,
+        client: None,
+        message: None,
     });
     app.frame(Frame::Committed(newest));
     app.catch_up().await;

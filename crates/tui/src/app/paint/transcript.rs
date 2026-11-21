@@ -5652,6 +5652,8 @@ pub(crate) mod rows {
             app.frame(Frame::UserMessage {
                 text: "and the lints".into(),
                 images: 0,
+                client: None,
+                message: None,
             });
             app.commit();
             turn(&mut app, "2", "bash", r#"{"command":"cargo clippy"}"#, "ok");

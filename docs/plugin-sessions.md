@@ -44,9 +44,13 @@ A call of a session that belongs to another plugin rejects, so one plugin never 
 | `provider` | string | the provider it starts on, as `--provider` names it |
 | `model` | string | the model it starts on |
 | `profile` | string | the config profile it reads |
+| `tools` | string | the tools it may use, such as `"read,find,grep"` |
 
 Only `task` is required.
 A `provider` of `fake:replies.json` starts the session on that scripted provider, which is how a test keeps the session off the provider of the run: a session that reads the same scripted replies as the run it starts from would call the tool that started it again, for ever.
+
+A `tools` key replaces the whole `--tools` list the session inherits, so a session started with `tools: "read,grep"` has those two tools and no other one.
+A `tools` of `null` or `undefined` is the same as no `tools`, and any other value that is not a non-empty string rejects with `tools must be a non-empty string`.
 
 A plugin may have 8 sessions open at once, and a start whose worker is still coming takes a place of its own, so nine starts at once still leave the ninth out.
 A ninth `start` rejects with `plugin <name> has 8 sessions open, the limit`, and a session whose worker stopped frees its place and leaves `list`.
@@ -108,7 +112,7 @@ The words that serve people stay behind too, because a worker already has its cl
 
 Every other flag passes on, so a session runs on the same provider, the same model, the same profile, the same tool list (`--tools`), the same policy (`--policy`), the same MCP servers, the same limits and the same reasoning setting.
 It reads the same config file as the run, and takes its sandbox from it.
-The `cwd`, `provider`, `model` and `profile` of the `start` call come after the flags of the run, so the session's own words are the ones its worker reads.
+The `cwd`, `provider`, `model`, `profile` and `tools` of the `start` call come after the flags of the run, so the session's own words are the ones its worker reads.
 
 A session starts with no history: its first message is its `task`.
 

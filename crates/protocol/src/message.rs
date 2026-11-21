@@ -33,6 +33,8 @@ pub mod methods {
     pub const PLUGIN_PANEL: &str = "plugin_panel";
     /// A note to show in the transcript.
     pub const NOTE: &str = "note";
+    /// A JS plugin command a client asked for is done.
+    pub const COMMAND_END: &str = "command_end";
 }
 
 const JSONRPC: &str = "2.0";
@@ -209,6 +211,11 @@ pub struct InitializeResult<'a> {
     /// key at all, so it sends the bytes it sent before the field.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub skills: &'a [SkillInfo<'a>],
+    /// The permission mode in force, so a client that joins a live session knows
+    /// it. No key at all when the sender names none, so the bytes are the ones
+    /// sent before the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'a str>,
 }
 
 /// One skill a session found, as its `initialize` answer names it.
@@ -300,6 +307,15 @@ pub enum PanelLine<'a> {
 pub struct Note<'a> {
     #[serde(borrow)]
     pub text: Cow<'a, str>,
+}
+
+/// A JS plugin command a client asked for is done: its name, and whether it
+/// queued a message for the session, so a run follows.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CommandEnd<'a> {
+    #[serde(borrow)]
+    pub name: Cow<'a, str>,
+    pub sent: bool,
 }
 
 /// The worker's answer to `attach`.
@@ -596,6 +612,18 @@ pub fn note(buf: &mut Vec<u8>, text: &str) {
         methods::NOTE,
         &Note {
             text: Cow::Borrowed(text),
+        },
+    );
+}
+
+/// Writes the `command_end` notice line into `buf`.
+pub fn command_end(buf: &mut Vec<u8>, name: &str, sent: bool) {
+    notice(
+        buf,
+        methods::COMMAND_END,
+        &CommandEnd {
+            name: Cow::Borrowed(name),
+            sent,
         },
     );
 }
@@ -1058,6 +1086,7 @@ mod tests {
                 context_window: Some(200_000),
                 level: None,
                 skills: &[],
+                mode: None,
             },
         );
         assert_eq!(
@@ -1081,6 +1110,7 @@ mod tests {
                 context_window: None,
                 level: None,
                 skills: &[],
+                mode: None,
             },
         );
         assert_eq!(
@@ -1108,9 +1138,44 @@ mod tests {
                 context_window: None,
                 level: Some("high"),
                 skills: &[],
+                mode: None,
             },
         );
         assert!(text(&buf).contains("\"level\":\"high\""), "{}", text(&buf));
+    }
+
+    #[test]
+    fn the_command_end_notice_names_the_command_and_whether_it_sent() {
+        let mut buf = Vec::new();
+        command_end(&mut buf, "deploy", true);
+        assert_eq!(
+            text(&buf),
+            "{\"jsonrpc\":\"2.0\",\"method\":\"command_end\",\"params\":\
+             {\"name\":\"deploy\",\"sent\":true}}\n"
+        );
+    }
+
+    #[test]
+    fn the_initialize_answer_names_the_mode_in_force() {
+        let mut buf = Vec::new();
+        result(
+            &mut buf,
+            1,
+            &InitializeResult {
+                major: 1,
+                version: "0.1.0",
+                session: "s1",
+                client: 1,
+                capabilities: &[],
+                committed: 0,
+                model: "m",
+                context_window: None,
+                level: None,
+                skills: &[],
+                mode: Some("auto"),
+            },
+        );
+        assert!(text(&buf).contains("\"mode\":\"auto\""), "{}", text(&buf));
     }
 
     #[test]
@@ -1134,6 +1199,7 @@ mod tests {
                     path: "/w/.agents/skills/demo/SKILL.md",
                     scope: "project",
                 }],
+                mode: None,
             },
         );
         assert_eq!(
@@ -1163,6 +1229,7 @@ mod tests {
                 context_window: None,
                 level: None,
                 skills: &[],
+                mode: None,
             },
         );
         let line = text(&buf);

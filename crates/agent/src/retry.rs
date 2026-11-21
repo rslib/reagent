@@ -29,6 +29,13 @@ pub fn delay(attempt: u32, provider_wait: Option<Duration>, jitter: f64) -> Dura
     }
 }
 
+/// Whether the provider's wait is past the cap, such as a usage limit that
+/// resets in hours: a retry after the capped wait fails the same way, so the
+/// turn ends at once with the provider's error instead.
+pub fn too_far(provider_wait: Option<Duration>) -> bool {
+    provider_wait.is_some_and(|wait| wait > MAX_PROVIDER_WAIT)
+}
+
 fn backoff(attempt: u32, jitter: f64) -> Duration {
     let factor = 2_u32.saturating_pow(attempt);
     let base = BASE

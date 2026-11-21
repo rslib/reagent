@@ -204,3 +204,28 @@ A value that is not one of the above throws at `reagent.hook`.
 
 Each layer has its own limit, and a chain of layers is bounded by the sum of them: no layer is cut short by the limit of another.
 A layer may wait on a promise for its whole `timeoutMs`, for example while it asks a coordinator. Each piece of its JS that runs without a pause still stops after 5 s, as every plugin call does. The plugin thread serves one call at a time, so a long wait also delays the plugin's other hooks and events.
+
+## Plugin tools
+
+`reagent.registerTool(spec)` offers a tool to the model, as a native tool is offered.
+The spec has a `name`, a `description`, a `parameters` JSON Schema and the `run` function.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `name` | string | 1 to 64 letters, digits, `_` or `-`, and no other plugin may take it |
+| `description` | string | what the tool does, which the model reads |
+| `parameters` | object | the JSON Schema of its arguments |
+| `timeoutMs` | number | how long the promise `run` hands back may wait, 1000 to 7200000, `120000` when absent |
+| `run` | function | `(args, context)`, which answers a value, a promise, or `{ text, isError }` |
+
+`args` is the arguments object, after the tool's own repair.
+`context` names the call and the plugin: `context.tool` and `context.plugin`.
+It also carries `context.onCancel(fn)`: the function the runtime runs once when the run cancels this call, and a later call replaces the earlier one.
+A call that ends on its own never runs `fn`, and a throw in `fn` leaves one note, `plugin <name>: tool <tool> onCancel threw: <message>`.
+
+A cancel drops the promise the tool handed back and then runs `fn` on a 5 s budget of its own, so a tool's near deadline never cuts `fn` short, and the plugin's next call answers at once instead of waiting for a promise nothing settles.
+
+A tool whose promise does not settle within its `timeoutMs` gives an error result, `the plugin call was stopped after <n> s`, and a note that names the plugin and the tool.
+`<n>` keeps a fraction, so a `timeoutMs` of 1500 is stopped after `1.5 s`.
+A `timeoutMs` of `null` or `undefined` is the same as no `timeoutMs`.
+Any other `timeoutMs` that is not a whole number from 1000 to 7200000 throws at `reagent.registerTool`, with a message that names the tool and `timeoutMs`.

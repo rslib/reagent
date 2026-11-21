@@ -214,6 +214,8 @@ struct Start {
     profile: Option<String>,
     /// The provider it starts on, or `None` for the one of the run.
     provider: Option<String>,
+    /// The tools its worker may use, or `None` for the tools of the run.
+    tools: Option<String>,
 }
 
 /// The sessions of one run, on the run's runtime.
@@ -378,6 +380,7 @@ impl Host {
                 model,
                 profile,
                 provider,
+                tools,
             } => {
                 let it = Start {
                     task,
@@ -385,6 +388,7 @@ impl Host {
                     model,
                     profile,
                     provider,
+                    tools,
                 };
                 self.start(plugin, it, reply);
             }
@@ -824,7 +828,9 @@ fn lock(run: &Arc<Mutex<Run>>) -> std::sync::MutexGuard<'_, Run> {
 
 /// The flags of the worker of one session: this run's own words, which
 /// [`inherited`] already opens with `worker`, then the session's own, so its own
-/// `--cwd`, `--provider` and `-p` come after the ones it inherits and win.
+/// `--tools`, `--cwd`, `--provider` and `-p` come after the ones it inherits and
+/// win. A `--tools` of its own replaces the list it inherits, since the last
+/// list a run reads is the one it takes.
 fn worker_flags(base: &[OsString], cwd: &Path, it: &Start) -> Vec<OsString> {
     let mut flags: Vec<OsString> = base.to_vec();
     flags.push(OsString::from("--cwd"));
@@ -833,6 +839,7 @@ fn worker_flags(base: &[OsString], cwd: &Path, it: &Start) -> Vec<OsString> {
         ("--provider", &it.provider),
         ("--model", &it.model),
         ("--profile", &it.profile),
+        ("--tools", &it.tools),
     ] {
         if let Some(value) = value {
             flags.push(OsString::from(flag));
@@ -856,6 +863,7 @@ mod tests {
             model: Some("p/m".into()),
             profile: Some("dev".into()),
             provider: Some("fake:y.json".into()),
+            tools: None,
         };
         let flags = worker_flags(
             &[
@@ -884,6 +892,47 @@ mod tests {
                 "p/m",
                 "--profile",
                 "dev",
+                "-p",
+                "a task",
+            ]
+        );
+    }
+
+    /// A start of a session whose own `tools` come after the ones it inherits:
+    /// the list of `--tools` the worker reads is the last one.
+    #[test]
+    fn plugin_session_tools_follow_the_inherited_flags() {
+        let it = Start {
+            task: String::from("a task"),
+            cwd: None,
+            model: None,
+            profile: None,
+            provider: None,
+            tools: Some("read,grep".into()),
+        };
+        let flags = worker_flags(
+            &[
+                OsString::from("worker"),
+                OsString::from("--tools"),
+                OsString::from("read,write"),
+            ],
+            Path::new("/work"),
+            &it,
+        );
+        let words: Vec<String> = flags
+            .iter()
+            .map(|word| word.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            words,
+            [
+                "worker",
+                "--tools",
+                "read,write",
+                "--cwd",
+                "/work",
+                "--tools",
+                "read,grep",
                 "-p",
                 "a task",
             ]
@@ -1027,6 +1076,7 @@ mod tests {
                 model: None,
                 profile: None,
                 provider: None,
+                tools: None,
             },
             reply,
         })

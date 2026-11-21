@@ -1,0 +1,13 @@
+{
+  "name": "reagent-task",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "reagent": {
+    "entry": "index.js",
+    "permissions": {
+      "sessions": true,
+      "env": ["REAGENT_TASK_PROVIDER", "REAGENT_TASK_MODEL"]
+    }
+  }
+}

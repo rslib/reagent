@@ -38,7 +38,7 @@ mod term;
 #[cfg(test)]
 mod tests;
 
-pub use term::Real;
+pub use term::{Limit, Real};
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
@@ -3532,7 +3532,7 @@ impl App {
                 self.settled = Status::of(end);
                 self.turn_end(true);
             }
-            Frame::UserMessage { text, images } => {
+            Frame::UserMessage { text, images, .. } => {
                 self.push_user(&text);
                 // The images of the message, pasted or attached with `@`, are in
                 // the journal: the frame carries only their count.
@@ -3564,6 +3564,8 @@ impl App {
                 after,
                 replaced,
             } => self.compacted(before, after, replaced),
+            // The app shows a message when its `user_message` comes.
+            Frame::MessageState { .. } => {}
             Frame::Retry { attempt, error } => {
                 let message = format!("retry {attempt}: {error}");
                 self.note(message);
@@ -3595,6 +3597,7 @@ impl App {
                 self.plugin_panel(&id, &title, &lines);
             }
             Frame::Note(text) => self.note(text.into_owned()),
+            Frame::CommandEnd { .. } | Frame::Refused { .. } => {}
             Frame::Settings {
                 model,
                 context_window,
@@ -6168,7 +6171,7 @@ impl App {
                 }
                 Command::Detach => client.detach().await,
                 Command::Compact { note } => client.compact(note.as_deref()).await,
-                Command::Plugin { name, args } => client.command(&name, &args).await,
+                Command::Plugin { name, args } => client.command(&name, &args).await.map(drop),
             };
             if sent.is_err() {
                 self.exit = true;

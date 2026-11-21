@@ -38,6 +38,8 @@ pub struct Initialized {
     pub context_window: Option<u64>,
     /// The reasoning level the session sends, when it sends one.
     pub level: Option<Arc<str>>,
+    /// The permission mode in force. A worker older than the field names none.
+    pub mode: Option<Arc<str>>,
     /// The skills the session found, in name order. A worker that found none,
     /// and one older than the field, names none.
     pub skills: Vec<Skill>,
@@ -154,6 +156,17 @@ pub enum Frame<'a> {
         text: Cow<'a, str>,
         /// How many images follow it, such as a pasted one.
         images: usize,
+        /// The client that sent it, `None` from a worker that names none.
+        client: Option<u64>,
+        /// The id the worker gave it, which its [`Frame::MessageState`] names.
+        message: Option<u64>,
+    },
+    /// A sent message entered the conversation, or was dropped before it did.
+    MessageState {
+        /// The id its [`Frame::UserMessage`] named.
+        message: u64,
+        /// Where it stands.
+        state: Settled,
     },
     /// A provider or tool error.
     Error(Cow<'a, str>),
@@ -254,6 +267,15 @@ pub enum Frame<'a> {
     /// Text the worker asks the transcript to show, such as what a plugin
     /// command printed.
     Note(Cow<'a, str>),
+    /// The worker refused a request of this client: the id of that request,
+    /// when the answer names one, and the words it gave.
+    Refused { id: Option<u64>, text: Cow<'a, str> },
+    /// The plugin command this client asked for is done, and whether it queued
+    /// a message, so a run follows.
+    CommandEnd {
+        /// Whether the command queued a message for the session.
+        sent: bool,
+    },
     /// A method or an event type this build does not know, or an answer to a
     /// request: nothing to draw.
     Unknown,
@@ -261,6 +283,17 @@ pub enum Frame<'a> {
 
 /// Why a run ended, as the `reason` of the worker's `run_end` frame names it.
 ///
+/// Where a sent message stands once the worker settled it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    /// It entered the conversation, so the run that follows is its own.
+    Landed,
+    /// A cancel dropped it before it entered.
+    Cancelled,
+    /// The worker dropped it for another reason, such as the session ending.
+    Dropped,
+}
+
 /// A word this build does not know is [`RunEnd::Other`]: the run ended all the
 /// same, and a frame that names no reason at all is one too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -289,6 +322,29 @@ impl RunEnd {
             Some("cancelled") => RunEnd::Cancelled,
             Some("error") => RunEnd::Error,
             _ => RunEnd::Other,
+        }
+    }
+}
+
+/// Why the provider stopped the reply of a run, as the `stop` field of the
+/// worker's `run_end` line names it. A worker older than the field names none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStop {
+    /// The output limit of the model ended the reply, so the task may not be
+    /// done.
+    MaxTokens,
+    /// The model refused to answer.
+    Refusal,
+}
+
+impl RunStop {
+    /// The word the worker's `stop` field names, and nothing for a word this
+    /// build does not know.
+    fn of(word: Option<&str>) -> Option<RunStop> {
+        match word {
+            Some("max_tokens") => Some(RunStop::MaxTokens),
+            Some("refusal") => Some(RunStop::Refusal),
+            _ => None,
         }
     }
 }
@@ -351,6 +407,9 @@ pub struct Client {
     replay: Vec<Vec<u8>>,
     /// How many of them [`Client::next_frame`] served.
     at: usize,
+    /// Why the provider stopped the run of the last `run_end` frame, when it
+    /// did, which [`Client::last_stop`] answers.
+    stop: Option<RunStop>,
 }
 
 impl Client {
@@ -373,6 +432,7 @@ impl Client {
             next: 0,
             replay: Vec::new(),
             at: 0,
+            stop: None,
         };
         let init = client.initialize(token, name).await?;
         Ok((client, init))
@@ -472,8 +532,9 @@ impl Client {
 
     /// Runs the JS plugin command `name` with `args`: the rest of the line as
     /// it was typed. The answer is empty, and the text the command prints
-    /// comes back as a `note`.
-    pub async fn command(&mut self, name: &str, args: &str) -> io::Result<()> {
+    /// comes back as a `note`. Gives the id of the request, which a refusal
+    /// of it names.
+    pub async fn command(&mut self, name: &str, args: &str) -> io::Result<u64> {
         let id = self.id();
         begin(&mut self.out, id, "command");
         self.out.extend_from_slice(b"{\"name\":");
@@ -481,7 +542,7 @@ impl Client {
         self.out.extend_from_slice(b",\"args\":");
         push_str(&mut self.out, args);
         self.out.extend_from_slice(b"}}\n");
-        self.flush().await
+        self.flush().await.map(|()| id)
     }
 
     /// Sets the model, the reasoning level or the permission mode of the
@@ -589,14 +650,24 @@ impl Client {
         let at = self.at;
         if at < self.replay.len() {
             self.at = at + 1;
-            let line: &[u8] = &self.replay[at];
-            return Ok(Next::Frame(decode(line).unwrap_or(Frame::Unknown)));
+            let (frame, stop) = decode_with_stop(&self.replay[at]);
+            self.stop = stop;
+            return Ok(Next::Frame(frame.unwrap_or(Frame::Unknown)));
         }
         if at > 0 {
             self.replay.clear();
             self.at = 0;
         }
-        self.reader.next().await
+        let (next, stop) = self.reader.next().await?;
+        self.stop = stop;
+        Ok(next)
+    }
+
+    /// Why the provider stopped the run of the `run_end` frame that
+    /// [`Client::next_frame`] served last, when it stopped it: a client reads it
+    /// after that frame, and no copy of the run end text is kept for it.
+    pub fn last_stop(&self) -> Option<RunStop> {
+        self.stop
     }
 
     /// The id of the next request.
@@ -661,15 +732,18 @@ impl Reader {
     /// A line this build does not know comes back as [`Frame::Unknown`], which
     /// the app drops: skipping it here would fold a loop into the one borrow
     /// that leaves this call, which the borrow checker does not allow.
-    async fn next(&mut self) -> io::Result<Next<'_>> {
+    async fn next(&mut self) -> io::Result<(Next<'_>, Option<RunStop>)> {
         // Read before the call, since the call takes the mutable borrow the
         // match holds; a reader that closes during it answers `More` once and
         // `End` on the next call.
         let closed = self.closed;
         match self.line().await? {
-            Some(line) => Ok(Next::Frame(decode(line).unwrap_or(Frame::Unknown))),
-            None if closed => Ok(Next::End),
-            None => Ok(Next::More),
+            Some(line) => {
+                let (frame, stop) = decode_with_stop(line);
+                Ok((Next::Frame(frame.unwrap_or(Frame::Unknown)), stop))
+            }
+            None if closed => Ok((Next::End, None)),
+            None => Ok((Next::More, None)),
         }
     }
 
@@ -725,6 +799,9 @@ fn read_init(line: &[u8], id: u64) -> io::Result<Option<Initialized>> {
         context_window: Option<u64>,
         #[serde(borrow, default)]
         level: Option<Cow<'a, str>>,
+        /// Absent from the answer of a worker older than the field.
+        #[serde(borrow, default)]
+        mode: Option<Cow<'a, str>>,
         /// Absent from the answer of a worker that found no skill.
         #[serde(borrow, default)]
         skills: Vec<SkillLine<'a>>,
@@ -743,6 +820,7 @@ fn read_init(line: &[u8], id: u64) -> io::Result<Option<Initialized>> {
             model: result.model.as_deref().map(Arc::from),
             context_window: result.context_window,
             level: result.level.as_deref().map(Arc::from),
+            mode: result.mode.as_deref().map(Arc::from),
             skills: result
                 .skills
                 .iter()
@@ -788,10 +866,37 @@ fn read_attached(line: &[u8], id: u64) -> io::Result<Option<Attached>> {
 
 /// A frame this build knows, or `None` for one it skips.
 pub fn decode(line: &[u8]) -> Option<Frame<'_>> {
-    let Ok(line) = serde_json::from_slice::<Line<'_>>(line) else {
-        return None;
+    decode_with_stop(line).0
+}
+
+/// A frame this build knows and the stop word of its `run_end`, in one parse:
+/// `None` for a line it skips, and no word for a run the provider did not stop.
+fn decode_with_stop(line: &[u8]) -> (Option<Frame<'_>>, Option<RunStop>) {
+    let Ok(wire) = serde_json::from_slice::<Line<'_>>(line) else {
+        return (None, None);
     };
-    let Line { method, params } = line;
+    let stop = RunStop::of(
+        wire.params
+            .as_ref()
+            .and_then(|params| params.stop.as_deref()),
+    );
+    (decode_line(wire), stop)
+}
+
+/// The frame of one worker line, or `None` for a line this build skips.
+fn decode_line(line: Line<'_>) -> Option<Frame<'_>> {
+    let Line {
+        method,
+        params,
+        id,
+        error,
+    } = line;
+    if method.is_empty() {
+        return error.map(|error| Frame::Refused {
+            id,
+            text: error.message,
+        });
+    }
     let Params {
         kind,
         text,
@@ -820,6 +925,8 @@ pub fn decode(line: &[u8]) -> Option<Frame<'_>> {
         save,
         reason,
         client,
+        message_id,
+        state,
         model,
         context_window,
         level,
@@ -828,8 +935,10 @@ pub fn decode(line: &[u8]) -> Option<Frame<'_>> {
         commands,
         title,
         lines,
+        sent,
+        stop: _,
     } = params?;
-    Some(match (&*method, kind.as_deref().unwrap_or_default()) {
+    let frame = match (&*method, kind.as_deref().unwrap_or_default()) {
         ("event", "turn_start") => Frame::TurnStart,
         ("event", "text_delta") => Frame::TextDelta(text?),
         ("event", "thinking_delta") => Frame::ThinkingDelta(text?),
@@ -858,6 +967,16 @@ pub fn decode(line: &[u8]) -> Option<Frame<'_>> {
         ("event", "user_message") => Frame::UserMessage {
             text: text?,
             images: images.len(),
+            client,
+            message: message_id,
+        },
+        ("event", "message_state") => Frame::MessageState {
+            message: message_id?,
+            state: match (state.as_deref(), reason.as_deref()) {
+                (Some("landed"), _) => Settled::Landed,
+                (_, Some("cancelled")) => Settled::Cancelled,
+                _ => Settled::Dropped,
+            },
         },
         ("event", "error") => Frame::Error(message?),
         ("event", "retry") => Frame::Retry {
@@ -911,8 +1030,10 @@ pub fn decode(line: &[u8]) -> Option<Frame<'_>> {
             lines,
         },
         ("note", _) => Frame::Note(text?),
+        ("command_end", _) => Frame::CommandEnd { sent },
         _ => return None,
-    })
+    };
+    Some(frame)
 }
 
 /// One worker line: the method and the params of every method, flat so no tag
@@ -923,6 +1044,19 @@ struct Line<'a> {
     method: Cow<'a, str>,
     #[serde(borrow, default)]
     params: Option<Params<'a>>,
+    /// The id of an answer to a request of this client.
+    #[serde(default)]
+    id: Option<u64>,
+    /// The error of an answer to a request.
+    #[serde(borrow, default)]
+    error: Option<Refusal<'a>>,
+}
+
+/// The error of an answer: the words of the worker.
+#[derive(Deserialize)]
+struct Refusal<'a> {
+    #[serde(borrow, default)]
+    message: Cow<'a, str>,
 }
 
 /// The params of every method and event type, each optional so a line without
@@ -939,6 +1073,8 @@ struct Params<'a> {
     name: Option<Cow<'a, str>>,
     #[serde(default, borrow, deserialize_with = "cow")]
     arguments: Option<Cow<'a, str>>,
+    #[serde(default)]
+    sent: bool,
     #[serde(default)]
     is_error: bool,
     #[serde(default)]
@@ -988,8 +1124,18 @@ struct Params<'a> {
     save: Vec<Cow<'a, str>>,
     #[serde(default, borrow, deserialize_with = "cow")]
     reason: Option<Cow<'a, str>>,
+    /// Why the provider stopped the reply of a `run_end` frame: `max_tokens` or
+    /// `refusal`, which a worker older than the field does not send.
+    #[serde(default, borrow, deserialize_with = "cow")]
+    stop: Option<Cow<'a, str>>,
     #[serde(default)]
     client: Option<u64>,
+    /// The id of a message in `user_message` and `message_state`.
+    #[serde(default)]
+    message_id: Option<u64>,
+    /// Where a message stands in `message_state`.
+    #[serde(default, borrow, deserialize_with = "cow")]
+    state: Option<Cow<'a, str>>,
     #[serde(default, borrow, deserialize_with = "cow")]
     model: Option<Cow<'a, str>>,
     #[serde(default)]
@@ -1238,7 +1384,10 @@ mod tests {
 
     use std::sync::Arc;
 
-    use super::{Attached, Client, Frame, Initialized, Next, RunEnd, Scope, Skill, decode};
+    use super::{
+        Attached, Client, Frame, Initialized, Next, RunEnd, RunStop, Scope, Skill, decode,
+        decode_with_stop,
+    };
 
     /// How long a test waits for a frame before it fails.
     const WAIT: Duration = Duration::from_secs(10);
@@ -1446,6 +1595,7 @@ mod tests {
                 model: Some(Arc::from(MODEL)),
                 context_window: Some(WINDOW),
                 level: None,
+                mode: None,
                 skills: Vec::new(),
             }
         );
@@ -1506,6 +1656,24 @@ mod tests {
             .expect("connect");
         assert_eq!(init.model, None);
         assert_eq!(init.context_window, None);
+    }
+
+    /// The `initialize` answer names the mode in force, and one that names none
+    /// is an older worker.
+    #[test]
+    fn an_initialize_answer_names_the_mode_in_force() {
+        let line = br#"{"jsonrpc":"2.0","id":4,"result":{"session":"s1","client":7,
+            "committed":0,"mode":"auto"}}"#;
+        let init = super::read_init(line, 4)
+            .expect("a line reads")
+            .expect("the answer");
+        assert_eq!(init.mode.as_deref(), Some("auto"));
+        let line = br#"{"jsonrpc":"2.0","id":4,"result":{"session":"s1","client":7,
+            "committed":0}}"#;
+        let init = super::read_init(line, 4)
+            .expect("a line reads")
+            .expect("the answer");
+        assert_eq!(init.mode, None);
     }
 
     /// The `initialize` answer names the skills the session found, with the
@@ -1986,7 +2154,7 @@ mod tests {
         match frame(
             r#"{"jsonrpc":"2.0","method":"event","params":{"type":"user_message","client":7,"mode":"steer","text":"hi"}}"#,
         ) {
-            Some(Frame::UserMessage { text, images }) => {
+            Some(Frame::UserMessage { text, images, .. }) => {
                 assert_eq!(text, "hi");
                 assert_eq!(images, 0);
             }
@@ -2060,6 +2228,48 @@ mod tests {
         match frame(r#"{"jsonrpc":"2.0","method":"event","params":{"type":"run_end"}}"#) {
             Some(Frame::RunEnd { end }) => assert_eq!(end, RunEnd::Other),
             other => panic!("expected a run end, got {other:?}"),
+        }
+    }
+
+    /// The `stop` field of a `run_end` names why the provider stopped, and the
+    /// `reason` word keeps its meaning for a client that does not read it.
+    #[test]
+    fn program_status_run_end_stop_parses() {
+        let cases = [
+            (
+                r#""reason":"stopped","stop":"max_tokens""#,
+                RunEnd::Stopped,
+                Some(RunStop::MaxTokens),
+            ),
+            (
+                r#""reason":"stopped","stop":"refusal""#,
+                RunEnd::Stopped,
+                Some(RunStop::Refusal),
+            ),
+            (
+                r#""reason":"stopped","stop":"budget""#,
+                RunEnd::Stopped,
+                None,
+            ),
+            (r#""reason":"stopped""#, RunEnd::Stopped, None),
+            (r#""reason":"cancelled""#, RunEnd::Cancelled, None),
+            (
+                r#""stop":"max_tokens""#,
+                RunEnd::Other,
+                Some(RunStop::MaxTokens),
+            ),
+        ];
+        for (fields, end, stop) in cases {
+            let line = format!(
+                r#"{{"jsonrpc":"2.0","method":"event","params":{{"type":"run_end",{fields}}}}}"#
+            );
+            match decode_with_stop(line.as_bytes()) {
+                (Some(Frame::RunEnd { end: got }), got_stop) => {
+                    assert_eq!(got, end, "{fields}");
+                    assert_eq!(got_stop, stop, "{fields}");
+                }
+                other => panic!("expected the run end of {fields}, got {other:?}"),
+            }
         }
     }
 
@@ -2203,6 +2413,31 @@ mod tests {
         }
     }
 
+    /// An error answer is the words the worker refused with.
+    #[test]
+    fn an_error_answer_is_a_refusal() {
+        match frame(
+            r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"no plugin command is named '/x'"}}"#,
+        ) {
+            Some(Frame::Refused { id, text }) => {
+                assert_eq!(id, Some(4));
+                assert_eq!(text, "no plugin command is named '/x'");
+            }
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+    }
+
+    /// A `command_end` notice says whether the command queued a message.
+    #[test]
+    fn a_command_end_notice_says_whether_the_command_sent() {
+        match frame(
+            r#"{"jsonrpc":"2.0","method":"command_end","params":{"name":"deploy","sent":true}}"#,
+        ) {
+            Some(Frame::CommandEnd { sent }) => assert!(sent),
+            other => panic!("expected the command end, got {other:?}"),
+        }
+    }
+
     /// A command request carries the plugin command's name and the rest of the
     /// line as one string, as typed.
     #[tokio::test]
@@ -2327,8 +2562,8 @@ mod tests {
         }
     }
 
-    /// A method or a type this build does not know, and an answer to a request,
-    /// have nothing to draw.
+    /// A method or a type this build does not know, and a result answer to a
+    /// request, have nothing to draw. An error answer is a refusal.
     #[test]
     fn decode_an_unknown_line_gives_none() {
         for line in [
@@ -2337,7 +2572,6 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"event","params":{"anything":1}}"#,
             r#"{"jsonrpc":"2.0","method":"event"}"#,
             "{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{}}",
-            r#"{"jsonrpc":"2.0","id":1,"error":{"code":1,"message":"no"}}"#,
         ] {
             assert!(frame(line).is_none(), "{line} decoded to a frame");
         }

@@ -11,14 +11,28 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+mod media;
+mod sessions;
+mod settings;
+mod updates;
 
 const BIN: &str = env!("CARGO_BIN_EXE_reagent");
 
 /// How long a test waits for a line before it fails.
 const WAIT: Duration = Duration::from_secs(30);
+
+/// The 64x48 PNG the tools tests use.
+const SHOT: &[u8] = include_bytes!("../../../tools/tests/fixtures/shot.png");
+
+/// The base64 text of the fixture image.
+fn shot() -> String {
+    base64::engine::general_purpose::STANDARD.encode(SHOT)
+}
 
 /// A state folder short enough for a socket path, which the platform caps.
 fn state() -> tempfile::TempDir {
@@ -30,13 +44,18 @@ fn state() -> tempfile::TempDir {
 
 /// A folder the session runs in, with the repository marker the config walks up
 /// to.
+///
+/// The path is the one the platform resolves it to, which is the folder a worker
+/// keys its session by.
 async fn work(state: &Path) -> PathBuf {
     let cwd = state.join("work");
     tokio::fs::create_dir(&cwd).await.expect("the work folder");
     tokio::fs::create_dir(cwd.join(".git"))
         .await
         .expect("the repo folder");
-    cwd
+    tokio::fs::canonicalize(&cwd)
+        .await
+        .expect("the real work folder")
 }
 
 /// A folder whose project config asks a person before every `bash` call.
@@ -196,12 +215,18 @@ impl Acp {
 
     /// Initializes the connection, as an editor does first.
     async fn initialize(&mut self) -> Value {
+        self.initialize_with(json!({})).await
+    }
+
+    /// Initializes the connection as an editor whose `clientCapabilities` are
+    /// `capabilities`.
+    async fn initialize_with(&mut self, capabilities: Value) -> Value {
         let id = self
             .request(
                 "initialize",
                 json!({
                     "protocolVersion": 1,
-                    "clientCapabilities": {},
+                    "clientCapabilities": capabilities,
                     "clientInfo": {"name": "acp-test", "version": "1"},
                 }),
             )
@@ -231,12 +256,15 @@ impl Acp {
 
     /// Sends one prompt of one text block and answers the id of its request.
     async fn prompt(&mut self, session: &str, text: &str) -> u64 {
+        self.prompt_blocks(session, json!([{"type": "text", "text": text}]))
+            .await
+    }
+
+    /// Sends one prompt of the blocks `blocks`.
+    async fn prompt_blocks(&mut self, session: &str, blocks: Value) -> u64 {
         self.request(
             "session/prompt",
-            json!({
-                "sessionId": session,
-                "prompt": [{"type": "text", "text": text}],
-            }),
+            json!({"sessionId": session, "prompt": blocks}),
         )
         .await
     }
@@ -288,7 +316,7 @@ async fn acp_initialize_answers_version_one() {
     assert_eq!(result["protocolVersion"], 1, "{answer}");
     let agent = &result["agentCapabilities"];
     assert_eq!(agent["loadSession"], true, "{answer}");
-    assert_eq!(agent["promptCapabilities"]["image"], false, "{answer}");
+    assert_eq!(agent["promptCapabilities"]["image"], true, "{answer}");
     assert_eq!(agent["promptCapabilities"]["audio"], false, "{answer}");
     assert_eq!(
         agent["promptCapabilities"]["embeddedContext"], true,
@@ -549,7 +577,8 @@ async fn acp_load_replays_the_history() {
         .await;
     let lines = second.until(|line| line["id"].as_u64() == Some(id)).await;
     let answer = lines.last().expect("an answer");
-    assert_eq!(answer["result"], json!({}), "{answer}");
+    assert!(answer.get("error").is_none(), "{answer}");
+    model_option(&answer["result"]);
     assert!(
         chunks(&lines, "user_message_chunk").contains("say hi"),
         "the prompt is replayed: {lines:?}"
@@ -608,24 +637,360 @@ async fn acp_bad_cwd_is_invalid_params() {
     assert_eq!(answer["error"]["code"], -32602, "invalid params: {answer}");
 }
 
-/// An image block is refused, since this agent takes no images.
+/// An image block is accepted, and its file is written under the state folder
+/// and not in the work tree.
 #[tokio::test]
-async fn acp_image_block_is_refused() {
+async fn acp_image_block_is_accepted() {
     let state = state();
     let cwd = work(state.path()).await;
-    let provider = script(state.path(), r#"{"replies":[{"text":"never asked"}]}"#).await;
+    let provider = script(state.path(), r#"{"replies":[{"text":"seen"}]}"#).await;
     let mut acp = Acp::start(state.path(), &cwd, &["--provider", provider.as_str()]).await;
     acp.initialize().await;
     let session = acp.new_session(&cwd).await;
+    let data = base64::engine::general_purpose::STANDARD.encode(SHOT);
     let id = acp
         .request(
             "session/prompt",
             json!({
                 "sessionId": session,
-                "prompt": [{"type": "image", "data": "aGk=", "mimeType": "image/png"}],
+                "prompt": [{"type": "image", "data": data, "mimeType": "image/png"}],
             }),
         )
         .await;
+    let lines = acp.until(|line| line["id"].as_u64() == Some(id)).await;
+    let answer = lines.last().expect("an answer");
+    assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+
+    let mut entries: Vec<String> = Vec::new();
+    let mut read = tokio::fs::read_dir(&cwd).await.expect("the work folder");
+    while let Ok(Some(entry)) = read.next_entry().await {
+        entries.push(entry.file_name().to_string_lossy().to_string());
+    }
+    assert_eq!(entries, [".git"], "the work tree holds no image");
+    let sessions = state.path().join("reagent").join("sessions");
+    let mut found = false;
+    let mut stack = vec![sessions];
+    while let Some(dir) = stack.pop() {
+        let Ok(mut read) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = read.next_entry().await {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "png") {
+                found = true;
+            } else if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    assert!(found, "the image file is under the state folder");
+}
+
+/// A prompt a second editor queues behind the run of the first is answered at
+/// the end of its own run, not at the end of the run it waited behind.
+#[tokio::test]
+async fn acp_queued_prompt_waits_for_its_own_run() {
+    let state = state();
+    let cwd = work(state.path()).await;
+    ask_folder(&cwd).await;
+    let provider = script(
+        state.path(),
+        r#"{"replies":[{"calls":[{"name":"bash","arguments":{"command":"echo hi"}}]},{"text":"first done"},{"text":"second done"}]}"#,
+    )
+    .await;
+    let mut first = Acp::start(state.path(), &cwd, &["--provider", provider.as_str()]).await;
+    first.initialize().await;
+    let session = first.new_session(&cwd).await;
+    let id = first.prompt(&session, "first prompt").await;
+    let asked = first
+        .until(|line| line["method"] == "session/request_permission")
+        .await;
+    let ask = asked.last().expect("a permission request")["id"]
+        .as_u64()
+        .expect("a request id");
+
+    let mut second = Acp::start(state.path(), &cwd, &["--provider", provider.as_str()]).await;
+    second.initialize().await;
+    let load = second
+        .request(
+            "session/load",
+            json!({"sessionId": session, "cwd": path(&cwd), "mcpServers": []}),
+        )
+        .await;
+    let answer = second.answer(load).await;
+    assert!(answer.get("error").is_none(), "{answer}");
+    model_option(&answer["result"]);
+    let queued = second.prompt(&session, "queued prompt").await;
+
+    first
+        .send(json!({
+            "jsonrpc": "2.0",
+            "id": ask,
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+        }))
+        .await;
+    first.until(|line| line["id"].as_u64() == Some(id)).await;
+    let lines = second
+        .until(|line| line["id"].as_u64() == Some(queued) && line.get("method").is_none())
+        .await;
+    assert!(
+        chunks(&lines, "agent_message_chunk").contains("second done"),
+        "the queued prompt is answered after its own run: {lines:?}"
+    );
+}
+
+/// A load replays a tool call the way the live run sent it: pending when it
+/// starts, in progress once its arguments are known, then its result.
+#[tokio::test]
+async fn acp_load_replays_tool_calls_as_live() {
+    let state = state();
+    let cwd = work(state.path()).await;
+    tokio::fs::write(cwd.join("a.txt"), "hi there\n")
+        .await
+        .expect("the file");
+    let provider = script(
+        state.path(),
+        r#"{"replies":[{"calls":[{"name":"read","arguments":{"path":"a.txt"}}]},{"text":"done"}]}"#,
+    )
+    .await;
+    let mut first = Acp::start(state.path(), &cwd, &["--provider", provider.as_str()]).await;
+    first.initialize().await;
+    let session = first.new_session(&cwd).await;
+    let id = first.prompt(&session, "read it").await;
+    let live = first.until(|line| line["id"].as_u64() == Some(id)).await;
+
+    let mut second = Acp::start(state.path(), &cwd, &["--provider", provider.as_str()]).await;
+    second.initialize().await;
+    let load = second
+        .request(
+            "session/load",
+            json!({"sessionId": session, "cwd": path(&cwd), "mcpServers": []}),
+        )
+        .await;
+    let replayed = second.until(|line| line["id"].as_u64() == Some(load)).await;
+
+    let steps = |lines: &[Value]| -> Vec<(String, String)> {
+        updates(lines)
+            .into_iter()
+            .filter(|update| update["toolCallId"] == "call_0")
+            .map(|update| {
+                (
+                    update["sessionUpdate"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    update["status"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        steps(&replayed),
+        steps(&live),
+        "the replay maps the call as the live run did: {replayed:?}"
+    );
+}
+
+/// A load of a session this same agent already serves sends each update of the
+/// next run once.
+#[tokio::test]
+async fn acp_load_of_a_served_session_sends_each_update_once() {
+    let state = state();
+    let cwd = work(state.path()).await;
+    let provider = script(
+        state.path(),
+        r#"{"replies":[{"text":"first reply"},{"text":"second reply"}]}"#,
+    )
+    .await;
+    let mut acp = Acp::start(state.path(), &cwd, &["--provider", provider.as_str()]).await;
+    acp.initialize().await;
+    let session = acp.new_session(&cwd).await;
+    let id = acp.prompt(&session, "say hi").await;
+    acp.until(|line| line["id"].as_u64() == Some(id)).await;
+
+    let load = acp
+        .request(
+            "session/load",
+            json!({"sessionId": session, "cwd": path(&cwd), "mcpServers": []}),
+        )
+        .await;
+    let answer = acp.answer(load).await;
+    assert!(answer.get("error").is_none(), "{answer}");
+    model_option(&answer["result"]);
+
+    let id = acp.prompt(&session, "say hi again").await;
+    let mut lines = acp.until(|line| line["id"].as_u64() == Some(id)).await;
+    // A late second copy must not hide behind the answer.
+    while let Ok(line) = tokio::time::timeout(Duration::from_secs(2), acp.line()).await {
+        lines.push(line);
+    }
+    let seen = updates(&lines)
+        .into_iter()
+        .filter(|update| {
+            update["sessionUpdate"] == "user_message_chunk"
+                && update["content"]["text"] == "say hi again"
+        })
+        .count();
+    assert_eq!(seen, 1, "one prompt reaches the editor once: {lines:?}");
+}
+
+/// A cancel while a prompt still waits behind the run of another editor
+/// answers that prompt `cancelled`, not an error.
+#[tokio::test]
+async fn acp_cancel_of_a_queued_prompt_ends_with_cancelled() {
+    let state = state();
+    let cwd = work(state.path()).await;
+    ask_folder(&cwd).await;
+    let provider = script(
+        state.path(),
+        r#"{"replies":[{"calls":[{"name":"bash","arguments":{"command":"echo hi"}}]},{"text":"done"}]}"#,
+    )
+    .await;
+    let mut first = Acp::start(state.path(), &cwd, &["--provider", provider.as_str()]).await;
+    first.initialize().await;
+    let session = first.new_session(&cwd).await;
+    first.prompt(&session, "first prompt").await;
+    first
+        .until(|line| line["method"] == "session/request_permission")
+        .await;
+
+    let mut second = Acp::start(state.path(), &cwd, &["--provider", provider.as_str()]).await;
+    second.initialize().await;
+    let load = second
+        .request(
+            "session/load",
+            json!({"sessionId": session, "cwd": path(&cwd), "mcpServers": []}),
+        )
+        .await;
+    second.answer(load).await;
+    let queued = second.prompt(&session, "queued prompt").await;
+    second
+        .until(|line| {
+            line["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+                && line["params"]["update"]["content"]["text"] == "queued prompt"
+        })
+        .await;
+    second
+        .notify("session/cancel", json!({"sessionId": session}))
+        .await;
+    let lines = second
+        .until(|line| line["id"].as_u64() == Some(queued) && line.get("method").is_none())
+        .await;
+    let answer = lines.last().expect("an answer");
+    assert_eq!(answer["result"]["stopReason"], "cancelled", "{answer}");
+}
+
+/// The model select of a session's `configOptions`, from the answer of a
+/// `session/new`, a `session/load` or a `session/set_config_option`.
+fn model_option(result: &Value) -> &Value {
+    result["configOptions"]
+        .as_array()
+        .and_then(|options| options.iter().find(|option| option["id"] == "model"))
+        .unwrap_or_else(|| panic!("a model option in {result}"))
+}
+
+/// A new session names its model as a select config option, and the editor
+/// switches it with `session/set_config_option`, which the worker takes.
+#[tokio::test]
+async fn acp_model_is_a_config_option_the_editor_sets() {
+    let state = state();
+    let cwd = work(state.path()).await;
+    let provider = script(state.path(), r#"{"replies":[{"text":"hi"}]}"#).await;
+    let mut acp = Acp::start(state.path(), &cwd, &["--provider", provider.as_str()]).await;
+    acp.initialize().await;
+    let id = acp
+        .request("session/new", json!({"cwd": path(&cwd), "mcpServers": []}))
+        .await;
     let answer = acp.answer(id).await;
-    assert_eq!(answer["error"]["code"], -32602, "invalid params: {answer}");
+    let session = answer["result"]["sessionId"]
+        .as_str()
+        .expect("a session id")
+        .to_string();
+    let model = model_option(&answer["result"]);
+    assert_eq!(model["category"], "model", "{model}");
+    assert_eq!(model["type"], "select", "{model}");
+    let current = model["currentValue"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a current model: {model}"))
+        .to_string();
+    assert!(!current.is_empty(), "{model}");
+    let listed = model["options"]
+        .as_array()
+        .unwrap_or_else(|| panic!("options: {model}"));
+    assert!(
+        listed
+            .iter()
+            .any(|option| option["value"] == current.as_str()),
+        "the current model is one of the options: {model}"
+    );
+
+    let wanted = format!(
+        "{}/other-model",
+        current.split('/').next().unwrap_or("fake")
+    );
+    let id = acp
+        .request(
+            "session/set_config_option",
+            json!({"sessionId": session, "configId": "model", "value": wanted}),
+        )
+        .await;
+    let answer = acp.answer(id).await;
+    assert_eq!(
+        model_option(&answer["result"])["currentValue"],
+        wanted.as_str(),
+        "{answer}"
+    );
+
+    // Another editor that loads the session reads the model the worker runs.
+    let mut second = Acp::start(state.path(), &cwd, &["--provider", provider.as_str()]).await;
+    second.initialize().await;
+    let load = second
+        .request(
+            "session/load",
+            json!({"sessionId": session, "cwd": path(&cwd), "mcpServers": []}),
+        )
+        .await;
+    let answer = second.answer(load).await;
+    assert_eq!(
+        model_option(&answer["result"])["currentValue"],
+        wanted.as_str(),
+        "{answer}"
+    );
+
+    // Another option, or another session, is refused.
+    let id = acp
+        .request(
+            "session/set_config_option",
+            json!({"sessionId": session, "configId": "flavor", "value": "x"}),
+        )
+        .await;
+    let answer = acp.answer(id).await;
+    assert_eq!(answer["error"]["code"], -32602, "{answer}");
+}
+
+/// A retried provider call shows in the editor with its reason, so a run that
+/// waits on a provider does not look stuck.
+#[tokio::test]
+async fn acp_retry_is_shown_with_its_reason() {
+    let state = state();
+    let cwd = work(state.path()).await;
+    let provider = script(
+        state.path(),
+        r#"{"replies":[{"fail":"overloaded, try again"},{"text":"done"}]}"#,
+    )
+    .await;
+    let mut acp = Acp::start(state.path(), &cwd, &["--provider", provider.as_str()]).await;
+    acp.initialize().await;
+    let session = acp.new_session(&cwd).await;
+    let id = acp.prompt(&session, "say it").await;
+    let lines = acp.until(|line| line["id"].as_u64() == Some(id)).await;
+    assert_eq!(
+        lines.last().expect("an answer")["result"]["stopReason"],
+        "end_turn",
+        "{lines:?}"
+    );
+    assert!(
+        chunks(&lines, "agent_thought_chunk").contains("overloaded, try again"),
+        "the retry names its reason: {lines:?}"
+    );
 }

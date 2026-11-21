@@ -40,15 +40,29 @@ const SLOW: Duration = Duration::from_secs(1);
 /// job or one callback, which the host runs between two polls of its own.
 const STOP: Duration = Duration::from_secs(5);
 
-/// How long one plugin tool or command may wait on the promise it handed back.
-/// A hook, a listener and a timer callback wait [`STOP`] instead.
+/// How long one plugin command may wait on the promise it handed back, which
+/// is also the `timeoutMs` of a tool that names none. A hook, a listener and a
+/// timer callback wait [`STOP`] instead.
 const LONG: Duration = Duration::from_secs(120);
 
 /// What a plugin call that did not answer says when it was cut short, with the
 /// budget that ended it.
 fn stopped_after(limit: Duration) -> String {
-    format!("the plugin call was stopped after {} s", limit.as_secs())
+    format!("the plugin call was stopped after {} s", seconds(limit))
 }
+
+/// A budget in seconds as a person writes it: `120`, or `1.5` for 1500 ms.
+fn seconds(limit: Duration) -> String {
+    let millis = limit.as_millis();
+    if millis.is_multiple_of(1000) {
+        return (millis / 1000).to_string();
+    }
+    let text = format!("{}.{:03}", millis / 1000, millis % 1000);
+    text.trim_end_matches('0').to_string()
+}
+
+/// What a tool call answers when the run cancelled it.
+const CANCELLED: &str = "cancelled";
 
 /// The most timers that may be waiting at once.
 const TIMERS: usize = 1024;
@@ -84,6 +98,9 @@ pub(crate) enum Job {
         tool: String,
         /// Its arguments, as JSON text.
         args: String,
+        /// Answers when the run cancels this call, which drops the promise it
+        /// handed back and runs the `onCancel` it registered.
+        cancel: oneshot::Receiver<()>,
         /// Carries the result back.
         reply: oneshot::Sender<RunReply>,
     },
@@ -300,8 +317,13 @@ async fn serve(
                 let report = fleet.load(&root, role).await;
                 let _ = reply.send(report);
             }
-            Job::Run { tool, args, reply } => {
-                let out = fleet.run(&tool, &args).await;
+            Job::Run {
+                tool,
+                args,
+                cancel,
+                reply,
+            } => {
+                let out = fleet.run(&tool, &args, cancel).await;
                 let _ = reply.send(out);
             }
             Job::Command { name, args, reply } => {
@@ -347,6 +369,8 @@ enum InJob {
         tool: String,
         /// Its arguments, as JSON text.
         args: String,
+        /// Answers when the run cancels this call.
+        cancel: oneshot::Receiver<()>,
         /// Carries the result back.
         reply: oneshot::Sender<RunReply>,
     },
@@ -704,7 +728,7 @@ impl Fleet {
     }
 
     /// Runs one plugin tool on the instance that owns its name.
-    async fn run(&self, tool: &str, args: &str) -> RunReply {
+    async fn run(&self, tool: &str, args: &str, cancel: oneshot::Receiver<()>) -> RunReply {
         let unknown = || RunReply {
             text: format!("no plugin tool is named '{tool}'"),
             is_error: true,
@@ -716,6 +740,7 @@ impl Fleet {
         let job = InJob::Run {
             tool: tool.to_string(),
             args: args.to_string(),
+            cancel,
             reply,
         };
         if instance.jobs.send(job).await.is_err() {
@@ -979,8 +1004,13 @@ async fn instance(
 async fn answer(ctx: &Ctx<'_>, engine: &Engine, watch: &Rc<Watch>, shared: &Shared, job: InJob) {
     let notes = &shared.notes;
     match job {
-        InJob::Run { tool, args, reply } => {
-            let out = run_tool(ctx, engine, watch, notes, &tool, &args).await;
+        InJob::Run {
+            tool,
+            args,
+            cancel,
+            reply,
+        } => {
+            let out = run_tool(ctx, engine, watch, notes, &tool, &args, cancel).await;
             let _ = reply.send(out);
         }
         InJob::Command { name, args, reply } => {
@@ -1312,7 +1342,7 @@ async fn watched<T>(
             format!(
                 "plugin {}: {what} stopped after {} s",
                 who.name,
-                budget.as_secs()
+                seconds(budget)
             ),
         );
         return Err(Failed::Stopped(budget));
@@ -1641,6 +1671,8 @@ struct Registered {
     plugin: String,
     /// The index of that plugin, which is what a stop matches.
     index: usize,
+    /// How long its promise may wait: its own `timeoutMs`, or [`LONG`].
+    timeout: Duration,
     /// The function that runs it.
     run: Persistent<Function<'static>>,
 }
@@ -1802,6 +1834,7 @@ async fn load_one(
             name: tool.name,
             plugin: manifest.name.clone(),
             index,
+            timeout: tool.timeout,
             run: tool.run,
         });
     }
@@ -1905,7 +1938,7 @@ async fn run_command(
         }
         Err(Failed::Stopped(budget)) => Some(format!(
             "plugin {plugin}: command /{name} stopped after {} s",
-            budget.as_secs()
+            seconds(budget)
         )),
     }
 }
@@ -1930,6 +1963,11 @@ fn shown<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Option<String>, Faile
 }
 
 /// Runs one plugin tool and turns whatever it returned into a result.
+///
+/// The promise the tool hands back waits its own `timeoutMs`. A run that
+/// cancels the call drops that promise, runs the `onCancel` the call
+/// registered, once, and answers at once, so the plugin's next call does not
+/// wait on a promise nothing settles.
 async fn run_tool(
     ctx: &Ctx<'_>,
     engine: &Engine,
@@ -1937,6 +1975,7 @@ async fn run_tool(
     notes: &Mutex<Notes>,
     tool: &str,
     args: &str,
+    cancel: oneshot::Receiver<()>,
 ) -> RunReply {
     let Some(registered) = engine.tools.iter().find(|entry| entry.name == tool) else {
         return RunReply {
@@ -1944,39 +1983,92 @@ async fn run_tool(
             is_error: true,
         };
     };
+    let limit = registered.timeout;
     let Some(func) = restore(ctx, &registered.run) else {
-        return stopped(LONG);
+        return stopped(limit);
     };
     let parsed = args_object(args);
-    let out = watched(
-        ctx,
-        watch,
-        notes,
-        Who {
-            index: registered.index,
-            name: &registered.plugin,
-        },
-        &format!("tool {tool}"),
-        LONG,
-        async |window| {
-            let arguments = api::from_json(ctx, &parsed).map_err(|error| failure(ctx, error))?;
-            let context = Object::new(ctx.clone()).map_err(|error| failure(ctx, error))?;
-            context
-                .set("tool", tool)
-                .and_then(|_| context.set("plugin", registered.plugin.as_str()))
-                .map_err(|error| failure(ctx, error))?;
-            let value = call2(ctx, watch, window, &func, arguments, context.into_value()).await?;
-            Ok(answered(ctx, value))
-        },
-    )
+    let who = Who {
+        index: registered.index,
+        name: &registered.plugin,
+    };
+    let what = format!("tool {tool}");
+    // The `onCancel` this call registers, which the cancel below runs.
+    let handler = Rc::new(RefCell::new(None));
+    let mut cancel = cancel;
+    let out = watched(ctx, watch, notes, who, &what, limit, async |window| {
+        let arguments = api::from_json(ctx, &parsed).map_err(|error| failure(ctx, error))?;
+        let context = Object::new(ctx.clone()).map_err(|error| failure(ctx, error))?;
+        let on_cancel =
+            api::on_cancel(ctx, Rc::clone(&handler)).map_err(|error| failure(ctx, error))?;
+        context
+            .set("tool", tool)
+            .and_then(|_| context.set("plugin", registered.plugin.as_str()))
+            .and_then(|_| context.set("onCancel", on_cancel))
+            .map_err(|error| failure(ctx, error))?;
+        let run = call2(ctx, watch, window, &func, arguments, context.into_value());
+        tokio::pin!(run);
+        // A cancel only drops the call here: its `onCancel` runs below, after
+        // this window and its deadline are gone, on a budget of its own.
+        tokio::select! {
+            value = &mut run => Ok(Some(answered(ctx, value?))),
+            _ = &mut cancel => Ok(None),
+        }
+    })
     .await;
     match out {
-        Ok(reply) => reply,
+        Ok(Some(reply)) => reply,
+        Ok(None) => {
+            cancel_run(ctx, watch, notes, who, &what, &handler).await;
+            RunReply {
+                text: CANCELLED.to_string(),
+                is_error: true,
+            }
+        }
         Err(Failed::Threw(text)) => RunReply {
             text,
             is_error: true,
         },
         Err(Failed::Stopped(budget)) => stopped(budget),
+    }
+}
+
+/// Runs the `onCancel` function of a call the run cancelled, once, as a short
+/// job: a throw is one note, and nothing else changes.
+async fn cancel_run(
+    ctx: &Ctx<'_>,
+    watch: &Rc<Watch>,
+    notes: &Mutex<Notes>,
+    who: Who<'_>,
+    what: &str,
+    handler: &RefCell<Option<Persistent<Function<'static>>>>,
+) {
+    let taken = handler.borrow_mut().take();
+    let Some(func) = taken else {
+        return;
+    };
+    let Some(func) = restore(ctx, &func) else {
+        return;
+    };
+    let out = watched(
+        ctx,
+        watch,
+        notes,
+        who,
+        &format!("{what} onCancel"),
+        STOP,
+        async |window| {
+            let none = Value::new_undefined(ctx.clone());
+            call1(ctx, watch, window, &func, none).await?;
+            Ok(())
+        },
+    )
+    .await;
+    if let Err(Failed::Threw(reason)) = out {
+        note(
+            notes,
+            format!("plugin {}: {what} onCancel threw: {reason}", who.name),
+        );
     }
 }
 

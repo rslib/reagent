@@ -6,6 +6,7 @@ use serde::ser::SerializeSeq;
 use reagent_agent::event::{DropReason, Event, MessageState, TurnEndReason};
 use reagent_agent::guard::Answer;
 use reagent_agent::live::{ClientId, SendMode};
+use reagent_ai::StopReason;
 use reagent_ai::Usage;
 use reagent_config::permissions::PermissionMode;
 
@@ -73,6 +74,11 @@ enum Line<'a> {
     },
     RunEnd {
         reason: &'static str,
+        /// Why the provider stopped the reply, when the run stopped: the word a
+        /// client that knows the v1 stop reasons reads. A client that does not
+        /// knows the `reason` word alone.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop: Option<&'static str>,
     },
     Error {
         message: &'a str,
@@ -396,6 +402,7 @@ fn write(buf: &mut Vec<u8>, event: &Event, names: Names<'_>, tailed: bool) {
         },
         Event::RunEnd(reason) => Line::RunEnd {
             reason: turn_reason(reason),
+            stop: turn_stop(reason),
         },
         Event::Error(message) => Line::Error { message },
         Event::Retry {
@@ -676,6 +683,16 @@ fn answer_line(answer: &Answer) -> (&'static str, Option<&str>) {
     }
 }
 
+/// The v1 stop reason word of a run the provider stopped, and nothing for a
+/// run that ended any other way.
+fn turn_stop(reason: &TurnEndReason) -> Option<&'static str> {
+    match reason {
+        TurnEndReason::Stopped(StopReason::MaxTokens) => Some("max_tokens"),
+        TurnEndReason::Stopped(StopReason::Refusal) => Some("refusal"),
+        _ => None,
+    }
+}
+
 fn turn_reason(reason: &TurnEndReason) -> &'static str {
     match reason {
         TurnEndReason::EndTurn => "end_turn",
@@ -911,6 +928,20 @@ mod tests {
             (
                 Event::RunEnd(TurnEndReason::Cancelled),
                 json!({ "type": "run_end", "reason": "cancelled" }),
+            ),
+            // A run the provider stopped keeps the `stopped` word and adds the
+            // v1 stop reason, which a client that knows the field reads.
+            (
+                Event::RunEnd(TurnEndReason::Stopped(StopReason::MaxTokens)),
+                json!({ "type": "run_end", "reason": "stopped", "stop": "max_tokens" }),
+            ),
+            (
+                Event::RunEnd(TurnEndReason::Stopped(StopReason::Refusal)),
+                json!({ "type": "run_end", "reason": "stopped", "stop": "refusal" }),
+            ),
+            (
+                Event::RunEnd(TurnEndReason::Stopped(StopReason::EndTurn)),
+                json!({ "type": "run_end", "reason": "stopped" }),
             ),
             (
                 Event::Error("boom".into()),

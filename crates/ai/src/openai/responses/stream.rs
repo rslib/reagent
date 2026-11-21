@@ -142,34 +142,19 @@ impl StreamParser {
                 Ok(())
             }
             "response.failed" => {
-                let (message, transient) = match event.response.error {
-                    Some(error) => {
-                        // A plan error names its own cause and is never retried.
-                        match error
-                            .code
-                            .and_then(|code| super::plan_error(code, error.param))
-                        {
-                            Some(message) => (message, false),
-                            None => {
-                                let kind = error.kind.or(error.code);
-                                (
-                                    error.message.as_str().to_string(),
-                                    kind.is_some_and(retryable),
-                                )
-                            }
-                        }
-                    }
-                    None => ("response failed".into(), false),
-                };
                 self.failed = true;
-                if transient {
-                    Err(Error::Transient(message))
-                } else {
-                    Err(Error::Protocol(message))
-                }
+                Err(match event.response.error {
+                    Some(error) => api_failure(&error),
+                    None => Error::Protocol("response failed".into()),
+                })
             }
             "error" => {
                 self.failed = true;
+                // The Responses API puts the error at the top level, while
+                // the ChatGPT backend nests it in an `error` object.
+                if let Some(error) = event.error {
+                    return Err(api_failure(&error));
+                }
                 let message = event
                     .message
                     .as_ref()
@@ -294,6 +279,8 @@ struct Event<'a> {
     message: Option<JsonStr<'a>>,
     #[serde(default, borrow)]
     code: Option<&'a str>,
+    #[serde(default, borrow)]
+    error: Option<ApiError<'a>>,
 }
 
 #[derive(Deserialize)]
@@ -336,6 +323,24 @@ struct ApiError<'a> {
     code: Option<&'a str>,
     #[serde(default, borrow)]
     param: Option<&'a str>,
+}
+
+/// The error an API error object stands for: a plan error names its own
+/// cause and is never retried, and any other error is retried only when its
+/// type or code is transient.
+fn api_failure(error: &ApiError<'_>) -> Error {
+    if let Some(message) = error
+        .code
+        .and_then(|code| super::plan_error(code, error.param))
+    {
+        return Error::Protocol(message);
+    }
+    let message = error.message.as_str().to_string();
+    if error.kind.or(error.code).is_some_and(retryable) {
+        Error::Transient(message)
+    } else {
+        Error::Protocol(message)
+    }
 }
 
 /// Whether an OpenAI Responses stream error is safe to retry: a server or
@@ -509,6 +514,31 @@ mod tests {
         let mut out = Vec::new();
         let error = parser.push_line(line, &mut out).unwrap_err();
         assert!(matches!(error, Error::Protocol(message) if message == "no"));
+    }
+
+    #[test]
+    fn plan_error_an_error_event_names_the_usage_limit() {
+        let mut parser = StreamParser::new();
+        let line = br#"data: {"type":"error","sequence_number":3,"error":{"message":"detail","type":"invalid_request_error","param":null,"code":"subscription_sharing_usage_limit_exceeded"}}"#;
+        let mut out = Vec::new();
+        let error = parser.push_line(line, &mut out).unwrap_err();
+        assert_eq!(error.retry_hint(), None);
+        assert!(
+            matches!(&error, Error::Protocol(message) if message.contains("https://chatgpt.com/settings/usage")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_error_event_reads_its_nested_error() {
+        let mut parser = StreamParser::new();
+        let line = br#"data: {"type":"error","error":{"type":"server_error","message":"boom"}}"#;
+        let mut out = Vec::new();
+        let error = parser.push_line(line, &mut out).unwrap_err();
+        assert!(
+            matches!(&error, Error::Transient(message) if message == "boom"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -178,7 +178,7 @@ fn opened(state: &Path, cwd: &Path, entry: &discovery::Entry) -> Opened {
 }
 
 /// The models of one folder's config, read in one blocking job.
-fn models_of(cwd: &Path, profile: Option<&str>, state: &Path) -> Models {
+pub(crate) fn models_of(cwd: &Path, profile: Option<&str>, state: &Path) -> Models {
     let Ok(layers) = reagent_config::load_for(cwd, profile) else {
         return Models::default();
     };

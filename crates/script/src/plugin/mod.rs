@@ -16,6 +16,8 @@ mod runtime;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tool_calls;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -120,6 +122,9 @@ pub enum SessionOp {
         /// The provider it starts on, as `--provider` names it, which is the
         /// provider of the run when it is `None`.
         provider: Option<String>,
+        /// The tools its worker may use, as `--tools` names them, which are
+        /// the tools of the run when it is `None`.
+        tools: Option<String>,
     },
     /// Queue `text` as the next message of the session.
     Send {
@@ -844,9 +849,15 @@ impl Tool for PluginTool {
     ) -> BoxFuture<'a, ToolOutput> {
         Box::pin(async move {
             let (reply, answer) = tokio::sync::oneshot::channel();
+            // The runtime gets a message when this call is cancelled, and no
+            // poll of the token: it drops the promise the tool handed back and
+            // runs the `onCancel` the call registered, so the plugin's next
+            // call does not wait on a promise nothing settles.
+            let (stopped, told) = tokio::sync::oneshot::channel();
             let job = Job::Run {
                 tool: self.spec.name.clone(),
                 args: args.to_string(),
+                cancel: told,
                 reply,
             };
             if self.jobs.send(job).await.is_err() {
@@ -854,7 +865,10 @@ impl Tool for PluginTool {
             }
             let out = tokio::select! {
                 out = answer => out,
-                () = cancel.cancelled() => return ToolOutput::error("cancelled"),
+                () = cancel.cancelled() => {
+                    let _ = stopped.send(());
+                    return ToolOutput::error("cancelled");
+                }
             };
             match out {
                 Ok(RunReply { text, is_error }) => {

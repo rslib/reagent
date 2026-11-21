@@ -26,18 +26,42 @@ impl fmt::Display for TooLong {
 impl std::error::Error for TooLong {}
 
 /// Lines read from one buffer that grows once and is then reused.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Lines {
     buf: Vec<u8>,
     written: usize,
     pos: usize,
     searched: usize,
     skip: bool,
+    limit: usize,
+    /// Whether the buffer grew past [`MAX_LINE`] and is empty now, so the next
+    /// call frees it: the slice of the last line borrows from it until then.
+    release: bool,
+}
+
+impl Default for Lines {
+    fn default() -> Self {
+        Self::with_limit(MAX_LINE)
+    }
 }
 
 impl Lines {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Lines up to `limit` bytes, for a reader whose peer sends more than
+    /// [`MAX_LINE`] in one line.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            written: 0,
+            pos: 0,
+            searched: 0,
+            skip: false,
+            limit,
+            release: false,
+        }
     }
 
     /// Bytes held for a line that has no `\n` yet.
@@ -56,6 +80,7 @@ impl Lines {
 
     /// The spare capacity to read into; the bytes read are handed to `advance`.
     pub fn spare(&mut self) -> &mut [u8] {
+        self.drop_big();
         self.compact();
         if self.written == self.buf.len() {
             self.grow(CHUNK.max(self.buf.len()));
@@ -70,6 +95,7 @@ impl Lines {
 
     /// Adds bytes that were not read through `spare`, such as a test's.
     pub fn extend(&mut self, bytes: &[u8]) {
+        self.drop_big();
         self.compact();
         let need = self.written + bytes.len();
         if need > self.buf.len() {
@@ -96,6 +122,7 @@ impl Lines {
         reason = "a line can be too long, which an Iterator cannot say"
     )]
     pub fn next(&mut self) -> Option<Result<&[u8], TooLong>> {
+        self.drop_big();
         loop {
             if self.skip {
                 match find(&self.buf[self.searched..self.written]) {
@@ -103,11 +130,13 @@ impl Lines {
                         self.searched += at + 1;
                         self.pos = self.searched;
                         self.skip = false;
+                        if self.pos == self.written {
+                            self.buf_clear();
+                        }
                         continue;
                     }
                     None => {
-                        self.pos = self.written;
-                        self.searched = self.written;
+                        self.buf_clear();
                         return None;
                     }
                 }
@@ -117,11 +146,11 @@ impl Lines {
                 let end = self.searched + at;
                 self.pos = end + 1;
                 self.searched = self.pos;
-                if end - start > MAX_LINE {
+                if end - start > self.limit {
                     if self.pos == self.written {
                         self.buf_clear();
                     }
-                    return Some(Err(TooLong { limit: MAX_LINE }));
+                    return Some(Err(TooLong { limit: self.limit }));
                 }
                 if self.pos == self.written {
                     self.buf_clear();
@@ -129,10 +158,10 @@ impl Lines {
                 return Some(Ok(&self.buf[start..end]));
             }
             self.searched = self.written;
-            if self.written - self.pos > MAX_LINE {
+            if self.written - self.pos > self.limit {
                 self.skip = true;
-                self.pos = self.written;
-                return Some(Err(TooLong { limit: MAX_LINE }));
+                self.buf_clear();
+                return Some(Err(TooLong { limit: self.limit }));
             }
             return None;
         }
@@ -142,6 +171,19 @@ impl Lines {
         self.written = 0;
         self.pos = 0;
         self.searched = 0;
+        self.release = self.buf.len() > MAX_LINE;
+    }
+
+    /// Frees a buffer that a line over [`MAX_LINE`] grew, once nothing is held
+    /// in it, so one large line does not keep its memory.
+    fn drop_big(&mut self) {
+        if self.release && self.written == self.pos {
+            self.buf = Vec::new();
+            self.written = 0;
+            self.pos = 0;
+            self.searched = 0;
+            self.release = false;
+        }
     }
 
     fn grow(&mut self, more: usize) {
@@ -245,6 +287,38 @@ mod tests {
         lines.extend(b"rest\nshort\n");
         assert_eq!(line(&mut lines), Some("short"));
         assert_eq!(line(&mut lines), None);
+    }
+
+    #[test]
+    fn a_reader_with_a_higher_limit_takes_a_line_over_the_default() {
+        let mut lines = Lines::with_limit(MAX_LINE * 2);
+        let mut buf = vec![b'a'; MAX_LINE + 5];
+        buf.push(b'\n');
+        lines.extend(&buf);
+        assert_eq!(line(&mut lines).map(str::len), Some(MAX_LINE + 5));
+        lines.extend(&vec![b'a'; MAX_LINE * 2 + 1]);
+        assert_eq!(
+            lines.next().expect("an error"),
+            Err(TooLong {
+                limit: MAX_LINE * 2
+            })
+        );
+    }
+
+    #[test]
+    fn the_buffer_of_a_line_over_the_default_limit_is_dropped() {
+        let mut lines = Lines::with_limit(MAX_LINE * 4);
+        let mut buf = vec![b'a'; MAX_LINE * 2];
+        buf.push(b'\n');
+        lines.extend(&buf);
+        assert_eq!(line(&mut lines).map(str::len), Some(MAX_LINE * 2));
+        assert_eq!(line(&mut lines), None);
+        assert_eq!(lines.capacity(), 0);
+
+        lines.extend(&vec![b'a'; MAX_LINE * 5]);
+        assert!(matches!(lines.next(), Some(Err(TooLong { .. }))));
+        assert_eq!(line(&mut lines), None);
+        assert_eq!(lines.capacity(), 0, "a line over the limit holds no buffer");
     }
 
     #[test]

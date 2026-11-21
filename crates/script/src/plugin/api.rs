@@ -48,6 +48,16 @@ const TIMEOUT_MS: u64 = 5_000;
 /// The longest `timeoutMs` a `tool.call` layer may name.
 const TIMEOUT_MAX_MS: u64 = 120_000;
 
+/// The budget a plugin tool's promise waits when the tool names no
+/// `timeoutMs`: the two minutes every tool call waited before a tool could
+/// name its own.
+const TOOL_TIMEOUT_MS: u64 = 120_000;
+
+/// The shortest and the longest `timeoutMs` a plugin tool may name: one second
+/// and two hours.
+const TOOL_TIMEOUT_MIN_MS: u64 = 1_000;
+const TOOL_TIMEOUT_MAX_MS: u64 = 7_200_000;
+
 /// The roles a panel line may carry; any other role is dropped.
 const ROLES: [&str; 7] = ["text", "dim", "strong", "accent", "good", "warn", "bad"];
 
@@ -82,6 +92,8 @@ pub(crate) struct StagedTool {
     pub description: String,
     /// The JSON Schema of its arguments.
     pub parameters: JsonValue,
+    /// How long its promise may wait: its own `timeoutMs`, or two minutes.
+    pub timeout: Duration,
     /// The function that runs it.
     pub run: Persistent<Function<'static>>,
 }
@@ -235,10 +247,21 @@ pub(crate) fn reagent<'js>(
                 }
                 _ => serde_json::from_str(NO_PARAMETERS).unwrap_or_default(),
             };
+            let timeout = match spec.get::<_, Option<Value>>("timeoutMs") {
+                Ok(Some(value)) => tool_timeout(&ctx, &name, &value)?,
+                Ok(None) => Duration::from_millis(TOOL_TIMEOUT_MS),
+                Err(_) => {
+                    return Err(fail(
+                        &ctx,
+                        format!("tool '{name}': timeoutMs must be a whole number of milliseconds"),
+                    ));
+                }
+            };
             staging.borrow_mut().tools.push(StagedTool {
                 name,
                 description,
                 parameters,
+                timeout,
                 run: Persistent::save(&ctx, run),
             });
             Ok(())
@@ -598,6 +621,17 @@ fn sessions<'js>(ctx: &Ctx<'js>, plugin: &str, host: &Host) -> rquickjs::Result<
             let model = spec.get::<_, Option<String>>("model").ok().flatten();
             let profile = spec.get::<_, Option<String>>("profile").ok().flatten();
             let provider = spec.get::<_, Option<String>>("provider").ok().flatten();
+            // The tools of the child replace the ones it inherits, so a list
+            // that is not a list would leave it without tools it cannot get
+            // back.
+            let tools = match spec.get::<_, Option<Value>>("tools") {
+                Ok(None) => None,
+                Ok(Some(value)) => match text_of(&value) {
+                    Some(text) if !text.trim().is_empty() => Some(text),
+                    _ => return Ok(call.refuse(&ctx, "tools must be a non-empty string")),
+                },
+                Err(_) => return Ok(call.refuse(&ctx, "tools must be a non-empty string")),
+            };
             Ok(ask(
                 &ctx,
                 talk.as_ref(),
@@ -609,6 +643,7 @@ fn sessions<'js>(ctx: &Ctx<'js>, plugin: &str, host: &Host) -> rquickjs::Result<
                     model,
                     profile,
                     provider,
+                    tools,
                 },
                 call,
             ))
@@ -892,6 +927,51 @@ fn text_of(value: &Value<'_>) -> Option<String> {
 /// Throws `message` and returns the error that carries it.
 fn fail(ctx: &Ctx<'_>, message: impl AsRef<str>) -> rquickjs::Error {
     Exception::throw_message(ctx, message.as_ref())
+}
+
+/// The `timeoutMs` a tool names, which is how long its promise may wait: a
+/// whole number of milliseconds from 1000 to 7200000.
+fn tool_timeout(ctx: &Ctx<'_>, tool: &str, value: &Value<'_>) -> rquickjs::Result<Duration> {
+    let Some(ms) = value.as_int() else {
+        return Err(fail(
+            ctx,
+            format!("tool '{tool}': timeoutMs must be a whole number of milliseconds"),
+        ));
+    };
+    let Some(ms) = u64::try_from(ms)
+        .ok()
+        .filter(|ms| (TOOL_TIMEOUT_MIN_MS..=TOOL_TIMEOUT_MAX_MS).contains(ms))
+    else {
+        return Err(fail(
+            ctx,
+            format!(
+                "tool '{tool}': timeoutMs must be {TOOL_TIMEOUT_MIN_MS} to {TOOL_TIMEOUT_MAX_MS} ms, not {ms}"
+            ),
+        ));
+    };
+    Ok(Duration::from_millis(ms))
+}
+
+/// The `onCancel` a tool call's context carries: the function the runtime runs
+/// once when the run cancels that call. A later call replaces the earlier one.
+pub(crate) type CancelHandler = Rc<RefCell<Option<Persistent<Function<'static>>>>>;
+
+/// The `onCancel` function of one tool call, which keeps the function the
+/// plugin hands it in `handler`.
+pub(crate) fn on_cancel<'js>(
+    ctx: &Ctx<'js>,
+    handler: CancelHandler,
+) -> rquickjs::Result<Function<'js>> {
+    Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, func: Value<'js>| -> rquickjs::Result<()> {
+            let Some(func) = func.as_function() else {
+                return Err(fail(&ctx, "onCancel needs a function"));
+            };
+            *handler.borrow_mut() = Some(Persistent::save(&ctx, func.clone()));
+            Ok(())
+        },
+    )
 }
 
 /// Whether `name` matches `^[a-zA-Z0-9_-]{1,64}$`.

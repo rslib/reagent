@@ -502,11 +502,9 @@ async fn gateway_a_deadline_expires_the_question() {
     assert_eq!(closed["how"], "expired");
     assert_eq!(closed["by"], "deadline");
 
-    let records = home
-        .records_until(&session, "No answer; decide yourself and state the choice.")
-        .await;
+    let records = home.records_until(&session, "done").await;
     assert!(
-        records.contains("done"),
+        records.contains("No answer; decide yourself and state the choice."),
         "the run goes on after the deadline: {records}"
     );
     let (code, error) = gateway.term().await;
