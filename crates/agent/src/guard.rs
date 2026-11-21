@@ -185,17 +185,38 @@ impl Guard {
     /// `None` when the run was cancelled while the call waited: the call does
     /// not run and the turn ends as cancelled. With no listening session the
     /// call is refused at once, as a headless run has always refused it.
-    pub async fn approve(&self, ask: &Ask, token: &CancellationToken) -> Option<Grant> {
+    ///
+    /// `call` names a call whose wait the journal holds with an id, so a park
+    /// ends it and a later process answers it. `given` is the answer a later
+    /// process already gave a resumed call: it takes that answer and asks no
+    /// client, and the rules it adds are the ones this ask shows, from this
+    /// run's own check.
+    pub async fn approve(
+        &self,
+        ask: &Ask,
+        call: Option<&str>,
+        given: Option<Answer>,
+        token: &CancellationToken,
+    ) -> Option<Grant> {
+        if let Some(answer) = given {
+            return Some(self.apply(ask, answer, token).await);
+        }
         let Some(approver) = self.approver() else {
             return Some(Grant::Refuse(ask.refusal()));
         };
-        match approver.ask(ask, token).await {
+        match approver.ask(ask, call, token).await {
             Waited::Answered(answer) => Some(self.apply(ask, answer, token).await),
             Waited::Cancelled => None,
             Waited::Silent => Some(Grant::Refuse(ToolOutput::error(
                 "the approval request reached no client; the call did not run",
             ))),
+            Waited::Parked => Some(Grant::Park),
         }
+    }
+
+    /// The calls of this guard that wait for an answer, which a worker parks.
+    pub fn approvals(&self) -> &Arc<Approvals> {
+        &self.approvals
     }
 
     /// What one answer means for the call it was given for.
@@ -215,9 +236,7 @@ impl Guard {
                 }
                 Grant::Run
             }
-            Answer::Refuse { reason } => Grant::Refuse(ToolOutput::error(
-                reason.unwrap_or_else(|| Text::from("the user refused this call")),
-            )),
+            Answer::Refuse { reason } => Grant::Refuse(refusal(reason)),
             Answer::Skip => Grant::Refuse(ToolOutput::error(
                 "the user skipped this call; continue without it",
             )),
@@ -247,6 +266,11 @@ impl Guard {
     }
 }
 
+/// The result of a call a person refused, with their reason when they gave one.
+pub fn refusal(reason: Option<Text>) -> ToolOutput {
+    ToolOutput::error(reason.unwrap_or_else(|| Text::from("the user refused this call")))
+}
+
 /// What the guard says about one call.
 #[derive(Debug)]
 pub enum Verdict {
@@ -268,6 +292,8 @@ pub enum Grant {
     Run,
     /// The call does not run; the model gets this result instead.
     Refuse(ToolOutput),
+    /// The run parked the wait: the call has no result in this run.
+    Park,
 }
 
 /// What one ask shows a client about the call it would run.
@@ -787,7 +813,7 @@ mod tests {
         };
         let refusal = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            guard.approve(&ask, &CancellationToken::new()),
+            guard.approve(&ask, None, None, &CancellationToken::new()),
         )
         .await
         .expect("the refusal is at once")

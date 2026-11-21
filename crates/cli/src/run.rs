@@ -21,6 +21,7 @@ use reagent_agent::compact::Compact;
 use reagent_agent::event::{Event, TurnEndReason};
 use reagent_agent::guard::Guard;
 use reagent_agent::hook::{EventHook, Seen};
+use reagent_agent::journal::resume::Waiting;
 use reagent_agent::policy::TurnPolicy;
 use reagent_agent::policy::budget::Budget;
 use reagent_agent::policy::completion::Completion;
@@ -871,6 +872,12 @@ pub async fn run(mut args: Args) -> ExitCode {
     // A served run takes clients, but the answers a person gives are not its:
     // a call the rules send to a person is refused at once, as in a plain run.
     let guard = Guard::new(args.rules.clone());
+    // The worker parks the approval its run waits for, as it parks a question.
+    if let Some(worker) = worker.as_ref()
+        && !args.serve
+    {
+        worker.approvals(Arc::clone(guard.approvals()));
+    }
     agent = agent.with_guard(if args.serve {
         guard.without_clients()
     } else {
@@ -1115,11 +1122,12 @@ pub async fn run(mut args: Args) -> ExitCode {
             .await;
     }
     // A session a person answered from another process owes the model that
-    // answer: the results of the reply are in the history, nothing is pending,
-    // and the run goes on here, with no client of its own to read it.
+    // answer: the results of the reply are in the history, or the call whose
+    // approval they gave ran above, and the run goes on here, with no client of
+    // its own to read it. A pending call that parked again ends it instead.
     if !steered
         && no_task
-        && !matches!(pending_reason, TurnEndReason::Error)
+        && !matches!(pending_reason, TurnEndReason::Error | TurnEndReason::Parked)
         && resumed.is_some_and(|resumed| resumed.answered)
         && let Some(worker) = worker.as_mut()
         && let Some((journal, _)) = journal.as_mut()
@@ -2750,8 +2758,9 @@ fn chosen(selected: &[String], name: &str) -> bool {
     selected.iter().any(|chosen| chosen == name)
 }
 
-/// Writes the entry of every question the session at `dir` still waits for, so
-/// a process that did not run it answers one, and returns how many it left.
+/// Writes the entry of every question and approval the session at `dir` still
+/// waits for, so a process that did not run it answers one, and returns how
+/// many it left.
 ///
 /// Reading the journal blocks, so a caller runs this on the blocking pool.
 fn parked_questions(dir: &std::path::Path) -> Result<usize, String> {
@@ -2764,12 +2773,39 @@ fn parked_questions(dir: &std::path::Path) -> Result<usize, String> {
     let open = reagent_agent::journal::resume::parked(&session)
         .map_err(|error| format!("{}: {error}", dir.display()))?;
     let at = reagent_store::paths::now_ms();
-    for question in &open {
-        let entry = reagent_protocol::discovery::Parked {
-            qid: question.qid.clone(),
-            session: id.clone(),
-            questions: serde_json::from_str(&question.questions).unwrap_or(serde_json::Value::Null),
-            at,
+    for wait in &open {
+        let entry = match &wait.what {
+            Waiting::Question(questions) => reagent_protocol::discovery::Parked {
+                qid: wait.qid.clone(),
+                session: id.clone(),
+                questions: serde_json::from_str(questions).unwrap_or(serde_json::Value::Null),
+                approval: None,
+                forwards: wait
+                    .forwards
+                    .iter()
+                    .map(|forward| reagent_protocol::discovery::ParkedForward {
+                        hop: forward.hop,
+                        from: forward.from.clone(),
+                        to: forward.to.clone(),
+                        name: forward.name.clone(),
+                        note: forward.note.clone(),
+                    })
+                    .collect(),
+                at,
+            },
+            Waiting::Approval(ask) => reagent_protocol::discovery::Parked {
+                qid: wait.qid.clone(),
+                session: id.clone(),
+                questions: serde_json::Value::Null,
+                approval: Some(reagent_protocol::discovery::ParkedApproval {
+                    tool: ask.tool.clone(),
+                    call: ask.line.clone(),
+                    rule: ask.rule.clone(),
+                    save: ask.save.clone(),
+                }),
+                forwards: Vec::new(),
+                at,
+            },
         };
         reagent_protocol::discovery::write_parked_blocking(&folder, &entry)
             .map_err(|error| format!("{}: {error}", folder.display()))?;

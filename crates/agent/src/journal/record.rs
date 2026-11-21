@@ -15,7 +15,9 @@ use reagent_ai::{Message, Text, Usage};
 use reagent_store::{DecodeError, Decoder, Encoder, Value};
 
 use crate::journal::kinds;
-use crate::journal::registry::{approval, base, call_start, model, question, settings, turn_end};
+use crate::journal::registry::{
+    approval, base, call_start, forward, model, question, settings, turn_end,
+};
 use crate::journal::state::{LedgerEntry, State};
 use crate::tool::EffectClass;
 
@@ -27,6 +29,8 @@ const APPROVAL_WAIT: u64 = 1;
 const APPROVAL_RUN: u64 = 2;
 /// The kind byte of an approval record a client refused.
 const APPROVAL_REFUSED: u64 = 3;
+/// The kind byte of the answer a later process gave to a parked wait.
+const APPROVAL_ANSWER: u64 = 4;
 
 /// The kind byte of a question record that waits for an answer.
 const QUESTION_ASKED: u64 = 1;
@@ -88,6 +92,82 @@ pub struct Approval {
     pub id: String,
     /// Whether the record is the wait or the answer.
     pub kind: ApprovalKind,
+    /// What a later process shows of a wait that can park; a wait of a run
+    /// that keeps no journal, and every answer, has none.
+    pub parked: Option<ParkedAsk>,
+}
+
+/// What a wait that can park keeps of its request, so a process that did not
+/// run the call shows it and answers it under `qid`.
+///
+/// It is for showing only: the run that resumes checks the call again, so the
+/// rules an answer adds come from that check, never from this record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParkedAsk {
+    /// The id the answer names: 32 lowercase hex characters.
+    pub qid: String,
+    /// The tool the call names.
+    pub tool: String,
+    /// One line that shows the call.
+    pub line: String,
+    /// The rule that asked, or `default`.
+    pub rule: String,
+    /// The rule a save would write, when one would.
+    pub save: Option<String>,
+}
+
+/// The answer a later process gave to a parked wait.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalAnswer {
+    /// The id of the parked wait.
+    pub qid: String,
+    /// Who answered, such as `cli` or `gateway:<plugin>:<user>`.
+    pub by: String,
+    /// What they answered.
+    pub answer: Given,
+    /// The reason of a refusal, when one was given.
+    pub reason: Option<String>,
+}
+
+/// One answer a later process may give to a parked wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Given {
+    /// Run the call, and ask again for the next one.
+    Once,
+    /// Run the call, and every later call its rules match this session.
+    Session,
+    /// As `Session`; the answer's writer saved the rules to the config.
+    Save,
+    /// Do not run the call.
+    Refuse,
+}
+
+impl Given {
+    /// The word the record and the wire carry.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Given::Once => "once",
+            Given::Session => "session",
+            Given::Save => "save",
+            Given::Refuse => "refuse",
+        }
+    }
+}
+
+impl std::str::FromStr for Given {
+    type Err = String;
+
+    fn from_str(word: &str) -> Result<Self, Self::Err> {
+        match word {
+            "once" => Ok(Given::Once),
+            "session" => Ok(Given::Session),
+            "save" => Ok(Given::Save),
+            "refuse" => Ok(Given::Refuse),
+            other => Err(format!(
+                "`{other}` is not an answer; use once, session, save or refuse"
+            )),
+        }
+    }
 }
 
 /// What an [`Approval`] record says about its call.
@@ -134,6 +214,25 @@ pub enum Question {
         by: String,
         /// The JSON text of the answers, one list per question.
         answers: String,
+        /// The hop whose person answered: 0 is the owner, and any other is
+        /// the [`Question::Forwarded`] of that hop.
+        hop: u64,
+    },
+    /// A person handed the parked question to one more person, who may now
+    /// answer it too; the first answer closes it.
+    Forwarded {
+        /// The id of the question.
+        qid: String,
+        /// The number of this forward: 1 for the first.
+        hop: u64,
+        /// Who forwarded it, as the model may read it.
+        from: String,
+        /// The key of the contact it went to.
+        to: String,
+        /// The name of that contact, as the model may read it.
+        name: String,
+        /// What the person who forwarded it wrote, or nothing.
+        note: String,
     },
 }
 
@@ -148,6 +247,8 @@ pub enum Question {
 pub enum Aside {
     /// A call that waits for a client's answer, or the answer it got.
     Approval(Approval),
+    /// The answer a later process gave to a parked wait.
+    ApprovalAnswer(ApprovalAnswer),
     /// A change of the reasoning level or the permission mode.
     Settings(Settings),
     /// A question the model asked, or the answer a person gave it.
@@ -158,9 +259,10 @@ pub enum Aside {
 /// `None` for a kind [`decode`] carries.
 pub fn decode_aside(kind: u8, payload: &Bytes) -> io::Result<Option<Aside>> {
     match kind {
-        kinds::APPROVAL => decode_approval(payload).map(Aside::Approval).map(Some),
+        kinds::APPROVAL => decode_approval(payload).map(Some),
         kinds::SETTINGS => decode_settings(payload).map(Aside::Settings).map(Some),
         kinds::QUESTION => decode_question(payload).map(Aside::Question).map(Some),
+        kinds::FORWARD => decode_forward(payload).map(Aside::Question).map(Some),
         _ => Ok(None),
     }
 }
@@ -254,6 +356,27 @@ pub fn encode_approval(out: &mut Vec<u8>, record: &Approval) {
             ApprovalKind::Refused => APPROVAL_REFUSED,
         },
     );
+    if let Some(parked) = &record.parked {
+        encoder.str(approval::QID, &parked.qid);
+        encoder.str(approval::TOOL, &parked.tool);
+        encoder.str(approval::LINE, &parked.line);
+        encoder.str(approval::RULE, &parked.rule);
+        if let Some(save) = &parked.save {
+            encoder.str(approval::SAVE, save);
+        }
+    }
+}
+
+/// Writes the answer a later process gave to a parked wait.
+pub fn encode_approval_answer(out: &mut Vec<u8>, record: &ApprovalAnswer) {
+    let mut encoder = Encoder::new(out);
+    encoder.u64(approval::KIND, APPROVAL_ANSWER);
+    encoder.str(approval::QID, &record.qid);
+    encoder.str(approval::BY, &record.by);
+    encoder.str(approval::ANSWER, record.answer.as_str());
+    if let Some(reason) = &record.reason {
+        encoder.str(approval::REASON, reason);
+    }
 }
 
 /// Writes one settings change. A field the change leaves alone is not written.
@@ -281,13 +404,74 @@ pub fn encode_question(out: &mut Vec<u8>, record: &Question) {
             encoder.str(question::QID, qid);
             encoder.str(question::QUESTIONS, questions);
         }
-        Question::Answered { qid, by, answers } => {
+        Question::Answered {
+            qid,
+            by,
+            answers,
+            hop,
+        } => {
             encoder.u64(question::KIND, QUESTION_ANSWERED);
             encoder.str(question::QID, qid);
             encoder.str(question::BY, by);
             encoder.str(question::ANSWERS, answers);
+            if *hop != 0 {
+                encoder.u64(question::HOP, *hop);
+            }
+        }
+        Question::Forwarded {
+            qid,
+            hop,
+            from,
+            to,
+            name,
+            note,
+        } => {
+            encoder.str(forward::QID, qid);
+            encoder.u64(forward::HOP, *hop);
+            encoder.str(forward::FROM, from);
+            encoder.str(forward::TO, to);
+            encoder.str(forward::NAME, name);
+            encoder.str(forward::NOTE, note);
         }
     }
+}
+
+/// The kind of the record [`encode_question`] writes for `record`: a forward
+/// has a kind of its own.
+pub fn question_kind(record: &Question) -> u8 {
+    match record {
+        Question::Forwarded { .. } => kinds::FORWARD,
+        Question::Asked { .. } | Question::Answered { .. } => kinds::QUESTION,
+    }
+}
+
+fn decode_forward(payload: &Bytes) -> io::Result<Question> {
+    let mut decoder = Decoder::new(payload);
+    let mut qid = String::new();
+    let mut hop = 0;
+    let mut from = String::new();
+    let mut to = String::new();
+    let mut name = String::new();
+    let mut note = String::new();
+    while let Some((field, value)) = next(&mut decoder)? {
+        match field {
+            forward::QID => qid = string_of(&value)?,
+            forward::HOP => hop = varint_of(&value)?,
+            forward::FROM => from = string_of(&value)?,
+            forward::TO => to = string_of(&value)?,
+            forward::NAME => name = string_of(&value)?,
+            forward::NOTE => note = string_of(&value)?,
+            _ => {}
+        }
+    }
+    Ok(Question::Forwarded {
+        qid,
+        hop,
+        from,
+        to,
+        name,
+        note,
+    })
 }
 
 fn decode_question(payload: &Bytes) -> io::Result<Question> {
@@ -298,6 +482,7 @@ fn decode_question(payload: &Bytes) -> io::Result<Question> {
     let mut questions = String::new();
     let mut by = String::new();
     let mut answers = String::new();
+    let mut hop = 0;
     while let Some((field, value)) = next(&mut decoder)? {
         match field {
             question::KIND => kind = varint_of(&value)?,
@@ -306,17 +491,22 @@ fn decode_question(payload: &Bytes) -> io::Result<Question> {
             question::QUESTIONS => questions = string_of(&value)?,
             question::BY => by = string_of(&value)?,
             question::ANSWERS => answers = string_of(&value)?,
+            question::HOP => hop = varint_of(&value)?,
             _ => {}
         }
     }
-    Ok(if kind == QUESTION_ANSWERED {
-        Question::Answered { qid, by, answers }
-    } else {
-        Question::Asked {
+    Ok(match kind {
+        QUESTION_ANSWERED => Question::Answered {
+            qid,
+            by,
+            answers,
+            hop,
+        },
+        _ => Question::Asked {
             call,
             qid,
             questions,
-        }
+        },
     })
 }
 
@@ -426,26 +616,57 @@ fn decode_model(payload: &Bytes) -> io::Result<Model> {
     Ok(record)
 }
 
-fn decode_approval(payload: &Bytes) -> io::Result<Approval> {
+fn decode_approval(payload: &Bytes) -> io::Result<Aside> {
     let mut decoder = Decoder::new(payload);
-    let mut record = Approval {
-        id: String::new(),
-        kind: ApprovalKind::Wait,
-    };
+    let mut id = String::new();
+    let mut kind = APPROVAL_WAIT;
+    let mut qid = None;
+    let mut tool = String::new();
+    let mut line = String::new();
+    let mut rule = String::new();
+    let mut save = None;
+    let mut by = String::new();
+    let mut answer = String::new();
+    let mut reason = None;
     while let Some((field, value)) = next(&mut decoder)? {
         match field {
-            approval::CALL_ID => record.id = string_of(&value)?,
-            approval::KIND => {
-                record.kind = match varint_of(&value)? {
-                    APPROVAL_RUN => ApprovalKind::Run,
-                    APPROVAL_REFUSED => ApprovalKind::Refused,
-                    _ => ApprovalKind::Wait,
-                };
-            }
+            approval::CALL_ID => id = string_of(&value)?,
+            approval::KIND => kind = varint_of(&value)?,
+            approval::QID => qid = Some(string_of(&value)?),
+            approval::TOOL => tool = string_of(&value)?,
+            approval::LINE => line = string_of(&value)?,
+            approval::RULE => rule = string_of(&value)?,
+            approval::SAVE => save = Some(string_of(&value)?),
+            approval::BY => by = string_of(&value)?,
+            approval::ANSWER => answer = string_of(&value)?,
+            approval::REASON => reason = Some(string_of(&value)?),
             _ => {}
         }
     }
-    Ok(record)
+    if kind == APPROVAL_ANSWER {
+        let answer = answer
+            .parse()
+            .map_err(|error: String| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        return Ok(Aside::ApprovalAnswer(ApprovalAnswer {
+            qid: qid.unwrap_or_default(),
+            by,
+            answer,
+            reason,
+        }));
+    }
+    let kind = match kind {
+        APPROVAL_RUN => ApprovalKind::Run,
+        APPROVAL_REFUSED => ApprovalKind::Refused,
+        _ => ApprovalKind::Wait,
+    };
+    let parked = qid.map(|qid| ParkedAsk {
+        qid,
+        tool,
+        line,
+        rule,
+        save,
+    });
+    Ok(Aside::Approval(Approval { id, kind, parked }))
 }
 
 fn decode_settings(payload: &Bytes) -> io::Result<Settings> {

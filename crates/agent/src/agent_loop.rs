@@ -15,10 +15,11 @@ use crate::archive::Archive;
 use crate::batch::{Note, Outcome, run_all_noted};
 use crate::compact::{Compact, Compacted};
 use crate::event::{DropReason, Event, MessageState, TurnEndReason};
+use crate::guard::approval::Approvals;
 use crate::guard::{Answer, Guard};
 use crate::hook::{EventHook, Seen, TurnHook};
 use crate::journal::Journal;
-use crate::journal::record::ApprovalKind;
+use crate::journal::record::{ApprovalKind, Given, ParkedAsk};
 use crate::journal::resume::PendingCall;
 use crate::journal::state::State;
 use crate::live::{ClientId, Command, Inbox, SendMode, Settings, Waiting};
@@ -1261,6 +1262,19 @@ impl<'a> Agent<'a> {
                 }
             }
         }
+        // A call whose approval parked waits again under its id, or takes the
+        // answer a later process gave it.
+        if let Some(approvals) = self.guard.as_ref().map(Guard::approvals) {
+            for call in pending {
+                let Some(held) = &call.held else {
+                    continue;
+                };
+                match &held.given {
+                    Some((given, reason)) => approvals.give(&call.id, answer_of(*given, reason)),
+                    None => approvals.reuse(&call.id, &held.qid),
+                }
+            }
+        }
         let mut ledger = std::mem::take(&mut self.ledger);
         let (notes, mut progress) = mpsc::unbounded_channel();
         let batch = run_all_noted(
@@ -1287,6 +1301,7 @@ impl<'a> Agent<'a> {
             slots: calls.iter().map(|_| None).collect(),
             facts: calls.iter().map(|_| None).collect(),
             questions: self.questions.as_ref(),
+            approvals: self.guard.as_ref().map(Guard::approvals),
             parked: false,
             failure: None,
         };
@@ -1294,6 +1309,9 @@ impl<'a> Agent<'a> {
             .await;
         while let Ok(note) = progress.try_recv() {
             results.note(note).await;
+        }
+        if let Some(approvals) = self.guard.as_ref().map(Guard::approvals) {
+            approvals.settle();
         }
         let Results {
             slots,
@@ -1310,9 +1328,11 @@ impl<'a> Agent<'a> {
             match result {
                 Some(result) => history.push(result),
                 None => assert!(
-                    self.questions
-                        .as_ref()
-                        .is_some_and(|questions| questions.parked_call(&call.id)),
+                    parked_call(
+                        self.questions.as_ref(),
+                        self.guard.as_ref().map(Guard::approvals),
+                        &call.id
+                    ),
                     "the batch answers every call it did not park"
                 ),
             }
@@ -1793,6 +1813,7 @@ impl<'a> Agent<'a> {
                     slots: calls.iter().map(|_| None).collect(),
                     facts: calls.iter().map(|_| None).collect(),
                     questions: self.questions.as_ref(),
+                    approvals: self.guard.as_ref().map(Guard::approvals),
                     parked: false,
                     failure: None,
                 };
@@ -1820,9 +1841,11 @@ impl<'a> Agent<'a> {
                     match result {
                         Some(result) => history.push(result),
                         None => assert!(
-                            self.questions
-                                .as_ref()
-                                .is_some_and(|questions| questions.parked_call(&call.id)),
+                            parked_call(
+                                self.questions.as_ref(),
+                                self.guard.as_ref().map(Guard::approvals),
+                                &call.id
+                            ),
                             "the batch answers every call it did not park"
                         ),
                     }
@@ -2093,6 +2116,8 @@ struct Results<'a, 'b, 'c> {
     facts: Vec<Option<Fact>>,
     /// The registry of the questions, to know which call a park ended.
     questions: Option<&'a Arc<Questions>>,
+    /// The registry of the approvals, to know which call a park ended.
+    approvals: Option<&'a Arc<Approvals>>,
     /// Whether a park ended the question of a call, so the run ends.
     parked: bool,
     /// The first journal error, which ends the turn.
@@ -2104,8 +2129,8 @@ impl Results<'_, '_, '_> {
     async fn note(&mut self, note: Note) {
         match note {
             Note::Done(at, outcome) => self.done(at, outcome).await,
-            Note::Wait { at, done } => {
-                self.approval(at, ApprovalKind::Wait).await;
+            Note::Wait { at, parked, done } => {
+                self.approval_wait(at, parked).await;
                 let _ = done.send(());
             }
             Note::Answer { at, run, done } => {
@@ -2136,10 +2161,11 @@ impl Results<'_, '_, '_> {
         // A call whose question the run parked has no result: the process ends
         // and a later one answers the question, so nothing of the call reaches
         // the journal or the history.
-        if self.calls.get(at).is_some_and(|call| {
-            self.questions
-                .is_some_and(|questions| questions.parked_call(&call.id))
-        }) {
+        if self
+            .calls
+            .get(at)
+            .is_some_and(|call| parked_call(self.questions, self.approvals, &call.id))
+        {
             self.parked = true;
             return;
         }
@@ -2223,6 +2249,16 @@ impl Results<'_, '_, '_> {
     /// Records a call that waits for a client, or the answer it got, so a
     /// resume knows a call without an answer never ran.
     async fn approval(&mut self, at: usize, kind: ApprovalKind) {
+        self.approval_record(at, kind, None).await;
+    }
+
+    /// Records the wait of a call for a client, with the id a later process
+    /// answers it under when the run parks it.
+    async fn approval_wait(&mut self, at: usize, parked: Option<ParkedAsk>) {
+        self.approval_record(at, ApprovalKind::Wait, parked).await;
+    }
+
+    async fn approval_record(&mut self, at: usize, kind: ApprovalKind, parked: Option<ParkedAsk>) {
         let Some(call) = self.calls.get(at) else {
             return;
         };
@@ -2230,7 +2266,11 @@ impl Results<'_, '_, '_> {
         if let Some(journal) = self.journal.as_mut() {
             // An approval is rare and waits for a person, so it is synced: the
             // call asks or runs only once the record is on the disk.
-            let written = match journal.approval(&call.id, kind) {
+            let recorded = match parked {
+                Some(parked) => journal.approval_parkable(&call.id, parked),
+                None => journal.approval(&call.id, kind),
+            };
+            let written = match recorded {
                 Ok(()) => journal.sync().await,
                 Err(error) => Err(error),
             };
@@ -2244,6 +2284,31 @@ impl Results<'_, '_, '_> {
         if wrote {
             committed(self.journal, self.live, self.events, self.token).await;
         }
+    }
+}
+
+/// Whether a park ended the wait of call `id`, a question or an approval, so
+/// the call has no result in this run.
+fn parked_call(
+    questions: Option<&Arc<Questions>>,
+    approvals: Option<&Arc<Approvals>>,
+    id: &str,
+) -> bool {
+    questions.is_some_and(|questions| questions.parked_call(id))
+        || approvals.is_some_and(|approvals| approvals.parked_call(id))
+}
+
+/// The answer a call takes for the answer a later process wrote to its parked
+/// wait. A save runs as a save in this run, so the rules it writes are the
+/// ones this run's own check shows.
+fn answer_of(given: Given, reason: &Option<String>) -> Answer {
+    match given {
+        Given::Once => Answer::Once,
+        Given::Session => Answer::Session,
+        Given::Save => Answer::Save,
+        Given::Refuse => Answer::Refuse {
+            reason: reason.as_deref().map(Text::from),
+        },
     }
 }
 
@@ -5065,6 +5130,57 @@ mod tests {
         }
     }
 
+    /// A refusal another process wrote holds in a plain resumed run too: no
+    /// rules this run reads turn the refused call into one that runs.
+    #[tokio::test]
+    async fn a_refused_parked_approval_holds_in_a_plain_resumed_run() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let provider = FakeProvider::new(Vec::new());
+        let registry = registry();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut assembler = Assembler::new();
+        for event in tool_reply("call_1", "echo", r#"{"message":"ran"}"#) {
+            assembler.push(event);
+        }
+        let mut history = vec![
+            Message::user("hello"),
+            Message::Assistant(assembler.finish("fake".into(), "fake-model".into())),
+        ];
+        let pending = [crate::journal::resume::PendingCall {
+            id: "call_1".into(),
+            name: "echo".into(),
+            class: Some(EffectClass::Read),
+            qid: None,
+            held: Some(crate::journal::resume::Held {
+                qid: "0123456789abcdef0123456789abcdef".into(),
+                given: Some((record::Given::Refuse, Some("not on a friday".into()))),
+            }),
+        }];
+        let mut journal = journal(dir.path());
+        // Open rules now allow the call, as a rule saved or written between
+        // the park and this run.
+        let guard = crate::guard::Guard::new(reagent_config::permissions::Rules::none());
+        Agent::new(&provider, &registry, config(), CancellationToken::new())
+            .with_guard(guard)
+            .run_pending(&mut history, &mut Some(&mut journal), &tx, &pending)
+            .await;
+        journal.close().expect("close the journal");
+
+        let Message::ToolResult(result) = history.last().expect("the call has a result") else {
+            panic!("the entry behind the call is {:?}", history.last());
+        };
+        assert!(
+            result.is_error,
+            "the refused call did not run: {}",
+            result.content
+        );
+        assert!(
+            result.content.as_ref().contains("not on a friday"),
+            "the model reads the reason another process wrote: {}",
+            result.content
+        );
+    }
+
     /// A pending call whose result the log cannot hold ends the run as an
     /// error, not as a run that finished.
     #[tokio::test]
@@ -5092,6 +5208,7 @@ mod tests {
             name: "huge".into(),
             class: Some(EffectClass::Read),
             qid: None,
+            held: None,
         }];
         let (tx, mut rx) = mpsc::channel(64);
         let mut journal = journal(dir.path());

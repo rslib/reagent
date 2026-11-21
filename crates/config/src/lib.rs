@@ -1,6 +1,7 @@
 //! Settings read from the global and the repo `config.toml`.
 
 pub mod auth;
+pub mod contacts;
 pub mod glob;
 pub mod mcp;
 pub mod permissions;

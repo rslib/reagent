@@ -152,6 +152,8 @@ pub(crate) enum Job {
         name: String,
         /// What the listener sees.
         payload: JsonValue,
+        /// The one plugin that hears it, or `None` for all.
+        to: Option<String>,
     },
     /// Hands one frame of a session to the plugin that started it.
     Session {
@@ -353,7 +355,7 @@ async fn serve(
                 let out = fleet.turn(index, ran_tools, &text).await;
                 let _ = reply.send(out);
             }
-            Job::Event { name, payload } => fleet.event(&name, &payload).await,
+            Job::Event { name, payload, to } => fleet.event(&name, &payload, to.as_deref()).await,
             Job::Session { plugin, id, event } => fleet.session(&plugin, &id, &event),
         }
     }
@@ -859,15 +861,16 @@ impl Fleet {
         follow
     }
 
-    /// Hands one event to every instance that waits on it, in load order.
-    async fn event(&self, name: &str, payload: &JsonValue) {
+    /// Hands one event to every instance that waits on it, in load order, or
+    /// to the one named `to` only.
+    async fn event(&self, name: &str, payload: &JsonValue, to: Option<&str>) {
         let Some(bit) = api::event_bit(name) else {
             return;
         };
         for instance in self
             .instances
             .iter()
-            .filter(|entry| entry.shares.events & bit != 0)
+            .filter(|entry| entry.shares.events & bit != 0 && to.is_none_or(|to| entry.name == to))
         {
             let (reply, answer) = oneshot::channel();
             let job = InJob::Event {

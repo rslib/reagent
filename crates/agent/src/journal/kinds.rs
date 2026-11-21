@@ -54,6 +54,14 @@ pub const SETTINGS: u8 = RECORD_FIRST + 10;
 /// before an answer leaves a question a later process answers.
 pub const QUESTION: u8 = RECORD_FIRST + 11;
 
+/// A forward of a parked question to one more person: the question id, the
+/// hop, who forwarded it, the contact and the note.
+///
+/// It is a kind of its own, not one more [`QUESTION`] kind, because a build
+/// that reads every [`QUESTION`] kind it does not know as a wait would take a
+/// forward for a new, empty question; a kind it does not know it skips.
+pub const FORWARD: u8 = RECORD_FIRST + 12;
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -61,7 +69,8 @@ mod tests {
     use reagent_store::Encoder;
 
     use crate::journal::record::{
-        self, Approval, ApprovalKind, CallStart, Model, Question, Record, Settings, TurnEnd,
+        self, Approval, ApprovalAnswer, ApprovalKind, CallStart, Given, Model, ParkedAsk, Question,
+        Record, Settings, TurnEnd,
     };
     use crate::journal::state::{LedgerEntry, State};
     use crate::tool::EffectClass;
@@ -225,6 +234,7 @@ mod tests {
             let approval = Approval {
                 id: "call_1".into(),
                 kind,
+                parked: None,
             };
             let mut out = Vec::new();
             record::encode_approval(&mut out, &approval);
@@ -232,6 +242,61 @@ mod tests {
             let decoded = record::decode_aside(APPROVAL, &payload).expect("decode");
             assert_eq!(decoded, Some(record::Aside::Approval(approval)), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn a_parkable_approval_wait_round_trips() {
+        for save in [Some("Bash(git push:*)".to_string()), None] {
+            let approval = Approval {
+                id: "call_1".into(),
+                kind: ApprovalKind::Wait,
+                parked: Some(ParkedAsk {
+                    qid: "0123456789abcdef0123456789abcdef".into(),
+                    tool: "bash".into(),
+                    line: "git push".into(),
+                    rule: "default".into(),
+                    save: save.clone(),
+                }),
+            };
+            let mut out = Vec::new();
+            record::encode_approval(&mut out, &approval);
+            let decoded = record::decode_aside(APPROVAL, &Bytes::from(out)).expect("decode");
+            assert_eq!(decoded, Some(record::Aside::Approval(approval)), "{save:?}");
+        }
+    }
+
+    #[test]
+    fn an_approval_answer_round_trips() {
+        for (answer, reason) in [
+            (Given::Once, None),
+            (Given::Session, None),
+            (Given::Save, None),
+            (Given::Refuse, Some("not on main".to_string())),
+            (Given::Refuse, None),
+        ] {
+            let record = ApprovalAnswer {
+                qid: "0123456789abcdef0123456789abcdef".into(),
+                by: "gateway:telegram:ray".into(),
+                answer,
+                reason: reason.clone(),
+            };
+            let mut out = Vec::new();
+            record::encode_approval_answer(&mut out, &record);
+            let decoded = record::decode_aside(APPROVAL, &Bytes::from(out)).expect("decode");
+            assert_eq!(
+                decoded,
+                Some(record::Aside::ApprovalAnswer(record)),
+                "{answer:?} {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_answer_word_reads_back() {
+        for answer in [Given::Once, Given::Session, Given::Save, Given::Refuse] {
+            assert_eq!(answer.as_str().parse::<Given>(), Ok(answer));
+        }
+        assert!("skip".parse::<Given>().is_err(), "only the four answers");
     }
 
     #[test]
@@ -262,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn question_record_asked_and_answered_round_trip() {
+    fn question_record_asked_answered_and_forwarded_round_trip() {
         let asked = Question::Asked {
             call: "call_1".into(),
             qid: "0123456789abcdef0123456789abcdef".into(),
@@ -274,18 +339,50 @@ mod tests {
             qid: "0123456789abcdef0123456789abcdef".into(),
             by: "3".into(),
             answers: r#"[["sqlite"]]"#.into(),
+            hop: 0,
         };
-        for question in [asked, answered] {
+        let forwarded = Question::Forwarded {
+            qid: "0123456789abcdef0123456789abcdef".into(),
+            hop: 1,
+            from: "the owner".into(),
+            to: "bob".into(),
+            name: "Bob".into(),
+            note: "Bob owns the budget".into(),
+        };
+        let by_bob = Question::Answered {
+            qid: "0123456789abcdef0123456789abcdef".into(),
+            by: "gateway:telegram:bob".into(),
+            answers: r#"[["sqlite"]]"#.into(),
+            hop: 1,
+        };
+        for question in [asked, answered, forwarded, by_bob] {
             let mut out = Vec::new();
             record::encode_question(&mut out, &question);
             let payload = Bytes::from(out);
-            let decoded = record::decode_aside(QUESTION, &payload).expect("decode");
+            let decoded =
+                record::decode_aside(record::question_kind(&question), &payload).expect("decode");
             assert_eq!(
                 decoded,
                 Some(record::Aside::Question(question.clone())),
                 "{question:?}"
             );
         }
+    }
+
+    /// A forward has a kind of its own: a build that reads every question kind
+    /// it does not know as a wait never sees it as a new question.
+    #[test]
+    fn question_a_forward_is_not_a_question_record() {
+        let forward = Question::Forwarded {
+            qid: "0123456789abcdef0123456789abcdef".into(),
+            hop: 1,
+            from: "the owner".into(),
+            to: "bob".into(),
+            name: "Bob".into(),
+            note: String::new(),
+        };
+        assert_eq!(record::question_kind(&forward), FORWARD);
+        assert_ne!(FORWARD, QUESTION);
     }
 
     /// A question record of a build that wrote a field this one does not know
@@ -324,6 +421,7 @@ mod tests {
             OWNER,
             SETTINGS,
             QUESTION,
+            FORWARD,
         ];
         for (at, kind) in kinds.iter().enumerate() {
             assert_eq!(*kind, RECORD_FIRST + at as u8);

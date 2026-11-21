@@ -392,3 +392,252 @@ async fn park_an_answer_of_a_live_session_is_refused() {
     );
     live.kill().await;
 }
+
+/// A worker whose run waits for the approval of `touch ran.txt`, with `a`
+/// attached.
+async fn approving(state: &Path) -> (Worker, Client) {
+    let cwd = state.join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    ask_folder(&cwd).await;
+    let provider = script(
+        state,
+        r#"{"replies":[{"calls":[{"name":"bash","arguments":{"command":"touch ran.txt"}}]},{"text":"never read"}]}"#,
+    )
+    .await;
+    let worker = Worker::start(state, &cwd, &["--provider", &provider]).await;
+    let token = worker.entry().await.token;
+    let mut a = Client::initialize(&worker, &token, "a").await;
+    a.attach(a.committed).await;
+    a.request("send", r#"{"text":"run it","mode":"queue"}"#)
+        .await;
+    a.until(|frame| frame["method"] == "approval_request").await;
+    (worker, a)
+}
+
+/// Parks the approval of a run as its last client leaves, and returns the
+/// session, its entry and the work folder; the worker is gone.
+async fn parked_approval(
+    state: &Path,
+) -> (
+    String,
+    reagent_protocol::discovery::Parked,
+    std::path::PathBuf,
+) {
+    let (worker, a) = approving(state).await;
+    let session = worker.session().to_string();
+    drop(a);
+    let entry = parked_until(state).await;
+    let mut worker = worker;
+    worker.kill().await;
+    (session, entry, state.join("work"))
+}
+
+/// Continues `session` with no client, as `reagent answer` starts it, and
+/// returns the records once its run ended.
+async fn resume_headless(state: &Path, cwd: &Path, session: &str) -> String {
+    let path = state.join("resumed.json");
+    tokio::fs::write(&path, r#"{"replies":[{"text":"done"}]}"#)
+        .await
+        .expect("writes the script");
+    let provider = format!("fake:{}", path.display());
+    let resumed = Worker::start(state, cwd, &["-r", session, "--provider", &provider]).await;
+    let token = resumed.entry().await.token;
+    let mut b = Client::initialize(&resumed, &token, "b").await;
+    b.attach(b.committed).await;
+    let frames = b
+        .until(|frame| crate::worker_live::is_event(frame, "run_end"))
+        .await;
+    let shown = crate::worker_live::events(frames);
+    let ended = shown
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "run_end")
+        .expect("the run ends");
+    assert_eq!(ended["reason"], "end_turn", "{shown:?}");
+    let mut resumed = resumed;
+    resumed.kill().await;
+    records_until(state, cwd, session, "done").await
+}
+
+/// The last client of a run that waits for an approval leaves: the run parks,
+/// the index lists the call, and a `once` answer runs it in the session that
+/// goes on.
+#[tokio::test]
+async fn park_an_approval_once_runs_the_call() {
+    let dir = state();
+    let state = dir.path();
+    let (session, entry, cwd) = parked_approval(state).await;
+    let approval = entry.approval.clone().expect("the entry is an approval");
+    assert_eq!(approval.tool, "bash");
+    assert_eq!(entry.first(), "bash: touch ran.txt", "{entry:?}");
+    assert_eq!(
+        approval.save.as_deref(),
+        Some("Bash(touch ran.txt:*)"),
+        "{entry:?}"
+    );
+    assert!(!cwd.join("ran.txt").exists(), "the call has not run");
+
+    let (code, out, error) = run(state, &cwd, &["answer"], "").await;
+    assert_eq!(code, 0, "{error}");
+    assert!(
+        out.contains(&entry.qid) && out.contains("approve bash: touch ran.txt"),
+        "the listing names the approval: {out}"
+    );
+
+    let (code, out, error) = run(state, &cwd, &["answer", &entry.qid, "--no-resume"], "once").await;
+    assert_eq!(code, 0, "{error}");
+    assert!(out.contains(&session), "{out}");
+    assert!(parked(state).await.is_empty(), "the index drops it");
+
+    resume_headless(state, &cwd, &session).await;
+    assert!(cwd.join("ran.txt").exists(), "the approved call ran");
+    let (code, _, error) = run(state, &cwd, &["answer", &entry.qid], "once").await;
+    assert_eq!(code, 1, "a second answer finds nothing open: {error}");
+}
+
+/// A refusal of a parked approval does not run the call, and the model reads
+/// the reason.
+#[tokio::test]
+async fn park_a_refused_approval_tells_the_model_why() {
+    let dir = state();
+    let state = dir.path();
+    let (session, entry, cwd) = parked_approval(state).await;
+    let (code, _, error) = run(
+        state,
+        &cwd,
+        &["answer", &entry.qid, "--no-resume"],
+        r#"{"answer":"refuse","reason":"not on a friday"}"#,
+    )
+    .await;
+    assert_eq!(code, 0, "{error}");
+    let records = resume_headless(state, &cwd, &session).await;
+    assert!(
+        !cwd.join("ran.txt").exists(),
+        "the refused call did not run"
+    );
+    assert!(
+        records.contains("not on a friday"),
+        "the model reads the reason: {records}"
+    );
+}
+
+/// A `save` answer runs the call and saves its rule for the project.
+#[tokio::test]
+async fn park_a_saved_approval_runs_and_saves_the_rule() {
+    let dir = state();
+    let state = dir.path();
+    let (session, entry, cwd) = parked_approval(state).await;
+    let (code, _, error) = run(state, &cwd, &["answer", &entry.qid, "--no-resume"], "save").await;
+    assert_eq!(code, 0, "{error}");
+    resume_headless(state, &cwd, &session).await;
+    assert!(cwd.join("ran.txt").exists(), "the approved call ran");
+    let saved = saved_rules(state);
+    assert!(
+        saved.contains("Bash(touch ran.txt:*)"),
+        "the rule is saved: {saved}"
+    );
+}
+
+/// Every saved permission file under `state`, as one text.
+#[expect(clippy::disallowed_methods, reason = "a test reads its own folder")]
+fn saved_rules(state: &Path) -> String {
+    let mut text = String::new();
+    let mut folders = vec![state.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                folders.push(path);
+            } else if path
+                .parent()
+                .is_some_and(|parent| parent.ends_with("permissions"))
+            {
+                text.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+    text
+}
+
+/// An answer an approval does not take records nothing: a word that is not
+/// one of the four, and a reason with a yes.
+#[tokio::test]
+async fn park_a_wrong_approval_answer_records_nothing() {
+    let dir = state();
+    let state = dir.path();
+    let (_, entry, cwd) = parked_approval(state).await;
+    for wrong in [
+        "skip",
+        r#"[["yes"]]"#,
+        r#"{"answer":"once","reason":"why not"}"#,
+        r#""once"#,
+        r#"once""#,
+        r#""once""#,
+        r#"{"answer":"once""#,
+    ] {
+        let (code, _, error) =
+            run(state, &cwd, &["answer", &entry.qid, "--no-resume"], wrong).await;
+        assert_eq!(code, 2, "{wrong}: {error}");
+    }
+    assert_eq!(parked(state).await.len(), 1, "the approval stays open");
+}
+
+/// A refusal holds even when the rules allow the call by the time the session
+/// goes on: a `session` answer to the first of two parked calls adds a rule that
+/// matches the second, and the second, refused, still does not run.
+#[tokio::test]
+async fn park_a_refusal_holds_when_the_rules_now_allow_the_call() {
+    let dir = state();
+    let state = dir.path();
+    let cwd = state.join("work");
+    tokio::fs::create_dir(&cwd).await.expect("the work folder");
+    ask_folder(&cwd).await;
+    let provider = script(
+        state,
+        r#"{"replies":[{"calls":[{"name":"bash","arguments":{"command":"touch ran.txt"}},{"name":"bash","arguments":{"command":"touch ran.txt refused.txt"}}]},{"text":"never read"}]}"#,
+    )
+    .await;
+    let worker = Worker::start(state, &cwd, &["--provider", &provider]).await;
+    let session = worker.session().to_string();
+    let token = worker.entry().await.token;
+    let mut a = Client::initialize(&worker, &token, "a").await;
+    a.attach(a.committed).await;
+    a.request("send", r#"{"text":"run it","mode":"queue"}"#)
+        .await;
+    a.until(|frame| frame["method"] == "approval_request").await;
+    drop(a);
+    let mut entries = Vec::new();
+    for _ in 0..(WAIT.as_millis() / MARK.as_millis()) {
+        entries = parked(state).await;
+        if entries.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(MARK).await;
+    }
+    assert_eq!(entries.len(), 2, "both calls parked: {entries:?}");
+    let mut worker = worker;
+    worker.kill().await;
+    for entry in &entries {
+        let reply = if entry.first().contains("refused.txt") {
+            r#"{"answer":"refuse","reason":"not on a friday"}"#
+        } else {
+            "session"
+        };
+        let (code, _, error) =
+            run(state, &cwd, &["answer", &entry.qid, "--no-resume"], reply).await;
+        assert_eq!(code, 0, "{error}");
+    }
+    let records = resume_headless(state, &cwd, &session).await;
+    assert!(cwd.join("ran.txt").exists(), "the approved call ran");
+    assert!(
+        !cwd.join("refused.txt").exists(),
+        "the refused call did not run"
+    );
+    assert!(
+        records.contains("not on a friday"),
+        "the model reads the reason: {records}"
+    );
+}

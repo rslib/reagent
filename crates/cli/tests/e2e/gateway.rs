@@ -60,10 +60,17 @@ impl Home {
     /// The entry module of the test's gateway plugin, which logs every event it
     /// hears and answers the question the answers file names.
     fn gateway_plugin(&self) -> String {
-        let events = self.events.display();
-        let answers = self.answers.display();
-        format!(
-            r#"
+        gateway_plugin_at(&self.events, &self.answers)
+    }
+}
+
+/// The entry module of a gateway plugin that logs every event it hears to
+/// `events` and asks the gateway what the file `answers` holds.
+fn gateway_plugin_at(events: &std::path::Path, answers: &std::path::Path) -> String {
+    let events = events.display();
+    let answers = answers.display();
+    format!(
+        r#"
 import {{ readFileSync, writeFileSync }} from "node:fs";
 
 const events = {events:?};
@@ -83,6 +90,15 @@ export default function (reagent) {{
   reagent.on("question_closed", (event) => {{
     log({{ event: "question_closed", ...event }});
   }});
+  reagent.on("approval_parked", (event) => {{
+    log({{ event: "approval_parked", ...event }});
+  }});
+  reagent.on("approval_closed", (event) => {{
+    log({{ event: "approval_closed", ...event }});
+  }});
+  reagent.on("question_forwarded", (event) => {{
+    log({{ event: "question_forwarded", ...event }});
+  }});
   // The test writes one request at a time; a changed file is a new answer.
   let last = "";
   setInterval(() => {{
@@ -97,16 +113,22 @@ export default function (reagent) {{
     }}
     last = text;
     const ask = JSON.parse(text);
-    reagent.gateway
-      .answer(ask.qid, ask.token, ask.answers, ask.by)
+    const verdict =
+      ask.forward !== undefined
+        ? reagent.gateway.forward(ask.qid, ask.token, ask.forward, ask.note)
+        : ask.approve === undefined
+          ? reagent.gateway.answer(ask.qid, ask.token, ask.answers, ask.by)
+          : reagent.gateway.approve(ask.qid, ask.token, ask.approve, ask.by, ask.reason);
+    verdict
       .then((verdict) => log({{ event: "answer", verdict }}))
       .catch((error) => log({{ event: "answer", error: String(error) }}));
   }}, 30);
 }}
 "#
-        )
-    }
+    )
+}
 
+impl Home {
     /// Writes one plugin folder of the config, with `role` in its manifest.
     async fn plugin_with(&self, folder: &str, role: &str, entry: &str) {
         let dir = self.plugins().join(folder);
@@ -131,6 +153,27 @@ export default function (reagent) {{
         self.plugin_with(folder, "gateway", entry).await;
     }
 
+    /// Writes the contacts file of the config.
+    async fn contacts(&self, body: &str) {
+        let dir = self.config.join("reagent");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("the config folder");
+        tokio::fs::write(dir.join("contacts.toml"), body)
+            .await
+            .expect("the contacts file");
+    }
+
+    /// Adds the gateway plugin `folder`, which logs to its own events file and
+    /// reads its own answers file, and returns the two.
+    async fn second(&self, folder: &str) -> (PathBuf, PathBuf) {
+        let events = self.state.join(format!("{folder}-events.jsonl"));
+        let answers = self.state.join(format!("{folder}-answers.json"));
+        self.plugin(folder, &gateway_plugin_at(&events, &answers))
+            .await;
+        (events, answers)
+    }
+
     /// The plugins folder of the config.
     fn plugins(&self) -> PathBuf {
         self.config.join("reagent").join("plugins")
@@ -153,35 +196,14 @@ export default function (reagent) {{
         Gateway { child: Some(child) }
     }
 
-    /// Every event the plugin logged, one JSON object per line.
-    async fn told(&self) -> Vec<Value> {
-        let text = match tokio::fs::read_to_string(&self.events).await {
-            Ok(text) => text,
-            Err(_) => return Vec::new(),
-        };
-        text.lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
-    }
-
     /// Every event the plugin logged once `done` says one is enough.
     async fn told_until(&self, done: impl Fn(&[Value]) -> bool) -> Vec<Value> {
-        let mut last = Vec::new();
-        for _ in 0..(WAIT.as_millis() / MARK.as_millis()) {
-            last = self.told().await;
-            if done(&last) {
-                return last;
-            }
-            tokio::time::sleep(MARK).await;
-        }
-        panic!("the plugin never heard it: {last:?}");
+        told_until_in(&self.events, done).await
     }
 
     /// Writes the answer the plugin asks the gateway to record.
     async fn answer(&self, request: Value) {
-        tokio::fs::write(&self.answers, request.to_string())
-            .await
-            .expect("writes the answer");
+        answer_in(&self.answers, request).await;
     }
 
     /// The parked entries of the discovery folder of this home.
@@ -252,6 +274,39 @@ export default function (reagent) {{
         }
         panic!("the records never held {text}: {last}");
     }
+}
+
+/// Every event the plugin that logs to `events` logged, one JSON object per
+/// line.
+async fn told_in(events: &std::path::Path) -> Vec<Value> {
+    let text = match tokio::fs::read_to_string(events).await {
+        Ok(text) => text,
+        Err(_) => return Vec::new(),
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Every event the plugin that logs to `events` logged once `done` says one is
+/// enough.
+async fn told_until_in(events: &std::path::Path, done: impl Fn(&[Value]) -> bool) -> Vec<Value> {
+    let mut last = Vec::new();
+    for _ in 0..(WAIT.as_millis() / MARK.as_millis()) {
+        last = told_in(events).await;
+        if done(&last) {
+            return last;
+        }
+        tokio::time::sleep(MARK).await;
+    }
+    panic!("the plugin never heard it: {last:?}");
+}
+
+/// Writes the request the plugin that reads `answers` hands the gateway.
+async fn answer_in(answers: &std::path::Path, request: Value) {
+    tokio::fs::write(answers, request.to_string())
+        .await
+        .expect("writes the answer");
 }
 
 /// A gateway the test started, with the file its plugin logs to.
@@ -643,4 +698,491 @@ async fn gateway_an_answer_waits_for_the_answer_lock_of_the_session() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// An answer to a session a live worker holds is `busy`: the question stays
+/// open, and the same answer after the worker is gone closes it.
+#[tokio::test]
+#[expect(clippy::disallowed_types, reason = "the test holds a part's lock")]
+async fn gateway_an_answer_to_a_live_session_is_busy() {
+    let home = Home::new("").await;
+    let (session, entry) = parked(&home).await;
+    settle(&home).await;
+    let dir = session_dir(&home.state, &session);
+    let part = reagent_store::paths::part_ids(&dir)
+        .expect("the parts")
+        .into_iter()
+        .max()
+        .expect("a part");
+    let live =
+        std::fs::File::open(reagent_store::paths::part_path(&dir, part)).expect("the part file");
+    live.lock()
+        .expect("the test holds the session as a live worker would");
+
+    let mut gateway = home.gateway();
+    let told = home
+        .told_until(|told| told.iter().any(|entry| entry["event"] == "question_parked"))
+        .await;
+    let token = event(&told, "question_parked")["token"]
+        .as_str()
+        .expect("a token")
+        .to_string();
+    let answer = serde_json::json!({
+        "qid": entry.qid,
+        "token": token,
+        "answers": [["sqlite"]],
+        "by": "ray",
+    });
+    home.answer(answer.clone()).await;
+    let told = home
+        .told_until(|told| told.iter().any(|entry| entry["event"] == "answer"))
+        .await;
+    assert_eq!(event(&told, "answer")["verdict"], "busy", "{told:?}");
+    assert_eq!(home.parked().await.len(), 1, "a busy question stays open");
+    assert!(
+        !home.records(&session).await.contains("A: sqlite"),
+        "no answer is written to a live session"
+    );
+
+    live.unlock().expect("the test lets the session go");
+    let mut again = answer;
+    again["again"] = Value::Bool(true);
+    home.answer(again).await;
+    let told = home
+        .told_until(|told| {
+            told.iter()
+                .filter(|entry| entry["event"] == "answer")
+                .count()
+                == 2
+        })
+        .await;
+    let verdicts: Vec<&Value> = told
+        .iter()
+        .filter(|entry| entry["event"] == "answer")
+        .map(|entry| &entry["verdict"])
+        .collect();
+    assert_eq!(verdicts[1], "ok", "{told:?}");
+    let (code, error) = gateway.term().await;
+    assert_eq!(code, 0, "{error}");
+}
+
+/// A run of the home's config that waits for the approval of `touch ran.txt`,
+/// with `a` attached, then parks when `a` leaves: the run's session and its
+/// parked entry.
+async fn parked_approval(home: &Home) -> (String, reagent_protocol::discovery::Parked) {
+    script(
+        &home.state,
+        r#"{"replies":[{"calls":[{"name":"bash","arguments":{"command":"touch ran.txt"}}]},{"text":"never read"}]}"#,
+    )
+    .await;
+    let worker = Worker::start_with(
+        &home.state,
+        &home.work,
+        &home.config,
+        &["--model", "alpha/m"],
+    )
+    .await;
+    let session = worker.session().to_string();
+    let token = worker.entry().await.token;
+    let mut a = Client::initialize(&worker, &token, "a").await;
+    a.attach(a.committed).await;
+    a.request("send", r#"{"text":"run it","mode":"queue"}"#)
+        .await;
+    a.until(|frame| frame["method"] == "approval_request").await;
+    drop(a);
+    let entry = home.parked_until().await;
+    let mut worker = worker;
+    worker.kill().await;
+    (session, entry)
+}
+
+/// The verdicts of the answers the plugin logged, in order.
+fn verdicts(told: &[Value]) -> Vec<&Value> {
+    told.iter()
+        .filter(|entry| entry["event"] == "answer")
+        .map(|entry| &entry["verdict"])
+        .collect()
+}
+
+/// A parked approval reaches the plugin with the call it asks about, and the
+/// `once` it gives back runs the call in the run that goes on.
+#[tokio::test]
+async fn gateway_a_parked_approval_is_given_by_a_plugin() {
+    let home = Home::new("").await;
+    let (session, entry) = parked_approval(&home).await;
+    settle(&home).await;
+    let mut gateway = home.gateway();
+
+    let told = home
+        .told_until(|told| told.iter().any(|entry| entry["event"] == "approval_parked"))
+        .await;
+    let parked = event(&told, "approval_parked").clone();
+    assert_eq!(parked["qid"], entry.qid.as_str());
+    assert_eq!(parked["session"], session.as_str());
+    assert_eq!(parked["tool"], "bash");
+    assert_eq!(parked["call"], "bash: touch ran.txt");
+    assert_eq!(parked["save"], "Bash(touch ran.txt:*)");
+    assert!(
+        !told.iter().any(|entry| entry["event"] == "question_parked"),
+        "an approval is no question: {told:?}"
+    );
+    let token = parked["token"].as_str().expect("a token").to_string();
+
+    home.answer(serde_json::json!({
+        "qid": entry.qid,
+        "token": token,
+        "approve": "once",
+        "by": "ray",
+    }))
+    .await;
+    let told = home
+        .told_until(|told| told.iter().any(|entry| entry["event"] == "approval_closed"))
+        .await;
+    assert_eq!(verdicts(&told), ["ok"], "{told:?}");
+    let closed = event(&told, "approval_closed");
+    assert_eq!(closed["how"], "answered");
+    assert_eq!(closed["by"], "gateway:telegram:ray");
+
+    home.records_until(&session, "done").await;
+    assert!(home.work.join("ran.txt").exists(), "the approved call ran");
+    let (code, error) = gateway.term().await;
+    assert_eq!(code, 0, "{error}");
+}
+
+/// A parked approval takes only an approval: the answers of a question, a word
+/// that is not one of the four, and a reason with a yes are denied, and the
+/// approval stays open.
+#[tokio::test]
+async fn gateway_a_wrong_approval_answer_is_denied() {
+    let home = Home::new("").await;
+    home.contacts("[bob]\nchannel = \"telegram\"\nuser = \"42\"\n")
+        .await;
+    let (_, entry) = parked_approval(&home).await;
+    settle(&home).await;
+    let mut gateway = home.gateway();
+    let told = home
+        .told_until(|told| told.iter().any(|entry| entry["event"] == "approval_parked"))
+        .await;
+    let token = event(&told, "approval_parked")["token"]
+        .as_str()
+        .expect("a token")
+        .to_string();
+    let wrong = [
+        serde_json::json!({"qid": entry.qid, "token": token, "answers": [["yes"]], "by": "ray"}),
+        serde_json::json!({"qid": entry.qid, "token": token, "approve": "skip", "by": "ray"}),
+        serde_json::json!({"qid": entry.qid, "token": token, "approve": "once", "by": "ray", "reason": "why not"}),
+        serde_json::json!({"qid": entry.qid, "token": token, "forward": "bob"}),
+    ];
+    for (at, ask) in wrong.into_iter().enumerate() {
+        home.answer(ask).await;
+        let told = home.told_until(|told| verdicts(told).len() == at + 1).await;
+        assert_eq!(verdicts(&told)[at], "denied", "{told:?}");
+    }
+    assert_eq!(home.parked().await.len(), 1, "the approval stays open");
+    let (code, error) = gateway.term().await;
+    assert_eq!(code, 0, "{error}");
+}
+
+/// An approval nobody gives is refused at its deadline: silence is never a
+/// yes, so the call does not run and the run goes on with the refusal.
+#[tokio::test]
+async fn gateway_a_deadline_refuses_the_approval() {
+    let home = Home::new("[gateway]\ndeadline = \"2s\"\n").await;
+    let (session, entry) = parked_approval(&home).await;
+    settle(&home).await;
+    let mut gateway = home.gateway();
+
+    let told = home
+        .told_until(|told| told.iter().any(|entry| entry["event"] == "approval_closed"))
+        .await;
+    let closed = event(&told, "approval_closed").clone();
+    assert_eq!(closed["qid"], entry.qid.as_str());
+    assert_eq!(closed["how"], "expired");
+    assert_eq!(closed["by"], "deadline");
+
+    let records = home.records_until(&session, "done").await;
+    assert!(
+        records.contains("nobody answered the approval request before its deadline"),
+        "the model reads why the call did not run: {records}"
+    );
+    assert!(
+        !home.work.join("ran.txt").exists(),
+        "the refused call did not run"
+    );
+    let (code, error) = gateway.term().await;
+    assert_eq!(code, 0, "{error}");
+}
+
+/// The contacts of the forward tests: Bob, whom the `mail` plugin reaches.
+const BOB: &str = "[bob]\nname = \"Bob\"\nchannel = \"mail\"\nuser = \"42\"\n";
+
+/// The token of the `question_parked` the owner's plugin heard.
+async fn owner_token(home: &Home) -> String {
+    let told = home
+        .told_until(|told| told.iter().any(|entry| entry["event"] == "question_parked"))
+        .await;
+    event(&told, "question_parked")["token"]
+        .as_str()
+        .expect("a token")
+        .to_string()
+}
+
+/// The owner forwards a parked question to a contact: only the plugin of that
+/// contact hears it, with a token of the contact's own that no other plugin can
+/// use, and the contact's answer reaches the model with who answered and who
+/// forwarded it.
+#[tokio::test]
+async fn gateway_a_forwarded_question_is_answered_by_the_contact() {
+    let home = Home::new("").await;
+    home.contacts(BOB).await;
+    let (mail, mail_answers) = home.second("mail").await;
+    let (session, entry) = parked(&home).await;
+    settle(&home).await;
+    let mut gateway = home.gateway();
+    let token = owner_token(&home).await;
+
+    home.answer(serde_json::json!({
+        "qid": entry.qid,
+        "token": token,
+        "forward": "bob",
+        "note": "Bob owns the budget",
+    }))
+    .await;
+    let told = home.told_until(|told| verdicts(told).len() == 1).await;
+    assert_eq!(verdicts(&told)[0], "ok", "{told:?}");
+    let heard = told_until_in(&mail, |told| {
+        told.iter()
+            .any(|entry| entry["event"] == "question_forwarded")
+    })
+    .await;
+    let forwarded = event(&heard, "question_forwarded").clone();
+    assert_eq!(forwarded["qid"], entry.qid.as_str());
+    assert_eq!(forwarded["hop"], 1);
+    assert_eq!(forwarded["to"], "bob");
+    assert_eq!(forwarded["name"], "Bob");
+    assert_eq!(forwarded["user"], "42");
+    assert_eq!(forwarded["from"], "the owner");
+    assert_eq!(forwarded["note"], "Bob owns the budget");
+    assert_eq!(forwarded["questions"][0]["q"], "Which database?");
+    assert!(forwarded.get("session").is_none(), "{forwarded}");
+    let bob = forwarded["token"].as_str().expect("a token").to_string();
+    assert_eq!(bob.len(), 32, "{bob}");
+    assert_ne!(bob, token, "the contact has a token of their own");
+    let parked = home.parked().await;
+    assert_eq!(parked[0].forwards.len(), 1, "the entry keeps the forward");
+
+    // The owner's plugin never hears the forward, and cannot use its token.
+    home.answer(serde_json::json!({
+        "qid": entry.qid,
+        "token": bob,
+        "answers": [["postgres"]],
+        "by": "bob",
+    }))
+    .await;
+    let told = home.told_until(|told| verdicts(told).len() == 2).await;
+    assert_eq!(verdicts(&told)[1], "denied", "{told:?}");
+    assert!(
+        !told
+            .iter()
+            .any(|entry| entry["event"] == "question_forwarded"),
+        "{told:?}"
+    );
+
+    answer_in(
+        &mail_answers,
+        serde_json::json!({
+            "qid": entry.qid,
+            "token": bob,
+            "answers": [["postgres"]],
+            "by": "bob",
+        }),
+    )
+    .await;
+    let heard = told_until_in(&mail, |told| verdicts(told).len() == 1).await;
+    assert_eq!(verdicts(&heard)[0], "ok", "{heard:?}");
+    let told = home
+        .told_until(|told| told.iter().any(|entry| entry["event"] == "question_closed"))
+        .await;
+    assert_eq!(event(&told, "question_closed")["by"], "gateway:mail:bob");
+
+    let records = home.records_until(&session, "done").await;
+    assert!(
+        records.contains(
+            r#"A: postgres\nAnswered by Bob, forwarded by the owner with the note \"Bob owns the budget\"."#
+        ),
+        "the model reads who answered: {records}"
+    );
+    let (code, error) = gateway.term().await;
+    assert_eq!(code, 0, "{error}");
+}
+
+/// A forward to a person who is not in the contacts file, or whose channel no
+/// gateway plugin is, is denied and leaves the question as it was.
+#[tokio::test]
+async fn gateway_a_forward_to_an_unknown_contact_is_denied() {
+    let home = Home::new("").await;
+    home.contacts(BOB).await;
+    let (_, entry) = parked(&home).await;
+    settle(&home).await;
+    let mut gateway = home.gateway();
+    let token = owner_token(&home).await;
+
+    for (at, to) in ["carol", "bob"].into_iter().enumerate() {
+        home.answer(serde_json::json!({"qid": entry.qid, "token": token, "forward": to}))
+            .await;
+        let told = home.told_until(|told| verdicts(told).len() == at + 1).await;
+        assert_eq!(verdicts(&told)[at], "denied", "{to}: {told:?}");
+    }
+    let parked = home.parked().await;
+    assert_eq!(parked.len(), 1, "the question stays open");
+    assert!(parked[0].forwards.is_empty(), "no forward is kept");
+    let (code, error) = gateway.term().await;
+    assert_eq!(code, 0, "{error}");
+}
+
+/// The owner's token stays good after a forward, so the first answer wins: a
+/// restarted gateway tells the contact again with a new token, the owner
+/// answers, and the contact's answer after that is stale.
+#[tokio::test]
+async fn gateway_the_first_answer_of_a_forwarded_question_wins() {
+    let home = Home::new("").await;
+    home.contacts(BOB).await;
+    let (mail, mail_answers) = home.second("mail").await;
+    let (session, entry) = parked(&home).await;
+    settle(&home).await;
+    let mut gateway = home.gateway();
+    let token = owner_token(&home).await;
+    home.answer(serde_json::json!({"qid": entry.qid, "token": token, "forward": "bob"}))
+        .await;
+    let told = home.told_until(|told| verdicts(told).len() == 1).await;
+    assert_eq!(verdicts(&told)[0], "ok", "{told:?}");
+    let heard = told_until_in(&mail, |told| {
+        told.iter()
+            .any(|entry| entry["event"] == "question_forwarded")
+    })
+    .await;
+    let first = event(&heard, "question_forwarded")["token"].clone();
+    let (code, error) = gateway.term().await;
+    assert_eq!(code, 0, "{error}");
+
+    // A plugin starts its log again with the gateway, so a new token tells the
+    // two starts apart; the old request must not be sent a second time.
+    tokio::fs::remove_file(&home.answers)
+        .await
+        .expect("the old request");
+    let mut gateway = home.gateway();
+    let heard = told_until_in(&mail, |told| {
+        told.iter()
+            .any(|entry| entry["event"] == "question_forwarded" && entry["token"] != first)
+    })
+    .await;
+    let again = event(&heard, "question_forwarded");
+    assert_eq!(again["hop"], 1, "{heard:?}");
+    assert_eq!(again["from"], "the owner", "{heard:?}");
+    let bob = again["token"].as_str().expect("a token").to_string();
+    let told = home
+        .told_until(|told| {
+            told.iter().any(|entry| {
+                entry["event"] == "question_parked" && entry["token"] != token.as_str()
+            })
+        })
+        .await;
+    let owner = event(&told, "question_parked")["token"]
+        .as_str()
+        .expect("a token")
+        .to_string();
+
+    home.answer(serde_json::json!({
+        "qid": entry.qid,
+        "token": owner,
+        "answers": [["sqlite"]],
+        "by": "ray",
+    }))
+    .await;
+    let told = home.told_until(|told| verdicts(told).len() == 1).await;
+    assert_eq!(verdicts(&told)[0], "ok", "{told:?}");
+    answer_in(
+        &mail_answers,
+        serde_json::json!({
+            "qid": entry.qid,
+            "token": bob,
+            "answers": [["postgres"]],
+            "by": "bob",
+        }),
+    )
+    .await;
+    let heard = told_until_in(&mail, |told| verdicts(told).len() == 1).await;
+    assert_eq!(verdicts(&heard)[0], "stale", "{heard:?}");
+
+    let records = home.records_until(&session, "done").await;
+    assert!(records.contains("A: sqlite"), "{records}");
+    assert!(
+        !records.contains("Answered by"),
+        "the owner's answer names nobody: {records}"
+    );
+    let (code, error) = gateway.term().await;
+    assert_eq!(code, 0, "{error}");
+}
+
+/// A forwarded person may forward the question again: the next forward names
+/// that person as `from`, and the forwards of one question stop at 16.
+#[tokio::test]
+async fn gateway_a_contact_forwards_again_and_the_hops_stop_at_sixteen() {
+    let home = Home::new("").await;
+    home.contacts(&format!(
+        "{BOB}\n[carol]\nname = \"Carol\"\nchannel = \"mail\"\nuser = \"7\"\n"
+    ))
+    .await;
+    let (mail, mail_answers) = home.second("mail").await;
+    let (_, entry) = parked(&home).await;
+    settle(&home).await;
+    let mut gateway = home.gateway();
+    let token = owner_token(&home).await;
+
+    home.answer(serde_json::json!({"qid": entry.qid, "token": token, "forward": "bob"}))
+        .await;
+    let heard = told_until_in(&mail, |told| {
+        told.iter()
+            .any(|entry| entry["event"] == "question_forwarded")
+    })
+    .await;
+    let bob = event(&heard, "question_forwarded")["token"].clone();
+    answer_in(
+        &mail_answers,
+        serde_json::json!({"qid": entry.qid, "token": bob, "forward": "carol", "note": "ask Carol"}),
+    )
+    .await;
+    let heard = told_until_in(&mail, |told| {
+        told.iter()
+            .any(|entry| entry["event"] == "question_forwarded" && entry["hop"] == 2)
+    })
+    .await;
+    assert_eq!(verdicts(&heard)[0], "ok", "{heard:?}");
+    let carol = heard
+        .iter()
+        .find(|entry| entry["event"] == "question_forwarded" && entry["hop"] == 2)
+        .expect("the second forward");
+    assert_eq!(carol["from"], "Bob", "{carol}");
+    assert_eq!(carol["to"], "carol", "{carol}");
+    assert_eq!(carol["user"], "7", "{carol}");
+    assert_eq!(carol["note"], "ask Carol", "{carol}");
+
+    // Hops 3 to 16 are taken; the 17th is denied.
+    for hop in 3..=17 {
+        home.answer(serde_json::json!({
+            "qid": entry.qid,
+            "token": token,
+            "forward": "bob",
+            "note": format!("hop {hop}"),
+        }))
+        .await;
+        let at = hop - 1;
+        let told = home.told_until(|told| verdicts(told).len() == at).await;
+        let want = if hop <= 16 { "ok" } else { "denied" };
+        assert_eq!(verdicts(&told)[at - 1], want, "hop {hop}: {told:?}");
+    }
+    let parked = home.parked().await;
+    assert_eq!(parked[0].forwards.len(), 16, "{:?}", parked[0].forwards);
+    let (code, error) = gateway.term().await;
+    assert_eq!(code, 0, "{error}");
 }

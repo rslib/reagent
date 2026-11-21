@@ -19,6 +19,7 @@ use reagent_agent::agent_loop::Agent;
 use reagent_agent::event::Event;
 use reagent_agent::event::TurnEndReason;
 use reagent_agent::guard::Answer;
+use reagent_agent::guard::approval::Approvals;
 use reagent_agent::journal::Journal;
 use reagent_agent::journal::resume::PendingCall;
 use reagent_agent::live;
@@ -477,6 +478,12 @@ impl Worker {
         self.shared.set_questions(questions);
     }
 
+    /// Hands the worker the approvals of the run, so a park leaves the
+    /// approval the last client could not give for a later process.
+    pub(crate) fn approvals(&self, approvals: Arc<Approvals>) {
+        let _ = self.shared.approvals.set(approvals);
+    }
+
     /// The shared state of the session: its settings, and the model and the
     /// provider a usage line names.
     pub(crate) fn shared(&self) -> Arc<Shared> {
@@ -578,6 +585,7 @@ impl Worker {
         // worker.
         let recorded = journal.is_some();
         let questions = self.shared.questions().cloned();
+        let approvals = self.shared.approvals.get().cloned();
         let run = agent.run_pending_with_inbox(history, journal, events, pending, inbox);
         tokio::pin!(run);
         let reason = match self.leaving.as_mut() {
@@ -585,7 +593,7 @@ impl Worker {
                 reason = &mut run => reason,
                 _ = leaving => {
                     self.stopping = true;
-                    if !parked(questions.as_ref(), recorded) {
+                    if !parked(questions.as_ref(), approvals.as_ref(), recorded) {
                         let _ = sender.send(live::Command::Cancel { client: WORKER }).await;
                     }
                     run.await
@@ -684,7 +692,7 @@ impl Worker {
                 // answers it, and cancelled otherwise. Then the senders go so
                 // the session returns.
                 end_pump(&mut pump).await;
-                if !parked(shared.questions(), recorded)
+                if !parked(shared.questions(), shared.approvals.get(), recorded)
                     && shared.waits()
                     && let Some(sender) = &sender
                 {
@@ -1036,6 +1044,9 @@ pub(crate) struct Shared {
     /// The questions of the run, set once before its tool batch: a worker parks
     /// the question its run waits for, so a later process answers it.
     questions: OnceLock<Arc<Questions>>,
+    /// The approvals of the run, set once: a worker parks the approval its
+    /// run waits for, so a later process gives it.
+    approvals: OnceLock<Arc<Approvals>>,
     /// Bumped on every change of `state`, so a wait wakes on it.
     changed: watch::Sender<u64>,
 }
@@ -1052,6 +1063,7 @@ impl Shared {
             plugins: OnceLock::new(),
             skills: OnceLock::new(),
             questions: OnceLock::new(),
+            approvals: OnceLock::new(),
             changed,
         }
     }
@@ -1474,21 +1486,30 @@ async fn stop_clients(acceptor: Option<JoinHandle<()>>) {
     }
 }
 
-/// Parks the question a run waits for, when the session keeps a journal and the
-/// question is on it: the run ends `Parked` and a later `reagent answer`
-/// continues the session.
+/// Parks the waits of the run when the last client leaves and the journal
+/// holds one with an id: the run ends `Parked`, and a later `reagent answer`
+/// or gateway answers the question or gives the approval and continues the
+/// session.
 ///
-/// A wait for an approval has no question to park, and a question the journal
-/// does not hold names no id for a later process, so both cancel as they always
-/// did. `recorded` says whether the session keeps a journal.
-fn parked(questions: Option<&Arc<Questions>>, recorded: bool) -> bool {
-    let Some(questions) = questions else {
-        return false;
-    };
-    if !recorded || !questions.parkable() {
+/// A wait the journal does not hold names no id for a later process, so a run
+/// with none cancels as it always did. `recorded` says whether the session
+/// keeps a journal.
+fn parked(
+    questions: Option<&Arc<Questions>>,
+    approvals: Option<&Arc<Approvals>>,
+    recorded: bool,
+) -> bool {
+    let asks = questions.is_some_and(|questions| questions.parkable());
+    let gives = approvals.is_some_and(|approvals| approvals.parkable());
+    if !recorded || !(asks || gives) {
         return false;
     }
-    questions.park();
+    if let Some(questions) = questions {
+        questions.park();
+    }
+    if let Some(approvals) = approvals {
+        approvals.park();
+    }
     true
 }
 

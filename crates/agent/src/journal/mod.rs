@@ -12,7 +12,9 @@ use bytes::Bytes;
 use reagent_ai::{Message, Usage};
 use reagent_store::{Header, Writer};
 
-use crate::journal::record::{Approval, ApprovalKind, Question, Settings, TurnEnd};
+use crate::journal::record::{
+    Approval, ApprovalAnswer, ApprovalKind, Given, ParkedAsk, Question, Settings, TurnEnd,
+};
 use crate::journal::state::State;
 use crate::tool::EffectClass;
 
@@ -135,6 +137,43 @@ impl Journal {
             &Approval {
                 id: id.to_owned(),
                 kind,
+                parked: None,
+            },
+        );
+        self.append(kinds::APPROVAL, false)
+    }
+
+    /// Appends the wait of a call for a client's answer that a later process
+    /// may answer under `parked.qid`, with what that process shows of it.
+    pub fn approval_parkable(&mut self, id: &str, parked: ParkedAsk) -> io::Result<()> {
+        self.scratch.clear();
+        record::encode_approval(
+            &mut self.scratch,
+            &Approval {
+                id: id.to_owned(),
+                kind: ApprovalKind::Wait,
+                parked: Some(parked),
+            },
+        );
+        self.append(kinds::APPROVAL, false)
+    }
+
+    /// Appends the answer a later process gave to the parked wait `qid`.
+    pub fn approval_answered(
+        &mut self,
+        qid: &str,
+        by: &str,
+        answer: Given,
+        reason: Option<&str>,
+    ) -> io::Result<()> {
+        self.scratch.clear();
+        record::encode_approval_answer(
+            &mut self.scratch,
+            &ApprovalAnswer {
+                qid: qid.to_owned(),
+                by: by.to_owned(),
+                answer,
+                reason: reason.map(str::to_owned),
             },
         );
         self.append(kinds::APPROVAL, false)
@@ -158,8 +197,15 @@ impl Journal {
     }
 
     /// Appends the answer a person gave to question `qid`, as the JSON text of
-    /// one list per question.
-    pub fn question_answered(&mut self, qid: &str, by: &str, answers: &str) -> io::Result<()> {
+    /// one list per question; `hop` is 0 for the owner, or the forward whose
+    /// person answered.
+    pub fn question_answered(
+        &mut self,
+        qid: &str,
+        by: &str,
+        answers: &str,
+        hop: u64,
+    ) -> io::Result<()> {
         self.scratch.clear();
         record::encode_question(
             &mut self.scratch,
@@ -167,9 +213,17 @@ impl Journal {
                 qid: qid.to_owned(),
                 by: by.to_owned(),
                 answers: answers.to_owned(),
+                hop,
             },
         );
         self.append(kinds::QUESTION, false)
+    }
+
+    /// Appends a forward of a parked question, a [`Question::Forwarded`].
+    pub fn question_forwarded(&mut self, forward: &Question) -> io::Result<()> {
+        self.scratch.clear();
+        record::encode_question(&mut self.scratch, forward);
+        self.append(record::question_kind(forward), false)
     }
 
     /// Appends a change of the reasoning level, the permission mode, or both.

@@ -1,5 +1,6 @@
 //! The `gateway` command: one long-lived process that hands the parked
-//! questions of this machine to the gateway plugins, and takes their answers.
+//! questions and approvals of this machine to the gateway plugins, and takes
+//! their answers.
 //!
 //! A run parks while it waits for a question whose client is gone: it leaves one
 //! file per open question in the `parked` folder of the discovery folder and
@@ -8,25 +9,36 @@
 //! what a plugin sends back. It is the only process that may write an answer for
 //! a plugin, and the token it hands out is the only thing that lets one in.
 //!
+//! A plugin may forward a question to a person of the contacts file. Only the
+//! plugin that reaches that person hears the forward, with a token of that
+//! person's own; the owner's token stays good, and the first answer closes the
+//! question. An approval is never forwarded.
+//!
 //! Two things close a question without a plugin: `reagent answer`, which writes
 //! the answer itself, and the deadline of `[gateway] deadline`, which writes an
 //! answer of no lists, so the run goes on with the text a client shows when
-//! nobody answered. Nothing expires while no gateway runs.
+//! nobody answered. The deadline refuses a parked approval: silence is never a
+//! yes. Nothing expires while no gateway runs.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use reagent_agent::journal::record::Given;
 use reagent_agent::journal::record::{self, Aside};
-use reagent_protocol::discovery::{self, Parked};
-use reagent_script::plugin::{AnswerAsk, Plugins};
+use reagent_config::contacts::Contact;
+use reagent_protocol::discovery::{self, Parked, ParkedForward};
+use reagent_script::plugin::{AnswerAsk, Answered, Plugins};
 use reagent_store::Session;
 use reagent_tui::watch::Watch;
 use serde_json::json;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::answer::{self, Refused};
+use crate::answer::{self, Refused, Reply};
+
+/// The reason the model reads when the deadline refuses a parked approval.
+const UNANSWERED: &str = "nobody answered the approval request before its deadline";
 
 /// How the command is used.
 const USAGE: &str = "usage: reagent gateway";
@@ -34,14 +46,38 @@ const USAGE: &str = "usage: reagent gateway";
 /// The most bytes of a plugin's name and its own `by` the journal records.
 const BY_BYTES: usize = 64;
 
+/// Who the model reads forwarded a question with the owner's token.
+const OWNER: &str = "the owner";
+
+/// The most forwards one question takes, so two people cannot pass it back and
+/// forth for ever.
+const MAX_HOPS: u64 = 16;
+
 /// One question the plugins were told about, and the secret they were given.
 struct Announced {
     /// The parked entry, as it was read.
     entry: Parked,
-    /// The 32 hex digits only this process knows.
+    /// The owner's 32 hex digits, which only this process knows.
     token: String,
+    /// The forwards the plugins of the contacts were told about.
+    hops: Vec<Hop>,
+    /// Whether the contacts file read when the forwards were told; a read
+    /// that failed is tried again at the next read of the folder.
+    told: bool,
     /// When it expires, in milliseconds since the epoch, when it does.
     deadline: Option<u64>,
+}
+
+/// One forward of a question, and the secret of the person it went to.
+struct Hop {
+    /// The number of the forward.
+    hop: u64,
+    /// The token of that person.
+    token: String,
+    /// The plugin that reaches that person: the only one the token works from.
+    plugin: String,
+    /// The name of that person, which a forward of theirs names.
+    name: String,
 }
 
 /// Runs the gateway until SIGINT or SIGTERM.
@@ -284,33 +320,126 @@ async fn read(
             _ => "answered",
         };
         plugins.event(
-            "question_closed",
+            closed_event(&known.entry),
             json!({ "qid": qid, "how": how, "by": by }),
         );
     }
-    for entry in open {
+    for mut entry in open {
         if announced.iter().any(|known| known.entry.qid == entry.qid) {
             continue;
         }
+        // The journal holds every forward, also one whose copy in the entry
+        // was never written.
+        if entry.approval.is_none()
+            && let Some(forwards) = answer::forwards(state, &entry.session, &entry.qid).await
+        {
+            entry.forwards = forwards;
+        }
         let token = token();
         let at = deadline.map(|wait| deadline_at(entry.at, wait));
-        plugins.event(
-            "question_parked",
-            json!({
-                "qid": entry.qid,
-                "session": entry.session,
-                "questions": entry.questions,
-                "at": entry.at,
-                "deadline": at,
-                "token": token,
-            }),
-        );
+        match &entry.approval {
+            Some(approval) => plugins.event(
+                "approval_parked",
+                json!({
+                    "qid": entry.qid,
+                    "session": entry.session,
+                    "tool": approval.tool,
+                    "call": approval.call,
+                    "rule": approval.rule,
+                    "save": approval.save,
+                    "at": entry.at,
+                    "deadline": at,
+                    "token": token,
+                }),
+            ),
+            None => plugins.event(
+                "question_parked",
+                json!({
+                    "qid": entry.qid,
+                    "session": entry.session,
+                    "questions": entry.questions,
+                    "at": entry.at,
+                    "deadline": at,
+                    "token": token,
+                }),
+            ),
+        }
         announced.push(Announced {
+            told: entry.forwards.is_empty(),
             entry,
             token,
+            hops: Vec::new(),
             deadline: at,
         });
     }
+    if announced.iter().all(|known| known.told) {
+        return;
+    }
+    let contacts = match load_contacts().await {
+        Ok(contacts) => contacts,
+        Err(message) => {
+            eprintln!("reagent: {message}");
+            return;
+        }
+    };
+    for known in announced.iter_mut().filter(|known| !known.told) {
+        known.told = true;
+        for forward in &known.entry.forwards {
+            match contacts.get(&forward.to) {
+                Some(contact) => {
+                    let hop = tell(plugins, &known.entry, forward, contact, known.deadline);
+                    known.hops.push(hop);
+                }
+                None => eprintln!(
+                    "reagent: {} was forwarded to {}, who is not in the contacts file",
+                    known.entry.qid, forward.to
+                ),
+            }
+        }
+    }
+}
+
+/// Tells the plugin of `contact` about the forward `forward` of `entry`, with a
+/// token for that person alone.
+fn tell(
+    plugins: &Plugins,
+    entry: &Parked,
+    forward: &ParkedForward,
+    contact: &Contact,
+    deadline: Option<u64>,
+) -> Hop {
+    let token = token();
+    plugins.event_to(
+        &contact.channel,
+        "question_forwarded",
+        json!({
+            "qid": entry.qid,
+            "questions": entry.questions,
+            "hop": forward.hop,
+            "to": forward.to,
+            "name": forward.name,
+            "user": contact.user,
+            "from": forward.from,
+            "note": forward.note,
+            "at": entry.at,
+            "deadline": deadline,
+            "token": token,
+        }),
+    );
+    Hop {
+        hop: forward.hop,
+        token,
+        plugin: contact.channel.clone(),
+        name: forward.name.clone(),
+    }
+}
+
+/// The contacts file, read on the blocking pool each time it is needed, so an
+/// edit of it counts without a restart.
+async fn load_contacts() -> Result<std::collections::BTreeMap<String, Contact>, String> {
+    tokio::task::spawn_blocking(reagent_config::contacts::load)
+        .await
+        .map_err(|_| "the contacts reader stopped".to_string())?
 }
 
 /// Writes the answer one gateway plugin asked for, and answers its promise.
@@ -331,17 +460,44 @@ async fn answered(
         let _ = ask.reply.send("stale".to_string());
         return false;
     };
-    if ask.token != announced[at].token {
+    // The owner's token works from every plugin; a forwarded person's only
+    // from the plugin that reaches that person.
+    let known = &announced[at];
+    let hop = if ask.token == known.token {
+        Some(0)
+    } else {
+        known
+            .hops
+            .iter()
+            .find(|hop| hop.token == ask.token && hop.plugin == ask.plugin)
+            .map(|hop| hop.hop)
+    };
+    let Some(hop) = hop else {
         let _ = ask.reply.send("denied".to_string());
         return false;
-    }
-    let entry = announced[at].entry.clone();
-    if answer::counted(&entry, &ask.answers).is_err() {
+    };
+    let entry = known.entry.clone();
+    // An answer of the wrong kind, or one the wait does not take, is denied.
+    let reply = match (&entry.approval, ask.answered) {
+        (None, Answered::Answers(answers)) => answer::counted(&entry, &answers)
+            .ok()
+            .map(|()| Reply::Answers { answers, hop }),
+        (Some(approval), Answered::Approval { word, reason }) if hop == 0 => {
+            answer::approval_reply(&entry, approval, &word, reason).ok()
+        }
+        (None, Answered::Forward { to, note }) => {
+            let verdict = forward(state, folder, plugins, &mut announced[at], hop, to, note).await;
+            let _ = ask.reply.send(verdict.to_string());
+            return verdict == "stale";
+        }
+        _ => None,
+    };
+    let Some(reply) = reply else {
         let _ = ask.reply.send("denied".to_string());
         return false;
-    }
+    };
     let by = format!("gateway:{}:{}", ask.plugin, cut(&ask.by, BY_BYTES));
-    let verdict = match answer::record(state, entry.clone(), &by, &ask.answers).await {
+    let verdict = match answer::record(state, entry.clone(), &by, reply).await {
         Ok((session, cwd)) => {
             if let Err(error) = discovery::remove_parked(folder, &entry.qid).await {
                 eprintln!(
@@ -356,7 +512,7 @@ async fn answered(
             }
             announced.remove(at);
             plugins.event(
-                "question_closed",
+                closed_event(&entry),
                 json!({ "qid": entry.qid, "how": "answered", "by": by }),
             );
             "ok"
@@ -371,6 +527,95 @@ async fn answered(
     };
     let _ = ask.reply.send(verdict.to_string());
     verdict == "stale"
+}
+
+/// Forwards the question of `known` to the contact of key `to`, for the person
+/// of hop `from`, and answers the verdict for the plugin.
+///
+/// The forward is in the journal before the contact's plugin hears it, so a
+/// gateway that restarts tells that plugin again.
+async fn forward(
+    state: &Path,
+    folder: &Path,
+    plugins: &Plugins,
+    known: &mut Announced,
+    from: u64,
+    to: String,
+    note: String,
+) -> &'static str {
+    let contacts = match load_contacts().await {
+        Ok(contacts) => contacts,
+        Err(message) => {
+            eprintln!("reagent: {message}");
+            return "denied";
+        }
+    };
+    let Some(contact) = contacts.get(&to) else {
+        return "denied";
+    };
+    if !plugins.names().contains(&contact.channel) {
+        eprintln!(
+            "reagent: contact {to} names the channel {}, which no gateway plugin is",
+            contact.channel
+        );
+        return "denied";
+    }
+    let hop = known
+        .entry
+        .forwards
+        .iter()
+        .map(|forward| forward.hop)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    if hop > MAX_HOPS {
+        return "denied";
+    }
+    let from = if from == 0 {
+        OWNER.to_string()
+    } else {
+        known
+            .hops
+            .iter()
+            .find(|known| known.hop == from)
+            .map_or_else(String::new, |known| known.name.clone())
+    };
+    let forward = ParkedForward {
+        hop,
+        from,
+        name: contact.shown(&to).to_string(),
+        to,
+        note,
+    };
+    match answer::record(
+        state,
+        known.entry.clone(),
+        "",
+        Reply::Forward(forward.clone()),
+    )
+    .await
+    {
+        Ok(_) => {
+            known.entry.forwards.push(forward);
+            let Some(forward) = known.entry.forwards.last() else {
+                return "ok";
+            };
+            if let Err(error) = discovery::write_parked(folder, known.entry.clone()).await {
+                eprintln!(
+                    "reagent: warning: could not write the entry of {}: {error}",
+                    known.entry.qid
+                );
+            }
+            let told = tell(plugins, &known.entry, forward, contact, known.deadline);
+            known.hops.push(told);
+            "ok"
+        }
+        Err(Refused::Stale) => "stale",
+        Err(refused) => {
+            eprintln!("reagent: {}", why(&refused));
+            "busy"
+        }
+    }
 }
 
 /// Expires every announced question whose deadline has come.
@@ -389,7 +634,14 @@ async fn expire(state: &Path, folder: &Path, plugins: &Plugins, announced: &mut 
             continue;
         }
         let entry = announced[at].entry.clone();
-        match answer::record(state, entry.clone(), "deadline", "null").await {
+        let reply = match entry.approval {
+            Some(_) => Reply::Approval(Given::Refuse, Some(UNANSWERED.to_string())),
+            None => Reply::Answers {
+                answers: "null".to_string(),
+                hop: 0,
+            },
+        };
+        match answer::record(state, entry.clone(), "deadline", reply).await {
             Ok((session, cwd)) => {
                 if let Err(error) = discovery::remove_parked(folder, &entry.qid).await {
                     eprintln!(
@@ -404,7 +656,7 @@ async fn expire(state: &Path, folder: &Path, plugins: &Plugins, announced: &mut 
                 }
                 announced.remove(at);
                 plugins.event(
-                    "question_closed",
+                    closed_event(&entry),
                     json!({ "qid": entry.qid, "how": "expired", "by": "deadline" }),
                 );
             }
@@ -427,11 +679,14 @@ async fn closed_by(state: &Path, id: &str, qid: &str) -> Option<String> {
         let session = Session::open(&dir).ok()?;
         for record in session.records() {
             let record = record.ok()?;
-            if let Ok(Some(Aside::Question(record::Question::Answered {
-                qid: closed, by, ..
-            }))) = record::decode_aside(record.kind, &record.payload)
-                && closed == qid
-            {
+            let (closed, by) = match record::decode_aside(record.kind, &record.payload) {
+                Ok(Some(Aside::Question(record::Question::Answered {
+                    qid: closed, by, ..
+                }))) => (closed, by),
+                Ok(Some(Aside::ApprovalAnswer(answer))) => (answer.qid, answer.by),
+                _ => continue,
+            };
+            if closed == qid {
                 return Some(by);
             }
         }
@@ -440,6 +695,15 @@ async fn closed_by(state: &Path, id: &str, qid: &str) -> Option<String> {
     .await
     .ok()
     .flatten()
+}
+
+/// The event that tells the plugins the wait of `entry` closed.
+fn closed_event(entry: &Parked) -> &'static str {
+    if entry.approval.is_some() {
+        "approval_closed"
+    } else {
+        "question_closed"
+    }
 }
 
 /// The deadline of a question parked at `at`, in milliseconds since the epoch,

@@ -11,8 +11,9 @@ use reagent_ai::{Message, ToolCall};
 use reagent_util::text;
 
 use crate::coerce;
-use crate::guard::{Ask, Grant, Guard, Verdict};
+use crate::guard::{Answer, Ask, Grant, Guard, Verdict, refusal};
 use crate::hook::{CallHook, CallVerdict, EventHook, WaitEnd, WaitKind};
+use crate::journal::record::ParkedAsk;
 use crate::question::Questions;
 use crate::tool::{Registry, Repaired, Reroute, Seen, Tool, ToolOutput};
 use tokio_util::sync::CancellationToken;
@@ -35,6 +36,9 @@ pub enum Note {
     Wait {
         /// The place of the call among the batch's calls.
         at: usize,
+        /// What a later process shows of the wait, which it answers under its
+        /// id when the run parks it.
+        parked: Option<ParkedAsk>,
         /// Fired once the wait is on the disk; the call asks only then.
         done: oneshot::Sender<()>,
     },
@@ -81,9 +85,17 @@ impl Report<'_> {
     /// Says that this call waits for a client's answer, and returns once the
     /// wait is on the disk, so a crash before the ask leaves a call that never
     /// ran.
-    async fn wait(self) {
+    async fn wait(self, parked: Option<ParkedAsk>) {
         let (done, written) = oneshot::channel();
-        if self.notes.send(Note::Wait { at: self.at, done }).is_ok() {
+        if self
+            .notes
+            .send(Note::Wait {
+                at: self.at,
+                parked,
+                done,
+            })
+            .is_ok()
+        {
             let _ = written.await;
         }
     }
@@ -378,7 +390,7 @@ fn run_one_with<'a>(
             );
             // The rules see the tool's own name, not the model's spelling of
             // it: `bash</arg_key>` must meet the `Bash(...)` rules.
-            let contain = match plan(guard, tool, args, token, report).await {
+            let contain = match plan(guard, tool, args, &call.id, token, report).await {
                 None => return None,
                 Some(Planned::Refuse(refused)) => return Some(refused),
                 Some(Planned::Run) => None,
@@ -414,7 +426,7 @@ fn run_one_with<'a>(
                 && let Some(converted) = coerce::by_schema(args, &tool.spec().input_schema)
             {
                 // The rules see the arguments the second run would use.
-                let contain = match plan(guard, tool, &converted, token, report).await {
+                let contain = match plan(guard, tool, &converted, &call.id, token, report).await {
                     None => return None,
                     Some(Planned::Refuse(refused)) => return Some(refused),
                     Some(Planned::Run) => None,
@@ -487,17 +499,35 @@ async fn approve(
     ask: &Ask,
     token: &CancellationToken,
     report: Option<Report<'_>>,
+    given: Option<Answer>,
 ) -> Option<Planned> {
     let Some(guard) = guard else {
         return Some(Planned::Run);
     };
-    if let Some(report) = report {
-        report.wait().await;
+    // The wait is on the journal with an id a later process answers under. A
+    // resumed call keeps the id and the record it already has, and a call a
+    // later process answered asks nobody, so neither writes a wait.
+    let approvals = guard.approvals();
+    if let Some(report) = report
+        && given.is_none()
+    {
+        let (qid, recorded) = approvals.qid(report.call);
+        if !recorded {
+            report.wait(Some(parked_ask(ask, qid))).await;
+        }
         report.waiting(&ask.tool);
     }
-    let (planned, how) = match guard.approve(ask, token).await {
+    let call = report.map(|report| report.call);
+    let (planned, how) = match guard.approve(ask, call, given, token).await {
         Some(Grant::Run) => (Planned::Run, WaitEnd::Answered),
         Some(Grant::Refuse(output)) => (Planned::Refuse(output), WaitEnd::Denied),
+        // The call has no result in this run: the batch drops what it returns.
+        Some(Grant::Park) => {
+            if let Some(report) = report {
+                report.waited(WaitEnd::Parked);
+            }
+            return Some(Planned::Refuse(ToolOutput::error(PARKED)));
+        }
         None => {
             if let Some(report) = report {
                 report.waited(WaitEnd::Cancelled);
@@ -510,6 +540,20 @@ async fn approve(
         report.waited(how);
     }
     Some(planned)
+}
+
+/// The result of a call whose approval the run parked, which no history keeps.
+const PARKED: &str = "the approval request parked; a later process answers it";
+
+/// What a later process shows of the wait of `ask`, under `qid`.
+fn parked_ask(ask: &Ask, qid: String) -> ParkedAsk {
+    ParkedAsk {
+        qid,
+        tool: ask.tool.to_string(),
+        line: ask.call.to_string(),
+        rule: ask.rule.to_string(),
+        save: ask.save.as_ref().map(ToString::to_string),
+    }
 }
 
 /// Runs one call: contained when `contain` is set and the tool can hold it,
@@ -532,7 +576,7 @@ async fn run_call(
             return Some(output);
         }
         // No sandbox could hold the call, so a client decides after all.
-        match approve(guard, ask, token, report).await? {
+        match approve(guard, ask, token, report, None).await? {
             Planned::Refuse(refused) => return Some(refused),
             Planned::Run | Planned::Contain(_) => {}
         }
@@ -556,17 +600,34 @@ async fn plan(
     guard: Option<&Guard>,
     tool: &dyn Tool,
     args: &str,
+    call: &str,
     token: &CancellationToken,
     report: Option<Report<'_>>,
 ) -> Option<Planned> {
     let Some(guard) = guard else {
         return Some(Planned::Run);
     };
+    // The answer a later process gave a parked wait is taken before the check,
+    // in a worker and in a plain resume alike, so a refusal holds whatever the
+    // rules of this run say: a rule a session answer added since, or a mode
+    // that changed, never turns it into a run.
+    let given = guard.approvals().take_given(call);
+    if let Some(Answer::Refuse { reason }) = given {
+        if let Some(report) = report {
+            report.answer(false).await;
+        }
+        return Some(Planned::Refuse(refusal(reason)));
+    }
     match guard.check(tool, tool.spec().name.as_str(), args) {
         Verdict::Run => Some(Planned::Run),
         Verdict::Refuse(output) => Some(Planned::Refuse(output)),
+        // A yes a person gave runs the call as they saw it, and adds the rules
+        // a session or save answer adds.
+        Verdict::Contain(ask) if given.is_some() => {
+            approve(Some(guard), &ask, token, report, given).await
+        }
         Verdict::Contain(ask) => Some(Planned::Contain(ask)),
-        Verdict::Ask(ask) => approve(Some(guard), &ask, token, report).await,
+        Verdict::Ask(ask) => approve(Some(guard), &ask, token, report, given).await,
     }
 }
 
@@ -2309,4 +2370,97 @@ mod tests {
 
         assert_eq!(content_of(&results[0]), "ro_a");
     }
+
+    /// A tool that should run contained but whose sandbox never starts.
+    struct NoSandbox {
+        spec: ToolSpec,
+        ran: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Tool for NoSandbox {
+        fn spec(&self) -> &ToolSpec {
+            &self.spec
+        }
+
+        fn main_arg(&self) -> Option<&'static str> {
+            Some("command")
+        }
+
+        fn can_contain(&self) -> bool {
+            true
+        }
+
+        fn run_contained<'a>(
+            &'a self,
+            _args: &'a str,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, Option<ToolOutput>> {
+            Box::pin(async { None })
+        }
+
+        fn run<'a>(
+            &'a self,
+            args: &'a str,
+            _cancel: &'a CancellationToken,
+        ) -> BoxFuture<'a, ToolOutput> {
+            self.ran.lock().expect("run log").push(args.to_owned());
+            Box::pin(async { ToolOutput::ok("plain") })
+        }
+    }
+
+    /// A yes a later process gave a parked call holds when the call should run
+    /// contained and no sandbox starts: it runs plainly and asks nobody.
+    #[tokio::test]
+    async fn a_given_once_survives_a_contained_fallback() {
+        let token = CancellationToken::new();
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = Registry::new();
+        registry.add(NoSandbox {
+            spec: ToolSpec {
+                name: "bash".into(),
+                description: "A shell.".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            ran: Arc::clone(&ran),
+        });
+        let guard = auto_guard();
+        guard.approvals().give("c1", Answer::Once);
+        let (notes, mut notes_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let driver = tokio::spawn(async move {
+            let mut result_tx = Some(result_tx);
+            while let Some(note) = notes_rx.recv().await {
+                match note {
+                    Note::Wait { done, .. } | Note::Answer { done, .. } => {
+                        let _ = done.send(());
+                    }
+                    Note::Done(_, (message, _)) => {
+                        if let Some(send) = result_tx.take() {
+                            let _ = send.send(content_of(&message));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        run_all_noted(
+            &[bash_call("rm -rf target/debug")],
+            &registry,
+            Some(&guard),
+            &token,
+            &notes,
+            true,
+            None,
+            None,
+        )
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(5), result_rx)
+            .await
+            .expect("the result arrived")
+            .expect("the tool result");
+        driver.abort();
+        assert_eq!(result, "plain", "an approved fallback must run without asking again");
+        assert_eq!(ran.lock().expect("run log").len(), 1);
+    }
+
 }

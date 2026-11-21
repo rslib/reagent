@@ -62,14 +62,38 @@ pub struct AnswerAsk {
     pub plugin: String,
     /// The question it answers.
     pub qid: String,
-    /// The token the gateway handed it with `question_parked`.
+    /// The token the gateway handed it with `question_parked`,
+    /// `question_forwarded` or `approval_parked`.
     pub token: String,
-    /// The answers, as JSON text, or `null` for none.
-    pub answers: String,
+    /// What it answers.
+    pub answered: Answered,
     /// Who answered, in the plugin's own words, such as a chat user name.
     pub by: String,
     /// Carries `"ok"`, `"denied"`, `"stale"` or `"busy"` back to the plugin.
     pub reply: tokio::sync::oneshot::Sender<String>,
+}
+
+/// What one gateway call carries: an answer or a forward.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Answered {
+    /// The answers to a question, as JSON text, or `null` for none.
+    Answers(String),
+    /// The answer to an approval, as the plugin typed it, with the reason of
+    /// a refusal; the gateway checks the word.
+    Approval {
+        /// `once`, `session`, `save` or `refuse`, when it is right.
+        word: String,
+        /// Why the call is refused, when the plugin gave a reason.
+        reason: Option<String>,
+    },
+    /// A forward of a question to one more person, by the key of the
+    /// contacts file, with the note the model reads.
+    Forward {
+        /// The key of the contact.
+        to: String,
+        /// What the person who forwarded it wrote, or nothing.
+        note: String,
+    },
 }
 
 impl fmt::Debug for AnswerAsk {
@@ -77,7 +101,7 @@ impl fmt::Debug for AnswerAsk {
         f.debug_struct("AnswerAsk")
             .field("plugin", &self.plugin)
             .field("qid", &self.qid)
-            .field("answers", &self.answers)
+            .field("answered", &self.answered)
             .field("by", &self.by)
             .finish_non_exhaustive()
     }
@@ -753,6 +777,24 @@ impl Plugins {
         let job = Job::Event {
             name: name.to_string(),
             payload,
+            to: None,
+        };
+        if self.jobs.try_send(job).is_err() {
+            self.lost_events.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Hands one event to the plugin named `plugin` only, as [`Plugins::event`]
+    /// hands it to all: a forwarded question carries a token for one person,
+    /// so only the plugin that reaches that person hears it.
+    pub fn event_to(&self, plugin: &str, name: &str, payload: JsonValue) {
+        if !self.wants(name) {
+            return;
+        }
+        let job = Job::Event {
+            name: name.to_string(),
+            payload,
+            to: Some(plugin.to_string()),
         };
         if self.jobs.try_send(job).is_err() {
             self.lost_events.fetch_add(1, Ordering::Relaxed);

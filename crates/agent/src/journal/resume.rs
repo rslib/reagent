@@ -44,19 +44,20 @@ pub struct Resumed {
     pub recorded: usize,
     /// The calls to run again, in the order the model asked for them.
     pub pending: Vec<PendingCall>,
-    /// The calls whose question a person has not answered, with the id of the
-    /// question, in the order the model asked them.
+    /// The calls whose question or parked approval nobody has answered, with
+    /// the id of the wait, in the order the model asked them.
     ///
-    /// A call here is also in [`Resumed::pending`]: the run asks its question
-    /// again under the same id, so a client answers the question it already
-    /// holds and no second wait reaches the journal.
+    /// A call here is also in [`Resumed::pending`]: the run asks again under
+    /// the same id, so a client answers the wait it already holds and no second
+    /// wait reaches the journal.
     pub parked: Vec<(String, String)>,
     /// Whether the last turn has no `TURN_END`.
     pub open_turn: bool,
-    /// Whether this read wrote the result of a question a person answered.
+    /// Whether this read wrote the result of a question a person answered, or
+    /// left a call pending whose parked approval a person answered.
     ///
     /// The model has not read that answer, so the turn goes on: a run that
-    /// resumes these messages and has nothing pending asks for the next reply.
+    /// resumes these messages runs what is pending and asks for the next reply.
     pub answered: bool,
     /// The reasoning level the run last moved to, when a settings record says.
     pub level: Option<Text>,
@@ -76,6 +77,18 @@ pub struct PendingCall {
     /// The question the call asks under again, when it asked before and nobody
     /// answered: 32 lowercase hex characters.
     pub qid: Option<String>,
+    /// The parked approval wait of the call, when the journal holds one.
+    pub held: Option<Held>,
+}
+
+/// The parked approval wait of a call a resumed run runs again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// The id the wait carries: 32 lowercase hex characters.
+    pub qid: String,
+    /// The answer a later process wrote, with the reason of a refusal; `None`
+    /// while nobody answered, so the run asks again under `qid`.
+    pub given: Option<(record::Given, Option<String>)>,
 }
 
 /// A turn the journal does not have.
@@ -140,8 +153,15 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
     let mut approvals: HashMap<String, ApprovalKind> = HashMap::new();
     // The question of each call that asked one: its id and the questions.
     let mut asked: HashMap<String, (String, String)> = HashMap::new();
-    // The answers a person gave, by the id of the question.
-    let mut answers: HashMap<String, String> = HashMap::new();
+    // The answers a person gave and the hop that gave them, by the id of the
+    // question.
+    let mut answers: HashMap<String, (String, u64)> = HashMap::new();
+    // The forwards of each question, by its id and the hop.
+    let mut forwards: HashMap<(String, u64), Forward> = HashMap::new();
+    // The id of the last parked approval wait of each call.
+    let mut held: HashMap<String, String> = HashMap::new();
+    // The answers later processes gave to parked approval waits, by id.
+    let mut given: HashMap<String, (record::Given, Option<String>)> = HashMap::new();
     // The tool calls of the last assistant message, in the order sent.
     let mut last_calls: Vec<(Text, Text)> = Vec::new();
     // The results that follow the last assistant message. A batch commits each
@@ -158,7 +178,19 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
         if let Some(aside) = record::decode_aside(record.kind, &record.payload)? {
             match aside {
                 Aside::Approval(approval) => {
+                    match approval.parked {
+                        Some(parked) => {
+                            held.insert(approval.id.clone(), parked.qid);
+                        }
+                        None if approval.kind == ApprovalKind::Wait => {
+                            held.remove(&approval.id);
+                        }
+                        None => {}
+                    }
                     approvals.insert(approval.id, approval.kind);
+                }
+                Aside::ApprovalAnswer(answer) => {
+                    given.insert(answer.qid, (answer.answer, answer.reason));
                 }
                 Aside::Question(question) => match question {
                     record::Question::Asked {
@@ -171,9 +203,29 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
                     record::Question::Answered {
                         qid,
                         answers: given,
+                        hop,
                         ..
                     } => {
-                        answers.insert(qid, given);
+                        answers.insert(qid, (given, hop));
+                    }
+                    record::Question::Forwarded {
+                        qid,
+                        hop,
+                        from,
+                        to,
+                        name,
+                        note,
+                    } => {
+                        forwards.insert(
+                            (qid, hop),
+                            Forward {
+                                hop,
+                                from,
+                                to,
+                                name,
+                                note,
+                            },
+                        );
                     }
                 },
                 Aside::Settings(change) => {
@@ -263,15 +315,15 @@ fn read(session: &Session, until: Option<u64>) -> io::Result<(Resumed, u64)> {
     }
     // Everything read so far is on the disk; what `settle` adds is not.
     resumed.recorded = resumed.history.len();
-    settle(
-        &mut resumed,
-        &started,
-        &answered,
-        &approvals,
-        &last_calls,
-        &asked,
-        &answers,
-    );
+    let waits = Waits {
+        approvals: &approvals,
+        asked: &asked,
+        answers: &answers,
+        forwards: &forwards,
+        held: &held,
+        given: &given,
+    };
+    settle(&mut resumed, &started, &answered, &last_calls, &waits);
     if resumed.state.provider.is_empty()
         && let Some(provider) = last_provider
     {
@@ -310,15 +362,30 @@ fn ordered(history: &mut Vec<Message>, trailing: &mut Vec<Message>, last_calls: 
     history.append(&mut results);
 }
 
+/// What the journal says about the waits of the calls without a result.
+struct Waits<'a> {
+    /// The kind of the last approval record of each call.
+    approvals: &'a HashMap<String, ApprovalKind>,
+    /// The question of each call that asked one: its id and the questions.
+    asked: &'a HashMap<String, (String, String)>,
+    /// The answers a person gave and the hop that gave them, by the id of the
+    /// question.
+    answers: &'a HashMap<String, (String, u64)>,
+    /// The forwards of each question, by its id and the hop.
+    forwards: &'a HashMap<(String, u64), Forward>,
+    /// The id of the last parked approval wait of each call.
+    held: &'a HashMap<String, String>,
+    /// The answers later processes gave to parked approval waits, by id.
+    given: &'a HashMap<String, (record::Given, Option<String>)>,
+}
+
 /// Applies the crash rule to the calls without a result.
 fn settle(
     resumed: &mut Resumed,
     started: &[(String, String, EffectClass)],
     answered: &HashSet<Text>,
-    approvals: &HashMap<String, ApprovalKind>,
     last_calls: &[(Text, Text)],
-    asked: &HashMap<String, (String, String)>,
-    answers: &HashMap<String, String>,
+    waits: &Waits<'_>,
 ) {
     let classes: HashMap<&str, EffectClass> = started
         .iter()
@@ -331,15 +398,7 @@ fn settle(
         if answered.contains(id) || !seen.insert(id.clone()) {
             continue;
         }
-        settle_one(
-            resumed,
-            id,
-            name,
-            classes.get(&**id).copied(),
-            approvals.get(&**id).copied(),
-            asked.get(&**id),
-            answers,
-        );
+        settle_one(resumed, id, name, classes.get(&**id).copied(), waits);
     }
 }
 
@@ -362,17 +421,17 @@ fn settle_one(
     id: &str,
     name: &str,
     class: Option<EffectClass>,
-    approval: Option<ApprovalKind>,
-    asked: Option<&(String, String)>,
-    answers: &HashMap<String, String>,
+    waits: &Waits<'_>,
 ) {
+    let approval = waits.approvals.get(id).copied();
     // A question the journal holds decides the call on its own: an answered
     // question is the call's result, so nothing runs again, and one nobody
     // answered is the call pending under its own id.
-    if let Some((qid, questions)) = asked {
-        match answers.get(qid) {
-            Some(answers) => {
-                let output = crate::question::from_record(questions, answers);
+    if let Some((qid, questions)) = waits.asked.get(id) {
+        match waits.answers.get(qid) {
+            Some((answers, hop)) => {
+                let forward = waits.forwards.get(&(qid.clone(), *hop));
+                let output = crate::question::from_record(questions, answers, forward);
                 resumed.answered = true;
                 resumed
                     .history
@@ -385,6 +444,7 @@ fn settle_one(
                     name: name.to_owned(),
                     class,
                     qid: Some(qid.clone()),
+                    held: None,
                 });
             }
         }
@@ -400,11 +460,29 @@ fn settle_one(
         (Some(_), _) => false,
     };
     if rerun {
+        // A wait that may have parked runs again under its own id: with the
+        // answer a later process gave, or asking again when nobody answered.
+        let held = match (approval, waits.held.get(id)) {
+            (Some(ApprovalKind::Wait), Some(qid)) => {
+                let given = waits.given.get(qid).cloned();
+                if given.is_none() {
+                    resumed.parked.push((id.to_owned(), qid.clone()));
+                } else {
+                    resumed.answered = true;
+                }
+                Some(Held {
+                    qid: qid.clone(),
+                    given,
+                })
+            }
+            _ => None,
+        };
         resumed.pending.push(PendingCall {
             id: id.to_owned(),
             name: name.to_owned(),
             class,
             qid: None,
+            held,
         });
     } else {
         resumed
@@ -424,29 +502,58 @@ fn tool_calls(content: &[Content]) -> Vec<(Text, Text)> {
         .collect()
 }
 
-/// One question a person has not answered, as a log left it.
+/// One wait nobody has answered, as a log left it: a question, or an approval
+/// that parked.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParkedQuestion {
+pub struct ParkedWait {
     /// The id the answer names: 32 lowercase hex characters.
     pub qid: String,
-    /// The tool call the question belongs to.
+    /// The tool call the wait belongs to.
     pub call: String,
-    /// The JSON text of the `questions` argument, as the model sent it.
-    pub questions: String,
+    /// What waits.
+    pub what: Waiting,
+    /// The people a question was forwarded to, in hop order.
+    pub forwards: Vec<Forward>,
 }
 
-/// The questions the log `session` holds that nobody answered and no result
+/// One forward of a parked question, as its record holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Forward {
+    /// The number of the forward: 1 for the first.
+    pub hop: u64,
+    /// Who forwarded it, as the model may read it.
+    pub from: String,
+    /// The key of the contact it went to.
+    pub to: String,
+    /// The name of that contact, as the model may read it.
+    pub name: String,
+    /// What the person who forwarded it wrote, or nothing.
+    pub note: String,
+}
+
+/// What a [`ParkedWait`] waits for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Waiting {
+    /// The answers to the JSON text of the `questions` argument, as the model
+    /// sent it.
+    Question(String),
+    /// An approval of the call this shows.
+    Approval(record::ParkedAsk),
+}
+
+/// The waits the log `session` holds that nobody answered and no result
 /// closes, in the order the model asked them.
 ///
 /// This is the list a client shows and answers: answering one writes the
-/// [`crate::journal::Journal::question_answered`] record it is closed by.
+/// [`crate::journal::Journal::question_answered`] or
+/// [`crate::journal::Journal::approval_answered`] record it is closed by.
 ///
 /// Reading blocks, so a caller runs this in `spawn_blocking`.
-pub fn parked(session: &Session) -> io::Result<Vec<ParkedQuestion>> {
+pub fn parked(session: &Session) -> io::Result<Vec<ParkedWait>> {
     let from = session
         .last_base()
         .unwrap_or(reagent_store::part::FIRST_SEQ);
-    let mut asked: Vec<ParkedQuestion> = Vec::new();
+    let mut asked: Vec<ParkedWait> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut answered: HashSet<String> = HashSet::new();
     let mut closed: HashSet<String> = HashSet::new();
@@ -459,17 +566,56 @@ pub fn parked(session: &Session) -> io::Result<Vec<ParkedQuestion>> {
                 questions,
             })) => {
                 if seen.insert(qid.clone()) {
-                    asked.push(ParkedQuestion {
+                    asked.push(ParkedWait {
                         qid,
                         call,
-                        questions,
+                        what: Waiting::Question(questions),
+                        forwards: Vec::new(),
                     });
                 }
             }
             Some(Aside::Question(record::Question::Answered { qid, .. })) => {
                 answered.insert(qid);
             }
-            Some(Aside::Approval(_) | Aside::Settings(_)) => {}
+            Some(Aside::Question(record::Question::Forwarded {
+                qid,
+                hop,
+                from,
+                to,
+                name,
+                note,
+            })) => {
+                if let Some(wait) = asked.iter_mut().find(|wait| wait.qid == qid) {
+                    wait.forwards.push(Forward {
+                        hop,
+                        from,
+                        to,
+                        name,
+                        note,
+                    });
+                }
+            }
+            Some(Aside::Approval(approval)) => match approval.parked {
+                Some(parked) => {
+                    if seen.insert(parked.qid.clone()) {
+                        asked.push(ParkedWait {
+                            qid: parked.qid.clone(),
+                            call: approval.id,
+                            what: Waiting::Approval(parked),
+                            forwards: Vec::new(),
+                        });
+                    }
+                }
+                // A client of a live run answered the call.
+                None if approval.kind != ApprovalKind::Wait => {
+                    closed.insert(approval.id);
+                }
+                None => {}
+            },
+            Some(Aside::ApprovalAnswer(answer)) => {
+                answered.insert(answer.qid);
+            }
+            Some(Aside::Settings(_)) => {}
             None => {
                 if let Record::Message(Message::ToolResult(result)) =
                     record::decode(record.kind, &record.payload)?
@@ -481,9 +627,7 @@ pub fn parked(session: &Session) -> io::Result<Vec<ParkedQuestion>> {
     }
     let parked = asked
         .into_iter()
-        .filter(|question| {
-            !answered.contains(&question.qid) && !closed.contains(question.call.as_str())
-        })
+        .filter(|wait| !answered.contains(&wait.qid) && !closed.contains(wait.call.as_str()))
         .collect();
     Ok(parked)
 }
@@ -658,6 +802,7 @@ mod tests {
                 name: "read".into(),
                 class: Some(EffectClass::Read),
                 qid: None,
+                held: None,
             }]
         );
     }
@@ -682,12 +827,14 @@ mod tests {
                     name: "bash".into(),
                     class: None,
                     qid: None,
+                    held: None,
                 },
                 PendingCall {
                     id: "c2".into(),
                     name: "read".into(),
                     class: None,
                     qid: None,
+                    held: None,
                 },
             ]
         );
@@ -748,6 +895,7 @@ mod tests {
                 name: "bash".into(),
                 class: Some(EffectClass::LocalReversible),
                 qid: None,
+                held: None,
             }],
             "the rerun asks the same question again"
         );
@@ -1028,7 +1176,7 @@ mod tests {
             .expect("question");
         if let Some(answers) = answers {
             journal
-                .question_answered(qid, "3", answers)
+                .question_answered(qid, "3", answers, 0)
                 .expect("answer");
         }
         journal.commit().expect("commit");
@@ -1132,7 +1280,12 @@ mod tests {
                 .expect("question");
         }
         journal
-            .question_answered("11111111111111111111111111111111", "3", r#"[["sqlite"]]"#)
+            .question_answered(
+                "11111111111111111111111111111111",
+                "3",
+                r#"[["sqlite"]]"#,
+                0,
+            )
             .expect("answer");
         journal
             .message(&Message::tool_result("call_3", "text", false))
@@ -1144,12 +1297,211 @@ mod tests {
         let open = parked(&session).expect("read the questions");
         assert_eq!(
             open,
-            [ParkedQuestion {
+            [ParkedWait {
                 qid: "22222222222222222222222222222222".into(),
                 call: "call_2".into(),
-                questions: questions.into(),
+                what: Waiting::Question(questions.into()),
+                forwards: Vec::new(),
             }],
             "only the question no answer and no result closes"
         );
+    }
+
+    /// A forward of the open question.
+    fn forward(hop: u64, from: &str, to: &str, name: &str) -> record::Question {
+        record::Question::Forwarded {
+            qid: "11111111111111111111111111111111".into(),
+            hop,
+            from: from.into(),
+            to: to.into(),
+            name: name.into(),
+            note: format!("hop {hop}"),
+        }
+    }
+
+    /// A forwarded question lists its forwards in hop order while it waits, and
+    /// the answer of a forwarded person reaches the model with that person's
+    /// name and who forwarded it.
+    #[tokio::test]
+    async fn a_forwarded_question_lists_its_hops_and_names_who_answered() {
+        let qid = "11111111111111111111111111111111";
+        let questions =
+            r#"[{"q":"Which database?","options":[{"label":"sqlite"},{"label":"postgres"}]}]"#;
+        // A closed journal of the question, its two forwards and, when given,
+        // the answer of the person of hop 2.
+        let written = |answered: bool| {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let mut journal = journal(dir.path());
+            journal.base(&State::new("p", "m", 0)).expect("base");
+            journal.message(&Message::user("hello")).expect("append");
+            journal
+                .message(&call_reply(&[("call_1", crate::question::NAME)]))
+                .expect("append");
+            journal
+                .question_asked("call_1", qid, questions)
+                .expect("question");
+            journal
+                .question_forwarded(&forward(1, "the owner", "bob", "Bob"))
+                .expect("forward");
+            journal
+                .question_forwarded(&forward(2, "Bob", "carol", "Carol"))
+                .expect("forward");
+            if answered {
+                journal
+                    .question_answered(qid, "gateway:chat:carol", r#"[["postgres"]]"#, 2)
+                    .expect("answer");
+            }
+            journal.commit().expect("commit");
+            journal.close().expect("close");
+            dir
+        };
+
+        let dir = written(false);
+        let session = Session::open(dir.path()).expect("open the session");
+        let open = parked(&session).expect("read the questions");
+        let hops: Vec<(u64, &str, &str)> = open[0]
+            .forwards
+            .iter()
+            .map(|hop| (hop.hop, hop.from.as_str(), hop.name.as_str()))
+            .collect();
+        assert_eq!(hops, [(1, "the owner", "Bob"), (2, "Bob", "Carol")]);
+
+        let dir = written(true);
+        let resumed = load_now(dir.path());
+        let Some(Message::ToolResult(result)) = resumed.history.last() else {
+            panic!("the answer is the call's result: {:?}", resumed.history);
+        };
+        assert_eq!(
+            result.content.as_ref(),
+            "Q: Which database?\nA: postgres\nAnswered by Carol, forwarded by Bob with the note \"hop 2\"."
+        );
+    }
+
+    /// What a parked approval wait shows.
+    fn shown(qid: &str) -> record::ParkedAsk {
+        record::ParkedAsk {
+            qid: qid.into(),
+            tool: "bash".into(),
+            line: "git push".into(),
+            rule: "default".into(),
+            save: Some("Bash(git push:*)".into()),
+        }
+    }
+
+    /// A parked approval wait nobody answered is listed, and one a later
+    /// process answered, or a live client answered, is not.
+    #[tokio::test]
+    async fn a_park_the_index_lists_only_the_open_approval() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = journal(dir.path());
+        journal.base(&State::new("p", "m", 0)).expect("base");
+        journal.message(&Message::user("hello")).expect("append");
+        journal
+            .message(&call_reply(&[
+                ("call_1", "bash"),
+                ("call_2", "bash"),
+                ("call_3", "bash"),
+            ]))
+            .expect("append");
+        for (call, qid) in [
+            ("call_1", "11111111111111111111111111111111"),
+            ("call_2", "22222222222222222222222222222222"),
+            ("call_3", "33333333333333333333333333333333"),
+        ] {
+            journal
+                .approval_parkable(call, shown(qid))
+                .expect("the wait");
+        }
+        journal
+            .approval_answered(
+                "11111111111111111111111111111111",
+                "cli",
+                record::Given::Once,
+                None,
+            )
+            .expect("the answer");
+        journal
+            .approval("call_3", ApprovalKind::Run)
+            .expect("a live answer");
+        journal.commit().expect("commit");
+        journal.close().expect("close");
+
+        let session = Session::open(dir.path()).expect("open the session");
+        let open = parked(&session).expect("read the waits");
+        assert_eq!(
+            open,
+            [ParkedWait {
+                qid: "22222222222222222222222222222222".into(),
+                call: "call_2".into(),
+                what: Waiting::Approval(shown("22222222222222222222222222222222")),
+                forwards: Vec::new(),
+            }],
+            "only the wait no answer closes"
+        );
+    }
+
+    /// A resumed call whose approval parked runs again under its id: with the
+    /// answer a later process gave, or open when nobody answered.
+    #[tokio::test]
+    async fn a_parked_approval_resumes_with_its_answer() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut journal = journal(dir.path());
+        journal.base(&State::new("p", "m", 0)).expect("base");
+        journal.message(&Message::user("hello")).expect("append");
+        journal
+            .message(&call_reply(&[("call_1", "bash"), ("call_2", "bash")]))
+            .expect("append");
+        journal
+            .approval_parkable("call_1", shown("11111111111111111111111111111111"))
+            .expect("the wait");
+        journal
+            .approval_parkable("call_2", shown("22222222222222222222222222222222"))
+            .expect("the wait");
+        journal
+            .approval_answered(
+                "11111111111111111111111111111111",
+                "gateway:t:ray",
+                record::Given::Refuse,
+                Some("not today"),
+            )
+            .expect("the answer");
+        journal.commit().expect("commit");
+        journal.close().expect("close");
+
+        let session = Session::open(dir.path()).expect("open the session");
+        let resumed = load(&session).expect("resume");
+        let held: Vec<_> = resumed
+            .pending
+            .iter()
+            .map(|call| (call.id.as_str(), call.held.clone()))
+            .collect();
+        assert_eq!(
+            held,
+            [
+                (
+                    "call_1",
+                    Some(Held {
+                        qid: "11111111111111111111111111111111".into(),
+                        given: Some((record::Given::Refuse, Some("not today".into()))),
+                    })
+                ),
+                (
+                    "call_2",
+                    Some(Held {
+                        qid: "22222222222222222222222222222222".into(),
+                        given: None,
+                    })
+                ),
+            ]
+        );
+        assert_eq!(
+            resumed.parked,
+            [(
+                "call_2".to_owned(),
+                "22222222222222222222222222222222".to_owned()
+            )],
+            "only the wait nobody answered is still open"
+        );
+        assert!(resumed.answered, "the answered wait carries the turn on");
     }
 }

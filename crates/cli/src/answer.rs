@@ -1,11 +1,11 @@
-//! The `answer` command: the questions the parked runs of this machine left, and
-//! the answer to one of them.
+//! The `answer` command: the questions and approvals the parked runs of this
+//! machine left, and the answer to one of them.
 //!
 //! A run parks when the last client of its session goes while it waits for a
-//! question: it ends `Parked`, leaves one file per open question in the `parked`
-//! folder of the discovery folder, and stops. `reagent answer` reads those
-//! files, writes the answer into the journal of the session and starts its
-//! worker again with no client, so the run goes on headless.
+//! question or an approval: it ends `Parked`, leaves one file per open wait in
+//! the `parked` folder of the discovery folder, and stops. `reagent answer`
+//! reads those files, writes the answer into the journal of the session and
+//! starts its worker again with no client, so the run goes on headless.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -14,6 +14,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reagent_agent::journal::Journal;
+use reagent_agent::journal::record::{Given, Question};
 use reagent_agent::journal::resume;
 use reagent_protocol::discovery;
 use reagent_store::Header;
@@ -100,11 +101,14 @@ pub async fn run(argv: Vec<OsString>) -> ExitCode {
     let Some(answers) = read_answers().await else {
         return ExitCode::from(2);
     };
-    if let Err(message) = counted(&entry, &answers) {
-        eprintln!("reagent: {message}");
-        return ExitCode::from(2);
-    }
-    let (session, cwd) = match record(&state, entry, "cli", &answers).await {
+    let reply = match reply_of(&entry, &answers) {
+        Ok(reply) => reply,
+        Err(message) => {
+            eprintln!("reagent: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let (session, cwd) = match record(&state, entry, "cli", reply).await {
         Ok(recorded) => recorded,
         Err(refused) => {
             eprintln!("reagent: {}", why(refused));
@@ -148,6 +152,40 @@ pub(crate) enum Refused {
 pub(crate) async fn list(folder: &Path, state: &Path) -> Vec<discovery::Parked> {
     let state = state.to_path_buf();
     discovery::list_parked(folder, move |session, qid| still_open(&state, session, qid)).await
+}
+
+/// The forwards the journal of session `id` holds for the open question
+/// `qid`, or `None` when it cannot be read or no longer waits for it.
+pub(crate) async fn forwards(
+    state: &Path,
+    id: &str,
+    qid: &str,
+) -> Option<Vec<discovery::ParkedForward>> {
+    let state = state.to_path_buf();
+    let id = id.to_string();
+    let qid = qid.to_string();
+    tokio::task::spawn_blocking(move || {
+        let session = Session::open(&find(&state, &id)?).ok()?;
+        let wait = resume::parked(&session)
+            .ok()?
+            .into_iter()
+            .find(|wait| wait.qid == qid)?;
+        Some(
+            wait.forwards
+                .into_iter()
+                .map(|forward| discovery::ParkedForward {
+                    hop: forward.hop,
+                    from: forward.from,
+                    to: forward.to,
+                    name: forward.name,
+                    note: forward.note,
+                })
+                .collect(),
+        )
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Whether the journal of session `id` still waits for question `qid`.
@@ -206,8 +244,13 @@ fn show(listed: &[discovery::Parked], json: bool) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     for entry in listed {
+        let kind = if entry.approval.is_some() {
+            "approve "
+        } else {
+            ""
+        };
         println!(
-            "{}  {}  {}  {}",
+            "{}  {}  {}  {kind}{}",
             entry.qid,
             entry.session,
             age(entry.at),
@@ -247,6 +290,85 @@ async fn read_answers() -> Option<String> {
     }
 }
 
+/// What one write into a waiting journal holds: the answers to a question,
+/// an approval, or a forward of a question to one more person.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Reply {
+    /// The answers to a question.
+    Answers {
+        /// The JSON text of the answers, one list per question, or `null`.
+        answers: String,
+        /// 0 for the owner, or the forward whose person answered.
+        hop: u64,
+    },
+    /// The answer to an approval, with the reason of a refusal.
+    Approval(Given, Option<String>),
+    /// A forward of the question; it closes nothing.
+    Forward(discovery::ParkedForward),
+}
+
+/// The reply `text` gives the wait of `entry`, checked against it.
+///
+/// A question takes the JSON list of answers [`counted`] checks. An approval
+/// takes one of `once`, `session`, `save` and `refuse`, as the word or as
+/// `{"answer": "refuse", "reason": "..."}`; `save` only when the approval
+/// names a rule to save.
+pub(crate) fn reply_of(entry: &discovery::Parked, text: &str) -> Result<Reply, String> {
+    let Some(approval) = &entry.approval else {
+        counted(entry, text)?;
+        return Ok(Reply::Answers {
+            answers: text.to_string(),
+            hop: 0,
+        });
+    };
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Typed {
+        answer: String,
+        #[serde(default)]
+        reason: Option<String>,
+    }
+    // Text that starts as JSON must be the whole object; anything else is the
+    // bare word, which `approval_reply` checks against the four answers.
+    let text = text.trim();
+    let (word, reason) = if text.starts_with('{') {
+        let typed = serde_json::from_str::<Typed>(text)
+            .map_err(|error| format!("the answer is not {{\"answer\", \"reason\"}}: {error}"))?;
+        (typed.answer, typed.reason)
+    } else {
+        (text.to_string(), None)
+    };
+    approval_reply(entry, approval, &word, reason)
+}
+
+/// The reply `word` gives the parked approval `approval` of `entry`, with the
+/// reason of a refusal: `save` only when the approval names a rule to save.
+pub(crate) fn approval_reply(
+    entry: &discovery::Parked,
+    approval: &discovery::ParkedApproval,
+    word: &str,
+    reason: Option<String>,
+) -> Result<Reply, String> {
+    let given: Given = word.parse()?;
+    if given == Given::Save && approval.save.is_none() {
+        return Err(format!(
+            "{} names no rule to save; answer once, session or refuse",
+            entry.qid
+        ));
+    }
+    if reason.is_some() && given != Given::Refuse {
+        return Err("only a refusal takes a reason".to_string());
+    }
+    let reason = reason.map(|mut reason| {
+        reason.truncate(reason.floor_char_boundary(REASON_BYTES));
+        reason
+    });
+    Ok(Reply::Approval(given, reason))
+}
+
+/// The most bytes of a refusal's reason the journal keeps, and the model reads.
+const REASON_BYTES: usize = 1024;
+
 /// Checks that the answers name one list per question of `entry`, or that they
 /// skip the whole request with `null`.
 pub(crate) fn counted(entry: &discovery::Parked, answers: &str) -> Result<(), String> {
@@ -264,8 +386,9 @@ pub(crate) fn counted(entry: &discovery::Parked, answers: &str) -> Result<(), St
     }
 }
 
-/// Writes the answer of a question into the journal of its session, and
-/// returns the session and the working folder the run continues in.
+/// Writes the answer of a question, or a forward of it, into the journal of its
+/// session, and returns the session and the working folder the run continues
+/// in.
 ///
 /// The journal is opened as a resume opens it: a new part that continues the
 /// session, so the run that restarts it reads the answer as a record of its
@@ -274,11 +397,10 @@ pub(crate) async fn record(
     state: &Path,
     entry: discovery::Parked,
     by: &str,
-    answers: &str,
+    reply: Reply,
 ) -> Result<(String, String), Refused> {
     let state = state.to_path_buf();
     let by = by.to_string();
-    let answers = answers.to_string();
     let recorded = tokio::task::spawn_blocking(move || {
         let Some(dir) = find(&state, &entry.session) else {
             return Err(Refused::Failed(format!("no session {}", entry.session)));
@@ -292,7 +414,7 @@ pub(crate) async fn record(
                 entry.session
             )));
         }
-        answer(&dir, &entry.qid, &by, &answers).map(|cwd| (entry.session.clone(), cwd))
+        answer(&dir, &entry.qid, &by, &reply).map(|cwd| (entry.session.clone(), cwd))
     })
     .await;
     match recorded {
@@ -332,7 +454,7 @@ fn live(dir: &Path) -> bool {
 
 /// Writes the answer of question `qid` as a part that continues the session at
 /// `dir`, and returns the working folder of the session.
-fn answer(dir: &Path, qid: &str, by: &str, answers: &str) -> Result<String, Refused> {
+fn answer(dir: &Path, qid: &str, by: &str, reply: &Reply) -> Result<String, Refused> {
     let failed = |error: std::io::Error| Refused::Failed(format!("{}: {error}", dir.display()));
     let session = Session::open(dir)
         .map_err(|error| Refused::Failed(format!("{}: {error}", dir.display())))?;
@@ -355,9 +477,21 @@ fn answer(dir: &Path, qid: &str, by: &str, answers: &str) -> Result<String, Refu
     drop(session);
     let header = Header::new(session_id, paths::now_ms(), Some(fork), meta.encode());
     let mut journal = Journal::resumed(dir, header, resumed.recorded).map_err(failed)?;
-    journal
-        .question_answered(qid, by, answers)
-        .map_err(failed)?;
+    match reply {
+        Reply::Answers { answers, hop } => journal.question_answered(qid, by, answers, *hop),
+        Reply::Approval(given, reason) => {
+            journal.approval_answered(qid, by, *given, reason.as_deref())
+        }
+        Reply::Forward(forward) => journal.question_forwarded(&Question::Forwarded {
+            qid: qid.to_owned(),
+            hop: forward.hop,
+            from: forward.from.clone(),
+            to: forward.to.clone(),
+            name: forward.name.clone(),
+            note: forward.note.clone(),
+        }),
+    }
+    .map_err(failed)?;
     journal.close().map_err(failed)?;
     Ok(meta.cwd)
 }

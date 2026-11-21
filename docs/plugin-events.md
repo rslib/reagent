@@ -112,7 +112,7 @@ A reader ignores the keys it does not know.
 
 ## Gateway events
 
-Two more events reach gateway plugins, and only them: a plugin whose
+Five more events reach gateway plugins, and only them: a plugin whose
 `package.json` sets `"reagent": { "role": "gateway" }`, loaded by
 `reagent gateway`. A normal run never fires them, so a normal plugin that
 listens on them hears nothing.
@@ -129,6 +129,24 @@ announced yet.
 | `deadline` | number or `null` | when it expires, in milliseconds since the epoch; `null` when it never does |
 | `token` | string | 32 lowercase hex digits, the secret `reagent.gateway.answer` wants |
 
+`question_forwarded` fires once for each forward of a question, at the
+forward and again at each gateway start. Only the plugin the contact's
+`channel` names hears it.
+
+| key | type | meaning |
+|---|---|---|
+| `qid` | string | the id of the question in its journal |
+| `questions` | array | the questions of the call, as the model asked them |
+| `hop` | number | the number of the forward: 1 for the first |
+| `to` | string | the key of the contact in `contacts.toml` |
+| `name` | string | the name of the contact, which the model reads |
+| `user` | string | the `user` of the contact: your plugin's own id of that person |
+| `from` | string | who forwarded it: `"the owner"`, or the name of a contact |
+| `note` | string | what the person who forwarded it wrote, or `""` |
+| `at` | number | when the run parked it, in milliseconds since the epoch |
+| `deadline` | number or `null` | as in `question_parked`; a forward does not move it |
+| `token` | string | 32 lowercase hex digits, this person's own secret for `reagent.gateway.answer` and `reagent.gateway.forward` |
+
 `question_closed` fires once for each announced question that is no longer
 open.
 
@@ -138,8 +156,28 @@ open.
 | `how` | string | `"answered"` or `"expired"` |
 | `by` | string or `null` | who closed it, such as `"cli"`, `"deadline"` or `"gateway:<plugin>:<by>"`; `null` when no record names it |
 
-The answers go back through `reagent.gateway.answer`, which only a gateway
-plugin has. See `docs/gateway.md`.
+`approval_parked` fires once for each parked approval the gateway has not
+announced yet.
+
+| key | type | meaning |
+|---|---|---|
+| `qid` | string | the id of the approval in its journal |
+| `session` | string | the session that waits for the answer |
+| `tool` | string | the tool the call names |
+| `call` | string | one line that shows the call |
+| `rule` | string | the rule that asked, or `"default"` |
+| `save` | string or `null` | the rule a `save` answer writes; `null` when the call has none, and then `save` is no answer |
+| `at` | number | when the run parked it, in milliseconds since the epoch |
+| `deadline` | number or `null` | when it is refused, in milliseconds since the epoch; `null` when it never is |
+| `token` | string | 32 lowercase hex digits, the secret `reagent.gateway.approve` wants |
+
+`approval_closed` fires once for each announced approval that is no longer
+open, with the keys of `question_closed`.
+
+The answers go back through `reagent.gateway.answer` and
+`reagent.gateway.approve`, and a forward through `reagent.gateway.forward`,
+which only a gateway plugin has. See
+`docs/gateway.md`.
 
 ## Requiring a plugin
 

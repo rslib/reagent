@@ -231,22 +231,65 @@ pub fn create_parked_blocking(folder: &Path) -> io::Result<PathBuf> {
     Ok(at)
 }
 
-/// One question a run parked, as a process that did not run it finds it.
+/// One question or approval a run parked, as a process that did not run it
+/// finds it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Parked {
-    /// The id the question carries in the journal of its session.
+    /// The id the wait carries in the journal of its session.
     pub qid: String,
     /// The session that waits for the answer.
     pub session: String,
-    /// The questions of the call, as the model asked them.
+    /// The questions of the call, as the model asked them; `null` for an
+    /// approval.
+    #[serde(default)]
     pub questions: serde_json::Value,
+    /// The call an approval asks about; `None` for a question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ParkedApproval>,
+    /// The people a question was forwarded to, in hop order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwards: Vec<ParkedForward>,
     /// When the run parked it, in milliseconds since the epoch.
     pub at: u64,
 }
 
+/// One forward of a parked question, as its journal records it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkedForward {
+    /// The number of the forward: 1 for the first.
+    pub hop: u64,
+    /// Who forwarded it, by name.
+    pub from: String,
+    /// The key of the contact it went to.
+    pub to: String,
+    /// The name of that contact.
+    pub name: String,
+    /// What the person who forwarded it wrote, or nothing.
+    pub note: String,
+}
+
+/// The call a parked approval asks about, as the run showed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParkedApproval {
+    /// The tool the call names.
+    pub tool: String,
+    /// One line that shows the call.
+    pub call: String,
+    /// The rule that asked, or `default`.
+    pub rule: String,
+    /// The rule a `save` answer writes, when one would; with none, `save`
+    /// is not an answer of this approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save: Option<String>,
+}
+
 impl Parked {
-    /// The text of the first question, as a listing names it.
+    /// The text of the first question, or the call of an approval, as a
+    /// listing names it.
     pub fn first(&self) -> &str {
+        if let Some(approval) = &self.approval {
+            return &approval.call;
+        }
         self.questions
             .as_array()
             .and_then(|list| list.first())
@@ -567,8 +610,55 @@ mod tests {
             questions: serde_json::json!([
                 {"q": "Which database?", "options": [{"label": "sqlite"}, {"label": "postgres"}]}
             ]),
+            approval: None,
+            forwards: Vec::new(),
             at: 7,
         }
+    }
+
+    /// An entry written before approvals parked reads as a question, and a
+    /// parked approval keeps its call through a write and a read.
+    #[test]
+    fn a_parked_entry_reads_with_and_without_an_approval() {
+        let old: Parked = serde_json::from_str(
+            r#"{"qid":"q1","session":"s1","questions":[{"q":"Which?"}],"at":7}"#,
+        )
+        .expect("an old entry");
+        assert_eq!(old.approval, None);
+        assert!(old.forwards.is_empty());
+        assert_eq!(old.first(), "Which?");
+
+        let mut forwarded = parked("q3");
+        forwarded.forwards.push(ParkedForward {
+            hop: 1,
+            from: "the owner".to_string(),
+            to: "bob".to_string(),
+            name: "Bob".to_string(),
+            note: String::new(),
+        });
+        let text = serde_json::to_string(&forwarded).expect("write");
+        let back: Parked = serde_json::from_str(&text).expect("read");
+        assert_eq!(back, forwarded);
+
+        let approval = Parked {
+            qid: "q2".to_string(),
+            session: "s1".to_string(),
+            questions: serde_json::Value::Null,
+            approval: Some(ParkedApproval {
+                tool: "bash".to_string(),
+                call: "git push".to_string(),
+                rule: "default".to_string(),
+                save: None,
+            }),
+            forwards: Vec::new(),
+            at: 7,
+        };
+        let text = serde_json::to_string(&approval).expect("write");
+        assert!(!text.contains("\"save\""), "no save rule is no key: {text}");
+        assert!(!text.contains("\"forwards\""), "no forward is no key: {text}");
+        let back: Parked = serde_json::from_str(&text).expect("read");
+        assert_eq!(back, approval);
+        assert_eq!(back.first(), "git push");
     }
 
     const QID: &str = "0123456789abcdef0123456789abcdef";

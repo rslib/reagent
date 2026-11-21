@@ -86,8 +86,26 @@ pub mod model {
 pub mod approval {
     /// The call id the request is about.
     pub const CALL_ID: u32 = 1;
-    /// The kind: 1 waits for an answer, 2 runs, 3 is refused.
+    /// The kind: 1 waits for an answer, 2 runs, 3 is refused, 4 is the
+    /// answer a later process gave to a parked wait.
     pub const KIND: u32 = 2;
+    /// The id a later process answers a parked wait under: 32 lowercase hex
+    /// characters. A wait that can park and its answer write it.
+    pub const QID: u32 = 3;
+    /// The tool the call names; a wait that can park only.
+    pub const TOOL: u32 = 4;
+    /// One line that shows the call; a wait that can park only.
+    pub const LINE: u32 = 5;
+    /// The rule that asked; a wait that can park only.
+    pub const RULE: u32 = 6;
+    /// The rule a save would write, when one would; a wait that can park only.
+    pub const SAVE: u32 = 7;
+    /// Who answered a parked wait; the answer only.
+    pub const BY: u32 = 8;
+    /// The answer: `once`, `session`, `save` or `refuse`; the answer only.
+    pub const ANSWER: u32 = 9;
+    /// The reason of a refusal, when one was given; the answer only.
+    pub const REASON: u32 = 10;
 }
 
 /// Fields of a [`kinds::SETTINGS`] record.
@@ -120,6 +138,25 @@ pub mod question {
     pub const BY: u32 = 5;
     /// The JSON text of the answers, one list per question; the answer only.
     pub const ANSWERS: u32 = 6;
+    /// The hop whose person answered; not written for hop 0, the owner. The
+    /// answer only.
+    pub const HOP: u32 = 7;
+}
+
+/// Fields of a [`kinds::FORWARD`] record.
+pub mod forward {
+    /// The id of the question: 32 lowercase hex characters.
+    pub const QID: u32 = 1;
+    /// The number of the forward: 1 for the first.
+    pub const HOP: u32 = 2;
+    /// Who forwarded, as the model may read it.
+    pub const FROM: u32 = 3;
+    /// The key of the contact the question went to.
+    pub const TO: u32 = 4;
+    /// The name of that contact, as the model may read it.
+    pub const NAME: u32 = 5;
+    /// The note of the person who forwarded.
+    pub const NOTE: u32 = 6;
 }
 
 /// Every pair the journal writes, in the order the golden test lists them.
@@ -286,6 +323,14 @@ pub const FIELDS: &[(u8, u32, &str)] = &[
     (kinds::MODEL, model::CONFIG, "model.config"),
     (kinds::APPROVAL, approval::CALL_ID, "approval.call_id"),
     (kinds::APPROVAL, approval::KIND, "approval.kind"),
+    (kinds::APPROVAL, approval::QID, "approval.qid"),
+    (kinds::APPROVAL, approval::TOOL, "approval.tool"),
+    (kinds::APPROVAL, approval::LINE, "approval.line"),
+    (kinds::APPROVAL, approval::RULE, "approval.rule"),
+    (kinds::APPROVAL, approval::SAVE, "approval.save"),
+    (kinds::APPROVAL, approval::BY, "approval.by"),
+    (kinds::APPROVAL, approval::ANSWER, "approval.answer"),
+    (kinds::APPROVAL, approval::REASON, "approval.reason"),
     (kinds::SETTINGS, settings::LEVEL, "settings.level"),
     (kinds::SETTINGS, settings::MODE, "settings.mode"),
     (kinds::QUESTION, question::KIND, "question.kind"),
@@ -294,6 +339,13 @@ pub const FIELDS: &[(u8, u32, &str)] = &[
     (kinds::QUESTION, question::QUESTIONS, "question.questions"),
     (kinds::QUESTION, question::BY, "question.by"),
     (kinds::QUESTION, question::ANSWERS, "question.answers"),
+    (kinds::QUESTION, question::HOP, "question.hop"),
+    (kinds::FORWARD, forward::QID, "forward.qid"),
+    (kinds::FORWARD, forward::HOP, "forward.hop"),
+    (kinds::FORWARD, forward::FROM, "forward.from"),
+    (kinds::FORWARD, forward::TO, "forward.to"),
+    (kinds::FORWARD, forward::NAME, "forward.name"),
+    (kinds::FORWARD, forward::NOTE, "forward.note"),
 ];
 
 #[cfg(test)]
@@ -392,6 +444,14 @@ mod tests {
 20 3 model.config
 24 1 approval.call_id
 24 2 approval.kind
+24 3 approval.qid
+24 4 approval.tool
+24 5 approval.line
+24 6 approval.rule
+24 7 approval.save
+24 8 approval.by
+24 9 approval.answer
+24 10 approval.reason
 26 1 settings.level
 26 2 settings.mode
 27 1 question.kind
@@ -400,6 +460,13 @@ mod tests {
 27 4 question.questions
 27 5 question.by
 27 6 question.answers
+27 7 question.hop
+28 1 forward.qid
+28 2 forward.hop
+28 3 forward.from
+28 4 forward.to
+28 5 forward.name
+28 6 forward.note
 ";
         let mut listed = String::new();
         for (kind, field, name) in FIELDS {

@@ -13,13 +13,14 @@ use rquickjs::{Array, Ctx, Exception, Function, Object, Persistent, Value};
 use serde_json::{Map, Value as JsonValue};
 
 use super::runtime;
-use super::{AnswerAsk, BY_BYTES, Live, Notes, SessionAsk, SessionOp, SessionReply};
+use super::{AnswerAsk, Answered, BY_BYTES, Live, Notes, SessionAsk, SessionOp, SessionReply};
 
 /// The events a plugin may listen on.
 ///
-/// `question_parked` and `question_closed` reach gateway plugins only: a normal
+/// `question_parked`, `question_forwarded`, `question_closed`,
+/// `approval_parked` and `approval_closed` reach gateway plugins only: a normal
 /// run never fires them.
-const EVENTS: [&str; 10] = [
+const EVENTS: [&str; 13] = [
     "run_start",
     "turn_start",
     "turn_end",
@@ -27,7 +28,10 @@ const EVENTS: [&str; 10] = [
     "run_end",
     "usage",
     "question_parked",
+    "question_forwarded",
     "question_closed",
+    "approval_parked",
+    "approval_closed",
     "waiting",
     "waited",
 ];
@@ -37,6 +41,9 @@ const DENIED: &str = "denied";
 
 /// What `reagent.gateway.answer` says of a question that is no longer open.
 const STALE: &str = "stale";
+
+/// The most bytes of a forward's note the journal keeps, and the model reads.
+const NOTE_BYTES: usize = 1024;
 
 /// The hooks a plugin may install.
 pub(crate) const HOOKS: [&str; 3] = ["tool.call", "tool.result", "turn.end"];
@@ -474,20 +481,22 @@ pub(crate) fn reagent<'js>(
 
 /// The `reagent.gateway` object a gateway plugin gets, and no other plugin.
 ///
-/// `answer(qid, token, answers, by)` hands the work to the gateway's async side
-/// and answers a Promise of `"ok"`, `"denied"`, `"stale"` or `"busy"`, which settles
-/// when the gateway is done with the journal, the parked folder and the worker
-/// it restarts. The plugin thread never waits on any of that itself.
+/// `answer(qid, token, answers, by)`, `approve(qid, token, answer, by,
+/// reason)` and `forward(qid, token, to, note)` hand the work to the gateway's
+/// async side and answer a Promise of `"ok"`, `"denied"`, `"stale"` or
+/// `"busy"`, which settles when the gateway is done with the journal, the
+/// parked folder and the worker it restarts. The plugin thread never waits on
+/// any of that itself.
 fn gateway<'js>(
     ctx: &Ctx<'js>,
     plugin: &str,
     answers: &tokio::sync::mpsc::UnboundedSender<AnswerAsk>,
 ) -> rquickjs::Result<Object<'js>> {
-    let answers = answers.clone();
     let plugin = plugin.to_string();
     // Its name is part of the `by` the journal records: `gateway:<plugin>:<by>`.
-    let answer = Function::new(
-        ctx.clone(),
+    let answer = Function::new(ctx.clone(), {
+        let answers = answers.clone();
+        let plugin = plugin.clone();
         move |ctx: Ctx<'js>,
               qid: Value<'js>,
               token: Value<'js>,
@@ -512,28 +521,129 @@ fn gateway<'js>(
                 plugin: plugin.clone(),
                 qid,
                 token,
-                answers: list,
+                answered: Answered::Answers(list),
                 by: cut(&by, BY_BYTES).to_owned(),
                 reply,
             };
-            if answers.send(ask).is_err() {
-                return Ok(refused(STALE));
-            }
-            // The gateway answers on its own thread; this future settles the
-            // promise with what it decided, whatever the plugin awaits.
-            ctx.spawn(async move {
-                let verdict = match done.await {
-                    Ok(verdict) => verdict,
-                    Err(_) => STALE.to_string(),
-                };
-                let _ = resolve.call::<_, ()>((verdict,));
-            });
-            Ok(promise.into_value())
-        },
-    )?;
+            Ok(hand(&ctx, &answers, ask, promise, resolve, done))
+        }
+    })?;
+    let approve = Function::new(ctx.clone(), {
+        let answers = answers.clone();
+        let plugin = plugin.clone();
+        move |ctx: Ctx<'js>,
+              qid: Value<'js>,
+              token: Value<'js>,
+              word: Value<'js>,
+              by: Value<'js>,
+              reason: Opt<Value<'js>>|
+              -> rquickjs::Result<Value<'js>> {
+            let (promise, resolve, _reject) = ctx.promise()?;
+            let (Some(qid), Some(token), Some(word)) =
+                (text_of(&qid), text_of(&token), text_of(&word))
+            else {
+                let _ = resolve.call::<_, ()>((DENIED,));
+                return Ok(promise.into_value());
+            };
+            let by = text_of(&by).unwrap_or_default();
+            let reason = reason
+                .0
+                .filter(|reason| !reason.is_undefined() && !reason.is_null())
+                .map(|reason| text_of(&reason));
+            // A reason that is not text is a wrong answer, not one without a
+            // reason.
+            let reason = match reason {
+                None => None,
+                Some(Some(reason)) => Some(reason),
+                Some(None) => {
+                    let _ = resolve.call::<_, ()>((DENIED,));
+                    return Ok(promise.into_value());
+                }
+            };
+            let (reply, done) = tokio::sync::oneshot::channel();
+            let ask = AnswerAsk {
+                plugin: plugin.clone(),
+                qid,
+                token,
+                answered: Answered::Approval { word, reason },
+                by: cut(&by, BY_BYTES).to_owned(),
+                reply,
+            };
+            Ok(hand(&ctx, &answers, ask, promise, resolve, done))
+        }
+    })?;
+    let forward = Function::new(ctx.clone(), {
+        let answers = answers.clone();
+        move |ctx: Ctx<'js>,
+              qid: Value<'js>,
+              token: Value<'js>,
+              to: Value<'js>,
+              note: Opt<Value<'js>>|
+              -> rquickjs::Result<Value<'js>> {
+            let (promise, resolve, _reject) = ctx.promise()?;
+            let (Some(qid), Some(token), Some(to)) = (text_of(&qid), text_of(&token), text_of(&to))
+            else {
+                let _ = resolve.call::<_, ()>((DENIED,));
+                return Ok(promise.into_value());
+            };
+            let note = match note
+                .0
+                .filter(|note| !note.is_undefined() && !note.is_null())
+            {
+                None => String::new(),
+                Some(note) => match text_of(&note) {
+                    Some(note) => note,
+                    None => {
+                        let _ = resolve.call::<_, ()>((DENIED,));
+                        return Ok(promise.into_value());
+                    }
+                },
+            };
+            let (reply, done) = tokio::sync::oneshot::channel();
+            let ask = AnswerAsk {
+                plugin: plugin.clone(),
+                qid,
+                token,
+                answered: Answered::Forward {
+                    to,
+                    note: cut(&note, NOTE_BYTES).to_owned(),
+                },
+                by: String::new(),
+                reply,
+            };
+            Ok(hand(&ctx, &answers, ask, promise, resolve, done))
+        }
+    })?;
     let object = Object::new(ctx.clone())?;
     object.set("answer", answer)?;
+    object.set("approve", approve)?;
+    object.set("forward", forward)?;
     Ok(object)
+}
+
+/// Hands one answer to the gateway, and settles `promise` with its verdict.
+fn hand<'js>(
+    ctx: &Ctx<'js>,
+    answers: &tokio::sync::mpsc::UnboundedSender<AnswerAsk>,
+    ask: AnswerAsk,
+    promise: rquickjs::Promise<'js>,
+    resolve: Function<'js>,
+    done: tokio::sync::oneshot::Receiver<String>,
+) -> Value<'js> {
+    if answers.send(ask).is_err() {
+        let _ = resolve.call::<_, ()>((STALE,));
+        return promise.into_value();
+    }
+    // The gateway answers on its own thread; this future settles the promise
+    // with what it decided, whatever the plugin awaits.
+    ctx.spawn(async move {
+        let verdict = match done.await {
+            Ok(verdict) => verdict,
+            Err(_) => STALE.to_string(),
+        };
+        let _ = resolve.call::<_, ()>((verdict,));
+    });
+    promise.into_value()
 }
 
 /// What a `reagent.sessions` call answers when the run has no host for the

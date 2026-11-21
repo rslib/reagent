@@ -408,7 +408,7 @@ impl Questions {
 /// The store's random source mixes two hashers a process seeds from the OS with
 /// a counter and the clock, which is enough for a name: an id is a name, not a
 /// key.
-fn fresh_qid() -> String {
+pub(crate) fn fresh_qid() -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut id = String::with_capacity(32);
     for word in [
@@ -667,14 +667,41 @@ fn questions_text(args: &str) -> String {
 /// The result an answered question gives in a process that only reads its
 /// record: the questions of the `questions` text and the answers of the
 /// `answers` text, as the live answer reads them. A `null` answer is no answer.
-pub(crate) fn from_record(questions: &str, answers: &str) -> ToolOutput {
+///
+/// An answer from a person the question was forwarded to ends with one line
+/// that names that person and who forwarded it, by the names of the contacts
+/// file, never by an id.
+pub(crate) fn from_record(
+    questions: &str,
+    answers: &str,
+    forward: Option<&crate::journal::resume::Forward>,
+) -> ToolOutput {
     let Some(questions) = listed(questions) else {
         return ToolOutput::ok(UNANSWERED);
     };
-    match serde_json::from_str::<Answers>(answers) {
-        Ok(Some(picks)) => told(&questions, &picks),
-        _ => ToolOutput::ok(UNANSWERED),
+    let Ok(Some(picks)) = serde_json::from_str::<Answers>(answers) else {
+        return ToolOutput::ok(UNANSWERED);
+    };
+    let mut output = told(&questions, &picks);
+    if let Some(forward) = forward
+        && output.content.as_ref() != UNANSWERED
+    {
+        let mut body = String::from(output.content.as_ref());
+        body.push_str(&format!(
+            "\nAnswered by {}, forwarded by {}",
+            forward.name, forward.from
+        ));
+        if forward.note.is_empty() {
+            body.push('.');
+        } else {
+            // JSON quotes keep the person's own script, where `{:?}` would
+            // escape combining marks.
+            let quoted = serde_json::to_string(&forward.note).unwrap_or_default();
+            body.push_str(&format!(" with the note {quoted}."));
+        }
+        output = ToolOutput::ok(body);
     }
+    output
 }
 
 /// The questions of a `questions` text, when it reads as the argument does.
@@ -925,12 +952,56 @@ mod tests {
     fn question_record_of_an_answer_reads_as_the_live_answer() {
         let questions = questions_text(ONE);
         assert_eq!(
-            from_record(&questions, r#"[["postgres"]]"#)
+            from_record(&questions, r#"[["postgres"]]"#, None)
                 .content
                 .as_ref(),
             "Q: Which database?\nA: postgres"
         );
-        assert_eq!(from_record(&questions, "null").content.as_ref(), UNANSWERED);
+        assert_eq!(
+            from_record(&questions, "null", None).content.as_ref(),
+            UNANSWERED
+        );
+    }
+
+    /// An answer from a person the question was forwarded to names that person
+    /// and who forwarded it; no answer names nobody.
+    #[test]
+    fn question_record_of_a_forwarded_answer_names_who_answered() {
+        let questions = questions_text(ONE);
+        let mut forward = crate::journal::resume::Forward {
+            hop: 1,
+            from: "the owner".into(),
+            to: "bob".into(),
+            name: "Bob".into(),
+            note: "Bob owns the budget".into(),
+        };
+        assert_eq!(
+            from_record(&questions, r#"[["postgres"]]"#, Some(&forward))
+                .content
+                .as_ref(),
+            "Q: Which database?\nA: postgres\nAnswered by Bob, forwarded by the owner with the note \"Bob owns the budget\"."
+        );
+        forward.note = "caf\u{e9} e\u{301}".into();
+        assert!(
+            from_record(&questions, r#"[["postgres"]]"#, Some(&forward))
+                .content
+                .as_ref()
+                .ends_with("with the note \"caf\u{e9} e\u{301}\"."),
+            "the note keeps its script"
+        );
+        forward.note.clear();
+        assert_eq!(
+            from_record(&questions, r#"[["postgres"]]"#, Some(&forward))
+                .content
+                .as_ref(),
+            "Q: Which database?\nA: postgres\nAnswered by Bob, forwarded by the owner."
+        );
+        assert_eq!(
+            from_record(&questions, "null", Some(&forward))
+                .content
+                .as_ref(),
+            UNANSWERED
+        );
     }
 
     #[tokio::test]

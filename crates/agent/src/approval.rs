@@ -6,7 +6,7 @@
 //! with no timer: a call that nobody answers waits until the run is cancelled.
 //! Silence is never a yes, so a run with no listener refuses instead of waiting.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -147,6 +147,9 @@ pub(crate) enum Waited {
     Cancelled,
     /// No answer could come: the event channel or the answer channel is gone.
     Silent,
+    /// The run parked the wait: a later process answers it, so the call has
+    /// no result in this run.
+    Parked,
 }
 
 /// The calls of one session that wait for an answer, by id.
@@ -157,6 +160,23 @@ pub(crate) enum Waited {
 pub struct Approvals {
     next: AtomicU64,
     pending: Mutex<HashMap<ApprovalId, oneshot::Sender<Answer>>>,
+    parking: Mutex<Parking>,
+}
+
+/// What the registry knows of waits a later process may answer.
+#[derive(Debug, Default)]
+struct Parking {
+    /// The call of each open wait whose request the journal holds with an id.
+    parkable: HashMap<ApprovalId, String>,
+    /// Whether the run parked: a wait that can park ends parked at once.
+    parked: bool,
+    /// The calls a park ended, so their results stay out of the journal.
+    stopped: HashSet<String>,
+    /// The id a resumed call waits under again, by call id.
+    reused: HashMap<String, String>,
+    /// The answer a later process gave, by call id: the call takes it and
+    /// asks no client.
+    given: HashMap<String, Answer>,
 }
 
 impl Approvals {
@@ -172,7 +192,87 @@ impl Approvals {
 
     /// Takes the sender of `id`: `None` when no call waits for it any more.
     fn take(&self, id: ApprovalId) -> Option<oneshot::Sender<Answer>> {
+        if let Ok(mut parking) = self.parking.lock() {
+            parking.parkable.remove(&id);
+        }
         self.pending.lock().ok()?.remove(&id)
+    }
+
+    fn parking(&self) -> std::sync::MutexGuard<'_, Parking> {
+        self.parking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Says that the resumed call `call` waits again under `qid`, whose wait a
+    /// process that ended already recorded: the wait writes no second record.
+    pub fn reuse(&self, call: &str, qid: &str) {
+        self.parking()
+            .reused
+            .insert(call.to_owned(), qid.to_owned());
+    }
+
+    /// Gives the resumed call `call` the answer a later process wrote, so the
+    /// call takes it and asks no client.
+    pub fn give(&self, call: &str, answer: Answer) {
+        self.parking().given.insert(call.to_owned(), answer);
+    }
+
+    /// The id the wait of `call` carries, and whether the journal already
+    /// holds it: a resumed call keeps its old id once, any other call gets a
+    /// new one.
+    pub(crate) fn qid(&self, call: &str) -> (String, bool) {
+        match self.parking().reused.remove(call) {
+            Some(qid) => (qid, true),
+            None => (crate::question::fresh_qid(), false),
+        }
+    }
+
+    /// Takes the answer a later process gave the wait of `call`.
+    pub(crate) fn take_given(&self, call: &str) -> Option<Answer> {
+        self.parking().given.remove(call)
+    }
+
+    /// Drops what a resumed batch left: an id or an answer no call took,
+    /// because the check of its call no longer asked.
+    pub(crate) fn settle(&self) {
+        let mut parking = self.parking();
+        parking.reused.clear();
+        parking.given.clear();
+    }
+
+    /// Parks the waits the journal holds with an id: each ends parked, and a
+    /// wait that opens after this ends parked at once.
+    ///
+    /// A parked call leaves no result, so the run ends once the other calls
+    /// of the reply are in, and a later process answers the wait and resumes
+    /// the session.
+    pub fn park(&self) {
+        let ids: Vec<ApprovalId> = {
+            let mut parking = self.parking();
+            parking.parked = true;
+            let parkable = std::mem::take(&mut parking.parkable);
+            let ids = parkable.keys().copied().collect();
+            parking.stopped.extend(parkable.into_values());
+            ids
+        };
+        // Dropping a sender ends its wait; the wait reads the park.
+        if let Ok(mut pending) = self.pending.lock() {
+            for id in ids {
+                pending.remove(&id);
+            }
+        }
+    }
+
+    /// Whether a park now leaves a wait a later process answers.
+    pub fn parkable(&self) -> bool {
+        !self.parking().parkable.is_empty()
+    }
+
+    /// Whether a park ended the wait of `call`, so its result stays out of
+    /// the journal and the history.
+    pub fn parked_call(&self, call: &str) -> bool {
+        self.parking().stopped.contains(call)
     }
 }
 
@@ -193,8 +293,28 @@ impl Approver {
     ///
     /// The call waits on the answer and on the token only, so a cancel reaches
     /// it at once and an unanswered request waits until the run ends.
-    pub(crate) async fn ask(&self, ask: &crate::guard::Ask, token: &CancellationToken) -> Waited {
-        let (id, receiver) = self.approvals.open();
+    pub(crate) async fn ask(
+        &self,
+        ask: &crate::guard::Ask,
+        call: Option<&str>,
+        token: &CancellationToken,
+    ) -> Waited {
+        // A call whose wait the journal holds with an id may park: after a park
+        // it parks at once, and until then a park ends it.
+        let (id, receiver) = {
+            let mut parking = self.approvals.parking();
+            if let Some(call) = call
+                && parking.parked
+            {
+                parking.stopped.insert(call.to_owned());
+                return Waited::Parked;
+            }
+            let (id, receiver) = self.approvals.open();
+            if let Some(call) = call {
+                parking.parkable.insert(id, call.to_owned());
+            }
+            (id, receiver)
+        };
         let request = Event::ApprovalRequest(Box::new(ApprovalRequest {
             id,
             tool: ask.tool.clone(),
@@ -222,7 +342,11 @@ impl Approver {
             Ok(answer) => Waited::Answered(answer),
             Err(_) => {
                 self.approvals.take(id);
-                Waited::Silent
+                if call.is_some_and(|call| self.approvals.parked_call(call)) {
+                    Waited::Parked
+                } else {
+                    Waited::Silent
+                }
             }
         }
     }
@@ -351,7 +475,7 @@ mod tests {
         let token = CancellationToken::new();
         let responder = approver.clone();
         let waited = token.clone();
-        let wait = tokio::spawn(async move { responder.ask(&ask(), &waited).await });
+        let wait = tokio::spawn(async move { responder.ask(&ask(), None, &waited).await });
         let Some(Event::ApprovalRequest(request)) = seen.recv().await else {
             panic!("expected an approval request");
         };
@@ -377,7 +501,7 @@ mod tests {
         let token = CancellationToken::new();
         let responder = approver.clone();
         let cancel = token.clone();
-        let wait = tokio::spawn(async move { responder.ask(&ask(), &cancel).await });
+        let wait = tokio::spawn(async move { responder.ask(&ask(), None, &cancel).await });
         let Some(Event::ApprovalRequest(request)) = seen.recv().await else {
             panic!("expected an approval request");
         };

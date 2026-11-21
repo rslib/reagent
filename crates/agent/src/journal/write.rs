@@ -1021,10 +1021,17 @@ async fn a_resume_of_a_waiting_approval_asks_the_same_question() {
         "the wait is on the disk with no answer"
     );
 
-    // A resume finds the call pending: its last approval record is a wait.
+    // A resume finds the call pending: its last approval record is a wait,
+    // which it asks again under the id the wait carries, with no answer yet.
     let parent = Session::open(dir.path()).expect("open the session");
     let resumed = resume::load(&parent).expect("resume");
     drop(parent);
+    let held = resumed.pending.first().and_then(|call| call.held.clone());
+    let qid = held
+        .as_ref()
+        .map(|held| held.qid.clone())
+        .unwrap_or_default();
+    assert_eq!(qid.len(), 32, "the wait carries an id: {held:?}");
     assert_eq!(
         resumed.pending,
         [PendingCall {
@@ -1032,7 +1039,16 @@ async fn a_resume_of_a_waiting_approval_asks_the_same_question() {
             name: "poke".into(),
             class: Some(EffectClass::LocalReversible),
             qid: None,
+            held: Some(resume::Held {
+                qid: qid.clone(),
+                given: None,
+            }),
         }]
+    );
+    assert_eq!(
+        resumed.parked,
+        [("call_1".to_owned(), qid)],
+        "a later process may answer it"
     );
     assert!(
         !resumed
@@ -1092,11 +1108,12 @@ async fn a_resume_of_a_waiting_approval_asks_the_same_question() {
     assert_eq!(
         approvals(dir.path()),
         [
-            ("call_1".to_owned(), ApprovalKind::Wait),
+            // The second ask waits under the id of the first wait, which is
+            // on the disk already, so it writes no second one.
             ("call_1".to_owned(), ApprovalKind::Wait),
             ("call_1".to_owned(), ApprovalKind::Run),
         ],
-        "the second ask and its answer are on the disk"
+        "the answer of the second ask is on the disk"
     );
 }
 
@@ -1188,6 +1205,7 @@ async fn a_resumed_read_runs_again_and_its_result_reaches_the_next_request() {
             name: "peek".into(),
             class: None,
             qid: None,
+            held: None,
         }]
     );
 
